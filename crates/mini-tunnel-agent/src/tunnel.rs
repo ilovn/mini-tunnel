@@ -1,10 +1,24 @@
 //! Bidirectional bridge between a validated L3 packet device and an authenticated peer channel.
 
-use std::{collections::HashMap, net::Ipv4Addr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap, future::Future, net::Ipv4Addr, pin::Pin, sync::Arc, time::Duration,
+};
 
 use thiserror::Error;
 
 use crate::{IdentityError, PeerChannel, tun_device::TunError};
+
+pub type PeerConnector = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Result<PeerChannel, IdentityError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+pub struct ReconnectingPeer {
+    pub address: Ipv4Addr,
+    pub channel: Arc<PeerChannel>,
+    pub connector: PeerConnector,
+}
 
 #[derive(Debug, Error)]
 pub enum PeerTunnelError {
@@ -77,38 +91,63 @@ pub async fn pump_peer_packets<T: TunnelPacketIo>(
 
 async fn receive_mesh_peer(
     address: Ipv4Addr,
-    channel: Arc<PeerChannel>,
+    channel: Arc<tokio::sync::RwLock<Arc<PeerChannel>>>,
+    connector: Option<PeerConnector>,
     event_tx: tokio::sync::mpsc::Sender<(Ipv4Addr, Result<Vec<u8>, IdentityError>)>,
 ) {
-    let mut keepalive = tokio::time::interval(Duration::from_secs(10));
-    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    keepalive.tick().await;
-    let mut last_received = tokio::time::Instant::now();
-    let mut inbound = Box::pin(channel.recv_packet());
     loop {
-        tokio::select! {
-            result = tokio::time::timeout_at(last_received + Duration::from_secs(30), &mut inbound) => {
-                let result = match result {
-                    Ok(result) => result,
-                    Err(_) => Err(IdentityError::Transport("peer keepalive timed out".to_owned())),
-                };
-                if matches!(&result, Ok(packet) if packet.is_empty()) {
-                    last_received = tokio::time::Instant::now();
-                    inbound = Box::pin(channel.recv_packet());
-                    continue;
+        let active = Arc::clone(&*channel.read().await);
+        let mut keepalive = tokio::time::interval(Duration::from_secs(10));
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        keepalive.tick().await;
+        let mut last_received = tokio::time::Instant::now();
+        let mut inbound = Box::pin(active.recv_packet());
+        let failure = loop {
+            tokio::select! {
+                result = tokio::time::timeout_at(last_received + Duration::from_secs(30), &mut inbound) => {
+                    let result = match result {
+                        Ok(result) => result,
+                        Err(_) => Err(IdentityError::Transport("peer keepalive timed out".to_owned())),
+                    };
+                    match result {
+                        Ok(packet) => {
+                            last_received = tokio::time::Instant::now();
+                            inbound = Box::pin(active.recv_packet());
+                            if !packet.is_empty() && event_tx.send((address, Ok(packet))).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(error) => break error,
+                    }
                 }
-                let disconnected = result.is_err();
-                if event_tx.send((address, result)).await.is_err() || disconnected {
-                    return;
+                _ = keepalive.tick() => {
+                    if let Err(error) = active.send_keepalive().await {
+                        break error;
+                    }
                 }
-                last_received = tokio::time::Instant::now();
-                inbound = Box::pin(channel.recv_packet());
             }
-            _ = keepalive.tick() => {
-                if channel.send_keepalive().await.is_err() {
-                    let _ = event_tx.send((address, Err(IdentityError::Transport("peer keepalive send failed".to_owned())))).await;
+        };
+        if connector.is_none() {
+            let _ = event_tx.send((address, Err(failure))).await;
+            return;
+        }
+        let connector = connector.as_ref().expect("checked above");
+        let mut attempt = 0_u32;
+        loop {
+            tokio::time::sleep(crate::reconnect_delay(attempt)).await;
+            attempt = attempt.saturating_add(1);
+            match (connector)().await {
+                Ok(reconnected) => {
+                    *channel.write().await = Arc::new(reconnected);
+                    break;
+                }
+                Err(IdentityError::UnauthorizedPeer) => {
+                    let _ = event_tx
+                        .send((address, Err(IdentityError::UnauthorizedPeer)))
+                        .await;
                     return;
                 }
+                Err(_) => continue,
             }
         }
     }
@@ -122,12 +161,46 @@ pub async fn pump_peer_mesh<T: TunnelPacketIo>(
     packet_io: &T,
     peers: Vec<(Ipv4Addr, Arc<PeerChannel>)>,
 ) -> Result<(), PeerTunnelError> {
+    pump_mesh(
+        packet_io,
+        peers
+            .into_iter()
+            .map(|(address, channel)| (address, channel, None))
+            .collect(),
+    )
+    .await
+}
+
+pub async fn pump_peer_mesh_reconnecting<T: TunnelPacketIo>(
+    packet_io: &T,
+    peers: Vec<ReconnectingPeer>,
+) -> Result<(), PeerTunnelError> {
+    pump_mesh(
+        packet_io,
+        peers
+            .into_iter()
+            .map(|peer| (peer.address, peer.channel, Some(peer.connector)))
+            .collect(),
+    )
+    .await
+}
+
+async fn pump_mesh<T: TunnelPacketIo>(
+    packet_io: &T,
+    peers: Vec<(Ipv4Addr, Arc<PeerChannel>, Option<PeerConnector>)>,
+) -> Result<(), PeerTunnelError> {
     if peers.is_empty() {
         return Err(PeerTunnelError::NoPeers);
     }
     let mut channels = HashMap::with_capacity(peers.len());
-    for (address, channel) in peers {
-        if channels.insert(address, channel).is_some() {
+    for (address, channel, connector) in peers {
+        if channels
+            .insert(
+                address,
+                (Arc::new(tokio::sync::RwLock::new(channel)), connector),
+            )
+            .is_some()
+        {
             return Err(PeerTunnelError::DuplicatePeerAddress);
         }
     }
@@ -135,11 +208,17 @@ pub async fn pump_peer_mesh<T: TunnelPacketIo>(
     let (event_tx, mut event_rx) =
         tokio::sync::mpsc::channel(channels.len().saturating_mul(8).max(8));
     let mut receivers = tokio::task::JoinSet::new();
-    for (&address, channel) in &channels {
+    for (&address, (channel, connector)) in &channels {
         let peer_address = address;
         let channel = Arc::clone(channel);
+        let connector = connector.clone();
         let event_tx = event_tx.clone();
-        receivers.spawn(receive_mesh_peer(peer_address, channel, event_tx));
+        receivers.spawn(receive_mesh_peer(
+            peer_address,
+            channel,
+            connector,
+            event_tx,
+        ));
     }
     drop(event_tx);
 
@@ -150,10 +229,11 @@ pub async fn pump_peer_mesh<T: TunnelPacketIo>(
                 let Some(destination) = ipv4_destination(&packet) else {
                     continue;
                 };
-                if let Some(channel) = channels.get(&destination)
-                    && channel.send_packet(&packet).await.is_err()
-                {
-                    channels.remove(&destination);
+                if let Some((channel, connector)) = channels.get(&destination) {
+                    let current = Arc::clone(&*channel.read().await);
+                    if current.send_packet(&packet).await.is_err() && connector.is_none() {
+                        channels.remove(&destination);
+                    }
                 }
             }
             inbound = event_rx.recv() => {
@@ -165,9 +245,7 @@ pub async fn pump_peer_mesh<T: TunnelPacketIo>(
                         Ok(()) | Err(TunError::InvalidPacket(_)) => {}
                         Err(error) => return Err(error.into()),
                     },
-                    Err(_) => {
-                        channels.remove(&address);
-                    }
+                    Err(_) => { channels.remove(&address); }
                 }
             }
         }
@@ -191,7 +269,10 @@ mod tests {
     use tokio::sync::{Mutex, mpsc};
 
     use super::*;
-    use crate::{Identity, accept_peer, connect_peer, peer_endpoint};
+    use crate::{
+        Identity, accept_peer, accept_tcp_peer_any, connect_peer, connect_tcp_peer, peer_endpoint,
+        peer_tcp_listener,
+    };
 
     struct MockPacketIo {
         outbound: Mutex<mpsc::Receiver<Vec<u8>>>,
@@ -241,6 +322,93 @@ mod tests {
         packet[12..16].copy_from_slice(&source.octets());
         packet[16..20].copy_from_slice(&destination.octets());
         packet
+    }
+
+    #[tokio::test]
+    async fn mesh_reconnects_peer_after_tcp_disconnect() {
+        async fn tcp_pair(a: Arc<Identity>, b: Arc<Identity>) -> (PeerChannel, PeerChannel) {
+            let listener = peer_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let allowed = vec![(a.device_id(), a.public_key())];
+            let peer_id = b.device_id();
+            let accept = accept_tcp_peer_any(&listener, "mesh-reconnect", &b, &allowed);
+            let connect = connect_tcp_peer(address, "mesh-reconnect", &a, &peer_id, b.public_key());
+            let (accepted, connected) = tokio::join!(accept, connect);
+            (connected.unwrap(), accepted.unwrap().1)
+        }
+
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-mesh-reconnect-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let a = Arc::new(Identity::load_or_create_at(temp.join("a/key")).unwrap());
+        let b = Arc::new(Identity::load_or_create_at(temp.join("b/key")).unwrap());
+        let (initial, remote_initial) = tcp_pair(Arc::clone(&a), Arc::clone(&b)).await;
+        let remote_channel = Arc::new(Mutex::new(None));
+        let remote_notify = Arc::new(tokio::sync::Notify::new());
+        let connector: PeerConnector = {
+            let a = Arc::clone(&a);
+            let b = Arc::clone(&b);
+            let remote_channel = Arc::clone(&remote_channel);
+            let remote_notify = Arc::clone(&remote_notify);
+            Arc::new(move || {
+                let a = Arc::clone(&a);
+                let b = Arc::clone(&b);
+                let remote_channel = Arc::clone(&remote_channel);
+                let remote_notify = Arc::clone(&remote_notify);
+                Box::pin(async move {
+                    let (local, remote) = tcp_pair(a, b).await;
+                    *remote_channel.lock().await = Some(remote);
+                    remote_notify.notify_one();
+                    Ok(local)
+                })
+            })
+        };
+        let local_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let peer_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let (outbound_tx, outbound_rx) = mpsc::channel(4);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(4);
+        let io = Arc::new(MockPacketIo {
+            outbound: Mutex::new(outbound_rx),
+            inbound: inbound_tx,
+            local_ipv4: local_ip,
+            mtu: 1500,
+        });
+        let pump_io = Arc::clone(&io);
+        let pump = tokio::spawn(async move {
+            pump_peer_mesh_reconnecting(
+                &*pump_io,
+                vec![ReconnectingPeer {
+                    address: peer_ip,
+                    channel: Arc::new(initial),
+                    connector,
+                }],
+            )
+            .await
+        });
+        drop(remote_initial);
+        tokio::time::timeout(Duration::from_secs(3), remote_notify.notified())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        outbound_tx
+            .send(packet(local_ip, peer_ip, 28))
+            .await
+            .unwrap();
+        let recovered = remote_channel.lock().await.take().unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), recovered.recv_packet())
+                .await
+                .unwrap()
+                .unwrap()
+                .len(),
+            28
+        );
+        pump.abort();
+        drop(recovered);
+        fs::remove_dir_all(temp).unwrap();
     }
 
     #[tokio::test]
