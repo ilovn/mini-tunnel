@@ -5,6 +5,13 @@ use std::{
     time::Duration,
 };
 
+use axum::{
+    Router,
+    extract::State,
+    http::{StatusCode, header},
+    response::IntoResponse,
+    routing::get,
+};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand};
 use mini_tunnel_protocol::{
@@ -103,6 +110,13 @@ enum RelayCommand {
             default_value = "0.0.0.0:42001"
         )]
         listen: SocketAddr,
+        /// Loopback-only HTTP health and Prometheus metrics listener.
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_RELAY_METRICS_LISTEN",
+            default_value = "127.0.0.1:42002"
+        )]
+        metrics_listen: SocketAddr,
         /// Maximum concurrent connections and sessions across all sources.
         #[arg(
             long,
@@ -406,6 +420,73 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
+fn validate_relay_metrics_address(address: SocketAddr) -> std::io::Result<()> {
+    if address.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "relay metrics listener must use a loopback address",
+        ))
+    }
+}
+
+fn relay_metrics_router(relay: mini_tunnel_relay::RelayServer) -> Router {
+    Router::new()
+        .route("/healthz", get(relay_health))
+        .route("/metrics", get(relay_metrics))
+        .with_state(relay)
+}
+
+async fn relay_health() -> impl IntoResponse {
+    (StatusCode::OK, "ok\n")
+}
+
+async fn relay_metrics(State(relay): State<mini_tunnel_relay::RelayServer>) -> impl IntoResponse {
+    let stats = relay.stats().await;
+    let body = format!(
+        "# HELP mini_tunnel_relay_active_connections Accepted relay connections, including pending and active sessions.\n\
+         # TYPE mini_tunnel_relay_active_connections gauge\n\
+         mini_tunnel_relay_active_connections {}\n\
+         # HELP mini_tunnel_relay_max_connections Configured global connection limit.\n\
+         # TYPE mini_tunnel_relay_max_connections gauge\n\
+         mini_tunnel_relay_max_connections {}\n\
+         # HELP mini_tunnel_relay_max_connections_per_source_ip Configured source IP connection limit.\n\
+         # TYPE mini_tunnel_relay_max_connections_per_source_ip gauge\n\
+         mini_tunnel_relay_max_connections_per_source_ip {}\n\
+         # HELP mini_tunnel_relay_active_sessions Pending or established relay sessions.\n\
+         # TYPE mini_tunnel_relay_active_sessions gauge\n\
+         mini_tunnel_relay_active_sessions {}\n\
+         # HELP mini_tunnel_relay_accepted_connections_total TCP connections accepted by the listener.\n\
+         # TYPE mini_tunnel_relay_accepted_connections_total counter\n\
+         mini_tunnel_relay_accepted_connections_total {}\n\
+         # HELP mini_tunnel_relay_capacity_rejections_total Connections rejected by global or source IP limits.\n\
+         # TYPE mini_tunnel_relay_capacity_rejections_total counter\n\
+         mini_tunnel_relay_capacity_rejections_total {}\n\
+         # HELP mini_tunnel_relay_handshake_failures_total Relay protocol or identity handshakes that failed or timed out.\n\
+         # TYPE mini_tunnel_relay_handshake_failures_total counter\n\
+         mini_tunnel_relay_handshake_failures_total {}\n\
+         # HELP mini_tunnel_relay_bytes_forwarded_total Bytes forwarded across all sessions.\n\
+         # TYPE mini_tunnel_relay_bytes_forwarded_total counter\n\
+         mini_tunnel_relay_bytes_forwarded_total {}\n",
+        stats.active_connections,
+        stats.max_connections,
+        stats.max_connections_per_source_ip,
+        stats.active_sessions,
+        stats.accepted_connections_total,
+        stats.capacity_rejections_total,
+        stats.handshake_failures_total,
+        stats.bytes_forwarded_total,
+    );
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+}
+
 fn default_coordinator_state_path() -> PathBuf {
     directories::ProjectDirs::from("org", "ilovn", "mini-tunnel")
         .map(|dirs| dirs.data_local_dir().join("coordinator-state.json"))
@@ -472,6 +553,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Relay { command } => match command {
             RelayCommand::Serve {
                 listen,
+                metrics_listen,
                 max_connections,
                 max_connections_per_source_ip,
                 previous_ticket_key,
@@ -496,15 +578,38 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         .map_err(|_| "previous relay ticket key must decode to exactly 32 bytes")?;
                     config = config.with_previous_ticket_key(previous);
                 }
+                validate_relay_metrics_address(metrics_listen)?;
                 let listener = tokio::net::TcpListener::bind(listen).await?;
                 eprintln!("relay listening on {}", listener.local_addr()?);
-                mini_tunnel_relay::RelayServer::new(config)
+                let metrics_listener = tokio::net::TcpListener::bind(metrics_listen).await?;
+                let relay = mini_tunnel_relay::RelayServer::new(config);
+                let metrics_relay = relay.clone();
+                let metrics_router = relay_metrics_router(metrics_relay);
+                let (metrics_shutdown_tx, mut metrics_shutdown_rx) =
+                    tokio::sync::watch::channel(false);
+                let metrics_task = tokio::spawn(async move {
+                    axum::serve(metrics_listener, metrics_router)
+                        .with_graceful_shutdown(async move {
+                            while !*metrics_shutdown_rx.borrow() {
+                                if metrics_shutdown_rx.changed().await.is_err() {
+                                    break;
+                                }
+                            }
+                        })
+                        .await
+                });
+                eprintln!("relay metrics listening on {metrics_listen}");
+                let result = relay
                     .run_until(listener, async {
                         if let Err(error) = tokio::signal::ctrl_c().await {
                             eprintln!("could not listen for shutdown signal: {error}");
                         }
                     })
-                    .await?;
+                    .await;
+                metrics_shutdown_tx.send_replace(true);
+                let metrics_result = metrics_task.await?;
+                result?;
+                metrics_result?;
             }
         },
         Command::Identity => {
@@ -2002,6 +2107,50 @@ mod tests {
         assert_eq!(parse_positive_usize("256").unwrap(), 256);
         assert!(parse_positive_usize("0").is_err());
         assert!(parse_positive_usize("nope").is_err());
+    }
+
+    #[test]
+    fn relay_metrics_listener_rejects_non_loopback_addresses() {
+        assert!(validate_relay_metrics_address("127.0.0.1:0".parse().unwrap()).is_ok());
+        assert!(validate_relay_metrics_address("[::1]:0".parse().unwrap()).is_ok());
+        assert!(validate_relay_metrics_address("0.0.0.0:42002".parse().unwrap()).is_err());
+        assert!(validate_relay_metrics_address("[::]:42002".parse().unwrap()).is_err());
+    }
+
+    #[tokio::test]
+    async fn relay_metrics_http_endpoint_reports_health_and_counters() {
+        let relay =
+            mini_tunnel_relay::RelayServer::new(mini_tunnel_relay::RelayConfig::new([21; 32]));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind metrics listener");
+        let address = listener.local_addr().expect("metrics address");
+        let server =
+            tokio::spawn(async move { axum::serve(listener, relay_metrics_router(relay)).await });
+        let client = reqwest::Client::new();
+        let health = client
+            .get(format!("http://{address}/healthz"))
+            .send()
+            .await
+            .expect("health response");
+        assert_eq!(health.status(), StatusCode::OK);
+        assert_eq!(health.text().await.expect("health body"), "ok\n");
+
+        let metrics = client
+            .get(format!("http://{address}/metrics"))
+            .send()
+            .await
+            .expect("metrics response");
+        assert_eq!(metrics.status(), StatusCode::OK);
+        assert_eq!(
+            metrics.headers()[header::CONTENT_TYPE],
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        let body = metrics.text().await.expect("metrics body");
+        assert!(body.contains("mini_tunnel_relay_active_connections 0"));
+        assert!(body.contains("mini_tunnel_relay_active_sessions 0"));
+        assert!(body.contains("mini_tunnel_relay_bytes_forwarded_total 0"));
+        server.abort();
     }
 
     #[test]

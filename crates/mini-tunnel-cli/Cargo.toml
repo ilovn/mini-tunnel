@@ -10,6 +10,7 @@ name = "mini-tunnel"
 path = "src/main.rs"
 
 [dependencies]
+axum.workspace = true
 clap.workspace = true
 base64.workspace = true
 directories.workspace = true

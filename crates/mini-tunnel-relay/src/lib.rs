@@ -55,6 +55,18 @@ pub struct RelayConfig {
     pub shutdown_grace: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayStats {
+    pub active_connections: usize,
+    pub max_connections: usize,
+    pub max_connections_per_source_ip: usize,
+    pub active_sessions: usize,
+    pub accepted_connections_total: u64,
+    pub capacity_rejections_total: u64,
+    pub handshake_failures_total: u64,
+    pub bytes_forwarded_total: u64,
+}
+
 impl RelayConfig {
     #[must_use]
     pub fn new(ticket_key: [u8; 32]) -> Self {
@@ -112,6 +124,12 @@ struct RelayInner {
     next_generation: AtomicU64,
     connections: Arc<Semaphore>,
     source_connections: Arc<SourceConnectionTracker>,
+    max_connections: usize,
+    max_connections_per_source_ip: usize,
+    accepted_connections_total: AtomicU64,
+    capacity_rejections_total: AtomicU64,
+    handshake_failures_total: AtomicU64,
+    bytes_forwarded_total: AtomicU64,
     shutdown: watch::Sender<bool>,
 }
 
@@ -211,8 +229,34 @@ impl RelayServer {
                     active: StdMutex::new(HashMap::new()),
                     limit: source_limit,
                 }),
+                max_connections,
+                max_connections_per_source_ip: source_limit,
+                accepted_connections_total: AtomicU64::new(0),
+                capacity_rejections_total: AtomicU64::new(0),
+                handshake_failures_total: AtomicU64::new(0),
+                bytes_forwarded_total: AtomicU64::new(0),
                 shutdown,
             }),
+        }
+    }
+
+    pub async fn stats(&self) -> RelayStats {
+        let active_sessions = self.inner.state.lock().await.sessions.len();
+        RelayStats {
+            active_connections: self
+                .inner
+                .max_connections
+                .saturating_sub(self.inner.connections.available_permits()),
+            max_connections: self.inner.max_connections,
+            max_connections_per_source_ip: self.inner.max_connections_per_source_ip,
+            active_sessions,
+            accepted_connections_total: self
+                .inner
+                .accepted_connections_total
+                .load(Ordering::Relaxed),
+            capacity_rejections_total: self.inner.capacity_rejections_total.load(Ordering::Relaxed),
+            handshake_failures_total: self.inner.handshake_failures_total.load(Ordering::Relaxed),
+            bytes_forwarded_total: self.inner.bytes_forwarded_total.load(Ordering::Relaxed),
         }
     }
 
@@ -242,7 +286,9 @@ impl RelayServer {
                             break 'accept;
                         }
                     };
+                    self.inner.accepted_connections_total.fetch_add(1, Ordering::Relaxed);
                     let Ok(permit) = Arc::clone(&self.inner.connections).try_acquire_owned() else {
+                        self.inner.capacity_rejections_total.fetch_add(1, Ordering::Relaxed);
                         drop(stream);
                         continue;
                     };
@@ -251,17 +297,24 @@ impl RelayServer {
                         .source_connections
                         .try_acquire(remote.ip())
                     else {
+                        self.inner.capacity_rejections_total.fetch_add(1, Ordering::Relaxed);
                         drop(stream);
                         drop(permit);
                         continue;
                     };
                     let server = self.clone();
                     handlers.spawn(async move {
-                        let _ = tokio::time::timeout(
+                        let result = tokio::time::timeout(
                             AUTH_TIMEOUT,
                             server.handle_connection(stream, permit, source_permit),
                         )
                         .await;
+                        if !matches!(result, Ok(Ok(()))) {
+                            server
+                                .inner
+                                .handshake_failures_total
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     });
                 }
             }
@@ -472,12 +525,14 @@ async fn pair_session(
                     &mut second_writer,
                     &total_bytes,
                     inner.config.max_session_bytes,
+                    &inner.bytes_forwarded_total,
                 ),
                 copy_session_bytes(
                     &mut second_reader,
                     &mut first_writer,
                     &total_bytes,
                     inner.config.max_session_bytes,
+                    &inner.bytes_forwarded_total,
                 ),
             )
         };
@@ -502,6 +557,7 @@ async fn copy_session_bytes<R, W>(
     writer: &mut W,
     total_bytes: &AtomicU64,
     max_bytes: u64,
+    total_forwarded_bytes: &AtomicU64,
 ) -> io::Result<u64>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -524,6 +580,7 @@ where
         if allowed > 0 {
             tokio::io::AsyncWriteExt::write_all(writer, &buffer[..allowed]).await?;
             copied = copied.saturating_add(allowed as u64);
+            total_forwarded_bytes.fetch_add(allowed as u64, Ordering::Relaxed);
         }
         if allowed < length {
             return Err(io::Error::other("relay session byte limit reached"));
@@ -704,6 +761,7 @@ mod tests {
         let mut config = RelayConfig::new(current_key).with_previous_ticket_key(old_key);
         config.pair_timeout = Duration::from_secs(2);
         let relay = RelayServer::new(config);
+        let observed_relay = relay.clone();
         let relay_task = tokio::spawn(async move { relay.run(listener).await });
 
         let mut stream_a = connect_and_authenticate(address, &ticket_a, &a).await;
@@ -731,6 +789,13 @@ mod tests {
             .await
             .expect("A receives response after half-close");
         assert_eq!(&response, b"response-after-half-close");
+        let stats = observed_relay.stats().await;
+        assert_eq!(stats.active_connections, 2);
+        assert_eq!(stats.active_sessions, 1);
+        assert_eq!(stats.accepted_connections_total, 2);
+        assert_eq!(stats.capacity_rejections_total, 0);
+        assert_eq!(stats.handshake_failures_total, 0);
+        assert_eq!(stats.bytes_forwarded_total, 51);
         drop(stream_a);
         drop(stream_b);
         relay_task.abort();

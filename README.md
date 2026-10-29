@@ -129,6 +129,8 @@ Each paired relay session has a default aggregate traffic budget of 1 GiB shared
 
 The relay accepts at most 256 concurrent connections globally and 32 from one source IP by default. Configure `MINI_TUNNEL_RELAY_MAX_CONNECTIONS` and `MINI_TUNNEL_RELAY_MAX_CONNECTIONS_PER_SOURCE_IP` (or the matching `--max-connections` and `--max-connections-per-source-ip` options); the per-source cap is clamped to the global cap. Connections held during authentication and established sessions both consume these limits. Source addresses are normalized so IPv4-mapped IPv6 cannot bypass the per-source cap.
 
+Relay health and Prometheus metrics are available at `/healthz` and `/metrics` on the loopback listener `127.0.0.1:42002` by default. Set `MINI_TUNNEL_RELAY_METRICS_LISTEN` or `--metrics-listen` to choose another loopback port. The listener rejects non-loopback addresses. Metrics include active connections/sessions, capacity rejections, handshake failures, and aggregate forwarded bytes.
+
 On Ctrl-C, the relay stops accepting new connections and lets paired sessions drain for up to 15 seconds by default. Set `MINI_TUNNEL_RELAY_SHUTDOWN_GRACE_SECONDS` to change that window; remaining sessions are then closed.
 
 ## Development
