@@ -294,6 +294,9 @@ enum TunnelCommand {
     Connect {
         #[arg(long, default_value = "0.0.0.0:0")]
         bind: SocketAddr,
+        /// Optional ticket-authorized relay TCP endpoint used after direct UDP/TCP attempts fail.
+        #[arg(long, env = "MINI_TUNNEL_RELAY_SERVER")]
+        relay_server: Option<SocketAddr>,
         /// Optional RFC 8489 STUN server used to discover and publish this UDP socket's mapped address.
         #[arg(long)]
         stun_server: Option<SocketAddr>,
@@ -327,6 +330,9 @@ enum TunnelCommand {
     Listen {
         #[arg(long, default_value = "0.0.0.0:42000")]
         bind: SocketAddr,
+        /// Optional ticket-authorized relay TCP endpoint used when no direct peer connects.
+        #[arg(long, env = "MINI_TUNNEL_RELAY_SERVER")]
+        relay_server: Option<SocketAddr>,
         /// Optional TLS/TCP listener for fallback candidates such as tcp://198.51.100.2:443.
         #[arg(long)]
         tcp_bind: Option<SocketAddr>,
@@ -634,6 +640,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             PeerCommand::Tunnel { command } => match command {
                 TunnelCommand::Connect {
                     bind,
+                    relay_server,
                     stun_server,
                     ice,
                     candidates,
@@ -672,6 +679,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 &network_id,
                                 &identity,
                                 peer_key,
+                                relay_server,
+                                &coordinator_url,
                             )
                             .await?;
                             run_peer_tunnel(
@@ -701,6 +710,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 TunnelCommand::Listen {
                     bind,
+                    relay_server,
                     tcp_bind,
                     stun_server,
                     ice,
@@ -741,16 +751,30 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             let peer = discover_peer(&coordinator_url, &network_id, &peer_id, &identity).await?;
                             let peer_key = decode_peer_key(&peer.public_key)?;
                             let _ = select_ice_peer_address(&endpoint, &peer, &identity).await;
-                            let channel = mini_tunnel_agent::accept_peer(
-                                &endpoint, &network_id, &identity, &peer.device_id, peer_key,
-                            );
-                            let channel = if let Some(listener) = &tcp_listener {
-                                let allowed = vec![(peer.device_id.clone(), peer_key)];
-                                tokio::select! {
-                                    result = channel => result?,
-                                    result = mini_tunnel_agent::accept_tcp_peer_any(listener, &network_id, &identity, &allowed) => result?.1,
+                            let accept_direct = async {
+                                let channel = mini_tunnel_agent::accept_peer(
+                                    &endpoint, &network_id, &identity, &peer.device_id, peer_key,
+                                );
+                                if let Some(listener) = &tcp_listener {
+                                    let allowed = vec![(peer.device_id.clone(), peer_key)];
+                                    tokio::select! {
+                                        result = channel => result,
+                                        result = mini_tunnel_agent::accept_tcp_peer_any(listener, &network_id, &identity, &allowed) => result.map(|(_, channel)| channel),
+                                    }
+                                } else {
+                                    channel.await
                                 }
-                            } else { channel.await? };
+                            };
+                            let channel = if let Some(relay) = relay_server {
+                                match tokio::time::timeout(Duration::from_secs(35), accept_direct).await {
+                                    Ok(result) => result?,
+                                    Err(_) => connect_peer_via_relay(
+                                        relay, &coordinator_url, &network_id, &identity, &peer,
+                                    ).await?,
+                                }
+                            } else {
+                                accept_direct.await?
+                            };
                             let remote = channel.remote_address();
                             run_peer_tunnel(
                                 &tun,
@@ -1468,6 +1492,8 @@ async fn connect_tunnel_peer(
     network_id: &str,
     identity: &mini_tunnel_agent::Identity,
     peer_key: [u8; 32],
+    relay_server: Option<SocketAddr>,
+    coordinator_url: &str,
 ) -> Result<(mini_tunnel_agent::PeerChannel, SocketAddr), mini_tunnel_agent::IdentityError> {
     if let Some(remote) = select_ice_peer_address(endpoint, peer, identity).await {
         match mini_tunnel_agent::connect_peer(
@@ -1489,7 +1515,7 @@ async fn connect_tunnel_peer(
             }
         }
     }
-    mini_tunnel_agent::connect_peer_candidates(
+    let direct_result = mini_tunnel_agent::connect_peer_candidates(
         &endpoint.endpoint,
         &peer.candidates,
         network_id,
@@ -1497,13 +1523,22 @@ async fn connect_tunnel_peer(
         &peer.device_id,
         peer_key,
     )
-    .await
-    .map_err(|error| match error {
-        mini_tunnel_agent::CandidateConnectError::UnauthorizedPeer => {
-            mini_tunnel_agent::IdentityError::UnauthorizedPeer
+    .await;
+    match direct_result {
+        Ok(connection) => Ok(connection),
+        Err(mini_tunnel_agent::CandidateConnectError::UnauthorizedPeer) => {
+            Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer)
         }
-        other => mini_tunnel_agent::IdentityError::Transport(other.to_string()),
-    })
+        Err(direct_error) => {
+            let relay = relay_server.ok_or_else(|| {
+                mini_tunnel_agent::IdentityError::Transport(direct_error.to_string())
+            })?;
+            let channel =
+                connect_peer_via_relay(relay, coordinator_url, network_id, identity, peer).await?;
+            let remote = channel.remote_address();
+            Ok((channel, remote))
+        }
+    }
 }
 
 async fn select_ice_peer_address(
@@ -1641,8 +1676,7 @@ async fn connect_mesh_peer(
                 mini_tunnel_agent::IdentityError::Transport(direct_error.to_string())
             })?;
             let channel =
-                connect_mesh_peer_via_relay(relay, coordinator_url, network_id, identity, &peer)
-                    .await?;
+                connect_peer_via_relay(relay, coordinator_url, network_id, identity, &peer).await?;
             let remote = channel.remote_address();
             Ok((channel, remote))
         }
@@ -1725,14 +1759,8 @@ fn build_mesh_peer_connectors(
                             "timed out waiting for peer redial".to_owned(),
                         )
                     })?;
-                    connect_mesh_peer_via_relay(
-                        relay,
-                        &coordinator_url,
-                        &network_id,
-                        &identity,
-                        &peer,
-                    )
-                    .await
+                    connect_peer_via_relay(relay, &coordinator_url, &network_id, &identity, &peer)
+                        .await
                 })
             },
         )
@@ -2034,7 +2062,7 @@ fn candidates_for_path(candidates: &[String], reliable_only: bool) -> Vec<String
     }
 }
 
-async fn connect_mesh_peer_via_relay(
+async fn connect_peer_via_relay(
     relay: SocketAddr,
     coordinator_url: &str,
     network_id: &str,
@@ -2751,6 +2779,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn single_peer_tunnel_commands_accept_optional_relay_endpoint() {
+        for args in [
+            [
+                "mini-tunnel",
+                "peer",
+                "tunnel",
+                "connect",
+                "--network-id",
+                "office",
+                "--peer-id",
+                "peer-a",
+                "--relay-server",
+                "127.0.0.1:42001",
+            ],
+            [
+                "mini-tunnel",
+                "peer",
+                "tunnel",
+                "listen",
+                "--network-id",
+                "office",
+                "--peer-id",
+                "peer-a",
+                "--relay-server",
+                "127.0.0.1:42001",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("valid relay-enabled tunnel command");
+            let Command::Peer {
+                command: PeerCommand::Tunnel { command },
+            } = cli.command
+            else {
+                panic!("expected peer tunnel command");
+            };
+            match command {
+                TunnelCommand::Connect { relay_server, .. }
+                | TunnelCommand::Listen { relay_server, .. } => {
+                    assert_eq!(relay_server, Some("127.0.0.1:42001".parse().unwrap()));
+                }
+                _ => panic!("expected connect or listen command"),
+            }
+        }
+    }
+
+    #[test]
     fn ipv4_host_candidate_filter_is_usable_sorted_and_deduplicated() {
         let candidates = filtered_host_candidates(
             [
@@ -2955,6 +3028,8 @@ mod tests {
                 "test-network",
                 &identity_a,
                 peer_key_b,
+                None,
+                "http://127.0.0.1:1",
             ),
             select_ice_peer_address(&endpoint_b, &peer_a, &identity_b),
             accept,
