@@ -202,6 +202,12 @@ impl PeerChannel {
         self.connection.remote_address()
     }
 
+    /// Close this peer session, for example after a simultaneous-connect probe loses election.
+    pub fn close(&self) {
+        self.connection
+            .close(0_u32.into(), b"peer path not selected");
+    }
+
     /// Send one bounded, unreliable QUIC DATAGRAM.
     pub fn send_packet(&self, payload: &[u8]) -> Result<(), IdentityError> {
         if payload.len() > MAX_PACKET_PAYLOAD {
@@ -1010,6 +1016,95 @@ mod tests {
         endpoint_a.close(0_u32.into(), b"test complete");
         endpoint_b.close(0_u32.into(), b"test complete");
         endpoint_c.close(0_u32.into(), b"test complete");
+        fs::remove_dir_all(temp).expect("remove test identities");
+    }
+
+    #[tokio::test]
+    async fn simultaneous_udp_connects_are_authenticated_and_one_path_is_elected() {
+        let temp = std::env::temp_dir().join(format!("mini-tunnel-punch-{}", uuid::Uuid::new_v4()));
+        let a = std::sync::Arc::new(
+            Identity::load_or_create_at(temp.join("a/device.key")).expect("identity A"),
+        );
+        let b = std::sync::Arc::new(
+            Identity::load_or_create_at(temp.join("b/device.key")).expect("identity B"),
+        );
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let endpoint_a = peer_endpoint(&a, bind).expect("endpoint A");
+        let endpoint_b = peer_endpoint(&b, bind).expect("endpoint B");
+        let a_id = a.device_id();
+        let b_id = b.device_id();
+        let a_key = a.public_key();
+        let b_key = b.public_key();
+        let accept_a_endpoint = endpoint_a.clone();
+        let accept_a_identity = std::sync::Arc::clone(&a);
+        let accept_a_allowed = vec![(b_id.clone(), b_key)];
+        let accept_a = tokio::spawn(async move {
+            accept_peer_any(
+                &accept_a_endpoint,
+                "punch",
+                &accept_a_identity,
+                &accept_a_allowed,
+            )
+            .await
+        });
+        let accept_b_endpoint = endpoint_b.clone();
+        let accept_b_identity = std::sync::Arc::clone(&b);
+        let accept_b_allowed = vec![(a_id.clone(), a_key)];
+        let accept_b = tokio::spawn(async move {
+            accept_peer_any(
+                &accept_b_endpoint,
+                "punch",
+                &accept_b_identity,
+                &accept_b_allowed,
+            )
+            .await
+        });
+
+        let (outbound_a, outbound_b) = tokio::join!(
+            connect_peer(
+                &endpoint_a,
+                endpoint_b.local_addr().expect("B address"),
+                "punch",
+                &a,
+                &b_id,
+                b_key,
+            ),
+            connect_peer(
+                &endpoint_b,
+                endpoint_a.local_addr().expect("A address"),
+                "punch",
+                &b,
+                &a_id,
+                a_key,
+            ),
+        );
+        let outbound_a = outbound_a.expect("A's simultaneous UDP check");
+        let outbound_b = outbound_b.expect("B's simultaneous UDP check");
+        let (accepted_a_id, inbound_a) = accept_a.await.expect("accept A task").expect("accept A");
+        let (accepted_b_id, inbound_b) = accept_b.await.expect("accept B task").expect("accept B");
+        assert_eq!(accepted_a_id, b_id);
+        assert_eq!(accepted_b_id, a_id);
+
+        let (sender, receiver, discarded_a, discarded_b) = if a_id < b_id {
+            (outbound_a, inbound_b, inbound_a, outbound_b)
+        } else {
+            (outbound_b, inbound_a, outbound_a, inbound_b)
+        };
+        discarded_a.close();
+        discarded_b.close();
+        sender
+            .send_packet(b"authenticated hole-punch path")
+            .expect("send packet");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv_packet())
+                .await
+                .expect("packet timeout")
+                .expect("receive packet"),
+            b"authenticated hole-punch path"
+        );
+
+        endpoint_a.close(0_u32.into(), b"test complete");
+        endpoint_b.close(0_u32.into(), b"test complete");
         fs::remove_dir_all(temp).expect("remove test identities");
     }
 

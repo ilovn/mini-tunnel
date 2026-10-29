@@ -6,7 +6,7 @@ A minimal, peer-to-peer virtual network tunnel. The design baseline is in [`docs
 
 Implemented: a Rust workspace, coordinator health endpoint and atomic state, network creation/invites/IPv4 allocation, stable Ed25519 device identities, signed discovery candidates, authenticated QUIC/UDP peer channels, STUN mapped-candidate discovery, and a multi-peer IPv4 TUN mesh.
 
-Not implemented yet: coordinated NAT hole punching, TCP fallback, and packet relay. The control API is a local development prototype and has no production rate limiting. **Do not expose it to untrusted networks.** The coordinator binds to loopback by default.
+Not implemented yet: full ICE connectivity checks, TCP fallback, and packet relay. Mesh peers now make simultaneous authenticated QUIC/UDP connection attempts to open NAT mappings, then elect one data connection by stable device ID. This is a best-effort hole-punch strategy, not full ICE; restrictive/symmetric NATs and UDP-blocking firewalls still need a relay or fallback. The control API is a local development prototype and has no production rate limiting. **Do not expose it to untrusted networks.** The coordinator binds to loopback by default.
 
 ## Quick start
 
@@ -49,7 +49,7 @@ cargo run -p mini-tunnel -- network peers --network-id '<network-id>'
 
 Candidate updates are signed, limited to eight usable socket addresses, and reject timestamps outside a five-minute window or replayed updates. This only exchanges control-plane information; it does not open a tunnel or prove that a candidate is reachable. Each invite expires after one hour and can enroll one device.
 
-Tunnel commands can optionally discover and publish a server-reflexive UDP candidate using a STUN Binding server. Pass `--stun-server '<stun-ip>:3478'`; the STUN request uses the same bound UDP socket later handed to QUIC. Additional addresses can be repeated as `--candidate '<ip>:<port>'`. The STUN option is off by default and an enabled candidate update replaces this device's previous candidate list. STUN only reports the mapping observed by that server: it does not itself punch through NAT, guarantee that the mapped endpoint is reachable, or work reliably with every symmetric NAT/firewall. Direct QUIC connection remains subject to network NAT/firewall behavior; TURN/relay fallback and coordinated ICE-style checks are not implemented yet. See [RFC 8489](https://www.rfc-editor.org/rfc/rfc8489.html) for STUN's scope and protocol.
+Tunnel commands can optionally discover and publish a server-reflexive UDP candidate using a STUN Binding server. Pass `--stun-server '<stun-ip>:3478'`; the STUN request uses the same bound UDP socket later handed to QUIC. Additional addresses can be repeated as `--candidate '<ip>:<port>'`. The STUN option is off by default and an enabled candidate update replaces this device's previous candidate list. Mesh peers attempt QUIC connections simultaneously over advertised candidates; device ID ordering elects one data connection while the reverse connection is discarded after authentication. This can open mappings on some NATs, but does not implement the complete ICE candidate checklist, keepalive, or nomination procedure. Symmetric NAT/firewall behavior may still prevent direct connectivity. TURN/relay and TCP fallback are not implemented. See [RFC 8489](https://www.rfc-editor.org/rfc/rfc8489.html) and [RFC 8445](https://www.rfc-editor.org/rfc/rfc8445.html) for STUN's scope and ICE connectivity checks.
 
 The low-level authenticated QUIC/UDP diagnostic can verify a reachable peer address without creating a TUN. Each side needs the other device's ID and URL-safe base64 public key shown by the identity command. On the receiving side:
 
@@ -96,7 +96,7 @@ For multiple enrolled devices, run `peer tunnel mesh` on each device with the sa
 cargo run -p mini-tunnel -- peer tunnel mesh --network-id '<network-id>' --bind 0.0.0.0:42000 --stun-server '<stun-ip>:3478' --manage-route
 ```
 
-Mesh startup keeps reachable authenticated peers and reports unavailable peers; at least one peer must connect. The peer list is a startup snapshot, so newly joined devices require restarting mesh. STUN candidates may still be unreachable behind restrictive or symmetric NATs; coordinated hole punching is not implemented yet.
+Mesh startup keeps reachable authenticated peers and reports unavailable peers; at least one peer must connect. Each peer pair probes candidates from both ends and elects one QUIC connection using device ID ordering. The peer list is a startup snapshot, so newly joined devices require restarting mesh. Simultaneous UDP probing may establish direct paths through common NATs, but restrictive or symmetric NATs can still require a relay; full ICE checks and relay fallback are not implemented.
 
 ## Development
 

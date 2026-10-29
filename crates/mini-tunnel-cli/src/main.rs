@@ -462,12 +462,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let local_device_id = identity.device_id();
                     let identity = std::sync::Arc::new(identity);
                     let mut attempts = tokio::task::JoinSet::new();
-                    let mut inbound_peers = Vec::new();
+                    let mut inbound_peers = peers.clone();
                     for peer in peers {
-                        if local_device_id > peer.device_id {
-                            inbound_peers.push(peer);
-                            continue;
-                        }
+                        let keep_outbound = local_device_id < peer.device_id;
                         let endpoint = endpoint.clone();
                         let identity = std::sync::Arc::clone(&identity);
                         let network_id = network_id.clone();
@@ -481,16 +478,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 &peer,
                             )
                             .await;
-                            (peer, result)
+                            (peer, keep_outbound, result)
                         });
                     }
                     let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::channel(64);
-                    let mut accept_task = if inbound_peers.is_empty() {
-                        None
-                    } else {
+                    let mut accept_task = {
                         let endpoint = endpoint.clone();
                         let identity = std::sync::Arc::clone(&identity);
                         let network_id = network_id.clone();
+                        let local_device_id = local_device_id.clone();
                         Some(tokio::spawn(async move {
                             let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
                             while !inbound_peers.is_empty() {
@@ -521,9 +517,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     .position(|peer| peer.device_id == device_id)
                                 {
                                     let peer = inbound_peers.remove(index);
-                                    let remote = channel.remote_address();
-                                    if accepted_tx.send((peer, channel, remote)).await.is_err() {
-                                        break;
+                                    if peer.device_id < local_device_id {
+                                        let remote = channel.remote_address();
+                                        if accepted_tx.send((peer, channel, remote)).await.is_err()
+                                        {
+                                            break;
+                                        }
+                                    } else {
+                                        // The smaller device owns the data session. This reverse
+                                        // connection is only a simultaneous UDP hole-punch probe.
+                                        channel.close();
                                     }
                                 }
                             }
@@ -554,14 +557,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             }
                             result = attempts.join_next(), if !attempts.is_empty() => {
                                 let Some(result) = result else { continue; };
-                                let (peer, result) = result?;
+                                let (peer, keep_outbound, result) = result?;
                                 match result {
                                     Ok((channel, remote)) => {
-                                        println!("Connected mesh peer {} at {remote}", peer.device_id);
-                                        connected.push((peer, channel, remote));
-                                        first_peer_at.get_or_insert_with(tokio::time::Instant::now);
+                                        if keep_outbound {
+                                            println!("Connected mesh peer {} at {remote}", peer.device_id);
+                                            connected.push((peer, channel, remote));
+                                            first_peer_at.get_or_insert_with(tokio::time::Instant::now);
+                                        } else {
+                                            // This authenticated reverse connection opened the
+                                            // NAT mapping; keep the elected inbound session instead.
+                                            channel.close();
+                                        }
                                     }
-                                    Err(error) => eprintln!("Peer {} unavailable: {error}", peer.device_id),
+                                    Err(error) => eprintln!("Peer {} UDP probe unavailable: {error}", peer.device_id),
                                 }
                             }
                             _ = tokio::time::sleep_until(settle_deadline), if first_peer_at.is_some() => break,
