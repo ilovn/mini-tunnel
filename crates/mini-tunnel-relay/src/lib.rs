@@ -4,9 +4,9 @@ use std::{
     collections::HashMap,
     future::Future,
     io,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -19,7 +19,7 @@ use mini_tunnel_protocol::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, Semaphore, mpsc, watch},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, watch},
 };
 
 pub use mini_tunnel_protocol as protocol;
@@ -29,6 +29,7 @@ const RELAY_CHALLENGE: u8 = 1;
 const RELAY_READY: u8 = 2;
 const MAX_TICKET_LENGTH: usize = 2048;
 const MAX_CONNECTIONS: usize = 256;
+const MAX_CONNECTIONS_PER_SOURCE_IP: usize = 32;
 const MAX_PENDING_SESSIONS: usize = 128;
 const MAX_USED_TICKETS: usize = 16_384;
 const MAX_SESSION_BYTES: u64 = 1024 * 1024 * 1024;
@@ -44,6 +45,8 @@ pub struct RelayConfig {
     /// Optional overlap key accepted for tickets issued before a key rotation.
     pub previous_ticket_key: Option<[u8; 32]>,
     pub max_connections: usize,
+    /// Maximum accepted relay handshakes and sessions held by one source IP.
+    pub max_connections_per_source_ip: usize,
     pub max_pending_sessions: usize,
     pub pair_timeout: Duration,
     /// Aggregate bytes forwarded in both directions before a paired session is closed.
@@ -59,6 +62,7 @@ impl RelayConfig {
             ticket_key,
             previous_ticket_key: None,
             max_connections: MAX_CONNECTIONS,
+            max_connections_per_source_ip: MAX_CONNECTIONS_PER_SOURCE_IP,
             max_pending_sessions: MAX_PENDING_SESSIONS,
             pair_timeout: PAIR_TIMEOUT,
             max_session_bytes: MAX_SESSION_BYTES,
@@ -81,6 +85,20 @@ impl RelayConfig {
         self.max_session_bytes = max_bytes.max(1);
         self
     }
+
+    /// Limit how many relay handshakes and sessions one source IP can occupy.
+    #[must_use]
+    pub fn with_max_connections_per_source_ip(mut self, max_connections: usize) -> Self {
+        self.max_connections_per_source_ip = max_connections.max(1);
+        self
+    }
+
+    /// Set the global concurrent relay connection limit.
+    #[must_use]
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = max_connections.max(1);
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -93,7 +111,59 @@ struct RelayInner {
     state: Mutex<RelayState>,
     next_generation: AtomicU64,
     connections: Arc<Semaphore>,
+    source_connections: Arc<SourceConnectionTracker>,
     shutdown: watch::Sender<bool>,
+}
+
+struct SourceConnectionTracker {
+    active: StdMutex<HashMap<IpAddr, usize>>,
+    limit: usize,
+}
+
+struct SourceConnectionPermit {
+    tracker: Arc<SourceConnectionTracker>,
+    source: IpAddr,
+}
+
+impl SourceConnectionTracker {
+    fn try_acquire(self: &Arc<Self>, source: IpAddr) -> Option<SourceConnectionPermit> {
+        let source = normalize_source_ip(source);
+        let mut active = self.active.lock().expect("source connection lock poisoned");
+        let count = active.entry(source).or_default();
+        if *count >= self.limit {
+            return None;
+        }
+        *count += 1;
+        Some(SourceConnectionPermit {
+            tracker: Arc::clone(self),
+            source,
+        })
+    }
+}
+
+impl Drop for SourceConnectionPermit {
+    fn drop(&mut self) {
+        let mut active = self
+            .tracker
+            .active
+            .lock()
+            .expect("source connection lock poisoned");
+        if let Some(count) = active.get_mut(&self.source) {
+            *count -= 1;
+            if *count == 0 {
+                active.remove(&self.source);
+            }
+        }
+    }
+}
+
+fn normalize_source_ip(source: IpAddr) -> IpAddr {
+    match source {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map_or(IpAddr::V6(address), IpAddr::V4),
+        source => source,
+    }
 }
 
 #[derive(Default)]
@@ -118,12 +188,18 @@ struct SessionKey {
 struct PendingConnection {
     claims: RelayTicketClaims,
     stream: TcpStream,
+    _connection_permit: OwnedSemaphorePermit,
+    _source_permit: SourceConnectionPermit,
 }
 
 impl RelayServer {
     #[must_use]
     pub fn new(config: RelayConfig) -> Self {
         let max_connections = config.max_connections.max(1);
+        let source_limit = config
+            .max_connections_per_source_ip
+            .max(1)
+            .min(max_connections);
         let (shutdown, _) = watch::channel(false);
         Self {
             inner: Arc::new(RelayInner {
@@ -131,6 +207,10 @@ impl RelayServer {
                 state: Mutex::new(RelayState::default()),
                 next_generation: AtomicU64::new(1),
                 connections: Arc::new(Semaphore::new(max_connections)),
+                source_connections: Arc::new(SourceConnectionTracker {
+                    active: StdMutex::new(HashMap::new()),
+                    limit: source_limit,
+                }),
                 shutdown,
             }),
         }
@@ -155,7 +235,7 @@ impl RelayServer {
                 _ = &mut shutdown => break,
                 Some(_) = handlers.join_next(), if !handlers.is_empty() => {},
                 accepted = listener.accept() => {
-                    let (stream, _remote) = match accepted {
+                    let (stream, remote) = match accepted {
                         Ok(accepted) => accepted,
                         Err(error) => {
                             accept_error = Some(error);
@@ -166,10 +246,22 @@ impl RelayServer {
                         drop(stream);
                         continue;
                     };
+                    let Some(source_permit) = self
+                        .inner
+                        .source_connections
+                        .try_acquire(remote.ip())
+                    else {
+                        drop(stream);
+                        drop(permit);
+                        continue;
+                    };
                     let server = self.clone();
                     handlers.spawn(async move {
-                        let _permit = permit;
-                        let _ = tokio::time::timeout(AUTH_TIMEOUT, server.handle_connection(stream)).await;
+                        let _ = tokio::time::timeout(
+                            AUTH_TIMEOUT,
+                            server.handle_connection(stream, permit, source_permit),
+                        )
+                        .await;
                     });
                 }
             }
@@ -203,7 +295,12 @@ impl RelayServer {
         accept_error.map_or(Ok(()), Err)
     }
 
-    async fn handle_connection(&self, mut stream: TcpStream) -> Result<(), RelayError> {
+    async fn handle_connection(
+        &self,
+        mut stream: TcpStream,
+        connection_permit: OwnedSemaphorePermit,
+        source_permit: SourceConnectionPermit,
+    ) -> Result<(), RelayError> {
         stream.set_nodelay(true)?;
         let mut preface = [0; 8];
         stream.read_exact(&mut preface).await?;
@@ -252,7 +349,12 @@ impl RelayServer {
             )
             .map_err(|_| RelayError::Unauthorized)?;
 
-        let pending = PendingConnection { claims, stream };
+        let pending = PendingConnection {
+            claims,
+            stream,
+            _connection_permit: connection_permit,
+            _source_permit: source_permit,
+        };
         self.register_connection(pending).await
     }
 
@@ -690,6 +792,223 @@ mod tests {
         );
         drop(legitimate_b);
         relay_task.abort();
+    }
+
+    #[tokio::test]
+    async fn source_connection_limit_rejects_excess_and_releases_slots() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind relay");
+        let address = listener.local_addr().expect("relay address");
+        let relay = RelayServer::new(
+            RelayConfig::new([11; 32])
+                .with_max_connections(4)
+                .with_max_connections_per_source_ip(1),
+        );
+        let observed_relay = relay.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let relay_task = tokio::spawn(async move {
+            relay
+                .run_until(listener, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let mut first = TcpStream::connect(address).await.expect("first connection");
+        first.write_all(b"M").await.expect("hold first handshake");
+        let source = normalize_source_ip(address.ip());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if observed_relay
+                    .inner
+                    .source_connections
+                    .active
+                    .lock()
+                    .expect("source lock")
+                    .get(&source)
+                    == Some(&1)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first connection should hold the source slot");
+
+        let mut excess = TcpStream::connect(address)
+            .await
+            .expect("excess connection");
+        let mut byte = [0; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), excess.read(&mut byte))
+                .await
+                .expect("excess source should be rejected promptly")
+                .expect("read excess close"),
+            0
+        );
+
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !observed_relay
+                    .inner
+                    .source_connections
+                    .active
+                    .lock()
+                    .expect("source lock")
+                    .contains_key(&source)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("source slot should be released after disconnect");
+
+        let mut replacement = TcpStream::connect(address)
+            .await
+            .expect("replacement connection");
+        replacement
+            .write_all(b"M")
+            .await
+            .expect("replacement handshake");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if observed_relay
+                    .inner
+                    .source_connections
+                    .active
+                    .lock()
+                    .expect("source lock")
+                    .get(&source)
+                    == Some(&1)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("source should be able to reconnect after release");
+
+        drop(replacement);
+        let _ = shutdown_tx.send(());
+        relay_task
+            .await
+            .expect("relay task")
+            .expect("relay shutdown");
+    }
+
+    #[tokio::test]
+    async fn global_and_source_permits_cover_established_sessions() {
+        let key = [12; 32];
+        let a = identity(10);
+        let b = identity(11);
+        let ticket_a = issue_relay_ticket(&key, &claims(&a, &b, 50)).expect("ticket A");
+        let ticket_b = issue_relay_ticket(&key, &claims(&b, &a, 51)).expect("ticket B");
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind relay");
+        let address = listener.local_addr().expect("relay address");
+        let relay = RelayServer::new(
+            RelayConfig::new(key)
+                .with_max_connections(4)
+                .with_max_connections_per_source_ip(2),
+        );
+        let observed_relay = relay.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let relay_task = tokio::spawn(async move {
+            relay
+                .run_until(listener, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let mut stream_a = connect_and_authenticate(address, &ticket_a, &a).await;
+        let mut stream_b = connect_and_authenticate(address, &ticket_b, &b).await;
+        assert_eq!(stream_a.read_u8().await.expect("A ready"), RELAY_READY);
+        assert_eq!(stream_b.read_u8().await.expect("B ready"), RELAY_READY);
+        let source = normalize_source_ip(address.ip());
+        assert_eq!(
+            observed_relay
+                .inner
+                .source_connections
+                .active
+                .lock()
+                .expect("source lock")
+                .get(&source),
+            Some(&2),
+            "paired sessions retain both connection permits"
+        );
+
+        let mut excess = TcpStream::connect(address)
+            .await
+            .expect("excess connection");
+        let mut byte = [0; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), excess.read(&mut byte))
+                .await
+                .expect("source cap applies to established sessions")
+                .expect("read rejected connection"),
+            0
+        );
+
+        drop(stream_a);
+        drop(stream_b);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !observed_relay
+                    .inner
+                    .source_connections
+                    .active
+                    .lock()
+                    .expect("source lock")
+                    .contains_key(&source)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("session closure releases source slots");
+
+        let mut replacement = TcpStream::connect(address)
+            .await
+            .expect("replacement connection");
+        replacement
+            .write_all(b"M")
+            .await
+            .expect("replacement accepted");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if observed_relay
+                    .inner
+                    .source_connections
+                    .active
+                    .lock()
+                    .expect("source lock")
+                    .get(&source)
+                    == Some(&1)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("released source can reconnect");
+
+        drop(replacement);
+        let _ = shutdown_tx.send(());
+        relay_task
+            .await
+            .expect("relay task")
+            .expect("relay shutdown");
     }
 
     #[tokio::test]

@@ -127,6 +127,8 @@ Relay ticket keys support a short overlap during rotation. Generate a new random
 
 Each paired relay session has a default aggregate traffic budget of 1 GiB shared between both directions. Set `MINI_TUNNEL_RELAY_MAX_SESSION_BYTES` to change the limit; once exhausted, the relay closes the session.
 
+The relay accepts at most 256 concurrent connections globally and 32 from one source IP by default. Configure `MINI_TUNNEL_RELAY_MAX_CONNECTIONS` and `MINI_TUNNEL_RELAY_MAX_CONNECTIONS_PER_SOURCE_IP` (or the matching `--max-connections` and `--max-connections-per-source-ip` options); the per-source cap is clamped to the global cap. Connections held during authentication and established sessions both consume these limits. Source addresses are normalized so IPv4-mapped IPv6 cannot bypass the per-source cap.
+
 On Ctrl-C, the relay stops accepting new connections and lets paired sessions drain for up to 15 seconds by default. Set `MINI_TUNNEL_RELAY_SHUTDOWN_GRACE_SECONDS` to change that window; remaining sessions are then closed.
 
 ## Development

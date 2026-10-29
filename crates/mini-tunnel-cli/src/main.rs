@@ -103,6 +103,22 @@ enum RelayCommand {
             default_value = "0.0.0.0:42001"
         )]
         listen: SocketAddr,
+        /// Maximum concurrent connections and sessions across all sources.
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_RELAY_MAX_CONNECTIONS",
+            default_value_t = 256,
+            value_parser = parse_positive_usize
+        )]
+        max_connections: usize,
+        /// Maximum concurrent relay connections held by one source IP.
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_RELAY_MAX_CONNECTIONS_PER_SOURCE_IP",
+            default_value_t = 32,
+            value_parser = parse_positive_usize
+        )]
+        max_connections_per_source_ip: usize,
         /// Previous ticket key accepted during rotation. Tickets still expire normally.
         #[arg(long, env = "MINI_TUNNEL_RELAY_PREVIOUS_TICKET_KEY")]
         previous_ticket_key: Option<String>,
@@ -380,6 +396,16 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| "value must be a positive integer".to_owned())?;
+    if parsed == 0 {
+        return Err("value must be greater than zero".to_owned());
+    }
+    Ok(parsed)
+}
+
 fn default_coordinator_state_path() -> PathBuf {
     directories::ProjectDirs::from("org", "ilovn", "mini-tunnel")
         .map(|dirs| dirs.data_local_dir().join("coordinator-state.json"))
@@ -446,6 +472,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Relay { command } => match command {
             RelayCommand::Serve {
                 listen,
+                max_connections,
+                max_connections_per_source_ip,
                 previous_ticket_key,
                 max_session_bytes,
                 shutdown_grace_seconds,
@@ -457,7 +485,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .try_into()
                     .map_err(|_| "relay ticket key must decode to exactly 32 bytes")?;
                 let mut config = mini_tunnel_relay::RelayConfig::new(key)
-                    .with_max_session_bytes(max_session_bytes);
+                    .with_max_session_bytes(max_session_bytes)
+                    .with_max_connections(max_connections)
+                    .with_max_connections_per_source_ip(max_connections_per_source_ip);
                 config.shutdown_grace = Duration::from_secs(shutdown_grace_seconds);
                 if let Some(previous) = previous_ticket_key {
                     let previous = URL_SAFE_NO_PAD.decode(previous)?;
@@ -1965,6 +1995,14 @@ fn print_tunnel_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_connection_limits_require_positive_values() {
+        assert_eq!(parse_positive_usize("1").unwrap(), 1);
+        assert_eq!(parse_positive_usize("256").unwrap(), 256);
+        assert!(parse_positive_usize("0").is_err());
+        assert!(parse_positive_usize("nope").is_err());
+    }
 
     #[test]
     fn reliable_path_preference_excludes_udp_candidates() {
