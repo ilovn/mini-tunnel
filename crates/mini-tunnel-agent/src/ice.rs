@@ -743,7 +743,9 @@ impl IceAgentDriver {
         datagrams: &mut mpsc::Receiver<IceDatagram>,
         timeout: Duration,
     ) -> Result<(SocketAddr, SocketAddr), IceDriverError> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(IceDriverError::Timeout)?;
         loop {
             let now = Instant::now();
             self.handle_timeout(now)?;

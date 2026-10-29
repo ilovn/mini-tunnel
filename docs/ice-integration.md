@@ -2,7 +2,7 @@
 
 Status: implementation in progress. The current peer path remains the existing bounded UDP candidate dialer with TCP and relay fallback; it must not be described as RFC 8445 ICE until the checks below are integrated and verified.
 
-Prototype progress: `mini-tunnel-agent::ice::IceAgentDriver` wraps the Sans-I/O agent and `peer_endpoint_with_ice` provides an optional Quinn endpoint using a same-socket demultiplexer. The candidate-update API now accepts member-signed ICE credentials and serves them only to same-network peers from bounded volatile memory. The regular CLI update still publishes candidates only, and the default peer setup does not yet create/use the ICE endpoint. Loopback tests verify authenticated nomination in the driver, STUN queue bounds, and QUIC/TLS peer data over the demultiplexed endpoint.
+Prototype progress: `mini-tunnel-agent::ice::IceAgentDriver` wraps the Sans-I/O agent and `peer_endpoint_with_ice` provides an optional Quinn endpoint using a same-socket demultiplexer. Its bounded per-peer router dispatches checks by the recipient ufrag and routes responses only for addresses accepted by ICE authentication. A loopback test now nominates a pair over real shared UDP sockets, then establishes the pinned QUIC peer channel over that endpoint. The candidate-update API accepts member-signed ICE credentials and serves them only to same-network peers from bounded volatile memory. The regular CLI update still publishes candidates only, and the default peer setup does not yet create/use the ICE endpoint.
 
 ## Selected ICE engine
 
