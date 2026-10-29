@@ -1,5 +1,6 @@
 //! Local device identity and signing helpers used by the CLI and tunnel agent.
 
+pub mod candidate;
 pub mod membership;
 pub mod routing;
 pub mod stun;
@@ -853,24 +854,22 @@ pub async fn connect_peer_candidates(
         return Err(CandidateConnectError::UnauthorizedPeer);
     }
 
-    let mut usable = 0;
+    let mut checklist =
+        candidate::CandidateChecklist::from_signaled(candidates, MAX_PEER_CANDIDATES)
+            .ok_or(CandidateConnectError::TooManyCandidates)?;
+    if checklist.checks().is_empty() {
+        return Err(CandidateConnectError::NoUsableCandidates);
+    }
     let mut last_error = None;
     let deadline = tokio::time::Instant::now() + CANDIDATE_CONNECT_BUDGET;
-    for candidate in candidates {
-        let (address, is_tcp) = if let Some(candidate) = candidate.strip_prefix("tcp://") {
-            (candidate.parse::<SocketAddr>(), true)
-        } else {
-            (candidate.parse::<SocketAddr>(), false)
-        };
-        let Ok(address) = address else {
-            continue;
-        };
-        if address.port() == 0 || address.ip().is_unspecified() {
-            continue;
-        }
-        usable += 1;
+    while let Some(index) = checklist.next_waiting() {
+        checklist.mark_in_progress(index);
+        let candidate = checklist.checks()[index].clone();
+        let address = candidate.address;
+        let is_tcp = candidate.transport == candidate::CandidateTransport::Tcp;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
+            checklist.finish(index, false);
             break;
         }
         let attempt_timeout = if is_tcp {
@@ -905,16 +904,22 @@ pub async fn connect_peer_candidates(
             .await
         };
         match connection {
-            Ok(Ok(channel)) => return Ok((channel, address)),
+            Ok(Ok(channel)) => {
+                checklist.finish(index, true);
+                return Ok((channel, address));
+            }
             Ok(Err(IdentityError::UnauthorizedPeer)) => {
                 return Err(CandidateConnectError::UnauthorizedPeer);
             }
-            Ok(Err(error)) => last_error = Some(error.to_string()),
-            Err(_) => last_error = Some(format!("connection to {address} timed out")),
+            Ok(Err(error)) => {
+                checklist.finish(index, false);
+                last_error = Some(error.to_string());
+            }
+            Err(_) => {
+                checklist.finish(index, false);
+                last_error = Some(format!("connection to {address} timed out"));
+            }
         }
-    }
-    if usable == 0 {
-        return Err(CandidateConnectError::NoUsableCandidates);
     }
     Err(CandidateConnectError::Unreachable(
         last_error.unwrap_or_else(|| "no connection attempt completed".to_owned()),
