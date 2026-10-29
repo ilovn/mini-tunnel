@@ -8,11 +8,9 @@ use thiserror::Error;
 
 use crate::{IdentityError, PeerChannel, tun_device::TunError};
 
-pub type PeerConnector = Arc<
-    dyn Fn(bool) -> Pin<Box<dyn Future<Output = Result<PeerChannel, IdentityError>> + Send>>
-        + Send
-        + Sync,
->;
+pub type PeerConnectFuture =
+    Pin<Box<dyn Future<Output = Result<PeerChannel, IdentityError>> + Send>>;
+pub type PeerConnector = Arc<dyn Fn(bool) -> PeerConnectFuture + Send + Sync>;
 
 #[derive(Default)]
 pub struct PathQualityTracker {
@@ -59,7 +57,26 @@ pub struct ReconnectingPeer {
     pub address: Ipv4Addr,
     pub channel: Arc<PeerChannel>,
     pub connector: PeerConnector,
+    /// Direct-only candidate probe used to migrate a healthy TCP/relay session back to UDP.
+    pub probe: Option<PeerConnector>,
+    /// Cooldown between path probes. Production callers should use at least 60 seconds.
+    pub probe_cooldown: Duration,
 }
+
+struct MeshPeerRuntime {
+    channel: Arc<tokio::sync::RwLock<Arc<PeerChannel>>>,
+    connector: Option<PeerConnector>,
+    probe: Option<PeerConnector>,
+    probe_cooldown: Duration,
+}
+
+type MeshPeerInput = (
+    Ipv4Addr,
+    Arc<PeerChannel>,
+    Option<PeerConnector>,
+    Option<PeerConnector>,
+    Duration,
+);
 
 #[derive(Debug, Error)]
 pub enum PeerTunnelError {
@@ -134,6 +151,8 @@ async fn receive_mesh_peer(
     address: Ipv4Addr,
     channel: Arc<tokio::sync::RwLock<Arc<PeerChannel>>>,
     connector: Option<PeerConnector>,
+    probe: Option<PeerConnector>,
+    probe_cooldown: Duration,
     event_tx: tokio::sync::mpsc::Sender<(Ipv4Addr, Result<Vec<u8>, IdentityError>)>,
 ) {
     loop {
@@ -145,7 +164,12 @@ async fn receive_mesh_peer(
         let mut inbound = Box::pin(active.recv_packet());
         let mut quality = PathQualityTracker::default();
         let mut force_reliable = false;
-        let failure = loop {
+        let mut probe_interval =
+            tokio::time::interval_at(tokio::time::Instant::now() + probe_cooldown, probe_cooldown);
+        probe_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let (probe_tx, mut probe_rx) = tokio::sync::mpsc::channel(1);
+        let mut probe_task = None;
+        let outcome = loop {
             tokio::select! {
                 result = tokio::time::timeout_at(last_received + Duration::from_secs(30), &mut inbound) => {
                     let result = match result {
@@ -160,19 +184,43 @@ async fn receive_mesh_peer(
                                 return;
                             }
                         }
-                        Err(error) => break error,
+                        Err(error) => break Err(error),
                     }
                 }
                 _ = keepalive.tick() => {
                     if active.transport_name() == "QUIC/UDP" && quality.observe(active.health_snapshot()) {
                         force_reliable = true;
-                        break IdentityError::Transport("peer path quality degraded".to_owned());
+                        break Err(IdentityError::Transport("peer path quality degraded".to_owned()));
                     }
                     if let Err(error) = active.send_keepalive().await {
-                        break error;
+                        break Err(error);
+                    }
+                }
+                _ = probe_interval.tick(), if probe.is_some() && active.transport_name() != "QUIC/UDP" && probe_task.is_none() => {
+                    let connector = Arc::clone(probe.as_ref().expect("guarded above"));
+                    let sender = probe_tx.clone();
+                    probe_task = Some(tokio::spawn(async move {
+                        let result = connector(false).await;
+                        let _ = sender.send(result).await;
+                    }));
+                }
+                result = probe_rx.recv(), if probe_task.is_some() => {
+                    probe_task = None;
+                    if let Some(Ok(candidate)) = result
+                        && path_rank(candidate.transport_name()) < path_rank(active.transport_name())
+                    {
+                        *channel.write().await = Arc::new(candidate);
+                        break Ok(());
                     }
                 }
             }
+        };
+        if let Some(task) = probe_task {
+            task.abort();
+        }
+        let failure = match outcome {
+            Ok(()) => continue,
+            Err(failure) => failure,
         };
         if active.transport_name() == "QUIC/UDP"
             && matches!(&failure, IdentityError::Transport(message) if message.contains("keepalive timed out") || message.contains("path quality degraded"))
@@ -205,6 +253,15 @@ async fn receive_mesh_peer(
     }
 }
 
+fn path_rank(transport: &str) -> u8 {
+    match transport {
+        "QUIC/UDP" => 0,
+        "TLS/TCP" => 1,
+        "Relay/TLS" => 2,
+        _ => u8::MAX,
+    }
+}
+
 /// Route packets across one TUN and multiple independently authenticated peer channels.
 ///
 /// Packets with no matching peer destination are dropped. A failed peer is removed from the
@@ -217,7 +274,7 @@ pub async fn pump_peer_mesh<T: TunnelPacketIo>(
         packet_io,
         peers
             .into_iter()
-            .map(|(address, channel)| (address, channel, None))
+            .map(|(address, channel)| (address, channel, None, None, Duration::from_secs(3600)))
             .collect(),
     )
     .await
@@ -231,7 +288,15 @@ pub async fn pump_peer_mesh_reconnecting<T: TunnelPacketIo>(
         packet_io,
         peers
             .into_iter()
-            .map(|peer| (peer.address, peer.channel, Some(peer.connector)))
+            .map(|peer| {
+                (
+                    peer.address,
+                    peer.channel,
+                    Some(peer.connector),
+                    peer.probe,
+                    peer.probe_cooldown,
+                )
+            })
             .collect(),
     )
     .await
@@ -239,17 +304,22 @@ pub async fn pump_peer_mesh_reconnecting<T: TunnelPacketIo>(
 
 async fn pump_mesh<T: TunnelPacketIo>(
     packet_io: &T,
-    peers: Vec<(Ipv4Addr, Arc<PeerChannel>, Option<PeerConnector>)>,
+    peers: Vec<MeshPeerInput>,
 ) -> Result<(), PeerTunnelError> {
     if peers.is_empty() {
         return Err(PeerTunnelError::NoPeers);
     }
     let mut channels = HashMap::with_capacity(peers.len());
-    for (address, channel, connector) in peers {
+    for (address, channel, connector, probe, probe_cooldown) in peers {
         if channels
             .insert(
                 address,
-                (Arc::new(tokio::sync::RwLock::new(channel)), connector),
+                MeshPeerRuntime {
+                    channel: Arc::new(tokio::sync::RwLock::new(channel)),
+                    connector,
+                    probe,
+                    probe_cooldown,
+                },
             )
             .is_some()
         {
@@ -260,15 +330,19 @@ async fn pump_mesh<T: TunnelPacketIo>(
     let (event_tx, mut event_rx) =
         tokio::sync::mpsc::channel(channels.len().saturating_mul(8).max(8));
     let mut receivers = tokio::task::JoinSet::new();
-    for (&address, (channel, connector)) in &channels {
+    for (&address, runtime) in &channels {
         let peer_address = address;
-        let channel = Arc::clone(channel);
-        let connector = connector.clone();
+        let channel = Arc::clone(&runtime.channel);
+        let connector = runtime.connector.clone();
+        let probe = runtime.probe.clone();
+        let probe_cooldown = runtime.probe_cooldown;
         let event_tx = event_tx.clone();
         receivers.spawn(receive_mesh_peer(
             peer_address,
             channel,
             connector,
+            probe,
+            probe_cooldown,
             event_tx,
         ));
     }
@@ -281,9 +355,9 @@ async fn pump_mesh<T: TunnelPacketIo>(
                 let Some(destination) = ipv4_destination(&packet) else {
                     continue;
                 };
-                if let Some((channel, connector)) = channels.get(&destination) {
-                    let current = Arc::clone(&*channel.read().await);
-                    if current.send_packet(&packet).await.is_err() && connector.is_none() {
+                if let Some(runtime) = channels.get(&destination) {
+                    let current = Arc::clone(&*runtime.channel.read().await);
+                    if current.send_packet(&packet).await.is_err() && runtime.connector.is_none() {
                         channels.remove(&destination);
                     }
                 }
@@ -435,7 +509,7 @@ mod tests {
             let b = Arc::clone(&b);
             let remote_channel = Arc::clone(&remote_channel);
             let remote_notify = Arc::clone(&remote_notify);
-            Arc::new(move |_force_reliable| {
+            Arc::new(move |_force_reliable| -> PeerConnectFuture {
                 let a = Arc::clone(&a);
                 let b = Arc::clone(&b);
                 let remote_channel = Arc::clone(&remote_channel);
@@ -466,6 +540,8 @@ mod tests {
                     address: peer_ip,
                     channel: Arc::new(initial),
                     connector,
+                    probe: None,
+                    probe_cooldown: Duration::from_secs(3600),
                 }],
             )
             .await
@@ -490,6 +566,134 @@ mod tests {
         );
         pump.abort();
         drop(recovered);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn mesh_promotes_reliable_session_after_healthy_direct_udp_probe() {
+        async fn tcp_pair(a: Arc<Identity>, b: Arc<Identity>) -> (PeerChannel, PeerChannel) {
+            let listener = peer_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let allowed = vec![(a.device_id(), a.public_key())];
+            let peer_id = b.device_id();
+            let accept = accept_tcp_peer_any(&listener, "mesh-promotion", &b, &allowed);
+            let connect = connect_tcp_peer(address, "mesh-promotion", &a, &peer_id, b.public_key());
+            let (accepted, connected) = tokio::join!(accept, connect);
+            (connected.unwrap(), accepted.unwrap().1)
+        }
+
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-mesh-promotion-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let a = Arc::new(Identity::load_or_create_at(temp.join("a/key")).unwrap());
+        let b = Arc::new(Identity::load_or_create_at(temp.join("b/key")).unwrap());
+        let (initial, _remote_initial) = tcp_pair(Arc::clone(&a), Arc::clone(&b)).await;
+        let endpoint_a =
+            peer_endpoint(&a, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+        let endpoint_b =
+            peer_endpoint(&b, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+        let remote_addr = endpoint_b.local_addr().unwrap();
+        let a_id = a.device_id();
+        let b_id = b.device_id();
+        let a_key = a.public_key();
+        let b_key = b.public_key();
+        let (accepted_tx, mut accepted_rx) = mpsc::channel(1);
+        let server_endpoint = endpoint_b.clone();
+        let server_identity = Arc::clone(&b);
+        let server_task = tokio::spawn(async move {
+            let channel = Arc::new(
+                accept_peer(
+                    &server_endpoint,
+                    "mesh-promotion",
+                    &server_identity,
+                    &a_id,
+                    a_key,
+                )
+                .await
+                .unwrap(),
+            );
+            accepted_tx.send(Arc::clone(&channel)).await.unwrap();
+            for _ in 0..3 {
+                channel.recv_packet().await.unwrap();
+            }
+        });
+        let connector: PeerConnector = Arc::new(|_| -> PeerConnectFuture {
+            Box::pin(async {
+                Err(IdentityError::Transport(
+                    "reconnect path should not run during promotion".to_owned(),
+                ))
+            })
+        });
+        let probe_endpoint = endpoint_a.clone();
+        let probe_identity = Arc::clone(&a);
+        let probe: PeerConnector = Arc::new(move |_| -> PeerConnectFuture {
+            let endpoint = probe_endpoint.clone();
+            let identity = Arc::clone(&probe_identity);
+            let peer_id = b_id.clone();
+            Box::pin(async move {
+                let channel = connect_peer(
+                    &endpoint,
+                    remote_addr,
+                    "mesh-promotion",
+                    &identity,
+                    &peer_id,
+                    b_key,
+                )
+                .await?;
+                let rtt = channel.probe_health(3, Duration::from_secs(2)).await?;
+                if rtt > Duration::from_millis(350) {
+                    return Err(IdentityError::Transport(
+                        "direct probe RTT exceeded threshold".to_owned(),
+                    ));
+                }
+                Ok(channel)
+            })
+        });
+        let local_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let peer_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let (outbound_tx, outbound_rx) = mpsc::channel(2);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(2);
+        let io = Arc::new(MockPacketIo {
+            outbound: Mutex::new(outbound_rx),
+            inbound: inbound_tx,
+            local_ipv4: local_ip,
+            mtu: 1500,
+        });
+        let pump_io = Arc::clone(&io);
+        let pump = tokio::spawn(async move {
+            pump_peer_mesh_reconnecting(
+                &*pump_io,
+                vec![ReconnectingPeer {
+                    address: peer_ip,
+                    channel: Arc::new(initial),
+                    connector,
+                    probe: Some(probe),
+                    probe_cooldown: Duration::from_millis(25),
+                }],
+            )
+            .await
+        });
+        let remote = tokio::time::timeout(Duration::from_secs(3), accepted_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        server_task.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        outbound_tx
+            .send(packet(local_ip, peer_ip, 28))
+            .await
+            .unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(3), remote.recv_packet())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.len(), 28);
+        pump.abort();
+        endpoint_a.close(0_u32.into(), b"test complete");
+        endpoint_b.close(0_u32.into(), b"test complete");
         fs::remove_dir_all(temp).unwrap();
     }
 

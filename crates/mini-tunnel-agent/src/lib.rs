@@ -382,6 +382,36 @@ impl PeerChannel {
             .unwrap_or_default()
     }
 
+    /// Validate a candidate path with authenticated ping/pong exchanges before it replaces a live path.
+    pub async fn probe_health(
+        &self,
+        probes: u8,
+        per_probe_timeout: Duration,
+    ) -> Result<Duration, IdentityError> {
+        if probes == 0 || probes > 8 || per_probe_timeout.is_zero() {
+            return Err(IdentityError::InvalidFrame);
+        }
+        let mut maximum_rtt = Duration::ZERO;
+        for _ in 0..probes {
+            let succeeded_before = self.health_snapshot().probes_succeeded;
+            self.send_keepalive().await?;
+            let deadline = tokio::time::Instant::now() + per_probe_timeout;
+            loop {
+                let _packet = tokio::time::timeout_at(deadline, self.recv_packet())
+                    .await
+                    .map_err(|_| {
+                        IdentityError::Transport("candidate path probe timed out".to_owned())
+                    })??;
+                let health = self.health_snapshot();
+                if health.probes_succeeded > succeeded_before {
+                    maximum_rtt = maximum_rtt.max(health.rtt.unwrap_or_default());
+                    break;
+                }
+            }
+        }
+        Ok(maximum_rtt)
+    }
+
     /// Receive one authenticated frame, rejecting malformed, cross-network, and replayed data.
     pub async fn recv_packet(&self) -> Result<Vec<u8>, IdentityError> {
         let frame = match &self.transport {

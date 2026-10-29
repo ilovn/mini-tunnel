@@ -559,6 +559,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let identity = std::sync::Arc::new(identity);
                     let mut attempts = tokio::task::JoinSet::new();
                     let mut peer_connectors = std::collections::HashMap::new();
+                    let mut peer_probes = std::collections::HashMap::new();
                     let mut accepted_peer_senders = std::collections::HashMap::new();
                     let inbound_peers = peers.clone();
                     for peer in peers.iter().cloned() {
@@ -569,9 +570,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let reconnect_coordinator_url = coordinator_url.clone();
                         let reconnect_network_id = network_id.clone();
                         let reconnect_peer = peer.clone();
-                        let connector: mini_tunnel_agent::tunnel::PeerConnector = if keep_outbound {
+                        let (connector, probe): (
+                            mini_tunnel_agent::tunnel::PeerConnector,
+                            mini_tunnel_agent::tunnel::PeerConnector,
+                        ) = if keep_outbound {
                             let reconnect_endpoint = endpoint.clone();
-                            std::sync::Arc::new(move |force_reliable| {
+                            let connector = std::sync::Arc::new(move |force_reliable| -> mini_tunnel_agent::tunnel::PeerConnectFuture {
                                 let endpoint = reconnect_endpoint.clone();
                                 let identity = std::sync::Arc::clone(&reconnect_identity);
                                 let network_id = reconnect_network_id.clone();
@@ -590,12 +594,51 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     .await
                                     .map(|(channel, _)| channel)
                                 })
-                            })
+                            });
+                            let probe_endpoint = endpoint.clone();
+                            let probe_identity = std::sync::Arc::clone(&identity);
+                            let probe_network_id = network_id.clone();
+                            let probe_coordinator_url = coordinator_url.clone();
+                            let probe_peer = peer.clone();
+                            let probe = std::sync::Arc::new(
+                                move |_| -> mini_tunnel_agent::tunnel::PeerConnectFuture {
+                                    let endpoint = probe_endpoint.clone();
+                                    let identity = std::sync::Arc::clone(&probe_identity);
+                                    let network_id = probe_network_id.clone();
+                                    let coordinator_url = probe_coordinator_url.clone();
+                                    let peer = probe_peer.clone();
+                                    Box::pin(async move {
+                                        let (channel, _) = connect_mesh_peer(
+                                            &endpoint,
+                                            &network_id,
+                                            &coordinator_url,
+                                            &identity,
+                                            &peer,
+                                            None,
+                                            false,
+                                        )
+                                        .await?;
+                                        let rtt =
+                                            channel.probe_health(3, Duration::from_secs(2)).await?;
+                                        if rtt > Duration::from_millis(350) {
+                                            return Err(
+                                                mini_tunnel_agent::IdentityError::Transport(
+                                                    "direct path probe exceeded RTT threshold"
+                                                        .to_owned(),
+                                                ),
+                                            );
+                                        }
+                                        Ok(channel)
+                                    })
+                                },
+                            );
+                            (connector, probe)
                         } else {
                             let receiver =
                                 std::sync::Arc::new(tokio::sync::Mutex::new(accepted_peer_rx));
-                            std::sync::Arc::new(move |force_reliable| {
-                                let receiver = std::sync::Arc::clone(&receiver);
+                            let connector_receiver = std::sync::Arc::clone(&receiver);
+                            let connector = std::sync::Arc::new(move |force_reliable| -> mini_tunnel_agent::tunnel::PeerConnectFuture {
+                                let receiver = std::sync::Arc::clone(&connector_receiver);
                                 let identity = std::sync::Arc::clone(&reconnect_identity);
                                 let coordinator_url = reconnect_coordinator_url.clone();
                                 let network_id = reconnect_network_id.clone();
@@ -624,9 +667,48 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     )
                                     .await
                                 })
-                            })
+                            });
+                            let probe_receiver = std::sync::Arc::clone(&receiver);
+                            let probe = std::sync::Arc::new(
+                                move |_| -> mini_tunnel_agent::tunnel::PeerConnectFuture {
+                                    let receiver = std::sync::Arc::clone(&probe_receiver);
+                                    Box::pin(async move {
+                                        let deadline =
+                                            tokio::time::Instant::now() + Duration::from_secs(35);
+                                        loop {
+                                            let channel =
+                                                tokio::time::timeout_at(deadline, async {
+                                                    receiver.lock().await.recv().await
+                                                })
+                                                .await
+                                                .map_err(|_| {
+                                                    mini_tunnel_agent::IdentityError::Transport(
+                                                        "timed out waiting for direct probe"
+                                                            .to_owned(),
+                                                    )
+                                                })?
+                                                .ok_or_else(|| {
+                                                    mini_tunnel_agent::IdentityError::Transport(
+                                                        "peer accept dispatcher stopped".to_owned(),
+                                                    )
+                                                })?;
+                                            match channel
+                                                .probe_health(3, Duration::from_secs(2))
+                                                .await
+                                            {
+                                                Ok(rtt) if rtt <= Duration::from_millis(350) => {
+                                                    return Ok(channel);
+                                                }
+                                                Ok(_) | Err(_) => continue,
+                                            }
+                                        }
+                                    })
+                                },
+                            );
+                            (connector, probe)
                         };
                         peer_connectors.insert(peer.device_id.clone(), connector);
+                        peer_probes.insert(peer.device_id.clone(), probe);
                         let endpoint = endpoint.clone();
                         let identity = std::sync::Arc::clone(&identity);
                         let network_id = network_id.clone();
@@ -747,6 +829,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         mini_tunnel_agent::PeerChannel,
                         SocketAddr,
                         mini_tunnel_agent::tunnel::PeerConnector,
+                        mini_tunnel_agent::tunnel::PeerConnector,
                     )> = Vec::new();
                     let mut accept_finished = accept_tasks.is_empty();
                     let startup_deadline = tokio::time::Instant::now() + Duration::from_secs(45);
@@ -767,7 +850,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                         } else {
                                             println!("Connected mesh peer {} at {remote}", peer.device_id);
                                             let connector = peer_connectors.remove(&peer.device_id).expect("peer connector exists");
-                                            connected.push((peer, channel, remote, connector));
+                                            let probe = peer_probes.remove(&peer.device_id).expect("peer probe exists");
+                                            connected.push((peer, channel, remote, connector, probe));
                                             first_peer_at.get_or_insert_with(tokio::time::Instant::now);
                                         }
                                     }
@@ -785,7 +869,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                             } else {
                                                 println!("Connected mesh peer {} at {remote}", peer.device_id);
                                                 let connector = peer_connectors.remove(&peer.device_id).expect("peer connector exists");
-                                                connected.push((peer, channel, remote, connector));
+                                                let probe = peer_probes.remove(&peer.device_id).expect("peer probe exists");
+                                                connected.push((peer, channel, remote, connector, probe));
                                                 first_peer_at.get_or_insert_with(tokio::time::Instant::now);
                                             }
                                         } else {
@@ -1247,6 +1332,7 @@ async fn run_peer_mesh(
         mini_tunnel_agent::PeerChannel,
         SocketAddr,
         mini_tunnel_agent::tunnel::PeerConnector,
+        mini_tunnel_agent::tunnel::PeerConnector,
     )>,
     manage_routes: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1256,13 +1342,14 @@ async fn run_peer_mesh(
 
     let prepared = peers
         .into_iter()
-        .map(|(peer, channel, remote, connector)| {
+        .map(|(peer, channel, remote, connector, probe)| {
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
                 peer.device_id,
                 peer.assigned_ipv4.parse::<Ipv4Addr>()?,
                 channel,
                 remote,
                 connector,
+                probe,
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1270,7 +1357,7 @@ async fn run_peer_mesh(
     let runner = SystemRouteRunner;
     let mut routes: Vec<RouteLease> = Vec::new();
     let mut reconnecting_peers = Vec::with_capacity(prepared.len());
-    for (device_id, peer_ipv4, channel, remote, connector) in prepared {
+    for (device_id, peer_ipv4, channel, remote, connector, probe) in prepared {
         if manage_routes {
             match install_peer_route(&runner, RoutingPlatform::current(), &interface, peer_ipv4)
                 .await
@@ -1292,6 +1379,8 @@ async fn run_peer_mesh(
             address: peer_ipv4,
             channel: std::sync::Arc::new(channel),
             connector,
+            probe: Some(probe),
+            probe_cooldown: Duration::from_secs(60),
         });
     }
     println!("Mesh established on TUN interface {interface}");
