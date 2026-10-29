@@ -298,6 +298,19 @@ pub struct CreateInviteRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevokeMemberRequest {
+    pub admin_token: String,
+    pub device_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokeMemberResponse {
+    pub revoked: bool,
+    pub released_ipv4: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateInviteResponse {
     /// One-time display of a high-entropy token that can enroll one device.
     pub invite_token: String,

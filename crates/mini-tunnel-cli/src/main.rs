@@ -11,8 +11,8 @@ use mini_tunnel_protocol::{
     ApiErrorResponse, CandidateUpdateRequest, CandidateUpdateResponse, CreateInviteRequest,
     CreateInviteResponse, CreateNetworkRequest, CreateNetworkResponse, JoinNetworkRequest,
     JoinNetworkResponse, PeerInfo, PeerListRequest, PeerListResponse, RelayTicketRequest,
-    RelayTicketResponse, candidate_signing_bytes, join_signing_bytes, peers_signing_bytes,
-    relay_ticket_request_signing_bytes,
+    RelayTicketResponse, RevokeMemberRequest, RevokeMemberResponse, candidate_signing_bytes,
+    join_signing_bytes, peers_signing_bytes, relay_ticket_request_signing_bytes,
 };
 use serde::Deserialize;
 
@@ -111,6 +111,20 @@ enum NetworkCommand {
     Invite {
         #[arg(long)]
         network_id: String,
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_COORDINATOR_URL",
+            default_value = "http://127.0.0.1:8080"
+        )]
+        coordinator_url: String,
+    },
+    /// Revoke a device from the network and release its assigned IPv4 address.
+    /// Reads MINI_TUNNEL_ADMIN_TOKEN from the environment.
+    Revoke {
+        #[arg(long)]
+        network_id: String,
+        #[arg(long)]
+        device_id: String,
         #[arg(
             long,
             env = "MINI_TUNNEL_COORDINATOR_URL",
@@ -1030,6 +1044,25 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!(
                     "Invite token (one device, expires in {} seconds): {}",
                     response.expires_in_seconds, response.invite_token
+                );
+            }
+            NetworkCommand::Revoke {
+                network_id,
+                device_id,
+                coordinator_url,
+            } => {
+                let admin_token = std::env::var("MINI_TUNNEL_ADMIN_TOKEN")
+                    .map_err(|_| "set MINI_TUNNEL_ADMIN_TOKEN before revoking a member")?;
+                let request = RevokeMemberRequest {
+                    admin_token,
+                    device_id: device_id.clone(),
+                };
+                let path = format!("/v1/networks/{network_id}/members/revoke");
+                let response: RevokeMemberResponse =
+                    post_json(&coordinator_url, &path, &request).await?;
+                println!(
+                    "Revoked device {device_id}; released IPv4 {}",
+                    response.released_ipv4
                 );
             }
             NetworkCommand::Join {

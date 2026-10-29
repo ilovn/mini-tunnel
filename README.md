@@ -45,9 +45,10 @@ Members publish socket candidates and request same-network peers:
 ```sh
 cargo run -p mini-tunnel -- network advertise --network-id '<network-id>' --candidate '203.0.113.10:42000'
 cargo run -p mini-tunnel -- network peers --network-id '<network-id>'
+MINI_TUNNEL_ADMIN_TOKEN='<admin-token>' cargo run -p mini-tunnel -- network revoke --network-id '<network-id>' --device-id '<device-id>'
 ```
 
-Candidate updates are signed, limited to eight usable socket addresses, and reject timestamps outside a five-minute window or replayed updates. This only exchanges control-plane information; it does not open a tunnel or prove that a candidate is reachable. Each invite expires after one hour and can enroll one device.
+Candidate updates are signed, limited to eight usable socket addresses, and reject timestamps outside a five-minute window or replayed updates. This only exchanges control-plane information; it does not open a tunnel or prove that a candidate is reachable. Each invite expires after one hour and can enroll one device. Network admins can revoke a member with `network revoke`; the assigned address is released for later enrollment.
 
 Tunnel commands can optionally discover and publish a server-reflexive UDP candidate using STUN. Pass `--stun-server '<stun-ip>:3478'`; the STUN request uses the same UDP socket later handed to QUIC. Additional addresses can be repeated as `--candidate '<ip>:<port>'`. Mesh peers prioritize UDP candidates, then try bounded TCP candidates; device ID ordering elects one data connection. Successful QUIC/TLS handshakes authenticate the peer before path selection. This is an ICE-inspired bounded dial checklist, not RFC 8445 full ICE: it does not implement STUN connectivity-check attributes, ICE roles, peer-reflexive candidates, or USE-CANDIDATE nomination. Hole punching remains best effort. See [RFC 8489](https://www.rfc-editor.org/rfc/rfc8489.html) and [RFC 8445](https://www.rfc-editor.org/rfc/rfc8445.html).
 

@@ -24,9 +24,9 @@ use mini_tunnel_protocol::{
     ApiErrorResponse, CandidateUpdateRequest, CandidateUpdateResponse, CreateInviteRequest,
     CreateInviteResponse, CreateNetworkRequest, CreateNetworkResponse, JoinNetworkRequest,
     JoinNetworkResponse, PeerInfo, PeerListRequest, PeerListResponse, RELAY_TICKET_VERSION,
-    RelayTicketClaims, RelayTicketRequest, RelayTicketResponse, candidate_signing_bytes,
-    device_id_from_public_key, issue_relay_ticket, join_signing_bytes, peers_signing_bytes,
-    relay_ticket_request_signing_bytes,
+    RelayTicketClaims, RelayTicketRequest, RelayTicketResponse, RevokeMemberRequest,
+    RevokeMemberResponse, candidate_signing_bytes, device_id_from_public_key, issue_relay_ticket,
+    join_signing_bytes, peers_signing_bytes, relay_ticket_request_signing_bytes,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -476,6 +476,40 @@ impl CoordinatorState {
         })
     }
 
+    async fn revoke_member(
+        &self,
+        network_id: Uuid,
+        request: RevokeMemberRequest,
+    ) -> Result<RevokeMemberResponse, ApiError> {
+        if request.device_id.trim().is_empty()
+            || request.device_id.len() > MAX_DEVICE_ID_BYTES
+            || request.device_id.chars().any(char::is_control)
+        {
+            return Err(ApiError::InvalidRequest(
+                "device_id must be 1-128 bytes and contain no control characters",
+            ));
+        }
+        let mut store = self.inner.write().await;
+        let previous = store.clone();
+        let network = store
+            .networks
+            .get_mut(&network_id)
+            .ok_or(ApiError::NotFound)?;
+        if !constant_time_equal(&network.admin_token_hash, &token_hash(&request.admin_token)) {
+            return Err(ApiError::Unauthorized);
+        }
+        let member = network
+            .members
+            .remove(&request.device_id)
+            .ok_or(ApiError::NotFound)?;
+        network.assigned_addresses.remove(&member.address);
+        self.persist_or_restore(&mut store, previous)?;
+        Ok(RevokeMemberResponse {
+            revoked: true,
+            released_ipv4: member.address.to_string(),
+        })
+    }
+
     async fn join_network(
         &self,
         network_id: Uuid,
@@ -880,6 +914,10 @@ pub fn router_with_state(state: CoordinatorState) -> Router {
         .route("/healthz", get(health))
         .route("/v1/networks", post(create_network))
         .route("/v1/networks/{network_id}/invites", post(create_invite))
+        .route(
+            "/v1/networks/{network_id}/members/revoke",
+            post(revoke_member),
+        )
         .route("/v1/networks/{network_id}/join", post(join_network))
         .route(
             "/v1/networks/{network_id}/candidates",
@@ -949,6 +987,16 @@ async fn join_network(
     let network_id = Uuid::parse_str(&network_id)
         .map_err(|_| ApiError::InvalidRequest("network_id must be a UUID"))?;
     state.join_network(network_id, request).await.map(Json)
+}
+
+async fn revoke_member(
+    State(state): State<CoordinatorState>,
+    Path(network_id): Path<String>,
+    Json(request): Json<RevokeMemberRequest>,
+) -> Result<Json<RevokeMemberResponse>, ApiError> {
+    let network_id = Uuid::parse_str(&network_id)
+        .map_err(|_| ApiError::InvalidRequest("network_id must be a UUID"))?;
+    state.revoke_member(network_id, request).await.map(Json)
 }
 
 async fn update_candidates(
@@ -1304,6 +1352,73 @@ mod tests {
             .await
             .expect("second device should enroll");
         assert_eq!(second.assigned_ipv4, "10.77.0.2");
+    }
+
+    #[tokio::test]
+    async fn admin_revocation_removes_member_and_releases_its_ipv4_address() {
+        let state = CoordinatorState::default();
+        let network = state
+            .create_network(create_request("lab", "10.79.0.0/16"))
+            .await
+            .unwrap();
+        let network_id = network_uuid(&network);
+        let invite = state
+            .create_invite(
+                network_id,
+                CreateInviteRequest {
+                    admin_token: network.admin_token.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let member = state
+            .join_network(network_id, signed_join(network_id, invite.invite_token, 1))
+            .await
+            .unwrap();
+        assert_eq!(member.assigned_ipv4, "10.79.0.1");
+
+        assert!(matches!(
+            state
+                .revoke_member(
+                    network_id,
+                    RevokeMemberRequest {
+                        admin_token: "wrong".to_owned(),
+                        device_id: member.device_id.clone(),
+                    },
+                )
+                .await,
+            Err(ApiError::Unauthorized)
+        ));
+        let revoked = state
+            .revoke_member(
+                network_id,
+                RevokeMemberRequest {
+                    admin_token: network.admin_token.clone(),
+                    device_id: member.device_id,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(revoked.revoked);
+        assert_eq!(revoked.released_ipv4, "10.79.0.1");
+
+        let next_invite = state
+            .create_invite(
+                network_id,
+                CreateInviteRequest {
+                    admin_token: network.admin_token,
+                },
+            )
+            .await
+            .unwrap();
+        let next = state
+            .join_network(
+                network_id,
+                signed_join(network_id, next_invite.invite_token, 2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(next.assigned_ipv4, "10.79.0.1");
     }
 
     #[tokio::test]
