@@ -559,15 +559,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let identity = std::sync::Arc::new(identity);
                     let mut attempts = tokio::task::JoinSet::new();
                     let mut peer_connectors = std::collections::HashMap::new();
-                    let mut inbound_peers = peers.clone();
+                    let mut accepted_peer_senders = std::collections::HashMap::new();
+                    let inbound_peers = peers.clone();
                     for peer in peers.iter().cloned() {
                         let keep_outbound = local_device_id < peer.device_id;
-                        let reconnect_endpoint = endpoint.clone();
+                        let (accepted_peer_tx, accepted_peer_rx) = tokio::sync::mpsc::channel(2);
+                        accepted_peer_senders.insert(peer.device_id.clone(), accepted_peer_tx);
                         let reconnect_identity = std::sync::Arc::clone(&identity);
-                        let reconnect_network_id = network_id.clone();
                         let reconnect_coordinator_url = coordinator_url.clone();
+                        let reconnect_network_id = network_id.clone();
                         let reconnect_peer = peer.clone();
-                        let connector: mini_tunnel_agent::tunnel::PeerConnector =
+                        let connector: mini_tunnel_agent::tunnel::PeerConnector = if keep_outbound {
+                            let reconnect_endpoint = endpoint.clone();
                             std::sync::Arc::new(move || {
                                 let endpoint = reconnect_endpoint.clone();
                                 let identity = std::sync::Arc::clone(&reconnect_identity);
@@ -586,7 +589,41 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     .await
                                     .map(|(channel, _)| channel)
                                 })
-                            });
+                            })
+                        } else {
+                            let receiver =
+                                std::sync::Arc::new(tokio::sync::Mutex::new(accepted_peer_rx));
+                            std::sync::Arc::new(move || {
+                                let receiver = std::sync::Arc::clone(&receiver);
+                                let identity = std::sync::Arc::clone(&reconnect_identity);
+                                let coordinator_url = reconnect_coordinator_url.clone();
+                                let network_id = reconnect_network_id.clone();
+                                let peer = reconnect_peer.clone();
+                                Box::pin(async move {
+                                    if let Ok(Some(channel)) =
+                                        tokio::time::timeout(Duration::from_secs(65), async {
+                                            receiver.lock().await.recv().await
+                                        })
+                                        .await
+                                    {
+                                        return Ok(channel);
+                                    }
+                                    let relay = relay_server.ok_or_else(|| {
+                                        mini_tunnel_agent::IdentityError::Transport(
+                                            "timed out waiting for peer redial".to_owned(),
+                                        )
+                                    })?;
+                                    connect_mesh_peer_via_relay(
+                                        relay,
+                                        &coordinator_url,
+                                        &network_id,
+                                        &identity,
+                                        &peer,
+                                    )
+                                    .await
+                                })
+                            })
+                        };
                         peer_connectors.insert(peer.device_id.clone(), connector);
                         let endpoint = endpoint.clone();
                         let identity = std::sync::Arc::clone(&identity);
@@ -613,35 +650,31 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let local_device_id = local_device_id.clone();
                         let accepted_tx = accepted_tx.clone();
                         tokio::spawn(async move {
-                            let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
-                            while !inbound_peers.is_empty() {
-                                let allowed = inbound_peers
-                                    .iter()
-                                    .map(|peer| {
-                                        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
-                                            peer.device_id.clone(),
-                                            decode_peer_key(&peer.public_key)?,
-                                        ))
-                                    })
-                                    .collect::<Result<Vec<_>, _>>()?;
-                                let accepted = tokio::time::timeout_at(
-                                    deadline,
-                                    mini_tunnel_agent::accept_peer_any(
-                                        &endpoint,
-                                        &network_id,
-                                        &identity,
-                                        &allowed,
-                                    ),
+                            let allowed = inbound_peers
+                                .iter()
+                                .map(|peer| {
+                                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
+                                        peer.device_id.clone(),
+                                        decode_peer_key(&peer.public_key)?,
+                                    ))
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            loop {
+                                let Ok((device_id, channel)) = mini_tunnel_agent::accept_peer_any(
+                                    &endpoint,
+                                    &network_id,
+                                    &identity,
+                                    &allowed,
                                 )
-                                .await;
-                                let Ok(Ok((device_id, channel))) = accepted else {
+                                .await
+                                else {
                                     break;
                                 };
-                                if let Some(index) = inbound_peers
+                                if let Some(peer) = inbound_peers
                                     .iter()
-                                    .position(|peer| peer.device_id == device_id)
+                                    .find(|peer| peer.device_id == device_id)
+                                    .cloned()
                                 {
-                                    let peer = inbound_peers.remove(index);
                                     if peer.device_id < local_device_id {
                                         let remote = channel.remote_address();
                                         if accepted_tx.send((peer, channel, remote)).await.is_err()
@@ -659,41 +692,38 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         })
                     }];
                     if let Some(listener) = tcp_listener {
-                        let mut tcp_inbound_peers = peers.clone();
+                        let tcp_inbound_peers = peers.clone();
                         let identity = std::sync::Arc::clone(&identity);
                         let network_id = network_id.clone();
                         let local_device_id = local_device_id.clone();
                         let accepted_tx = accepted_tx.clone();
                         accept_tasks.push(tokio::spawn(async move {
-                            let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
-                            while !tcp_inbound_peers.is_empty() {
-                                let allowed = tcp_inbound_peers
-                                    .iter()
-                                    .map(|peer| {
-                                        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
-                                            peer.device_id.clone(),
-                                            decode_peer_key(&peer.public_key)?,
-                                        ))
-                                    })
-                                    .collect::<Result<Vec<_>, _>>()?;
-                                let accepted = tokio::time::timeout_at(
-                                    deadline,
+                            let allowed = tcp_inbound_peers
+                                .iter()
+                                .map(|peer| {
+                                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
+                                        peer.device_id.clone(),
+                                        decode_peer_key(&peer.public_key)?,
+                                    ))
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            loop {
+                                let Ok((device_id, channel)) =
                                     mini_tunnel_agent::accept_tcp_peer_any(
                                         &listener,
                                         &network_id,
                                         &identity,
                                         &allowed,
-                                    ),
-                                )
-                                .await;
-                                let Ok(Ok((device_id, channel))) = accepted else {
+                                    )
+                                    .await
+                                else {
                                     break;
                                 };
-                                if let Some(index) = tcp_inbound_peers
+                                if let Some(peer) = tcp_inbound_peers
                                     .iter()
-                                    .position(|peer| peer.device_id == device_id)
+                                    .find(|peer| peer.device_id == device_id)
+                                    .cloned()
                                 {
-                                    let peer = tcp_inbound_peers.remove(index);
                                     if peer.device_id < local_device_id {
                                         let remote = channel.remote_address();
                                         if accepted_tx.send((peer, channel, remote)).await.is_err()
@@ -768,10 +798,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             _ = tokio::time::sleep_until(startup_deadline), if first_peer_at.is_none() => break,
                         }
                     }
-                    for task in accept_tasks.drain(..) {
-                        task.abort();
-                        let _ = task.await;
-                    }
+                    let mut reconnect_senders = accepted_peer_senders;
+                    tokio::spawn(async move {
+                        while let Some((peer, channel, _remote)) = accepted_rx.recv().await {
+                            if let Some(sender) = reconnect_senders.get_mut(&peer.device_id) {
+                                if let Err(error) = sender.try_send(channel) {
+                                    error.into_inner().close();
+                                }
+                            } else {
+                                channel.close();
+                            }
+                        }
+                    });
+                    drop(accept_tasks);
                     if connected.is_empty() {
                         return Err(
                             "no authenticated peer connected before the 45-second startup timeout"
@@ -1134,40 +1173,54 @@ async fn connect_mesh_peer(
             let relay = relay_server.ok_or_else(|| {
                 mini_tunnel_agent::IdentityError::Transport(direct_error.to_string())
             })?;
-            let device_id = identity.device_id();
-            let timestamp_ms = now_ms()
-                .map_err(|error| mini_tunnel_agent::IdentityError::Transport(error.to_string()))?;
-            let request = RelayTicketRequest {
-                device_id: device_id.clone(),
-                peer_id: peer.device_id.clone(),
-                timestamp_ms,
-                signature: identity.sign(&relay_ticket_request_signing_bytes(
-                    network_id,
-                    &device_id,
-                    &peer.device_id,
-                    timestamp_ms,
-                )),
-            };
-            let ticket: RelayTicketResponse = post_json(
-                coordinator_url,
-                &format!("/v1/networks/{network_id}/relay-ticket"),
-                &request,
-            )
-            .await
-            .map_err(|error| mini_tunnel_agent::IdentityError::Transport(error.to_string()))?;
-            let channel = mini_tunnel_agent::connect_relay_peer(
-                relay,
-                &ticket.ticket,
-                network_id,
-                identity,
-                &peer.device_id,
-                peer_key,
-            )
-            .await?;
+            let channel =
+                connect_mesh_peer_via_relay(relay, coordinator_url, network_id, identity, &peer)
+                    .await?;
             let remote = channel.remote_address();
             Ok((channel, remote))
         }
     }
+}
+
+async fn connect_mesh_peer_via_relay(
+    relay: SocketAddr,
+    coordinator_url: &str,
+    network_id: &str,
+    identity: &mini_tunnel_agent::Identity,
+    peer: &PeerInfo,
+) -> Result<mini_tunnel_agent::PeerChannel, mini_tunnel_agent::IdentityError> {
+    let peer_key = decode_peer_key(&peer.public_key)
+        .map_err(|_| mini_tunnel_agent::IdentityError::UnauthorizedPeer)?;
+    let device_id = identity.device_id();
+    let timestamp_ms =
+        now_ms().map_err(|error| mini_tunnel_agent::IdentityError::Transport(error.to_string()))?;
+    let request = RelayTicketRequest {
+        device_id: device_id.clone(),
+        peer_id: peer.device_id.clone(),
+        timestamp_ms,
+        signature: identity.sign(&relay_ticket_request_signing_bytes(
+            network_id,
+            &device_id,
+            &peer.device_id,
+            timestamp_ms,
+        )),
+    };
+    let ticket: RelayTicketResponse = post_json(
+        coordinator_url,
+        &format!("/v1/networks/{network_id}/relay-ticket"),
+        &request,
+    )
+    .await
+    .map_err(|error| mini_tunnel_agent::IdentityError::Transport(error.to_string()))?;
+    mini_tunnel_agent::connect_relay_peer(
+        relay,
+        &ticket.ticket,
+        network_id,
+        identity,
+        &peer.device_id,
+        peer_key,
+    )
+    .await
 }
 
 async fn run_peer_mesh(
