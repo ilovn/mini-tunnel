@@ -1,0 +1,27 @@
+[Unit]
+Description=mini-tunnel opaque TCP relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mini-tunnel
+Group=mini-tunnel
+EnvironmentFile=/etc/mini-tunnel/relay.env
+ExecStart=/usr/local/bin/mini-tunnel relay serve --listen 0.0.0.0:42001 --metrics-listen 127.0.0.1:42002
+Restart=on-failure
+RestartSec=3s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LimitNOFILE=65536
+TimeoutStopSec=25s
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target
