@@ -95,6 +95,9 @@ enum RelayCommand {
             default_value = "0.0.0.0:42001"
         )]
         listen: SocketAddr,
+        /// Previous ticket key accepted during rotation. Tickets still expire normally.
+        #[arg(long, env = "MINI_TUNNEL_RELAY_PREVIOUS_TICKET_KEY")]
+        previous_ticket_key: Option<String>,
     },
 }
 
@@ -414,16 +417,28 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         },
         Command::Relay { command } => match command {
-            RelayCommand::Serve { listen } => {
+            RelayCommand::Serve {
+                listen,
+                previous_ticket_key,
+            } => {
                 let key = std::env::var("MINI_TUNNEL_RELAY_TICKET_KEY")
                     .map_err(|_| "MINI_TUNNEL_RELAY_TICKET_KEY is required for relay service")?;
                 let key = URL_SAFE_NO_PAD.decode(key)?;
                 let key: [u8; 32] = key
                     .try_into()
                     .map_err(|_| "relay ticket key must decode to exactly 32 bytes")?;
+                let config = if let Some(previous) = previous_ticket_key {
+                    let previous = URL_SAFE_NO_PAD.decode(previous)?;
+                    let previous: [u8; 32] = previous
+                        .try_into()
+                        .map_err(|_| "previous relay ticket key must decode to exactly 32 bytes")?;
+                    mini_tunnel_relay::RelayConfig::new(key).with_previous_ticket_key(previous)
+                } else {
+                    mini_tunnel_relay::RelayConfig::new(key)
+                };
                 let listener = tokio::net::TcpListener::bind(listen).await?;
                 eprintln!("relay listening on {}", listener.local_addr()?);
-                mini_tunnel_relay::RelayServer::new(mini_tunnel_relay::RelayConfig::new(key))
+                mini_tunnel_relay::RelayServer::new(config)
                     .run(listener)
                     .await?;
             }

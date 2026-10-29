@@ -38,6 +38,8 @@ const COPY_BUFFER_SIZE: usize = 16 * 1024;
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
     pub ticket_key: [u8; 32],
+    /// Optional overlap key accepted for tickets issued before a key rotation.
+    pub previous_ticket_key: Option<[u8; 32]>,
     pub max_connections: usize,
     pub max_pending_sessions: usize,
     pub pair_timeout: Duration,
@@ -48,10 +50,20 @@ impl RelayConfig {
     pub fn new(ticket_key: [u8; 32]) -> Self {
         Self {
             ticket_key,
+            previous_ticket_key: None,
             max_connections: MAX_CONNECTIONS,
             max_pending_sessions: MAX_PENDING_SESSIONS,
             pair_timeout: PAIR_TIMEOUT,
         }
+    }
+
+    /// Accept tickets authenticated by the previous key until their short expiry.
+    #[must_use]
+    pub fn with_previous_ticket_key(mut self, key: [u8; 32]) -> Self {
+        if key != self.ticket_key {
+            self.previous_ticket_key = Some(key);
+        }
+        self
     }
 }
 
@@ -136,7 +148,16 @@ impl RelayServer {
         stream.read_exact(&mut ticket_bytes).await?;
         let ticket = std::str::from_utf8(&ticket_bytes).map_err(|_| RelayError::Protocol)?;
         let now_ms = unix_time_ms().ok_or(RelayError::Protocol)?;
-        let claims = verify_relay_ticket(&self.inner.config.ticket_key, ticket, now_ms)?;
+        let claims = verify_relay_ticket(&self.inner.config.ticket_key, ticket, now_ms).or_else(
+            |current_error| {
+                self.inner
+                    .config
+                    .previous_ticket_key
+                    .as_ref()
+                    .ok_or(current_error)
+                    .and_then(|key| verify_relay_ticket(key, ticket, now_ms))
+            },
+        )?;
         if claims.expires_at_ms.saturating_sub(now_ms) > MAX_TICKET_LIFETIME_MS {
             return Err(RelayError::InvalidTicket);
         }
@@ -419,18 +440,19 @@ mod tests {
 
     #[tokio::test]
     async fn pairs_only_ticketed_members_and_forwards_opaque_bytes_bidirectionally() {
-        let key = [4; 32];
+        let old_key = [4; 32];
+        let current_key = [6; 32];
         let a = identity(1);
         let b = identity(2);
         let claims_a = claims(&a, &b, 10);
         let claims_b = claims(&b, &a, 11);
-        let ticket_a = issue_relay_ticket(&key, &claims_a).expect("ticket A");
-        let ticket_b = issue_relay_ticket(&key, &claims_b).expect("ticket B");
+        let ticket_a = issue_relay_ticket(&old_key, &claims_a).expect("ticket A");
+        let ticket_b = issue_relay_ticket(&old_key, &claims_b).expect("ticket B");
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind relay");
         let address = listener.local_addr().expect("relay address");
-        let mut config = RelayConfig::new(key);
+        let mut config = RelayConfig::new(current_key).with_previous_ticket_key(old_key);
         config.pair_timeout = Duration::from_secs(2);
         let relay = RelayServer::new(config);
         let relay_task = tokio::spawn(async move { relay.run(listener).await });
