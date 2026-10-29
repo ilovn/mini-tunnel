@@ -27,6 +27,19 @@ pub enum StunError {
     Random,
 }
 
+/// Return whether a UDP payload has a complete RFC 8489 STUN message envelope.
+///
+/// This classifier is deliberately stricter than checking only the STUN magic cookie: it also
+/// validates the reserved top bits and exact padded message length so malformed packets are not
+/// diverted away from Quinn by a future shared-socket demultiplexer.
+pub(crate) fn is_stun_datagram(message: &[u8]) -> bool {
+    message.len() >= HEADER_LEN
+        && message[0] & 0b1100_0000 == 0
+        && usize::from(u16::from_be_bytes([message[2], message[3]])) == message.len() - HEADER_LEN
+        && message[2] & 0b0000_0011 == 0
+        && message[4..8] == MAGIC_COOKIE.to_be_bytes()
+}
+
 /// Ask a STUN server for the address mapped from this UDP socket.
 ///
 /// The socket is borrowed and remains bound to the same port for its caller to hand to QUIC.
@@ -82,12 +95,8 @@ fn parse_binding_response(
     if u16::from_be_bytes([message[0], message[1]]) != BINDING_SUCCESS {
         return Err(StunError::InvalidResponse("not a Binding success response"));
     }
-    let message_len = usize::from(u16::from_be_bytes([message[2], message[3]]));
-    if message_len % 4 != 0 || message_len != message.len() - HEADER_LEN {
-        return Err(StunError::InvalidResponse("invalid message length"));
-    }
-    if u32::from_be_bytes(message[4..8].try_into().expect("fixed header slice")) != MAGIC_COOKIE {
-        return Err(StunError::InvalidResponse("invalid magic cookie"));
+    if !is_stun_datagram(message) {
+        return Err(StunError::InvalidResponse("invalid STUN message envelope"));
     }
     if message[8..20] != expected_transaction_id {
         return Err(StunError::InvalidResponse("transaction ID mismatch"));
@@ -229,6 +238,26 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn stun_demux_classifier_accepts_complete_envelopes_only() {
+        let request = binding_request([7; 12]);
+        assert!(is_stun_datagram(&request));
+
+        let mut malformed_cookie = request;
+        malformed_cookie[4] ^= 0xff;
+        assert!(!is_stun_datagram(&malformed_cookie));
+
+        let mut malformed_length = request;
+        malformed_length[3] = 4;
+        assert!(!is_stun_datagram(&malformed_length));
+
+        let mut reserved_bits = request;
+        reserved_bits[0] = 0x40;
+        assert!(!is_stun_datagram(&reserved_bits));
+        assert!(!is_stun_datagram(&[0xc0; HEADER_LEN]));
+        assert!(!is_stun_datagram(&request[..HEADER_LEN - 1]));
     }
 
     #[test]
