@@ -1215,6 +1215,7 @@ dependencies = [
  "sha2",
  "subtle",
  "tokio",
+ "tower",
  "tracing",
  "uuid",
 ]

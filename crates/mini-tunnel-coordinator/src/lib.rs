@@ -2,16 +2,17 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     io::{self, Write},
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path as FsPath, PathBuf},
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, State},
-    http::StatusCode,
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State},
+    http::{HeaderValue, StatusCode},
+    middleware::{Next, from_fn_with_state},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -38,6 +39,9 @@ const MAX_DEVICE_ID_BYTES: usize = 128;
 const INVITE_TTL: Duration = Duration::from_secs(60 * 60);
 const SIGNATURE_CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
 const MAX_CANDIDATES: usize = 8;
+const MAX_REQUESTS_PER_MINUTE_PER_IP: usize = 600;
+const MAX_RATE_LIMIT_CLIENTS: usize = 8192;
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthResponse {
@@ -50,6 +54,62 @@ pub struct HealthResponse {
 pub struct CoordinatorState {
     inner: Arc<RwLock<Store>>,
     persistence: Option<Arc<PathBuf>>,
+    request_limiter: RequestRateLimiter,
+}
+
+#[derive(Clone)]
+struct RequestRateLimiter {
+    max_requests: usize,
+    window: Duration,
+    clients: Arc<Mutex<HashMap<IpAddr, RequestWindow>>>,
+}
+
+#[derive(Clone, Copy)]
+struct RequestWindow {
+    started_at: Instant,
+    request_count: usize,
+}
+
+impl Default for RequestRateLimiter {
+    fn default() -> Self {
+        Self::new(MAX_REQUESTS_PER_MINUTE_PER_IP, RATE_LIMIT_WINDOW)
+    }
+}
+
+impl RequestRateLimiter {
+    fn new(max_requests: usize, window: Duration) -> Self {
+        Self {
+            max_requests,
+            window,
+            clients: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn allow(&self, client: IpAddr, now: Instant) -> bool {
+        let Ok(mut clients) = self.clients.lock() else {
+            return false;
+        };
+        if !clients.contains_key(&client) && clients.len() >= MAX_RATE_LIMIT_CLIENTS {
+            clients
+                .retain(|_, bucket| now.saturating_duration_since(bucket.started_at) < self.window);
+            if clients.len() >= MAX_RATE_LIMIT_CLIENTS {
+                return false;
+            }
+        }
+        let bucket = clients.entry(client).or_insert(RequestWindow {
+            started_at: now,
+            request_count: 0,
+        });
+        if now.saturating_duration_since(bucket.started_at) >= self.window {
+            bucket.started_at = now;
+            bucket.request_count = 0;
+        }
+        if bucket.request_count >= self.max_requests {
+            return false;
+        }
+        bucket.request_count += 1;
+        true
+    }
 }
 
 #[derive(Clone, Default)]
@@ -192,6 +252,7 @@ impl CoordinatorState {
         Ok(Self {
             inner: Arc::new(RwLock::new(store)),
             persistence: Some(Arc::new(path)),
+            request_limiter: RequestRateLimiter::default(),
         })
     }
 
@@ -716,7 +777,32 @@ pub fn router_with_state(state: CoordinatorState) -> Router {
         )
         .route("/v1/networks/{network_id}/peers", post(list_peers))
         .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(from_fn_with_state(state.clone(), limit_requests))
         .with_state(state)
+}
+
+async fn limit_requests(
+    State(state): State<CoordinatorState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Some(ConnectInfo(remote)) = request.extensions().get::<ConnectInfo<SocketAddr>>()
+        && !state.request_limiter.allow(remote.ip(), Instant::now())
+    {
+        let mut response = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ApiErrorResponse {
+                error: "rate_limited".to_owned(),
+                message: "request rate limit exceeded".to_owned(),
+            }),
+        )
+            .into_response();
+        response
+            .headers_mut()
+            .insert("retry-after", HeaderValue::from_static("60"));
+        return response;
+    }
+    next.run(request).await
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -812,9 +898,12 @@ pub async fn serve_with_state_file(
 async fn serve_with_state(address: SocketAddr, state: CoordinatorState) -> std::io::Result<()> {
     let listener = TcpListener::bind(address).await?;
     tracing::info!(address = %listener.local_addr()?, "coordinator listening");
-    axum::serve(listener, router_with_state(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await
+    axum::serve(
+        listener,
+        router_with_state(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
 }
 
 fn create_token() -> Result<(String, [u8; 32]), ApiError> {
@@ -849,7 +938,86 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{body::Body, extract::connect_info::ConnectInfo, http::Request as HttpRequest};
     use ed25519_dalek::{Signer, SigningKey};
+    use tower::ServiceExt;
+
+    #[test]
+    fn request_limiter_is_per_ip_bounded_and_recovers_after_window() {
+        let limiter = RequestRateLimiter::new(2, Duration::from_secs(10));
+        let first_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let second_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+        let start = Instant::now();
+        assert!(limiter.allow(first_ip, start));
+        assert!(limiter.allow(first_ip, start));
+        assert!(!limiter.allow(first_ip, start));
+        assert!(limiter.allow(second_ip, start));
+        assert!(limiter.allow(first_ip, start + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn request_limiter_caps_source_table_and_reclaims_expired_entries() {
+        let limiter = RequestRateLimiter::new(1, Duration::from_secs(10));
+        let start = Instant::now();
+        for address in 0..MAX_RATE_LIMIT_CLIENTS as u32 {
+            assert!(limiter.allow(IpAddr::V4(Ipv4Addr::from(address)), start,));
+        }
+        let next_ip = IpAddr::V4(Ipv4Addr::from(MAX_RATE_LIMIT_CLIENTS as u32));
+        assert!(!limiter.allow(next_ip, start));
+        assert!(limiter.allow(next_ip, start + Duration::from_secs(10)));
+        assert_eq!(limiter.clients.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn router_returns_429_with_retry_after_for_over_limit_source() {
+        let state = CoordinatorState {
+            request_limiter: RequestRateLimiter::new(1, Duration::from_secs(60)),
+            ..CoordinatorState::default()
+        };
+        let app = router_with_state(state);
+        let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 12345);
+        let make_request = || {
+            let mut request = HttpRequest::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .expect("valid request");
+            request.extensions_mut().insert(ConnectInfo(source));
+            request
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(make_request())
+                .await
+                .expect("first response")
+                .status(),
+            StatusCode::OK
+        );
+        let limited = app
+            .clone()
+            .oneshot(make_request())
+            .await
+            .expect("limited response");
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(limited.headers().get("retry-after").unwrap(), "60");
+
+        let mut other_request = HttpRequest::builder()
+            .uri("/healthz")
+            .body(Body::empty())
+            .expect("valid request");
+        other_request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
+                12346,
+            )));
+        assert_eq!(
+            app.oneshot(other_request)
+                .await
+                .expect("independent source response")
+                .status(),
+            StatusCode::OK
+        );
+    }
 
     fn create_request(name: &str, cidr: &str) -> CreateNetworkRequest {
         CreateNetworkRequest {

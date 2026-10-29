@@ -6,7 +6,7 @@ A minimal, peer-to-peer virtual network tunnel. The design baseline is in [`docs
 
 Implemented: a Rust workspace, coordinator health endpoint and atomic state, network creation/invites/IPv4 allocation, stable Ed25519 device identities, signed discovery candidates, authenticated QUIC/UDP peer channels, STUN mapped-candidate discovery, and a multi-peer IPv4 TUN mesh.
 
-Not implemented yet: full ICE connectivity checks, TCP fallback, and packet relay. Mesh peers now make simultaneous authenticated QUIC/UDP connection attempts to open NAT mappings, then elect one data connection by stable device ID. This is a best-effort hole-punch strategy, not full ICE; restrictive/symmetric NATs and UDP-blocking firewalls still need a relay or fallback. The control API is a local development prototype and has no production rate limiting. **Do not expose it to untrusted networks.** The coordinator binds to loopback by default.
+Not implemented yet: full ICE connectivity checks, TCP fallback, and packet relay. Mesh peers now make simultaneous authenticated QUIC/UDP connection attempts to open NAT mappings, then elect one data connection by stable device ID. This is a best-effort hole-punch strategy, not full ICE; restrictive/symmetric NATs and UDP-blocking firewalls still need a relay or fallback. The control API has a bounded 600-request/minute per-source-IP limiter and a 64 KiB body cap, but remains a development prototype without TLS termination or distributed abuse controls. **Do not expose it directly to untrusted networks.** The coordinator binds to loopback by default; use a hardened TLS reverse proxy for remote clients.
 
 ## Quick start
 
