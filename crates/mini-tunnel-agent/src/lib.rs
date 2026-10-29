@@ -835,6 +835,49 @@ pub async fn accept_tcp_peer_any(
     }
 }
 
+/// Accept authenticated TLS/TCP peers using a runtime-refreshed allowlist.
+pub async fn accept_tcp_peer_any_dynamic(
+    listener: &tokio::net::TcpListener,
+    network_id: &str,
+    identity: &Identity,
+    allowed_peers: tokio::sync::watch::Receiver<Vec<(String, [u8; 32])>>,
+) -> Result<(String, PeerChannel), IdentityError> {
+    let acceptor = tokio_rustls::TlsAcceptor::from(peer_tcp_server_config(identity)?);
+    loop {
+        let (socket, remote_addr) = tokio::time::timeout(PEER_HANDSHAKE_TIMEOUT, listener.accept())
+            .await
+            .map_err(|error| IdentityError::Transport(error.to_string()))?
+            .map_err(|error| IdentityError::Transport(error.to_string()))?;
+        let _ = socket.set_nodelay(true);
+        let mut stream =
+            match tokio::time::timeout(PEER_HANDSHAKE_TIMEOUT, acceptor.accept(socket)).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(_)) | Err(_) => continue,
+            };
+        if stream.get_ref().1.alpn_protocol() != Some(b"mini-tunnel-peer-tcp/1") {
+            continue;
+        }
+        let current = allowed_peers.borrow().clone();
+        if current.is_empty() || !valid_peer_allowlist(&current) {
+            continue;
+        }
+        match tokio::time::timeout(
+            PEER_HANDSHAKE_TIMEOUT,
+            tcp_server_authenticate(&mut stream, network_id, identity, &current),
+        )
+        .await
+        {
+            Ok(Ok(device_id)) => {
+                return Ok((
+                    device_id,
+                    new_tcp_channel(Box::new(stream), remote_addr, network_id),
+                ));
+            }
+            Ok(Err(_)) | Err(_) => continue,
+        }
+    }
+}
+
 /// Try signed-discovery candidates in order with shorter UDP probes and a bounded TCP fallback.
 pub async fn connect_peer_candidates(
     endpoint: &Endpoint,
@@ -985,6 +1028,39 @@ pub async fn accept_peer_any(
             Err(_) => connection.close(0_u32.into(), b"peer authentication rejected"),
         }
     }
+}
+
+/// Accept authenticated peers using an allowlist that can be refreshed at runtime.
+pub async fn accept_peer_any_dynamic(
+    endpoint: &Endpoint,
+    network_id: &str,
+    identity: &Identity,
+    allowed_peers: tokio::sync::watch::Receiver<Vec<(String, [u8; 32])>>,
+) -> Result<(String, PeerChannel), IdentityError> {
+    loop {
+        let Some(incoming) = endpoint.accept().await else {
+            return Err(IdentityError::Transport("endpoint closed".to_owned()));
+        };
+        let connection = match tokio::time::timeout(PEER_HANDSHAKE_TIMEOUT, incoming).await {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(_)) | Err(_) => continue,
+        };
+        let current = allowed_peers.borrow().clone();
+        if current.is_empty() || !valid_peer_allowlist(&current) {
+            connection.close(0_u32.into(), b"peer is not currently authorized");
+            continue;
+        }
+        match server_authenticate(&connection, network_id, identity, None, Some(&current)).await {
+            Ok((device_id, _)) => return Ok((device_id, new_channel(connection, network_id))),
+            Err(_) => connection.close(0_u32.into(), b"peer authentication rejected"),
+        }
+    }
+}
+
+fn valid_peer_allowlist(allowed_peers: &[(String, [u8; 32])]) -> bool {
+    allowed_peers.iter().all(|(device_id, public_key)| {
+        device_id == &mini_tunnel_protocol::device_id_from_public_key(public_key)
+    })
 }
 
 fn new_channel(connection: Connection, network_id: &str) -> PeerChannel {
@@ -1843,6 +1919,59 @@ mod tests {
         endpoint_b.close(0_u32.into(), b"test complete");
         endpoint_c.close(0_u32.into(), b"test complete");
         fs::remove_dir_all(temp).expect("remove test identities");
+    }
+
+    #[tokio::test]
+    async fn dynamic_accept_uses_the_latest_member_allowlist() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-dynamic-accept-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let peer = Identity::load_or_create_at(temp.join("peer/device.key")).unwrap();
+        let local = std::sync::Arc::new(
+            Identity::load_or_create_at(temp.join("local/device.key")).unwrap(),
+        );
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let endpoint_peer = peer_endpoint(&peer, bind).unwrap();
+        let local_endpoint = peer_endpoint(&local, bind).unwrap();
+        let (allowed_tx, allowed_rx) = tokio::sync::watch::channel(Vec::new());
+        let accepting_endpoint = local_endpoint.clone();
+        let accepting_identity = std::sync::Arc::clone(&local);
+        let accept = tokio::spawn(async move {
+            accept_peer_any_dynamic(
+                &accepting_endpoint,
+                "dynamic-allowlist",
+                &accepting_identity,
+                allowed_rx,
+            )
+            .await
+        });
+        allowed_tx
+            .send(vec![(peer.device_id(), peer.public_key())])
+            .unwrap();
+        let peer_channel = connect_peer(
+            &endpoint_peer,
+            local_endpoint.local_addr().unwrap(),
+            "dynamic-allowlist",
+            &peer,
+            &local.device_id(),
+            local.public_key(),
+        )
+        .await
+        .unwrap();
+        let (accepted_id, local_channel) = accept.await.unwrap().unwrap();
+        assert_eq!(accepted_id, peer.device_id());
+        peer_channel
+            .send_packet(b"authorized after refresh")
+            .await
+            .unwrap();
+        assert_eq!(
+            local_channel.recv_packet().await.unwrap(),
+            b"authorized after refresh"
+        );
+        endpoint_peer.close(0_u32.into(), b"test complete");
+        local_endpoint.close(0_u32.into(), b"test complete");
+        fs::remove_dir_all(temp).unwrap();
     }
 
     #[tokio::test]
