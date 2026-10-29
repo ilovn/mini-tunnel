@@ -28,6 +28,8 @@ On clients, set `MINI_TUNNEL_COORDINATOR_URL='https://tunnel.example:8443'`. Cli
 
 Coordinator exposes basic Prometheus metrics at `/metrics` for loopback scrapes only. The endpoint reports configured networks, enrolled members, and rate-limited requests; when using a reverse proxy, keep `/metrics` off its public routes.
 
+CLI commands emit structured logs to stderr. Peer path degradation, reconnect attempts, relay/TCP fallback, and healthy UDP promotion include the peer overlay address, path, and reason. Set `RUST_LOG` to adjust verbosity, for example `RUST_LOG=mini_tunnel_agent=debug`.
+
 Create a network and save the admin token in a secret manager. The token is displayed only once:
 
 ```sh

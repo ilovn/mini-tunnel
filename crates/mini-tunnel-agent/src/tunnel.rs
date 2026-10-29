@@ -194,7 +194,17 @@ async fn receive_mesh_peer(
                     }
                 }
                 _ = keepalive.tick() => {
-                    if active.transport_name() == "QUIC/UDP" && quality.observe(active.health_snapshot()) {
+                    let health = active.health_snapshot();
+                    if active.transport_name() == "QUIC/UDP" && quality.observe(health) {
+                        tracing::warn!(
+                            peer_address = %address,
+                            path = active.transport_name(),
+                            rtt_ms = health.rtt.map(|rtt| rtt.as_millis() as u64),
+                            probes_succeeded = health.probes_succeeded,
+                            probes_missed = health.probes_missed,
+                            reason = "quality_threshold",
+                            "peer path quality degraded; switching to reliable fallback"
+                        );
                         force_reliable = true;
                         break Err(IdentityError::Transport("peer path quality degraded".to_owned()));
                     }
@@ -215,6 +225,15 @@ async fn receive_mesh_peer(
                     if let Some(Ok(candidate)) = result
                         && path_rank(candidate.transport_name()) < path_rank(active.transport_name())
                     {
+                        let previous_path = active.transport_name();
+                        let promoted_path = candidate.transport_name();
+                        tracing::info!(
+                            peer_address = %address,
+                            from_path = previous_path,
+                            to_path = promoted_path,
+                            reason = "healthy_direct_probe",
+                            "peer path promoted"
+                        );
                         *channel.write().await = Arc::new(candidate);
                         break Ok(());
                     }
@@ -233,6 +252,13 @@ async fn receive_mesh_peer(
         {
             force_reliable = true;
         }
+        tracing::warn!(
+            peer_address = %address,
+            path = active.transport_name(),
+            reason = %failure,
+            reliable_fallback = force_reliable,
+            "peer path failed; reconnecting"
+        );
         if connector.is_none() {
             let _ = event_tx.send((address, Err(failure))).await;
             return;
@@ -244,16 +270,36 @@ async fn receive_mesh_peer(
             attempt = attempt.saturating_add(1);
             match (connector)(force_reliable).await {
                 Ok(reconnected) => {
+                    tracing::info!(
+                        peer_address = %address,
+                        from_path = active.transport_name(),
+                        to_path = reconnected.transport_name(),
+                        attempt,
+                        reliable_fallback = force_reliable,
+                        "peer path reconnected"
+                    );
                     *channel.write().await = Arc::new(reconnected);
                     break;
                 }
                 Err(IdentityError::UnauthorizedPeer) => {
+                    tracing::error!(
+                        peer_address = %address,
+                        attempt,
+                        "peer identity authorization failed during reconnect"
+                    );
                     let _ = event_tx
                         .send((address, Err(IdentityError::UnauthorizedPeer)))
                         .await;
                     return;
                 }
-                Err(_) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        peer_address = %address,
+                        attempt,
+                        error = %error,
+                        "peer reconnect attempt failed"
+                    );
+                }
             }
         }
     }

@@ -359,6 +359,12 @@ struct HealthResponse {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
     if let Err(error) = run(Cli::parse()).await {
         eprintln!("error: {error}");
         return ExitCode::FAILURE;
@@ -381,12 +387,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 tls_cert,
                 tls_key,
             } => {
-                tracing_subscriber::fmt()
-                    .with_env_filter(
-                        tracing_subscriber::EnvFilter::try_from_default_env()
-                            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-                    )
-                    .init();
                 let relay_key = std::env::var("MINI_TUNNEL_RELAY_TICKET_KEY")
                     .ok()
                     .map(|value| {

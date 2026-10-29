@@ -1332,6 +1332,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
+ "tracing",
  "tun-rs",
  "uuid",
  "x509-parser",
