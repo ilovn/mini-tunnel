@@ -26,6 +26,8 @@ cargo run -p mini-tunnel -- coordinator serve --listen '0.0.0.0:8443'
 
 On clients, set `MINI_TUNNEL_COORDINATOR_URL='https://tunnel.example:8443'`. Clients validate the certificate chain and hostname; the CLI has no insecure TLS bypass. A reverse proxy that terminates TLS is also supported while the coordinator remains bound to loopback.
 
+Coordinator exposes basic Prometheus metrics at `/metrics` for loopback scrapes only. The endpoint reports configured networks, enrolled members, and rate-limited requests; when using a reverse proxy, keep `/metrics` off its public routes.
+
 Create a network and save the admin token in a secret manager. The token is displayed only once:
 
 ```sh

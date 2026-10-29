@@ -4,7 +4,10 @@ use std::{
     io::{self, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path as FsPath, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -75,6 +78,7 @@ struct RequestRateLimiter {
     max_requests: usize,
     window: Duration,
     clients: Arc<Mutex<HashMap<IpAddr, RequestWindow>>>,
+    rejected_total: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Copy)]
@@ -95,6 +99,7 @@ impl RequestRateLimiter {
             max_requests,
             window,
             clients: Arc::new(Mutex::new(HashMap::new())),
+            rejected_total: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -912,6 +917,7 @@ pub fn router() -> Router {
 pub fn router_with_state(state: CoordinatorState) -> Router {
     Router::new()
         .route("/healthz", get(health))
+        .route("/metrics", get(metrics))
         .route("/v1/networks", post(create_network))
         .route("/v1/networks/{network_id}/invites", post(create_invite))
         .route(
@@ -935,9 +941,20 @@ async fn limit_requests(
     request: Request,
     next: Next,
 ) -> Response {
-    if let Some(ConnectInfo(remote)) = request.extensions().get::<ConnectInfo<SocketAddr>>()
+    let remote = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(remote)| *remote);
+    let loopback_metrics = request.uri().path() == "/metrics"
+        && remote.is_some_and(|remote| remote.ip().is_loopback());
+    if !loopback_metrics
+        && let Some(remote) = remote
         && !state.request_limiter.allow(remote.ip(), Instant::now())
     {
+        state
+            .request_limiter
+            .rejected_total
+            .fetch_add(1, Ordering::Relaxed);
         let mut response = (
             StatusCode::TOO_MANY_REQUESTS,
             Json(ApiErrorResponse {
@@ -960,6 +977,35 @@ async fn health() -> Json<HealthResponse> {
         service: "coordinator",
         version: SERVICE_VERSION,
     })
+}
+
+async fn metrics(State(state): State<CoordinatorState>, request: Request) -> Response {
+    let loopback = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .is_some_and(|ConnectInfo(remote)| remote.ip().is_loopback());
+    if !loopback {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let store = state.inner.read().await;
+    let networks = store.networks.len();
+    let members: usize = store
+        .networks
+        .values()
+        .map(|network| network.members.len())
+        .sum();
+    let body = format!(
+        "# HELP mini_tunnel_coordinator_networks Configured overlay networks.\n# TYPE mini_tunnel_coordinator_networks gauge\nmini_tunnel_coordinator_networks {networks}\n# HELP mini_tunnel_coordinator_members Enrolled devices across all networks.\n# TYPE mini_tunnel_coordinator_members gauge\nmini_tunnel_coordinator_members {members}\n# HELP mini_tunnel_coordinator_rate_limited_total Requests rejected by the source IP rate limiter.\n# TYPE mini_tunnel_coordinator_rate_limited_total counter\nmini_tunnel_coordinator_rate_limited_total {}\n",
+        state.request_limiter.rejected_total.load(Ordering::Relaxed),
+    );
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
 }
 
 async fn create_network(
@@ -1319,6 +1365,72 @@ mod tests {
                 .status(),
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    async fn metrics_are_loopback_only_and_report_basic_service_totals() {
+        let state = CoordinatorState {
+            request_limiter: RequestRateLimiter::new(1, Duration::from_secs(60)),
+            ..CoordinatorState::default()
+        };
+        state
+            .create_network(create_request("metrics", "10.88.0.0/24"))
+            .await
+            .expect("create test network");
+        let app = router_with_state(state);
+        let public_source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 44)), 12345);
+        let request_from = |path: &str, source| {
+            let mut request = HttpRequest::builder()
+                .uri(path)
+                .body(Body::empty())
+                .expect("valid request");
+            request.extensions_mut().insert(ConnectInfo(source));
+            request
+        };
+
+        let response = app
+            .clone()
+            .oneshot(request_from("/healthz", public_source))
+            .await
+            .expect("initial request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let limited = app
+            .clone()
+            .oneshot(request_from("/healthz", public_source))
+            .await
+            .expect("limited request");
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let remote_metrics = app
+            .clone()
+            .oneshot(request_from(
+                "/metrics",
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 45)), 12346),
+            ))
+            .await
+            .expect("remote metrics request");
+        assert_eq!(remote_metrics.status(), StatusCode::NOT_FOUND);
+
+        let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54321);
+        let metrics = app
+            .oneshot(request_from("/metrics", loopback))
+            .await
+            .expect("loopback metrics request");
+        assert_eq!(metrics.status(), StatusCode::OK);
+        assert_eq!(
+            metrics
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(metrics.into_body(), 16 * 1024)
+            .await
+            .expect("metrics body");
+        let body = String::from_utf8(body.to_vec()).expect("UTF-8 metrics");
+        assert!(body.contains("mini_tunnel_coordinator_networks 1\n"));
+        assert!(body.contains("mini_tunnel_coordinator_members 0\n"));
+        assert!(body.contains("mini_tunnel_coordinator_rate_limited_total 1\n"));
     }
 
     fn create_request(name: &str, cidr: &str) -> CreateNetworkRequest {
