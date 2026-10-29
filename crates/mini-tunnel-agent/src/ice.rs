@@ -8,7 +8,7 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use bytes::BytesMut;
@@ -179,7 +179,7 @@ struct IceRoute {
 
 /// Bounded dispatcher for the STUN receive queue of one shared Quinn socket.
 ///
-/// Binding requests are routed by the recipient ufrag in USERNAME. Responses without USERNAME
+/// Binding requests are routed by the first (recipient) ufrag in USERNAME. Responses without USERNAME
 /// are routed only after the owning agent confirms an authenticated request via
 /// `associate_authenticated_peer`.
 #[derive(Default)]
@@ -300,8 +300,9 @@ pub enum IceRouterError {
 }
 
 fn ice_recipient_ufrag(username: &str) -> Option<&str> {
-    let (remote, local) = username.split_once(':')?;
-    (valid_ice_ufrag(remote) && valid_ice_ufrag(local) && !local.contains(':')).then_some(local)
+    let (recipient, remote) = username.split_once(':')?;
+    (valid_ice_ufrag(recipient) && valid_ice_ufrag(remote) && !remote.contains(':'))
+        .then_some(recipient)
 }
 
 fn valid_ice_ufrag(ufrag: &str) -> bool {
@@ -592,6 +593,12 @@ pub enum IceDriverError {
     InvalidDatagram,
     #[error("ICE agent rejected an input: {0}")]
     Agent(String),
+    #[error("ICE connectivity checks timed out")]
+    Timeout,
+    #[error("shared UDP socket failed: {0}")]
+    Socket(String),
+    #[error("ICE datagram router failed: {0}")]
+    Router(String),
 }
 
 /// Drives an RFC 8445 agent without owning its UDP socket or clock.
@@ -725,6 +732,48 @@ impl IceAgentDriver {
         self.agent
             .get_selected_candidate_pair()
             .map(|(local, remote)| (local.addr(), remote.addr()))
+    }
+
+    /// Run checks over the endpoint's shared UDP socket until nomination or timeout.
+    pub async fn run_checks(
+        &mut self,
+        socket: &IceSocketHandle,
+        router: &IceDatagramRouterHandle,
+        local_ufrag: &str,
+        datagrams: &mut mpsc::Receiver<IceDatagram>,
+        timeout: Duration,
+    ) -> Result<(SocketAddr, SocketAddr), IceDriverError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let now = Instant::now();
+            self.handle_timeout(now)?;
+            for transmit in self.poll_transmits() {
+                socket
+                    .send_to(&transmit.message, transmit.transport.peer_addr)
+                    .await
+                    .map_err(|error| IceDriverError::Socket(error.to_string()))?;
+            }
+            if let Some(pair) = self.selected_pair() {
+                return Ok(pair);
+            }
+            if now >= deadline {
+                return Err(IceDriverError::Timeout);
+            }
+            let next_deadline = self.next_timeout().unwrap_or(deadline).min(deadline);
+            tokio::select! {
+                datagram = datagrams.recv() => {
+                    let datagram = datagram.ok_or_else(|| IceDriverError::Router("peer datagram queue closed".to_owned()))?;
+                    router
+                        .handle_datagram(local_ufrag, self, datagram, Instant::now())
+                        .map_err(|error| IceDriverError::Router(error.to_string()))?;
+                }
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(next_deadline)) => {
+                    if Instant::now() >= deadline {
+                        return Err(IceDriverError::Timeout);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -898,8 +947,8 @@ mod tests {
         let peer_a: SocketAddr = "127.0.0.1:42001".parse().unwrap();
         let peer_b: SocketAddr = "127.0.0.1:42002".parse().unwrap();
 
-        assert!(router.route(ice_packet("remote:localA", peer_a)));
-        assert!(router.route(ice_packet("remote:localB", peer_b)));
+        assert!(router.route(ice_packet("localA:remote", peer_a)));
+        assert!(router.route(ice_packet("localB:remote", peer_b)));
         assert_eq!(session_a.recv().await.unwrap().peer_addr, peer_a);
         assert_eq!(session_b.recv().await.unwrap().peer_addr, peer_b);
 
@@ -926,8 +975,8 @@ mod tests {
             Some(IceRouterError::DuplicateUfrag)
         );
         let peer = "127.0.0.1:42003".parse().unwrap();
-        assert!(router.route(ice_packet("remote:local", peer)));
-        assert!(!router.route(ice_packet("remote:local", peer)));
+        assert!(router.route(ice_packet("local:remote", peer)));
+        assert!(!router.route(ice_packet("local:remote", peer)));
         assert!(receiver.recv().await.is_some());
     }
 
@@ -976,10 +1025,57 @@ mod tests {
             .endpoint
             .local_addr()
             .expect("endpoint B address");
+        let address_a = endpoint_a
+            .endpoint
+            .local_addr()
+            .expect("endpoint A address");
+        let credentials_a = generate_ice_credentials(1).expect("ICE credentials A");
+        let credentials_b = generate_ice_credentials(1).expect("ICE credentials B");
+        let mut ice_messages_a = endpoint_a
+            .ice_router
+            .register(credentials_a.ufrag.clone(), 8)
+            .expect("register A ICE session");
         let mut ice_messages = endpoint_b
             .ice_router
-            .register("localb".to_owned(), 8)
+            .register(credentials_b.ufrag.clone(), 8)
             .expect("register B ICE session");
+        let mut driver_a = IceAgentDriver::for_peer(
+            &credentials_a,
+            &credentials_b,
+            &[address_a],
+            &[address_b],
+            true,
+            Instant::now(),
+        )
+        .expect("construct A ICE session");
+        let mut driver_b = IceAgentDriver::for_peer(
+            &credentials_b,
+            &credentials_a,
+            &[address_b],
+            &[address_a],
+            false,
+            Instant::now(),
+        )
+        .expect("construct B ICE session");
+        let (pair_a, pair_b) = tokio::join!(
+            driver_a.run_checks(
+                &endpoint_a.socket,
+                &endpoint_a.ice_router,
+                &credentials_a.ufrag,
+                &mut ice_messages_a,
+                Duration::from_secs(3),
+            ),
+            driver_b.run_checks(
+                &endpoint_b.socket,
+                &endpoint_b.ice_router,
+                &credentials_b.ufrag,
+                &mut ice_messages,
+                Duration::from_secs(3),
+            ),
+        );
+        assert_eq!(pair_a.expect("A nominates pair"), (address_a, address_b));
+        assert_eq!(pair_b.expect("B nominates pair"), (address_b, address_a));
+
         let identity_a_id = identity_a.device_id();
         let identity_a_key = identity_a.public_key();
         let identity_b_id = identity_b.device_id();
@@ -1006,23 +1102,6 @@ mod tests {
         .await
         .expect("QUIC handshake through demux socket");
         let channel_b = accept.await.expect("accept task").expect("accept QUIC");
-
-        let request = ice_packet("remote:localb", address_b).payload;
-        endpoint_a
-            .socket
-            .send_to(&request, address_b)
-            .await
-            .expect("send an ICE STUN datagram");
-        let ice_message = tokio::time::timeout(Duration::from_secs(1), ice_messages.recv())
-            .await
-            .expect("STUN reaches ICE queue")
-            .expect("ICE queue remains open");
-        assert_eq!(ice_message.local_addr, address_b);
-        assert_eq!(
-            ice_message.peer_addr,
-            endpoint_a.socket.local_addr().unwrap()
-        );
-        assert_eq!(ice_message.payload, request);
 
         channel_a
             .send_packet(b"quic-survives-demux")
@@ -1056,12 +1135,12 @@ mod tests {
             .register("localq".to_owned(), 1)
             .expect("register ICE test session");
         let first_request = ice_packet(
-            "remote:localq",
+            "localq:remote",
             sender.local_addr().expect("sender address"),
         )
         .payload;
         let second_request = ice_packet(
-            "remote:localq",
+            "localq:remote",
             sender.local_addr().expect("sender address"),
         )
         .payload;
