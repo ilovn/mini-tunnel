@@ -1084,7 +1084,21 @@ pub async fn serve_with_state_file_and_relay_key(
     serve_with_state(address, state).await
 }
 
+pub async fn serve_with_state_file_and_relay_key_tls(
+    address: SocketAddr,
+    state_file: impl Into<PathBuf>,
+    relay_ticket_key: Option<[u8; 32]>,
+    tls_files: Option<(PathBuf, PathBuf)>,
+) -> std::io::Result<()> {
+    let mut state = CoordinatorState::load(state_file)?;
+    if let Some(key) = relay_ticket_key {
+        state = state.with_relay_ticket_key(key);
+    }
+    serve_with_state_and_tls(address, state, tls_files).await
+}
+
 async fn serve_with_state(address: SocketAddr, state: CoordinatorState) -> std::io::Result<()> {
+    validate_listener_security(address, false)?;
     let listener = TcpListener::bind(address).await?;
     tracing::info!(address = %listener.local_addr()?, "coordinator listening");
     axum::serve(
@@ -1093,6 +1107,43 @@ async fn serve_with_state(address: SocketAddr, state: CoordinatorState) -> std::
     )
     .with_graceful_shutdown(shutdown_signal())
     .await
+}
+
+async fn serve_with_state_and_tls(
+    address: SocketAddr,
+    state: CoordinatorState,
+    tls_files: Option<(PathBuf, PathBuf)>,
+) -> std::io::Result<()> {
+    validate_listener_security(address, tls_files.is_some())?;
+    let Some((certificate, private_key)) = tls_files else {
+        return serve_with_state(address, state).await;
+    };
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(certificate, private_key)
+        .await
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let handle = axum_server::Handle::new();
+    let shutdown_handle = handle.clone();
+    let shutdown = tokio::spawn(async move {
+        shutdown_signal().await;
+        shutdown_handle.graceful_shutdown(Some(Duration::from_secs(15)));
+    });
+    let result = axum_server::bind_rustls(address, config)
+        .handle(handle)
+        .serve(router_with_state(state).into_make_service_with_connect_info::<SocketAddr>())
+        .await;
+    shutdown.abort();
+    result
+}
+
+fn validate_listener_security(address: SocketAddr, tls_enabled: bool) -> io::Result<()> {
+    if !address.ip().is_loopback() && !tls_enabled {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "non-loopback coordinator listeners require TLS; configure both certificate and private key",
+        ));
+    }
+    Ok(())
 }
 
 fn create_token() -> Result<(String, [u8; 32]), ApiError> {
@@ -1130,6 +1181,68 @@ mod tests {
     use axum::{body::Body, extract::connect_info::ConnectInfo, http::Request as HttpRequest};
     use ed25519_dalek::{Signer, SigningKey};
     use tower::ServiceExt;
+
+    #[test]
+    fn plaintext_coordinator_listeners_are_loopback_only() {
+        assert!(validate_listener_security("127.0.0.1:8080".parse().unwrap(), false).is_ok());
+        assert!(validate_listener_security("[::1]:8080".parse().unwrap(), false).is_ok());
+        assert!(validate_listener_security("0.0.0.0:8080".parse().unwrap(), false).is_err());
+        assert!(validate_listener_security("[::]:8080".parse().unwrap(), false).is_err());
+        assert!(validate_listener_security("0.0.0.0:8080".parse().unwrap(), true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn configured_tls_serves_health_with_certificate_validation() {
+        let temporary =
+            std::env::temp_dir().join(format!("mini-tunnel-coordinator-tls-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temporary).unwrap();
+        let certified = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
+        let certificate_pem = certified.cert.pem();
+        let private_key_pem = certified.signing_key.serialize_pem();
+        let certificate_path = temporary.join("certificate.pem");
+        let key_path = temporary.join("private-key.pem");
+        fs::write(&certificate_path, &certificate_pem).unwrap();
+        fs::write(&key_path, &private_key_pem).unwrap();
+        let state_path = temporary.join("state.json");
+        let address = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let listener = TcpListener::bind(address).await.unwrap();
+        drop(listener);
+
+        let server = tokio::spawn(serve_with_state_file_and_relay_key_tls(
+            address,
+            state_path,
+            None,
+            Some((certificate_path, key_path)),
+        ));
+        let root = reqwest::Certificate::from_pem(certificate_pem.as_bytes()).unwrap();
+        let client = reqwest::Client::builder()
+            .add_root_certificate(root)
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let url = format!("https://{address}/healthz");
+        let mut response = None;
+        for _ in 0..40 {
+            if let Ok(result) = client.get(&url).send().await {
+                response = Some(result);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let response = response.expect("TLS coordinator should start and serve health");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["status"],
+            "ok"
+        );
+        assert!(reqwest::Client::new().get(&url).send().await.is_err());
+        server.abort();
+        fs::remove_dir_all(temporary).unwrap();
+    }
 
     #[test]
     fn request_limiter_is_per_ip_bounded_and_recovers_after_window() {

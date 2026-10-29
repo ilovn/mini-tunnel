@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 axum.workspace = true
+axum-server.workspace = true
 base64.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true
@@ -14,6 +15,7 @@ ipnet.workspace = true
 mini-tunnel-protocol = { path = "../mini-tunnel-protocol" }
 serde.workspace = true
 serde_json.workspace = true
+rustls.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 tokio.workspace = true
@@ -21,4 +23,6 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
+reqwest.workspace = true
 tower = { version = "0.5", features = ["util"] }

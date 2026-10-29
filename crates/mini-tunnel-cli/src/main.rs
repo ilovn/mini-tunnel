@@ -67,6 +67,12 @@ enum CoordinatorCommand {
             default_value_os_t = default_coordinator_state_path()
         )]
         state_file: PathBuf,
+        /// PEM certificate chain used to serve HTTPS. Required with --tls-key.
+        #[arg(long, env = "MINI_TUNNEL_COORDINATOR_TLS_CERT")]
+        tls_cert: Option<PathBuf>,
+        /// PEM private key used to serve HTTPS. Required with --tls-cert.
+        #[arg(long, env = "MINI_TUNNEL_COORDINATOR_TLS_KEY")]
+        tls_key: Option<PathBuf>,
     },
     /// Check a running coordinator's health endpoint.
     Health {
@@ -352,7 +358,12 @@ fn default_coordinator_state_path() -> PathBuf {
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match cli.command {
         Command::Coordinator { command } => match command {
-            CoordinatorCommand::Serve { listen, state_file } => {
+            CoordinatorCommand::Serve {
+                listen,
+                state_file,
+                tls_cert,
+                tls_key,
+            } => {
                 tracing_subscriber::fmt()
                     .with_env_filter(
                         tracing_subscriber::EnvFilter::try_from_default_env()
@@ -367,8 +378,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             .ok_or_else(|| "MINI_TUNNEL_RELAY_TICKET_KEY must be base64url encoding of exactly 32 bytes".to_owned())
                     })
                     .transpose()?;
-                mini_tunnel_coordinator::serve_with_state_file_and_relay_key(
-                    listen, state_file, relay_key,
+                let tls_files = match (tls_cert, tls_key) {
+                    (Some(certificate), Some(private_key)) => Some((certificate, private_key)),
+                    (None, None) => None,
+                    _ => return Err("--tls-cert and --tls-key must be provided together".into()),
+                };
+                if !listen.ip().is_loopback() && tls_files.is_none() {
+                    return Err(
+                        "non-loopback coordinator listeners require TLS; configure --tls-cert and --tls-key".into(),
+                    );
+                }
+                mini_tunnel_coordinator::serve_with_state_file_and_relay_key_tls(
+                    listen, state_file, relay_key, tls_files,
                 )
                 .await?;
             }

@@ -6,7 +6,7 @@ A minimal, peer-to-peer virtual network tunnel. The design baseline is in [`docs
 
 Implemented: coordinator health/state and enrollment, stable Ed25519 identities, signed discovery candidates, authenticated QUIC/UDP and TLS/TCP peer channels, STUN mapped candidates, multi-peer IPv4 TUN mesh, and an optional ticket-authorized opaque TCP relay with end-to-end pinned TLS.
 
-Still in progress: RFC 8445 full ICE, IPv6/Windows support, and production operational hardening. Peer sessions exchange encrypted RTT probes every 10 seconds and detect 30 seconds of receive silence. After three consecutive poor quality windows (initially RTT above 350 ms or probe loss above 20%), mesh reconnects only that peer and filters out UDP candidates, preferring direct TLS/TCP then relay. While on a reliable path, the elected dialer probes for direct UDP every 60 seconds; a healthy authenticated candidate is promoted without first dropping the existing path. Single-peer tunnel commands reconnect with capped full-jitter backoff; mesh reconnects each lost peer independently while other peers continue forwarding. An optional coordinator-authorized relay handles restrictive NATs; the relay sees only ticket metadata and TLS ciphertext. The control API has a bounded 600-request/minute per-source-IP limiter and a 64 KiB body cap, but remains a development prototype without TLS termination or distributed abuse controls. **Do not expose it directly to untrusted networks.** The coordinator binds to loopback by default; use a hardened TLS reverse proxy for remote clients.
+Still in progress: RFC 8445 full ICE, IPv6/Windows support, and production operational hardening. Peer sessions exchange encrypted RTT probes every 10 seconds and detect 30 seconds of receive silence. After three consecutive poor quality windows (initially RTT above 350 ms or probe loss above 20%), mesh reconnects only that peer and filters out UDP candidates, preferring direct TLS/TCP then relay. While on a reliable path, the elected dialer probes for direct UDP every 60 seconds; a healthy authenticated candidate is promoted without first dropping the existing path. Single-peer tunnel commands reconnect with capped full-jitter backoff; mesh reconnects each lost peer independently while other peers continue forwarding. An optional coordinator-authorized relay handles restrictive NATs; the relay sees only ticket metadata and TLS ciphertext. The control API has built-in HTTPS, a bounded 600-request/minute per-source-IP limiter, and a 64 KiB body cap, but remains a development prototype without distributed abuse controls. Remote plaintext binds are rejected; use a trusted certificate or keep the service behind a TLS-terminating proxy.
 
 ## Quick start
 
@@ -15,6 +15,16 @@ Start the coordinator:
 ```sh
 cargo run -p mini-tunnel -- coordinator serve
 ```
+
+The coordinator serves HTTP only on loopback. To bind a remote interface, configure a trusted PEM certificate chain and private key; non-loopback plaintext listeners are rejected:
+
+```sh
+MINI_TUNNEL_COORDINATOR_TLS_CERT='/etc/letsencrypt/live/tunnel.example/fullchain.pem' \
+MINI_TUNNEL_COORDINATOR_TLS_KEY='/etc/letsencrypt/live/tunnel.example/privkey.pem' \
+cargo run -p mini-tunnel -- coordinator serve --listen '0.0.0.0:8443'
+```
+
+On clients, set `MINI_TUNNEL_COORDINATOR_URL='https://tunnel.example:8443'`. Clients validate the certificate chain and hostname; the CLI has no insecure TLS bypass. A reverse proxy that terminates TLS is also supported while the coordinator remains bound to loopback.
 
 Create a network and save the admin token in a secret manager. The token is displayed only once:
 
