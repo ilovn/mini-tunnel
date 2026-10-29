@@ -130,6 +130,23 @@ enum NetworkCommand {
 
 #[derive(Debug, Subcommand)]
 enum PeerCommand {
+    /// Discover an authorized peer from the signed snapshot and send one diagnostic datagram.
+    Connect {
+        #[arg(long, default_value = "0.0.0.0:0")]
+        bind: SocketAddr,
+        #[arg(long)]
+        network_id: String,
+        #[arg(long)]
+        peer_id: String,
+        #[arg(long)]
+        message: String,
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_COORDINATOR_URL",
+            default_value = "http://127.0.0.1:8080"
+        )]
+        coordinator_url: String,
+    },
     /// Listen for one authenticated peer and receive one test datagram.
     Listen {
         #[arg(long, default_value = "127.0.0.1:42000")]
@@ -217,6 +234,53 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
         Command::Peer { command } => match command {
+            PeerCommand::Connect {
+                bind,
+                network_id,
+                peer_id,
+                message,
+                coordinator_url,
+            } => {
+                let identity = mini_tunnel_agent::Identity::load_or_create()?;
+                let device_id = identity.device_id();
+                let timestamp_ms = now_ms()?;
+                let request = PeerListRequest {
+                    device_id: device_id.clone(),
+                    timestamp_ms,
+                    signature: identity.sign(&peers_signing_bytes(
+                        &network_id,
+                        &device_id,
+                        timestamp_ms,
+                    )),
+                };
+                let path = format!("/v1/networks/{network_id}/peers");
+                let snapshot: PeerListResponse =
+                    post_json(&coordinator_url, &path, &request).await?;
+                let peer = snapshot
+                    .peers
+                    .into_iter()
+                    .find(|peer| peer.device_id == peer_id)
+                    .ok_or("peer is not present in the signed same-network snapshot")?;
+                let peer_key = decode_peer_key(&peer.public_key)?;
+                let endpoint = mini_tunnel_agent::peer_endpoint(&identity, bind)?;
+                let (channel, remote) = mini_tunnel_agent::connect_peer_candidates(
+                    &endpoint,
+                    &peer.candidates,
+                    &network_id,
+                    &identity,
+                    &peer.device_id,
+                    peer_key,
+                )
+                .await?;
+                channel.send_packet(message.as_bytes())?;
+                println!(
+                    "Connected to {} at {} and sent authenticated datagram ({} bytes)",
+                    peer.device_id,
+                    remote,
+                    message.len()
+                );
+                endpoint.close(0_u32.into(), b"diagnostic complete");
+            }
             PeerCommand::Listen {
                 bind,
                 network_id,

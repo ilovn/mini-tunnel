@@ -4,9 +4,9 @@ A minimal, peer-to-peer virtual network tunnel. The design baseline is in [`docs
 
 ## Current status
 
-Implemented: a Rust workspace, local coordinator health endpoint, in-memory network creation, admin capability tokens, one-time join invites, IPv4 allocation, stable Ed25519 device identities, signed enrollment, candidate publication, and signed same-network peer discovery.
+Implemented: a Rust workspace, local coordinator health endpoint, in-memory network creation, admin capability tokens, one-time join invites, IPv4 allocation, stable Ed25519 device identities, signed enrollment and peer discovery, candidate publication, and authenticated encrypted QUIC/UDP peer datagrams.
 
-Not implemented yet: persistent storage, TUN devices, encrypted peer transport, UDP/QUIC direct links, TCP fallback, and packet relay. The control API is a local development prototype and has no production rate limiting. **Do not expose it to untrusted networks.** The coordinator binds to loopback by default.
+Not implemented yet: persistent storage, TUN devices, NAT traversal, TCP fallback, and packet relay. The control API is a local development prototype and has no production rate limiting. **Do not expose it to untrusted networks.** The coordinator binds to loopback by default.
 
 ## Quick start
 
@@ -60,6 +60,14 @@ cargo run -p mini-tunnel -- peer send --remote '<receiver-ip>:42000' --network-i
 ```
 
 This diagnostic requires a directly reachable UDP address and an explicitly opened inbound UDP port. QUIC encrypts the datagram; TLS pins the receiver key and the receiver verifies a fresh Ed25519 proof from the sender. Datagrams are bounded and have an application replay window. It is not NAT traversal, does not use advertised candidates automatically, and does not yet carry IP packets from a TUN interface.
+
+With both devices enrolled and their reachable UDP addresses advertised, the sender can fetch the signed same-network peer snapshot and try the selected peer's candidates automatically:
+
+```sh
+cargo run -p mini-tunnel -- peer connect --network-id '<network-id>' --peer-id '<receiver-device-id>' --message 'hello'
+```
+
+The command checks the peer key from that signed snapshot, tries at most eight candidates in order (five seconds per attempt), then sends one authenticated datagram. It reports a missing peer, absent/unusable candidates, identity mismatch, and unreachable candidates as separate errors. The coordinator supplies discovery data only; the QUIC datagram travels directly between the devices.
 
 ## Development
 

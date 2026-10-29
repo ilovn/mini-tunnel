@@ -35,6 +35,20 @@ pub enum IdentityError {
     Transport(String),
 }
 
+#[derive(Debug, Error)]
+pub enum CandidateConnectError {
+    #[error("peer has no advertised candidate addresses")]
+    NoCandidates,
+    #[error("peer has no usable candidate addresses")]
+    NoUsableCandidates,
+    #[error("peer advertised more than {MAX_PEER_CANDIDATES} candidate addresses")]
+    TooManyCandidates,
+    #[error("peer identity did not match the authorized identity")]
+    UnauthorizedPeer,
+    #[error("all peer candidate addresses were unreachable: {0}")]
+    Unreachable(String),
+}
+
 pub struct Identity {
     signing_key: SigningKey,
     public_key: [u8; 32],
@@ -166,6 +180,7 @@ impl rcgen::SigningKey for IdentityCertificateKey<'_> {
 const MAX_PACKET_PAYLOAD: usize = 1175;
 const FRAME_HEADER_LEN: usize = 25;
 const PEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_PEER_CANDIDATES: usize = 8;
 
 /// Authenticated QUIC connection to one authorized peer.
 pub struct PeerChannel {
@@ -304,6 +319,64 @@ pub async fn connect_peer(
     verify_connection_identity(&connection, &expected_peer_key)?;
     client_authenticate(&connection, network_id, identity, expected_peer_id).await?;
     Ok(new_channel(connection, network_id))
+}
+
+/// Try signed-discovery candidate addresses in order, bounding both attempts and total time.
+pub async fn connect_peer_candidates(
+    endpoint: &Endpoint,
+    candidates: &[String],
+    network_id: &str,
+    identity: &Identity,
+    expected_peer_id: &str,
+    expected_peer_key: [u8; 32],
+) -> Result<(PeerChannel, SocketAddr), CandidateConnectError> {
+    if candidates.is_empty() {
+        return Err(CandidateConnectError::NoCandidates);
+    }
+    if candidates.len() > MAX_PEER_CANDIDATES {
+        return Err(CandidateConnectError::TooManyCandidates);
+    }
+    if expected_peer_id != mini_tunnel_protocol::device_id_from_public_key(&expected_peer_key) {
+        return Err(CandidateConnectError::UnauthorizedPeer);
+    }
+
+    let mut usable = 0;
+    let mut last_error = None;
+    for candidate in candidates {
+        let Ok(address) = candidate.parse::<SocketAddr>() else {
+            continue;
+        };
+        if address.port() == 0 || address.ip().is_unspecified() {
+            continue;
+        }
+        usable += 1;
+        match tokio::time::timeout(
+            PEER_HANDSHAKE_TIMEOUT,
+            connect_peer(
+                endpoint,
+                address,
+                network_id,
+                identity,
+                expected_peer_id,
+                expected_peer_key,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(channel)) => return Ok((channel, address)),
+            Ok(Err(IdentityError::UnauthorizedPeer)) => {
+                return Err(CandidateConnectError::UnauthorizedPeer);
+            }
+            Ok(Err(error)) => last_error = Some(error.to_string()),
+            Err(_) => last_error = Some(format!("connection to {address} timed out")),
+        }
+    }
+    if usable == 0 {
+        return Err(CandidateConnectError::NoUsableCandidates);
+    }
+    Err(CandidateConnectError::Unreachable(
+        last_error.unwrap_or_else(|| "no connection attempt completed".to_owned()),
+    ))
 }
 
 /// Accept exactly one configured peer; its Ed25519 challenge proof is checked before returning.
@@ -680,9 +753,16 @@ mod tests {
             tokio::spawn(
                 async move { accept_peer(&server_endpoint, "office", &b, &a_id, a_key).await },
             );
-        let channel_a = connect_peer(&endpoint_a, addr_b, "office", &a, &b_id, b_key)
-            .await
-            .expect("authenticated QUIC peer");
+        let candidates = vec![
+            "not-an-address".to_owned(),
+            "127.0.0.1:0".to_owned(),
+            addr_b.to_string(),
+        ];
+        let (channel_a, connected_addr) =
+            connect_peer_candidates(&endpoint_a, &candidates, "office", &a, &b_id, b_key)
+                .await
+                .expect("authenticated QUIC peer from candidate list");
+        assert_eq!(connected_addr, addr_b);
         let channel_b = accept
             .await
             .expect("accept task")
@@ -700,6 +780,61 @@ mod tests {
         ));
         endpoint_a.close(0_u32.into(), b"test complete");
         endpoint_b.close(0_u32.into(), b"test complete");
+        fs::remove_dir_all(temp).expect("remove test identities");
+    }
+
+    #[tokio::test]
+    async fn candidate_connection_reports_empty_unusable_and_wrong_identity() {
+        let temp =
+            std::env::temp_dir().join(format!("mini-tunnel-candidates-{}", uuid::Uuid::new_v4()));
+        let local =
+            Identity::load_or_create_at(temp.join("local/device.key")).expect("local identity");
+        let remote =
+            Identity::load_or_create_at(temp.join("remote/device.key")).expect("remote identity");
+        let endpoint = peer_endpoint(&local, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .expect("local endpoint");
+
+        assert!(matches!(
+            connect_peer_candidates(
+                &endpoint,
+                &[],
+                "office",
+                &local,
+                &remote.device_id(),
+                remote.public_key()
+            )
+            .await,
+            Err(CandidateConnectError::NoCandidates)
+        ));
+        assert!(matches!(
+            connect_peer_candidates(
+                &endpoint,
+                &[
+                    "bad".to_owned(),
+                    "0.0.0.0:42000".to_owned(),
+                    "127.0.0.1:0".to_owned()
+                ],
+                "office",
+                &local,
+                &remote.device_id(),
+                remote.public_key()
+            )
+            .await,
+            Err(CandidateConnectError::NoUsableCandidates)
+        ));
+        assert!(matches!(
+            connect_peer_candidates(
+                &endpoint,
+                &["127.0.0.1:42000".to_owned()],
+                "office",
+                &local,
+                "wrong-id",
+                remote.public_key()
+            )
+            .await,
+            Err(CandidateConnectError::UnauthorizedPeer)
+        ));
+        endpoint.close(0_u32.into(), b"test complete");
         fs::remove_dir_all(temp).expect("remove test identities");
     }
 
