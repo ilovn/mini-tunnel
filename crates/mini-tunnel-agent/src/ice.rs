@@ -399,6 +399,54 @@ impl IceAgentDriver {
         Self { agent, local_addr }
     }
 
+    /// Build an ICE connectivity-check session for one peer.
+    ///
+    /// Candidate gathering remains the caller's responsibility; this constructor refuses empty
+    /// candidate sets so it cannot silently start an agent that has no viable path to check.
+    pub fn for_peer(
+        local_credentials: &IceCredentials,
+        remote_credentials: &IceCredentials,
+        local_candidates: &[SocketAddr],
+        remote_candidates: &[SocketAddr],
+        controlling: bool,
+        now: Instant,
+    ) -> Result<Self, IceDriverError> {
+        if local_credentials.generation != remote_credentials.generation {
+            return Err(IceDriverError::Agent(
+                "peer ICE generations do not match".to_owned(),
+            ));
+        }
+        if local_candidates.is_empty() || remote_candidates.is_empty() {
+            return Err(IceDriverError::Agent(
+                "local and remote ICE candidates are required".to_owned(),
+            ));
+        }
+        let local_addr = local_candidates[0];
+        let crypto = rtc_ice::crypto::default_provider()
+            .map_err(|error| IceDriverError::Agent(error.to_string()))?;
+        let mut agent = Agent::new(now, Arc::new(agent_config(local_credentials)), crypto)
+            .map_err(|error| IceDriverError::Agent(error.to_string()))?;
+        for address in local_candidates {
+            agent
+                .add_local_candidate(host_candidate(*address)?)
+                .map_err(|error| IceDriverError::Agent(error.to_string()))?;
+        }
+        for address in remote_candidates {
+            agent
+                .add_remote_candidate(host_candidate(*address)?)
+                .map_err(|error| IceDriverError::Agent(error.to_string()))?;
+        }
+        agent
+            .start_connectivity_checks(
+                now,
+                controlling,
+                remote_credentials.ufrag.clone(),
+                remote_credentials.password.clone(),
+            )
+            .map_err(|error| IceDriverError::Agent(error.to_string()))?;
+        Ok(Self::new(agent, local_addr))
+    }
+
     /// Feed one datagram to ICE. `false` means it was not a complete STUN message envelope.
     pub fn handle_datagram(
         &mut self,
@@ -469,12 +517,27 @@ impl IceAgentDriver {
     }
 }
 
+fn host_candidate(address: SocketAddr) -> Result<rtc_ice::candidate::Candidate, IceDriverError> {
+    use rtc_ice::candidate::{CandidateConfig, candidate_host::CandidateHostConfig};
+    CandidateHostConfig {
+        base_config: CandidateConfig {
+            network: "udp".to_owned(),
+            address: address.ip().to_string(),
+            port: address.port(),
+            component: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+    .new_candidate_host()
+    .map_err(|error| IceDriverError::Agent(error.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, sync::Arc, thread, time::Duration};
 
     use super::*;
-    use rtc_ice::candidate::{CandidateConfig, candidate_host::CandidateHostConfig};
 
     #[test]
     fn generated_credentials_match_the_agent_config_and_are_valid_for_signaling() {
@@ -530,63 +593,29 @@ mod tests {
 
     #[test]
     fn two_sans_io_agents_authenticate_checks_and_nominate_a_candidate_pair() {
-        let provider = rtc_ice::crypto::default_provider().expect("ring ICE crypto provider");
-        let advertised_a = generate_ice_credentials(1).expect("A signaling credentials");
-        let advertised_b = generate_ice_credentials(1).expect("B signaling credentials");
-        let mut agent_a = Agent::new(
-            Instant::now(),
-            Arc::new(agent_config(&advertised_a)),
-            Arc::clone(&provider),
-        )
-        .expect("construct A ICE agent");
-        let mut agent_b = Agent::new(
-            Instant::now(),
-            Arc::new(agent_config(&advertised_b)),
-            provider,
-        )
-        .expect("construct B ICE agent");
+        let now = Instant::now();
         let address_a: SocketAddr = "127.0.0.1:41001".parse().unwrap();
         let address_b: SocketAddr = "127.0.0.1:41002".parse().unwrap();
-        let candidate = |address: SocketAddr| {
-            CandidateHostConfig {
-                base_config: CandidateConfig {
-                    network: "udp".to_owned(),
-                    address: address.ip().to_string(),
-                    port: address.port(),
-                    component: 1,
-                    ..Default::default()
-                },
-                ..Default::default()
-            }
-            .new_candidate_host()
-            .expect("construct loopback host candidate")
-        };
-        let candidate_a = candidate(address_a);
-        let candidate_b = candidate(address_b);
-        agent_a
-            .add_local_candidate(candidate_a.clone())
-            .expect("add A local candidate");
-        agent_a
-            .add_remote_candidate(candidate_b.clone())
-            .expect("add A remote candidate");
-        agent_b
-            .add_local_candidate(candidate_b)
-            .expect("add B local candidate");
-        agent_b
-            .add_remote_candidate(candidate_a)
-            .expect("add B remote candidate");
-
-        let credentials_a = agent_a.get_local_credentials().clone();
-        let credentials_b = agent_b.get_local_credentials().clone();
-        let now = Instant::now();
-        agent_a
-            .start_connectivity_checks(now, true, credentials_b.ufrag, credentials_b.pwd)
-            .expect("start controlling agent");
-        agent_b
-            .start_connectivity_checks(now, false, credentials_a.ufrag, credentials_a.pwd)
-            .expect("start controlled agent");
-        let mut driver_a = IceAgentDriver::new(agent_a, address_a);
-        let mut driver_b = IceAgentDriver::new(agent_b, address_b);
+        let advertised_a = generate_ice_credentials(1).expect("A signaling credentials");
+        let advertised_b = generate_ice_credentials(1).expect("B signaling credentials");
+        let mut driver_a = IceAgentDriver::for_peer(
+            &advertised_a,
+            &advertised_b,
+            &[address_a],
+            &[address_b],
+            true,
+            now,
+        )
+        .expect("construct controlling peer session");
+        let mut driver_b = IceAgentDriver::for_peer(
+            &advertised_b,
+            &advertised_a,
+            &[address_b],
+            &[address_a],
+            false,
+            now,
+        )
+        .expect("construct controlled peer session");
 
         for _ in 0..250 {
             let now = Instant::now();
@@ -616,6 +645,26 @@ mod tests {
 
         assert_eq!(driver_a.selected_pair(), Some((address_a, address_b)));
         assert_eq!(driver_b.selected_pair(), Some((address_b, address_a)));
+    }
+
+    #[test]
+    fn peer_session_rejects_mismatched_generations_and_empty_candidates() {
+        let local = generate_ice_credentials(1).expect("local credentials");
+        let mut remote = generate_ice_credentials(1).expect("remote credentials");
+        let now = Instant::now();
+        assert!(IceAgentDriver::for_peer(&local, &remote, &[], &[], true, now).is_err());
+        remote.generation = 2;
+        assert!(
+            IceAgentDriver::for_peer(
+                &local,
+                &remote,
+                &["127.0.0.1:41001".parse().unwrap()],
+                &["127.0.0.1:41002".parse().unwrap()],
+                true,
+                now,
+            )
+            .is_err()
+        );
     }
 
     fn binding_request(transaction: u8) -> [u8; 20] {
