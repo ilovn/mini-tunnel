@@ -47,6 +47,20 @@ cargo run -p mini-tunnel -- network peers --network-id '<network-id>'
 
 Candidate updates are signed, limited to eight usable socket addresses, and reject timestamps outside a five-minute window or replayed updates. This only exchanges control-plane information; it does not open a tunnel or prove that a candidate is reachable. The current coordinator state is in memory. Restarting it removes networks, tokens, identities, candidates, and address assignments. Each invite expires after one hour and can enroll one device.
 
+An authenticated QUIC/UDP diagnostic can verify a reachable peer address before TUN support exists. Each side needs the other device's ID and URL-safe base64 public key shown by the identity command. On the receiving side:
+
+```sh
+cargo run -p mini-tunnel -- peer listen --bind 0.0.0.0:42000 --network-id '<network-id>' --peer-id '<sender-device-id>' --peer-key '<sender-public-key>'
+```
+
+On the sending side:
+
+```sh
+cargo run -p mini-tunnel -- peer send --remote '<receiver-ip>:42000' --network-id '<network-id>' --peer-id '<receiver-device-id>' --peer-key '<receiver-public-key>' --message 'hello'
+```
+
+This diagnostic requires a directly reachable UDP address and an explicitly opened inbound UDP port. QUIC encrypts the datagram; TLS pins the receiver key and the receiver verifies a fresh Ed25519 proof from the sender. Datagrams are bounded and have an application replay window. It is not NAT traversal, does not use advertised candidates automatically, and does not yet carry IP packets from a TUN interface.
+
 ## Development
 
 Requirements: stable Rust and Cargo (see `rust-toolchain.toml`).

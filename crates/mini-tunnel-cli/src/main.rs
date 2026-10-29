@@ -31,6 +31,11 @@ enum Command {
     },
     /// Display this device's stable public identity.
     Identity,
+    /// Run a low-level authenticated UDP/QUIC peer diagnostic.
+    Peer {
+        #[command(subcommand)]
+        command: PeerCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -123,6 +128,38 @@ enum NetworkCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum PeerCommand {
+    /// Listen for one authenticated peer and receive one test datagram.
+    Listen {
+        #[arg(long, default_value = "127.0.0.1:42000")]
+        bind: SocketAddr,
+        #[arg(long)]
+        network_id: String,
+        #[arg(long)]
+        peer_id: String,
+        /// URL-safe base64 encoded 32-byte Ed25519 public key.
+        #[arg(long)]
+        peer_key: String,
+    },
+    /// Send one UTF-8 diagnostic datagram to an authenticated peer.
+    Send {
+        #[arg(long, default_value = "127.0.0.1:0")]
+        bind: SocketAddr,
+        #[arg(long)]
+        remote: SocketAddr,
+        #[arg(long)]
+        network_id: String,
+        #[arg(long)]
+        peer_id: String,
+        /// URL-safe base64 encoded 32-byte Ed25519 public key.
+        #[arg(long)]
+        peer_key: String,
+        #[arg(long)]
+        message: String,
+    },
+}
+
 #[derive(Debug, Deserialize)]
 struct HealthResponse {
     status: String,
@@ -179,6 +216,52 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!("Private key: {}", path.display());
             }
         }
+        Command::Peer { command } => match command {
+            PeerCommand::Listen {
+                bind,
+                network_id,
+                peer_id,
+                peer_key,
+            } => {
+                let identity = mini_tunnel_agent::Identity::load_or_create()?;
+                let peer_key = decode_peer_key(&peer_key)?;
+                let endpoint = mini_tunnel_agent::peer_endpoint(&identity, bind)?;
+                println!("Listening on {}", endpoint.local_addr()?);
+                let channel = mini_tunnel_agent::accept_peer(
+                    &endpoint,
+                    &network_id,
+                    &identity,
+                    &peer_id,
+                    peer_key,
+                )
+                .await?;
+                let packet = channel.recv_packet().await?;
+                println!("Received authenticated datagram ({} bytes)", packet.len());
+            }
+            PeerCommand::Send {
+                bind,
+                remote,
+                network_id,
+                peer_id,
+                peer_key,
+                message,
+            } => {
+                let identity = mini_tunnel_agent::Identity::load_or_create()?;
+                let peer_key = decode_peer_key(&peer_key)?;
+                let endpoint = mini_tunnel_agent::peer_endpoint(&identity, bind)?;
+                let channel = mini_tunnel_agent::connect_peer(
+                    &endpoint,
+                    remote,
+                    &network_id,
+                    &identity,
+                    &peer_id,
+                    peer_key,
+                )
+                .await?;
+                channel.send_packet(message.as_bytes())?;
+                println!("Sent authenticated datagram ({} bytes)", message.len());
+            }
+        },
         Command::Network { command } => match command {
             NetworkCommand::Create {
                 name,
@@ -298,6 +381,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         },
     }
     Ok(())
+}
+
+fn decode_peer_key(encoded: &str) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
+    use base64::Engine as _;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)?
+        .try_into()
+        .map_err(|_| "peer key must decode to exactly 32 bytes")?)
 }
 
 fn now_ms() -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
