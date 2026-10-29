@@ -20,6 +20,7 @@ use rustls::{
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 
 #[derive(Debug, Error)]
 pub enum IdentityError {
@@ -186,11 +187,30 @@ impl rcgen::SigningKey for IdentityCertificateKey<'_> {
 const MAX_PACKET_PAYLOAD: usize = 1175;
 const FRAME_HEADER_LEN: usize = 25;
 const PEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const UDP_CANDIDATE_TIMEOUT: Duration = Duration::from_secs(2);
+const TCP_CANDIDATE_TIMEOUT: Duration = Duration::from_secs(5);
+const CANDIDATE_CONNECT_BUDGET: Duration = Duration::from_secs(30);
 const MAX_PEER_CANDIDATES: usize = 8;
 
-/// Authenticated QUIC connection to one authorized peer.
+trait AsyncPeerIo: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncPeerIo for T {}
+
+type BoxedPeerIo = Box<dyn AsyncPeerIo>;
+
+struct TcpPeerTransport {
+    sender: tokio::sync::Mutex<WriteHalf<BoxedPeerIo>>,
+    receiver: tokio::sync::Mutex<ReadHalf<BoxedPeerIo>>,
+    remote_address: SocketAddr,
+}
+
+enum PeerTransport {
+    Quic(Connection),
+    Tcp(TcpPeerTransport),
+}
+
+/// Authenticated QUIC or TLS/TCP connection to one authorized peer.
 pub struct PeerChannel {
-    connection: Connection,
+    transport: PeerTransport,
     network_tag: [u8; 16],
     next_packet: Mutex<u64>,
     replay_window: Mutex<ReplayWindow>,
@@ -199,47 +219,95 @@ pub struct PeerChannel {
 impl PeerChannel {
     #[must_use]
     pub fn remote_address(&self) -> SocketAddr {
-        self.connection.remote_address()
+        match &self.transport {
+            PeerTransport::Quic(connection) => connection.remote_address(),
+            PeerTransport::Tcp(transport) => transport.remote_address,
+        }
+    }
+
+    #[must_use]
+    pub fn transport_name(&self) -> &'static str {
+        match &self.transport {
+            PeerTransport::Quic(_) => "QUIC/UDP",
+            PeerTransport::Tcp(_) => "TLS/TCP",
+        }
     }
 
     /// Close this peer session, for example after a simultaneous-connect probe loses election.
     pub fn close(&self) {
-        self.connection
-            .close(0_u32.into(), b"peer path not selected");
+        if let PeerTransport::Quic(connection) = &self.transport {
+            connection.close(0_u32.into(), b"peer path not selected");
+        }
     }
 
-    /// Send one bounded, unreliable QUIC DATAGRAM.
-    pub fn send_packet(&self, payload: &[u8]) -> Result<(), IdentityError> {
+    /// Send one bounded packet over QUIC DATAGRAM or a length-framed TLS/TCP stream.
+    pub async fn send_packet(&self, payload: &[u8]) -> Result<(), IdentityError> {
         if payload.len() > MAX_PACKET_PAYLOAD {
             return Err(IdentityError::InvalidFrame);
         }
-        let mut next_packet = self
-            .next_packet
-            .lock()
-            .map_err(|_| IdentityError::InvalidFrame)?;
-        let sequence = *next_packet;
-        *next_packet = sequence.checked_add(1).ok_or(IdentityError::InvalidFrame)?;
-        drop(next_packet);
+        let sequence = {
+            let mut next_packet = self
+                .next_packet
+                .lock()
+                .map_err(|_| IdentityError::InvalidFrame)?;
+            let sequence = *next_packet;
+            *next_packet = sequence.checked_add(1).ok_or(IdentityError::InvalidFrame)?;
+            sequence
+        };
         let frame = encode_frame(self.network_tag, sequence, payload);
-        if self
-            .connection
-            .max_datagram_size()
-            .is_none_or(|max| frame.len() > max)
-        {
-            return Err(IdentityError::InvalidFrame);
+        match &self.transport {
+            PeerTransport::Quic(connection) => {
+                if connection
+                    .max_datagram_size()
+                    .is_none_or(|max| frame.len() > max)
+                {
+                    return Err(IdentityError::InvalidFrame);
+                }
+                connection
+                    .send_datagram(Bytes::from(frame))
+                    .map_err(|error| IdentityError::Transport(error.to_string()))
+            }
+            PeerTransport::Tcp(transport) => {
+                let mut sender = transport.sender.lock().await;
+                sender
+                    .write_u32(frame.len() as u32)
+                    .await
+                    .map_err(|error| IdentityError::Transport(error.to_string()))?;
+                sender
+                    .write_all(&frame)
+                    .await
+                    .map_err(|error| IdentityError::Transport(error.to_string()))
+            }
         }
-        self.connection
-            .send_datagram(Bytes::from(frame))
-            .map_err(|error| IdentityError::Transport(error.to_string()))
     }
 
     /// Receive one authenticated frame, rejecting malformed, cross-network, and replayed data.
     pub async fn recv_packet(&self) -> Result<Vec<u8>, IdentityError> {
-        let frame = self
-            .connection
-            .read_datagram()
-            .await
-            .map_err(|error| IdentityError::Transport(error.to_string()))?;
+        let frame = match &self.transport {
+            PeerTransport::Quic(connection) => connection
+                .read_datagram()
+                .await
+                .map_err(|error| IdentityError::Transport(error.to_string()))?
+                .to_vec(),
+            PeerTransport::Tcp(transport) => {
+                let mut receiver = transport.receiver.lock().await;
+                let frame_len = receiver
+                    .read_u32()
+                    .await
+                    .map_err(|error| IdentityError::Transport(error.to_string()))?
+                    as usize;
+                if !(FRAME_HEADER_LEN..=FRAME_HEADER_LEN + MAX_PACKET_PAYLOAD).contains(&frame_len)
+                {
+                    return Err(IdentityError::InvalidFrame);
+                }
+                let mut frame = vec![0; frame_len];
+                receiver
+                    .read_exact(&mut frame)
+                    .await
+                    .map_err(|error| IdentityError::Transport(error.to_string()))?;
+                frame
+            }
+        };
         let (sequence, payload) =
             decode_frame(&frame, self.network_tag).ok_or(IdentityError::InvalidFrame)?;
         if !self
@@ -337,6 +405,46 @@ fn peer_client_config(
     Ok(config)
 }
 
+fn peer_tcp_server_config(
+    identity: &Identity,
+) -> Result<std::sync::Arc<rustls::ServerConfig>, IdentityError> {
+    let params = CertificateParams::new(vec!["mini-tunnel".to_owned()])
+        .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    let certificate = params
+        .self_signed(&IdentityCertificateKey(identity))
+        .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    let certificate_der = CertificateDer::from(certificate.der().to_vec());
+    let mut pkcs8 = identity.pkcs8_seed();
+    let server_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8.clone()));
+    pkcs8.fill(0);
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| IdentityError::Transport(error.to_string()))?
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate_der], server_key)
+        .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    config.alpn_protocols = vec![b"mini-tunnel-peer-tcp/1".to_vec()];
+    Ok(std::sync::Arc::new(config))
+}
+
+fn peer_tcp_client_config(
+    expected_key: [u8; 32],
+) -> Result<std::sync::Arc<rustls::ClientConfig>, IdentityError> {
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|error| IdentityError::Transport(error.to_string()))?
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(PinnedPeerVerifier {
+            provider,
+            expected_key,
+        }))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"mini-tunnel-peer-tcp/1".to_vec()];
+    Ok(std::sync::Arc::new(config))
+}
+
 fn peer_transport_config() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.datagram_receive_buffer_size(Some(64 * 1024));
@@ -368,7 +476,105 @@ pub async fn connect_peer(
     Ok(new_channel(connection, network_id))
 }
 
-/// Try signed-discovery candidate addresses in order, bounding both attempts and total time.
+/// Connect to a peer using a TLS-pinned TCP stream for reliable fallback transport.
+pub async fn connect_tcp_peer(
+    remote_addr: SocketAddr,
+    network_id: &str,
+    identity: &Identity,
+    expected_peer_id: &str,
+    expected_peer_key: [u8; 32],
+) -> Result<PeerChannel, IdentityError> {
+    if expected_peer_id != mini_tunnel_protocol::device_id_from_public_key(&expected_peer_key) {
+        return Err(IdentityError::UnauthorizedPeer);
+    }
+    let socket = tokio::time::timeout(
+        PEER_HANDSHAKE_TIMEOUT,
+        tokio::net::TcpStream::connect(remote_addr),
+    )
+    .await
+    .map_err(|error| IdentityError::Transport(error.to_string()))?
+    .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    socket
+        .set_nodelay(true)
+        .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    let server_name = ServerName::try_from("mini-tunnel")
+        .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    let connector = tokio_rustls::TlsConnector::from(peer_tcp_client_config(expected_peer_key)?);
+    let mut stream = tokio::time::timeout(
+        PEER_HANDSHAKE_TIMEOUT,
+        connector.connect(server_name, socket),
+    )
+    .await
+    .map_err(|error| IdentityError::Transport(error.to_string()))?
+    .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    if stream.get_ref().1.alpn_protocol() != Some(b"mini-tunnel-peer-tcp/1") {
+        return Err(IdentityError::UnauthorizedPeer);
+    }
+    tokio::time::timeout(
+        PEER_HANDSHAKE_TIMEOUT,
+        tcp_client_authenticate(&mut stream, network_id, identity, expected_peer_id),
+    )
+    .await
+    .map_err(|error| IdentityError::Transport(error.to_string()))??;
+    Ok(new_tcp_channel(Box::new(stream), remote_addr, network_id))
+}
+
+/// Bind a TCP listener for authenticated TCP fallback sessions.
+pub async fn peer_tcp_listener(
+    bind_addr: SocketAddr,
+) -> Result<tokio::net::TcpListener, IdentityError> {
+    tokio::net::TcpListener::bind(bind_addr)
+        .await
+        .map_err(|error| IdentityError::Transport(error.to_string()))
+}
+
+/// Accept and authenticate the next TCP member whose device identity is in the allowlist.
+pub async fn accept_tcp_peer_any(
+    listener: &tokio::net::TcpListener,
+    network_id: &str,
+    identity: &Identity,
+    allowed_peers: &[(String, [u8; 32])],
+) -> Result<(String, PeerChannel), IdentityError> {
+    if allowed_peers.is_empty()
+        || allowed_peers.iter().any(|(device_id, public_key)| {
+            device_id != &mini_tunnel_protocol::device_id_from_public_key(public_key)
+        })
+    {
+        return Err(IdentityError::UnauthorizedPeer);
+    }
+    let acceptor = tokio_rustls::TlsAcceptor::from(peer_tcp_server_config(identity)?);
+    loop {
+        let (socket, remote_addr) = tokio::time::timeout(PEER_HANDSHAKE_TIMEOUT, listener.accept())
+            .await
+            .map_err(|error| IdentityError::Transport(error.to_string()))?
+            .map_err(|error| IdentityError::Transport(error.to_string()))?;
+        let _ = socket.set_nodelay(true);
+        let mut stream =
+            match tokio::time::timeout(PEER_HANDSHAKE_TIMEOUT, acceptor.accept(socket)).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(_)) | Err(_) => continue,
+            };
+        if stream.get_ref().1.alpn_protocol() != Some(b"mini-tunnel-peer-tcp/1") {
+            continue;
+        }
+        match tokio::time::timeout(
+            PEER_HANDSHAKE_TIMEOUT,
+            tcp_server_authenticate(&mut stream, network_id, identity, allowed_peers),
+        )
+        .await
+        {
+            Ok(Ok(device_id)) => {
+                return Ok((
+                    device_id,
+                    new_tcp_channel(Box::new(stream), remote_addr, network_id),
+                ));
+            }
+            Ok(Err(_)) | Err(_) => continue,
+        }
+    }
+}
+
+/// Try signed-discovery candidates in order with shorter UDP probes and a bounded TCP fallback.
 pub async fn connect_peer_candidates(
     endpoint: &Endpoint,
     candidates: &[String],
@@ -389,27 +595,56 @@ pub async fn connect_peer_candidates(
 
     let mut usable = 0;
     let mut last_error = None;
+    let deadline = tokio::time::Instant::now() + CANDIDATE_CONNECT_BUDGET;
     for candidate in candidates {
-        let Ok(address) = candidate.parse::<SocketAddr>() else {
+        let (address, is_tcp) = if let Some(candidate) = candidate.strip_prefix("tcp://") {
+            (candidate.parse::<SocketAddr>(), true)
+        } else {
+            (candidate.parse::<SocketAddr>(), false)
+        };
+        let Ok(address) = address else {
             continue;
         };
         if address.port() == 0 || address.ip().is_unspecified() {
             continue;
         }
         usable += 1;
-        match tokio::time::timeout(
-            PEER_HANDSHAKE_TIMEOUT,
-            connect_peer(
-                endpoint,
-                address,
-                network_id,
-                identity,
-                expected_peer_id,
-                expected_peer_key,
-            ),
-        )
-        .await
-        {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let attempt_timeout = if is_tcp {
+            TCP_CANDIDATE_TIMEOUT.min(remaining)
+        } else {
+            UDP_CANDIDATE_TIMEOUT.min(remaining)
+        };
+        let connection = if is_tcp {
+            tokio::time::timeout(
+                attempt_timeout,
+                connect_tcp_peer(
+                    address,
+                    network_id,
+                    identity,
+                    expected_peer_id,
+                    expected_peer_key,
+                ),
+            )
+            .await
+        } else {
+            tokio::time::timeout(
+                attempt_timeout,
+                connect_peer(
+                    endpoint,
+                    address,
+                    network_id,
+                    identity,
+                    expected_peer_id,
+                    expected_peer_key,
+                ),
+            )
+            .await
+        };
+        match connection {
             Ok(Ok(channel)) => return Ok((channel, address)),
             Ok(Err(IdentityError::UnauthorizedPeer)) => {
                 return Err(CandidateConnectError::UnauthorizedPeer);
@@ -492,7 +727,28 @@ fn new_channel(connection: Connection, network_id: &str) -> PeerChannel {
     let mut network_tag = [0_u8; 16];
     network_tag.copy_from_slice(&hash[..16]);
     PeerChannel {
-        connection,
+        transport: PeerTransport::Quic(connection),
+        network_tag,
+        next_packet: Mutex::new(0),
+        replay_window: Mutex::new(ReplayWindow::default()),
+    }
+}
+
+fn new_tcp_channel(
+    stream: BoxedPeerIo,
+    remote_address: SocketAddr,
+    network_id: &str,
+) -> PeerChannel {
+    let hash = Sha256::digest(network_id.as_bytes());
+    let mut network_tag = [0_u8; 16];
+    network_tag.copy_from_slice(&hash[..16]);
+    let (receiver, sender) = tokio::io::split(stream);
+    PeerChannel {
+        transport: PeerTransport::Tcp(TcpPeerTransport {
+            sender: tokio::sync::Mutex::new(sender),
+            receiver: tokio::sync::Mutex::new(receiver),
+            remote_address,
+        }),
         network_tag,
         next_packet: Mutex::new(0),
         replay_window: Mutex::new(ReplayWindow::default()),
@@ -695,6 +951,107 @@ async fn server_authenticate(
     Ok((client_id, client_key))
 }
 
+async fn tcp_client_authenticate<S>(
+    stream: &mut S,
+    network_id: &str,
+    identity: &Identity,
+    server_id: &str,
+) -> Result<(), IdentityError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut nonce = [0_u8; 32];
+    getrandom::fill(&mut nonce).map_err(|_| IdentityError::Random)?;
+    stream
+        .write_all(&identity.public_key())
+        .await
+        .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    stream
+        .write_all(&nonce)
+        .await
+        .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    let mut server_nonce = [0_u8; 32];
+    stream
+        .read_exact(&mut server_nonce)
+        .await
+        .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    let proof = auth_bytes(
+        network_id,
+        &identity.device_id(),
+        server_id,
+        &nonce,
+        &server_nonce,
+    );
+    let signature = identity.signing_key.sign(&proof).to_bytes();
+    stream
+        .write_all(&signature)
+        .await
+        .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    let mut accepted = [0_u8; 1];
+    stream
+        .read_exact(&mut accepted)
+        .await
+        .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    if accepted[0] != 1 {
+        return Err(IdentityError::UnauthorizedPeer);
+    }
+    Ok(())
+}
+
+async fn tcp_server_authenticate<S>(
+    stream: &mut S,
+    network_id: &str,
+    identity: &Identity,
+    allowed_peers: &[(String, [u8; 32])],
+) -> Result<String, IdentityError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut client_key = [0_u8; 32];
+    stream
+        .read_exact(&mut client_key)
+        .await
+        .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    let client_id = mini_tunnel_protocol::device_id_from_public_key(&client_key);
+    if !allowed_peers
+        .iter()
+        .any(|(device_id, public_key)| device_id == &client_id && public_key == &client_key)
+    {
+        return Err(IdentityError::UnauthorizedPeer);
+    }
+    let mut client_nonce = [0_u8; 32];
+    stream
+        .read_exact(&mut client_nonce)
+        .await
+        .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    let mut server_nonce = [0_u8; 32];
+    getrandom::fill(&mut server_nonce).map_err(|_| IdentityError::Random)?;
+    stream
+        .write_all(&server_nonce)
+        .await
+        .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    let mut signature = [0_u8; 64];
+    stream
+        .read_exact(&mut signature)
+        .await
+        .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    let proof = auth_bytes(
+        network_id,
+        &client_id,
+        &identity.device_id(),
+        &client_nonce,
+        &server_nonce,
+    );
+    let key = VerifyingKey::from_bytes(&client_key).map_err(|_| IdentityError::UnauthorizedPeer)?;
+    key.verify_strict(&proof, &Signature::from_bytes(&signature))
+        .map_err(|_| IdentityError::UnauthorizedPeer)?;
+    stream
+        .write_all(&[1])
+        .await
+        .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    Ok(client_id)
+}
+
 fn auth_bytes(
     network_id: &str,
     client_id: &str,
@@ -864,19 +1221,124 @@ mod tests {
             .await
             .expect("accept task")
             .expect("accepted QUIC peer");
+        assert_eq!(channel_a.transport_name(), "QUIC/UDP");
         channel_a
             .send_packet(b"overlay-ip-packet")
+            .await
             .expect("send packet");
         assert_eq!(
             channel_b.recv_packet().await.expect("receive packet"),
             b"overlay-ip-packet"
         );
         assert!(matches!(
-            channel_a.send_packet(&vec![0; MAX_PACKET_PAYLOAD + 1]),
+            channel_a
+                .send_packet(&vec![0; MAX_PACKET_PAYLOAD + 1])
+                .await,
             Err(IdentityError::InvalidFrame)
         ));
         endpoint_a.close(0_u32.into(), b"test complete");
         endpoint_b.close(0_u32.into(), b"test complete");
+        fs::remove_dir_all(temp).expect("remove test identities");
+    }
+
+    #[tokio::test]
+    async fn tcp_peer_channel_authenticates_and_transfers_bounded_frames() {
+        let temp = std::env::temp_dir().join(format!("mini-tunnel-tcp-{}", uuid::Uuid::new_v4()));
+        let a = Identity::load_or_create_at(temp.join("a/device.key")).expect("identity A");
+        let b = Identity::load_or_create_at(temp.join("b/device.key")).expect("identity B");
+        let listener = peer_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("TCP listener");
+        let remote_addr = listener.local_addr().expect("TCP listener address");
+        let a_id = a.device_id();
+        let expected_a_id = a_id.clone();
+        let a_key = a.public_key();
+        let b_id = b.device_id();
+        let b_key = b.public_key();
+        let udp_endpoint = peer_endpoint(&a, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .expect("UDP endpoint");
+        let closed_udp =
+            tokio::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await
+                .expect("temporary UDP socket");
+        let closed_udp_addr = closed_udp.local_addr().expect("temporary UDP address");
+        drop(closed_udp);
+        let accept = tokio::spawn(async move {
+            accept_tcp_peer_any(&listener, "office", &b, &[(a_id, a_key)]).await
+        });
+        let (channel_a, connected_addr) = connect_peer_candidates(
+            &udp_endpoint,
+            &[closed_udp_addr.to_string(), format!("tcp://{remote_addr}")],
+            "office",
+            &a,
+            &b_id,
+            b_key,
+        )
+        .await
+        .expect("candidate fallback to authenticated TCP peer");
+        assert_eq!(connected_addr, remote_addr);
+        let (accepted_id, channel_b) = accept
+            .await
+            .expect("accept task")
+            .expect("accepted TCP peer");
+        assert_eq!(accepted_id, expected_a_id);
+        assert_eq!(channel_a.transport_name(), "TLS/TCP");
+        channel_a
+            .send_packet(b"reliable overlay packet")
+            .await
+            .expect("send TCP frame");
+        assert_eq!(
+            channel_b.recv_packet().await.expect("receive TCP frame"),
+            b"reliable overlay packet"
+        );
+        assert!(matches!(
+            channel_a
+                .send_packet(&vec![0; MAX_PACKET_PAYLOAD + 1])
+                .await,
+            Err(IdentityError::InvalidFrame)
+        ));
+        let PeerTransport::Tcp(transport) = &channel_a.transport else {
+            unreachable!("TCP fallback candidate returns a TCP peer channel");
+        };
+        transport
+            .sender
+            .lock()
+            .await
+            .write_u32(u32::MAX)
+            .await
+            .expect("write oversized test frame length");
+        assert!(matches!(
+            channel_b.recv_packet().await,
+            Err(IdentityError::InvalidFrame)
+        ));
+        fs::remove_dir_all(temp).expect("remove test identities");
+        udp_endpoint.close(0_u32.into(), b"test complete");
+    }
+
+    #[tokio::test]
+    async fn tcp_authentication_rejects_cross_network_sessions() {
+        let temp =
+            std::env::temp_dir().join(format!("mini-tunnel-tcp-auth-{}", uuid::Uuid::new_v4()));
+        let a = Identity::load_or_create_at(temp.join("a/device.key")).expect("identity A");
+        let b = Identity::load_or_create_at(temp.join("b/device.key")).expect("identity B");
+        let listener = peer_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("TCP listener");
+        let remote_addr = listener.local_addr().expect("TCP listener address");
+        let a_id = a.device_id();
+        let a_key = a.public_key();
+        let b_id = b.device_id();
+        let b_key = b.public_key();
+        let accept = tokio::spawn(async move {
+            accept_tcp_peer_any(&listener, "office", &b, &[(a_id, a_key)]).await
+        });
+        let result = connect_tcp_peer(remote_addr, "guest", &a, &b_id, b_key).await;
+        assert!(
+            result.is_err(),
+            "cross-network TCP authentication must fail"
+        );
+        accept.abort();
+        let _ = accept.await;
         fs::remove_dir_all(temp).expect("remove test identities");
     }
 
@@ -978,7 +1440,7 @@ mod tests {
         .expect("A connects to C");
         let (accepted_a, c_channel_a) = accept_a.await.expect("accept A task").expect("accept A");
         assert_eq!(accepted_a, a_id);
-        a_channel.send_packet(b"from A").expect("send from A");
+        a_channel.send_packet(b"from A").await.expect("send from A");
         assert_eq!(
             c_channel_a.recv_packet().await.expect("receive A"),
             b"from A"
@@ -1008,7 +1470,7 @@ mod tests {
         .expect("B connects to C");
         let (accepted_b, c_channel_b) = accept_b.await.expect("accept B task").expect("accept B");
         assert_eq!(accepted_b, b_id);
-        b_channel.send_packet(b"from B").expect("send from B");
+        b_channel.send_packet(b"from B").await.expect("send from B");
         assert_eq!(
             c_channel_b.recv_packet().await.expect("receive B"),
             b"from B"
@@ -1094,6 +1556,7 @@ mod tests {
         discarded_b.close();
         sender
             .send_packet(b"authenticated hole-punch path")
+            .await
             .expect("send packet");
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), receiver.recv_packet())

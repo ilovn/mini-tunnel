@@ -226,10 +226,13 @@ enum TunnelCommand {
         )]
         coordinator_url: String,
     },
-    /// Accept one authorized peer, then pump IPv4 packets over QUIC.
+    /// Accept one authorized peer over UDP/QUIC or optional TLS/TCP fallback.
     Listen {
         #[arg(long, default_value = "0.0.0.0:42000")]
         bind: SocketAddr,
+        /// Optional TLS/TCP listener for fallback candidates such as tcp://198.51.100.2:443.
+        #[arg(long)]
+        tcp_bind: Option<SocketAddr>,
         /// Optional RFC 8489 STUN server used to discover and publish this UDP socket's mapped address.
         #[arg(long)]
         stun_server: Option<SocketAddr>,
@@ -260,6 +263,9 @@ enum TunnelCommand {
     Mesh {
         #[arg(long, default_value = "0.0.0.0:42000")]
         bind: SocketAddr,
+        /// Optional TLS/TCP listener for fallback candidates such as tcp://198.51.100.2:443.
+        #[arg(long)]
+        tcp_bind: Option<SocketAddr>,
         /// Optional RFC 8489 STUN server used to discover and publish this UDP socket's mapped address.
         #[arg(long)]
         stun_server: Option<SocketAddr>,
@@ -391,6 +397,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 TunnelCommand::Listen {
                     bind,
+                    tcp_bind,
                     stun_server,
                     candidates,
                     network_id,
@@ -404,6 +411,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let identity = mini_tunnel_agent::Identity::load_or_create()?;
                     let (local_ipv4, prefix_len) =
                         resolve_tun_parameters(&network_id, &identity, local_ipv4, prefix_len)?;
+                    let tcp_listener = match tcp_bind {
+                        Some(address) => Some(mini_tunnel_agent::peer_tcp_listener(address).await?),
+                        None => None,
+                    };
                     let endpoint = create_tunnel_endpoint(
                         &identity,
                         bind,
@@ -427,13 +438,27 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         &identity,
                         &peer.device_id,
                         peer_key,
-                    )
-                    .await?;
+                    );
+                    let channel = if let Some(listener) = &tcp_listener {
+                        let allowed = vec![(peer.device_id.clone(), peer_key)];
+                        tokio::select! {
+                            result = channel => result?,
+                            result = mini_tunnel_agent::accept_tcp_peer_any(
+                                listener,
+                                &network_id,
+                                &identity,
+                                &allowed,
+                            ) => result?.1,
+                        }
+                    } else {
+                        channel.await?
+                    };
                     let remote = channel.remote_address();
                     run_peer_tunnel(&tun, &channel, &peer, remote, manage_route).await?;
                 }
                 TunnelCommand::Mesh {
                     bind,
+                    tcp_bind,
                     stun_server,
                     candidates,
                     network_id,
@@ -446,6 +471,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let identity = mini_tunnel_agent::Identity::load_or_create()?;
                     let (local_ipv4, prefix_len) =
                         resolve_tun_parameters(&network_id, &identity, local_ipv4, prefix_len)?;
+                    let tcp_listener = match tcp_bind {
+                        Some(address) => Some(mini_tunnel_agent::peer_tcp_listener(address).await?),
+                        None => None,
+                    };
                     let endpoint = create_tunnel_endpoint(
                         &identity,
                         bind,
@@ -455,6 +484,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         &coordinator_url,
                     )
                     .await?;
+                    if let Some(listener) = &tcp_listener {
+                        println!("TCP fallback listening on {}", listener.local_addr()?);
+                    }
                     let peers = discover_peers(&coordinator_url, &network_id, &identity).await?;
                     if peers.is_empty() {
                         return Err("no other enrolled peers are available in this network".into());
@@ -463,7 +495,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let identity = std::sync::Arc::new(identity);
                     let mut attempts = tokio::task::JoinSet::new();
                     let mut inbound_peers = peers.clone();
-                    for peer in peers {
+                    for peer in peers.iter().cloned() {
                         let keep_outbound = local_device_id < peer.device_id;
                         let endpoint = endpoint.clone();
                         let identity = std::sync::Arc::clone(&identity);
@@ -482,12 +514,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         });
                     }
                     let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::channel(64);
-                    let mut accept_task = {
+                    let mut accept_tasks = vec![{
                         let endpoint = endpoint.clone();
                         let identity = std::sync::Arc::clone(&identity);
                         let network_id = network_id.clone();
                         let local_device_id = local_device_id.clone();
-                        Some(tokio::spawn(async move {
+                        let accepted_tx = accepted_tx.clone();
+                        tokio::spawn(async move {
                             let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
                             while !inbound_peers.is_empty() {
                                 let allowed = inbound_peers
@@ -531,10 +564,62 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 }
                             }
                             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-                        }))
-                    };
-                    let mut connected = Vec::new();
-                    let mut accept_finished = accept_task.is_none();
+                        })
+                    }];
+                    if let Some(listener) = tcp_listener {
+                        let mut tcp_inbound_peers = peers.clone();
+                        let identity = std::sync::Arc::clone(&identity);
+                        let network_id = network_id.clone();
+                        let local_device_id = local_device_id.clone();
+                        let accepted_tx = accepted_tx.clone();
+                        accept_tasks.push(tokio::spawn(async move {
+                            let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+                            while !tcp_inbound_peers.is_empty() {
+                                let allowed = tcp_inbound_peers
+                                    .iter()
+                                    .map(|peer| {
+                                        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
+                                            peer.device_id.clone(),
+                                            decode_peer_key(&peer.public_key)?,
+                                        ))
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                let accepted = tokio::time::timeout_at(
+                                    deadline,
+                                    mini_tunnel_agent::accept_tcp_peer_any(
+                                        &listener,
+                                        &network_id,
+                                        &identity,
+                                        &allowed,
+                                    ),
+                                )
+                                .await;
+                                let Ok(Ok((device_id, channel))) = accepted else {
+                                    break;
+                                };
+                                if let Some(index) = tcp_inbound_peers
+                                    .iter()
+                                    .position(|peer| peer.device_id == device_id)
+                                {
+                                    let peer = tcp_inbound_peers.remove(index);
+                                    if peer.device_id < local_device_id {
+                                        let remote = channel.remote_address();
+                                        if accepted_tx.send((peer, channel, remote)).await.is_err()
+                                        {
+                                            break;
+                                        }
+                                    } else {
+                                        channel.close();
+                                    }
+                                }
+                            }
+                            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+                        }));
+                    }
+                    drop(accepted_tx);
+                    let mut connected: Vec<(PeerInfo, mini_tunnel_agent::PeerChannel, SocketAddr)> =
+                        Vec::new();
+                    let mut accept_finished = accept_tasks.is_empty();
                     let startup_deadline = tokio::time::Instant::now() + Duration::from_secs(45);
                     let mut first_peer_at = None;
                     loop {
@@ -548,9 +633,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             accepted = accepted_rx.recv(), if !accept_finished => {
                                 match accepted {
                                     Some((peer, channel, remote)) => {
-                                        println!("Connected mesh peer {} at {remote}", peer.device_id);
-                                        connected.push((peer, channel, remote));
-                                        first_peer_at.get_or_insert_with(tokio::time::Instant::now);
+                                        if connected.iter().any(|known| known.0.device_id == peer.device_id) {
+                                            channel.close();
+                                        } else {
+                                            println!("Connected mesh peer {} at {remote}", peer.device_id);
+                                            connected.push((peer, channel, remote));
+                                            first_peer_at.get_or_insert_with(tokio::time::Instant::now);
+                                        }
                                     }
                                     None => accept_finished = true,
                                 }
@@ -561,9 +650,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 match result {
                                     Ok((channel, remote)) => {
                                         if keep_outbound {
-                                            println!("Connected mesh peer {} at {remote}", peer.device_id);
-                                            connected.push((peer, channel, remote));
-                                            first_peer_at.get_or_insert_with(tokio::time::Instant::now);
+                                            if connected.iter().any(|known| known.0.device_id == peer.device_id) {
+                                                channel.close();
+                                            } else {
+                                                println!("Connected mesh peer {} at {remote}", peer.device_id);
+                                                connected.push((peer, channel, remote));
+                                                first_peer_at.get_or_insert_with(tokio::time::Instant::now);
+                                            }
                                         } else {
                                             // This authenticated reverse connection opened the
                                             // NAT mapping; keep the elected inbound session instead.
@@ -577,7 +670,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             _ = tokio::time::sleep_until(startup_deadline), if first_peer_at.is_none() => break,
                         }
                     }
-                    if let Some(task) = accept_task.take() {
+                    for task in accept_tasks.drain(..) {
                         task.abort();
                         let _ = task.await;
                     }
@@ -629,9 +722,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     peer_key,
                 )
                 .await?;
-                channel.send_packet(message.as_bytes())?;
+                channel.send_packet(message.as_bytes()).await?;
                 println!(
-                    "Connected to {} at {} and sent authenticated datagram ({} bytes)",
+                    "Connected to {} at {} and sent authenticated packet ({} bytes)",
                     peer.device_id,
                     remote,
                     message.len()
@@ -679,7 +772,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     peer_key,
                 )
                 .await?;
-                channel.send_packet(message.as_bytes())?;
+                channel.send_packet(message.as_bytes()).await?;
                 println!("Sent authenticated datagram ({} bytes)", message.len());
             }
         },
@@ -880,7 +973,7 @@ async fn run_peer_tunnel(
     } else {
         None
     };
-    print_tunnel_ready(tun, peer, remote, manage_route);
+    print_tunnel_ready(tun, peer, remote, channel.transport_name(), manage_route);
     let pump = mini_tunnel_agent::tunnel::pump_peer_packets(tun, channel, peer_ipv4);
     tokio::pin!(pump);
     let tunnel_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = tokio::select! {
@@ -961,7 +1054,10 @@ async fn run_peer_mesh(
                 }
             }
         }
-        println!("Mesh peer {device_id} {peer_ipv4} at {remote}");
+        println!(
+            "Mesh peer {device_id} {peer_ipv4} via {} at {remote}",
+            channel.transport_name()
+        );
         channels.push((peer_ipv4, std::sync::Arc::new(channel)));
     }
     println!("Mesh established on TUN interface {interface}");
@@ -1027,7 +1123,7 @@ async fn create_tunnel_endpoint(
     };
     let path = format!("/v1/networks/{network_id}/candidates");
     let _: CandidateUpdateResponse = post_json(coordinator_url, &path, &request).await?;
-    println!("Published {candidate_count} UDP candidate(s)");
+    println!("Published {candidate_count} peer candidate(s)");
     Ok(endpoint)
 }
 
@@ -1117,6 +1213,7 @@ fn print_tunnel_ready(
     tun: &mini_tunnel_agent::tun_device::TunDevice,
     peer: &PeerInfo,
     remote: SocketAddr,
+    transport: &str,
     managed_route: bool,
 ) {
     match tun.name() {
@@ -1124,11 +1221,10 @@ fn print_tunnel_ready(
         Err(error) => eprintln!("could not query TUN interface name: {error}"),
     }
     println!(
-        "Tunnel established: local {} -> peer {} ({}, UDP {})",
+        "Tunnel established: local {} -> peer {} ({}, {transport} {remote})",
         tun.local_ipv4(),
         peer.device_id,
-        peer.assigned_ipv4,
-        remote
+        peer.assigned_ipv4
     );
     if managed_route {
         println!(

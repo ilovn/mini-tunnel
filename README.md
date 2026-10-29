@@ -6,7 +6,7 @@ A minimal, peer-to-peer virtual network tunnel. The design baseline is in [`docs
 
 Implemented: a Rust workspace, coordinator health endpoint and atomic state, network creation/invites/IPv4 allocation, stable Ed25519 device identities, signed discovery candidates, authenticated QUIC/UDP peer channels, STUN mapped-candidate discovery, and a multi-peer IPv4 TUN mesh.
 
-Not implemented yet: full ICE connectivity checks, TCP fallback, and packet relay. Mesh peers now make simultaneous authenticated QUIC/UDP connection attempts to open NAT mappings, then elect one data connection by stable device ID. This is a best-effort hole-punch strategy, not full ICE; restrictive/symmetric NATs and UDP-blocking firewalls still need a relay or fallback. The control API has a bounded 600-request/minute per-source-IP limiter and a 64 KiB body cap, but remains a development prototype without TLS termination or distributed abuse controls. **Do not expose it directly to untrusted networks.** The coordinator binds to loopback by default; use a hardened TLS reverse proxy for remote clients.
+Not implemented yet: full ICE connectivity checks, adaptive QoS-driven path switching, and packet relay. Mesh peers make simultaneous authenticated QUIC/UDP connection attempts to open NAT mappings, then elect one data connection by stable device ID. When a member advertises `tcp://` candidates and runs a TCP listener, peers fall back to TLS/TCP after UDP candidates fail. This best-effort hole-punch strategy is not full ICE; restrictive/symmetric NATs and UDP-blocking firewalls may still need a relay. The control API has a bounded 600-request/minute per-source-IP limiter and a 64 KiB body cap, but remains a development prototype without TLS termination or distributed abuse controls. **Do not expose it directly to untrusted networks.** The coordinator binds to loopback by default; use a hardened TLS reverse proxy for remote clients.
 
 ## Quick start
 
@@ -71,7 +71,7 @@ With both devices enrolled and their reachable UDP addresses advertised, the sen
 cargo run -p mini-tunnel -- peer connect --network-id '<network-id>' --peer-id '<receiver-device-id>' --message 'hello'
 ```
 
-The command checks the peer key from that signed snapshot, tries at most eight candidates in order (five seconds per attempt), then sends one authenticated datagram. It reports a missing peer, absent/unusable candidates, identity mismatch, and unreachable candidates as separate errors. The coordinator supplies discovery data only; the QUIC datagram travels directly between the devices.
+The command checks the peer key from that signed snapshot, tries at most eight candidates in order (two seconds per UDP candidate, five seconds per TCP candidate, 30 seconds total), then sends one authenticated datagram. It reports a missing peer, absent/unusable candidates, identity mismatch, and unreachable candidates as separate errors. The coordinator supplies discovery data only; the QUIC datagram travels directly between the devices.
 
 The agent crate exposes an async Layer 3 IPv4 TUN adapter (`mini_tunnel_agent::tun_device::TunDevice`) with a default MTU of 1150 bytes, capped to fit the current QUIC datagram framing. It validates IPv4 header/length/MTU and enforces the local and authenticated peer IP boundary on packets. Creating a TUN assigns its local address and requires OS network-interface privileges; Linux may require the `tun` module and root or `CAP_NET_ADMIN`, macOS/BSD may require elevated permissions, and Windows requires Administrator privileges plus the matching `wintun.dll`. The adapter does not call an explicit route-management API and disables tun-rs automatic route management on macOS/BSD; the OS may still create a connected route from the configured interface address and prefix. Tunnel commands can use this adapter for one peer or a multi-peer mesh.
 
@@ -93,10 +93,10 @@ Both commands use the membership saved by `network join`; optional `--local-ipv4
 For multiple enrolled devices, run `peer tunnel mesh` on each device with the same mini-tunnel protocol version. Each process fetches the same-network peer snapshot and uses device ID ordering to choose one QUIC dialer per pair. One TUN routes each IPv4 packet to the authenticated peer matching its destination address. Pass `--stun-server` or publish manual candidates first. Example on each device:
 
 ```sh
-cargo run -p mini-tunnel -- peer tunnel mesh --network-id '<network-id>' --bind 0.0.0.0:42000 --stun-server '<stun-ip>:3478' --manage-route
+cargo run -p mini-tunnel -- peer tunnel mesh --network-id '<network-id>' --bind 0.0.0.0:42000 --stun-server '<stun-ip>:3478' --tcp-bind 0.0.0.0:443 --candidate 'tcp://<public-ip>:443' --manage-route
 ```
 
-Mesh startup keeps reachable authenticated peers and reports unavailable peers; at least one peer must connect. Each peer pair probes candidates from both ends and elects one QUIC connection using device ID ordering. The peer list is a startup snapshot, so newly joined devices require restarting mesh. Simultaneous UDP probing may establish direct paths through common NATs, but restrictive or symmetric NATs can still require a relay; full ICE checks and relay fallback are not implemented.
+Configure firewall/NAT forwarding for the UDP and TCP ports you advertise. `--tcp-bind` starts the TLS/TCP fallback listener; publish its externally reachable address as a `tcp://` candidate with `--candidate`. Mesh keeps reachable authenticated peers and reports unavailable ones; at least one peer must connect. Each pair probes UDP from both ends and elects one data connection using device ID ordering. TCP is reliable and encrypted, but currently serves as connect-time fallback only; it does not switch paths after a live UDP session degrades. The peer list is a startup snapshot, so newly joined devices require restarting mesh. Simultaneous UDP probing may establish direct paths through common NATs, but restrictive or symmetric NATs can still require a relay; full ICE checks and relay forwarding are not implemented.
 
 ## Development
 

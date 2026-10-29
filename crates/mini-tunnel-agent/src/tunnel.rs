@@ -55,7 +55,7 @@ pub async fn pump_peer_packets<T: TunnelPacketIo>(
     loop {
         tokio::select! {
             outbound = packet_io.read_outbound_packet() => {
-                peer.send_packet(&outbound?)?;
+                peer.send_packet(&outbound?).await?;
             }
             inbound = peer.recv_packet() => {
                 packet_io.write_inbound_packet(&inbound?, peer_ipv4).await?;
@@ -109,7 +109,7 @@ pub async fn pump_peer_mesh<T: TunnelPacketIo>(
                     continue;
                 };
                 if let Some(channel) = channels.get(&destination)
-                    && channel.send_packet(&packet).is_err()
+                    && channel.send_packet(&packet).await.is_err()
                 {
                     channels.remove(&destination);
                 }

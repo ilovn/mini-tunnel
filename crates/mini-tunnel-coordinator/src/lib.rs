@@ -484,9 +484,9 @@ impl CoordinatorState {
             ));
         }
         for candidate in &canonical {
-            let address = candidate
-                .parse::<SocketAddr>()
-                .map_err(|_| ApiError::InvalidRequest("candidate must be a socket address"))?;
+            let address = candidate_socket_address(candidate).ok_or(ApiError::InvalidRequest(
+                "candidate must be a socket address",
+            ))?;
             if address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {
                 return Err(ApiError::InvalidRequest("candidate address is not usable"));
             }
@@ -643,8 +643,7 @@ impl Store {
                 if member.device_id != device_id_from_public_key(&member.public_key)
                     || member.candidates.len() > MAX_CANDIDATES
                     || member.candidates.iter().any(|candidate| {
-                        candidate
-                            .parse::<SocketAddr>()
+                        candidate_socket_address(candidate)
                             .map(|address| {
                                 address.port() == 0
                                     || address.ip().is_unspecified()
@@ -862,6 +861,14 @@ async fn list_peers(
 
 fn decode_exact<const N: usize>(encoded: &str) -> Option<[u8; N]> {
     URL_SAFE_NO_PAD.decode(encoded).ok()?.try_into().ok()
+}
+
+fn candidate_socket_address(candidate: &str) -> Option<SocketAddr> {
+    candidate
+        .strip_prefix("tcp://")
+        .unwrap_or(candidate)
+        .parse::<SocketAddr>()
+        .ok()
 }
 
 fn verify_signature(public_key: &[u8; 32], message: &[u8], signature: &str) -> bool {
@@ -1192,7 +1199,10 @@ mod tests {
             .await
             .expect("join B");
         let key_a = SigningKey::from_bytes(&[11; 32]);
-        let mut candidates = vec!["198.51.100.8:42000".to_owned()];
+        let mut candidates = vec![
+            "198.51.100.8:42000".to_owned(),
+            "tcp://198.51.100.8:42001".to_owned(),
+        ];
         candidates.sort();
         let timestamp_ms = unix_time_ms().expect("clock");
         let signature = key_a.sign(&candidate_signing_bytes(
@@ -1235,7 +1245,10 @@ mod tests {
             .await
             .expect("same-network peers");
         assert_eq!(snapshot.peers.len(), 1);
-        assert_eq!(snapshot.peers[0].candidates, ["198.51.100.8:42000"]);
+        assert_eq!(
+            snapshot.peers[0].candidates,
+            ["198.51.100.8:42000", "tcp://198.51.100.8:42001"]
+        );
 
         let timestamp_ms = unix_time_ms().expect("clock");
         let signature = key_b.sign(&peers_signing_bytes(

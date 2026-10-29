@@ -1195,6 +1195,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tun-rs",
  "uuid",
  "x509-parser",
