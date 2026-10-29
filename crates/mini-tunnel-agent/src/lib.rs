@@ -6,7 +6,14 @@ pub mod stun;
 pub mod tun_device;
 pub mod tunnel;
 
-use std::{fs, io, net::SocketAddr, path::PathBuf, sync::Mutex, time::Duration};
+use std::{
+    collections::HashMap,
+    fs, io,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
@@ -228,6 +235,25 @@ pub struct PeerChannel {
     network_tag: [u8; 16],
     next_packet: Mutex<u64>,
     replay_window: Mutex<ReplayWindow>,
+    health: Mutex<PeerHealth>,
+}
+
+const HEALTH_PING: u8 = 0xf0;
+const HEALTH_PONG: u8 = 0xf1;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PeerHealthSnapshot {
+    pub rtt: Option<Duration>,
+    pub probes_succeeded: u64,
+    pub probes_missed: u64,
+}
+
+#[derive(Default)]
+struct PeerHealth {
+    rtt: Option<Duration>,
+    outstanding: HashMap<u64, Instant>,
+    probes_succeeded: u64,
+    probes_missed: u64,
 }
 
 impl PeerChannel {
@@ -300,7 +326,60 @@ impl PeerChannel {
 
     /// Send an authenticated transport keepalive; receivers consume it without exposing it to TUN.
     pub async fn send_keepalive(&self) -> Result<(), IdentityError> {
-        self.send_packet(&[]).await
+        let mut nonce_bytes = [0_u8; 8];
+        getrandom::fill(&mut nonce_bytes).map_err(|_| IdentityError::Random)?;
+        let nonce = u64::from_be_bytes(nonce_bytes);
+        {
+            let mut health = self
+                .health
+                .lock()
+                .map_err(|_| IdentityError::InvalidFrame)?;
+            let expired = health
+                .outstanding
+                .iter()
+                .filter(|(_, sent_at)| sent_at.elapsed() >= Duration::from_secs(20))
+                .map(|(nonce, _)| *nonce)
+                .collect::<Vec<_>>();
+            for expired_nonce in expired {
+                health.outstanding.remove(&expired_nonce);
+                health.probes_missed = health.probes_missed.saturating_add(1);
+            }
+            while health.outstanding.len() >= 8 {
+                if let Some(oldest) = health
+                    .outstanding
+                    .iter()
+                    .min_by_key(|(_, sent_at)| **sent_at)
+                    .map(|(id, _)| *id)
+                {
+                    health.outstanding.remove(&oldest);
+                    health.probes_missed = health.probes_missed.saturating_add(1);
+                }
+            }
+            health.outstanding.insert(nonce, Instant::now());
+        }
+        let mut payload = [0_u8; 9];
+        payload[0] = HEALTH_PING;
+        payload[1..].copy_from_slice(&nonce_bytes);
+        if let Err(error) = self.send_packet(&payload).await {
+            if let Ok(mut health) = self.health.lock() {
+                health.outstanding.remove(&nonce);
+                health.probes_missed = health.probes_missed.saturating_add(1);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn health_snapshot(&self) -> PeerHealthSnapshot {
+        self.health
+            .lock()
+            .map(|health| PeerHealthSnapshot {
+                rtt: health.rtt,
+                probes_succeeded: health.probes_succeeded,
+                probes_missed: health.probes_missed,
+            })
+            .unwrap_or_default()
     }
 
     /// Receive one authenticated frame, rejecting malformed, cross-network, and replayed data.
@@ -339,6 +418,24 @@ impl PeerChannel {
             .accept(sequence)
         {
             return Err(IdentityError::InvalidFrame);
+        }
+        if payload.len() == 9 && matches!(payload[0], HEALTH_PING | HEALTH_PONG) {
+            let nonce = u64::from_be_bytes(
+                payload[1..9]
+                    .try_into()
+                    .map_err(|_| IdentityError::InvalidFrame)?,
+            );
+            if payload[0] == HEALTH_PING {
+                let mut pong = payload.to_vec();
+                pong[0] = HEALTH_PONG;
+                self.send_packet(&pong).await?;
+            } else if let Ok(mut health) = self.health.lock()
+                && let Some(sent_at) = health.outstanding.remove(&nonce)
+            {
+                health.rtt = Some(sent_at.elapsed());
+                health.probes_succeeded = health.probes_succeeded.saturating_add(1);
+            }
+            return Ok(Vec::new());
         }
         Ok(payload.to_vec())
     }
@@ -865,6 +962,7 @@ fn new_channel(connection: Connection, network_id: &str) -> PeerChannel {
         network_tag,
         next_packet: Mutex::new(0),
         replay_window: Mutex::new(ReplayWindow::default()),
+        health: Mutex::new(PeerHealth::default()),
     }
 }
 
@@ -887,6 +985,7 @@ fn new_tcp_channel(
         network_tag,
         next_packet: Mutex::new(0),
         replay_window: Mutex::new(ReplayWindow::default()),
+        health: Mutex::new(PeerHealth::default()),
     }
 }
 
@@ -1441,6 +1540,14 @@ mod tests {
             channel_b.recv_packet().await.expect("receive TCP frame"),
             b"reliable overlay packet"
         );
+        assert!(
+            channel_a
+                .recv_packet()
+                .await
+                .expect("receive TCP pong")
+                .is_empty()
+        );
+        assert_eq!(channel_a.health_snapshot().probes_succeeded, 1);
         assert!(matches!(
             channel_a
                 .send_packet(&vec![0; MAX_PACKET_PAYLOAD + 1])

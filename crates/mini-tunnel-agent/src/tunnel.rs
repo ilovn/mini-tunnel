@@ -9,10 +9,51 @@ use thiserror::Error;
 use crate::{IdentityError, PeerChannel, tun_device::TunError};
 
 pub type PeerConnector = Arc<
-    dyn Fn() -> Pin<Box<dyn Future<Output = Result<PeerChannel, IdentityError>> + Send>>
+    dyn Fn(bool) -> Pin<Box<dyn Future<Output = Result<PeerChannel, IdentityError>> + Send>>
         + Send
         + Sync,
 >;
+
+#[derive(Default)]
+pub struct PathQualityTracker {
+    last_successes: u64,
+    last_missed: u64,
+    window_probes: u64,
+    window_missed: u64,
+    bad_windows: u8,
+    degraded: bool,
+}
+
+impl PathQualityTracker {
+    /// Require three probes per window and three consecutive bad windows before degrading.
+    pub fn observe(&mut self, snapshot: crate::PeerHealthSnapshot) -> bool {
+        let successes = snapshot
+            .probes_succeeded
+            .saturating_sub(self.last_successes);
+        let missed = snapshot.probes_missed.saturating_sub(self.last_missed);
+        self.last_successes = snapshot.probes_succeeded;
+        self.last_missed = snapshot.probes_missed;
+        self.window_probes = self.window_probes.saturating_add(successes + missed);
+        self.window_missed = self.window_missed.saturating_add(missed);
+        if self.window_probes < 3 || self.degraded {
+            return self.degraded;
+        }
+        let loss_ratio = self.window_missed as f64 / self.window_probes as f64;
+        let bad = loss_ratio > 0.20
+            || snapshot
+                .rtt
+                .is_some_and(|rtt| rtt > Duration::from_millis(350));
+        self.bad_windows = if bad {
+            self.bad_windows.saturating_add(1)
+        } else {
+            0
+        };
+        self.window_probes = 0;
+        self.window_missed = 0;
+        self.degraded = self.bad_windows >= 3;
+        self.degraded
+    }
+}
 
 pub struct ReconnectingPeer {
     pub address: Ipv4Addr,
@@ -102,6 +143,8 @@ async fn receive_mesh_peer(
         keepalive.tick().await;
         let mut last_received = tokio::time::Instant::now();
         let mut inbound = Box::pin(active.recv_packet());
+        let mut quality = PathQualityTracker::default();
+        let mut force_reliable = false;
         let failure = loop {
             tokio::select! {
                 result = tokio::time::timeout_at(last_received + Duration::from_secs(30), &mut inbound) => {
@@ -121,6 +164,10 @@ async fn receive_mesh_peer(
                     }
                 }
                 _ = keepalive.tick() => {
+                    if active.transport_name() == "QUIC/UDP" && quality.observe(active.health_snapshot()) {
+                        force_reliable = true;
+                        break IdentityError::Transport("peer path quality degraded".to_owned());
+                    }
                     if let Err(error) = active.send_keepalive().await {
                         break error;
                     }
@@ -136,7 +183,7 @@ async fn receive_mesh_peer(
         loop {
             tokio::time::sleep(crate::reconnect_delay(attempt)).await;
             attempt = attempt.saturating_add(1);
-            match (connector)().await {
+            match (connector)(force_reliable).await {
                 Ok(reconnected) => {
                     *channel.write().await = Arc::new(reconnected);
                     break;
@@ -274,6 +321,36 @@ mod tests {
         peer_tcp_listener,
     };
 
+    #[test]
+    fn path_quality_requires_three_bad_windows_and_resets_after_a_healthy_window() {
+        let mut tracker = PathQualityTracker::default();
+        let mut snapshot = crate::PeerHealthSnapshot {
+            rtt: Some(Duration::from_millis(500)),
+            probes_succeeded: 0,
+            probes_missed: 0,
+        };
+        for window in 0..2 {
+            snapshot.probes_succeeded += 3;
+            assert!(
+                !tracker.observe(snapshot),
+                "window {window} must not trigger a switch"
+            );
+        }
+        snapshot.rtt = Some(Duration::from_millis(50));
+        snapshot.probes_succeeded += 3;
+        assert!(
+            !tracker.observe(snapshot),
+            "healthy window resets the hysteresis counter"
+        );
+        snapshot.rtt = Some(Duration::from_millis(500));
+        for _ in 0..2 {
+            snapshot.probes_succeeded += 3;
+            assert!(!tracker.observe(snapshot));
+        }
+        snapshot.probes_succeeded += 3;
+        assert!(tracker.observe(snapshot));
+    }
+
     struct MockPacketIo {
         outbound: Mutex<mpsc::Receiver<Vec<u8>>>,
         inbound: mpsc::Sender<Vec<u8>>,
@@ -353,7 +430,7 @@ mod tests {
             let b = Arc::clone(&b);
             let remote_channel = Arc::clone(&remote_channel);
             let remote_notify = Arc::clone(&remote_notify);
-            Arc::new(move || {
+            Arc::new(move |_force_reliable| {
                 let a = Arc::clone(&a);
                 let b = Arc::clone(&b);
                 let remote_channel = Arc::clone(&remote_channel);

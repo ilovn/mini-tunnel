@@ -571,7 +571,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let reconnect_peer = peer.clone();
                         let connector: mini_tunnel_agent::tunnel::PeerConnector = if keep_outbound {
                             let reconnect_endpoint = endpoint.clone();
-                            std::sync::Arc::new(move || {
+                            std::sync::Arc::new(move |force_reliable| {
                                 let endpoint = reconnect_endpoint.clone();
                                 let identity = std::sync::Arc::clone(&reconnect_identity);
                                 let network_id = reconnect_network_id.clone();
@@ -585,6 +585,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                         &identity,
                                         &peer,
                                         relay_server,
+                                        force_reliable,
                                     )
                                     .await
                                     .map(|(channel, _)| channel)
@@ -593,18 +594,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         } else {
                             let receiver =
                                 std::sync::Arc::new(tokio::sync::Mutex::new(accepted_peer_rx));
-                            std::sync::Arc::new(move || {
+                            std::sync::Arc::new(move |force_reliable| {
                                 let receiver = std::sync::Arc::clone(&receiver);
                                 let identity = std::sync::Arc::clone(&reconnect_identity);
                                 let coordinator_url = reconnect_coordinator_url.clone();
                                 let network_id = reconnect_network_id.clone();
                                 let peer = reconnect_peer.clone();
                                 Box::pin(async move {
-                                    if let Ok(Some(channel)) =
-                                        tokio::time::timeout(Duration::from_secs(65), async {
-                                            receiver.lock().await.recv().await
-                                        })
-                                        .await
+                                    let direct_wait = if force_reliable { 35 } else { 65 };
+                                    if let Ok(Some(channel)) = tokio::time::timeout(
+                                        Duration::from_secs(direct_wait),
+                                        async { receiver.lock().await.recv().await },
+                                    )
+                                    .await
                                     {
                                         return Ok(channel);
                                     }
@@ -637,6 +639,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 &identity,
                                 &peer,
                                 relay_server,
+                                false,
                             )
                             .await;
                             (peer, keep_outbound, result)
@@ -1139,6 +1142,7 @@ async fn connect_mesh_peer(
     identity: &mini_tunnel_agent::Identity,
     peer: &PeerInfo,
     relay_server: Option<SocketAddr>,
+    reliable_only: bool,
 ) -> Result<(mini_tunnel_agent::PeerChannel, SocketAddr), mini_tunnel_agent::IdentityError> {
     let mut peer = peer.clone();
     for _ in 0..10 {
@@ -1152,9 +1156,10 @@ async fn connect_mesh_peer(
     }
     let peer_key = decode_peer_key(&peer.public_key)
         .map_err(|_| mini_tunnel_agent::IdentityError::UnauthorizedPeer)?;
+    let candidates = candidates_for_path(&peer.candidates, reliable_only);
     match mini_tunnel_agent::connect_peer_candidates(
         endpoint,
-        &peer.candidates,
+        &candidates,
         network_id,
         identity,
         &peer.device_id,
@@ -1179,6 +1184,18 @@ async fn connect_mesh_peer(
             let remote = channel.remote_address();
             Ok((channel, remote))
         }
+    }
+}
+
+fn candidates_for_path(candidates: &[String], reliable_only: bool) -> Vec<String> {
+    if reliable_only {
+        candidates
+            .iter()
+            .filter(|candidate| candidate.starts_with("tcp://"))
+            .cloned()
+            .collect()
+    } else {
+        candidates.to_vec()
     }
 }
 
@@ -1460,6 +1477,19 @@ fn print_tunnel_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reliable_path_preference_excludes_udp_candidates() {
+        let candidates = vec![
+            "203.0.113.1:42000".to_owned(),
+            "tcp://203.0.113.1:443".to_owned(),
+        ];
+        assert_eq!(
+            candidates_for_path(&candidates, true),
+            vec!["tcp://203.0.113.1:443"]
+        );
+        assert_eq!(candidates_for_path(&candidates, false), candidates);
+    }
 
     #[test]
     fn explicit_tun_overrides_must_match_saved_membership() {
