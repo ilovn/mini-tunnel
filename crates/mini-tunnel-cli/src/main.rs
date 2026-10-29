@@ -566,161 +566,23 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         println!("TCP fallback listening on {}", listener.local_addr()?);
                     }
                     let peers = discover_peers(&coordinator_url, &network_id, &identity).await?;
-                    if peers.is_empty() {
-                        return Err("no other enrolled peers are available in this network".into());
-                    }
                     let local_device_id = identity.device_id();
                     let identity = std::sync::Arc::new(identity);
                     let mut attempts = tokio::task::JoinSet::new();
                     let mut peer_connectors = std::collections::HashMap::new();
                     let mut peer_probes = std::collections::HashMap::new();
                     let mut accepted_peer_senders = std::collections::HashMap::new();
-                    let inbound_peers = peers.clone();
                     for peer in peers.iter().cloned() {
                         let keep_outbound = local_device_id < peer.device_id;
-                        let (accepted_peer_tx, accepted_peer_rx) = tokio::sync::mpsc::channel(2);
+                        let (connector, probe, accepted_peer_tx) = build_mesh_peer_connectors(
+                            endpoint.clone(),
+                            std::sync::Arc::clone(&identity),
+                            network_id.clone(),
+                            coordinator_url.clone(),
+                            peer.clone(),
+                            relay_server,
+                        );
                         accepted_peer_senders.insert(peer.device_id.clone(), accepted_peer_tx);
-                        let reconnect_identity = std::sync::Arc::clone(&identity);
-                        let reconnect_coordinator_url = coordinator_url.clone();
-                        let reconnect_network_id = network_id.clone();
-                        let reconnect_peer = peer.clone();
-                        let (connector, probe): (
-                            mini_tunnel_agent::tunnel::PeerConnector,
-                            mini_tunnel_agent::tunnel::PeerConnector,
-                        ) = if keep_outbound {
-                            let reconnect_endpoint = endpoint.clone();
-                            let connector = std::sync::Arc::new(move |force_reliable| -> mini_tunnel_agent::tunnel::PeerConnectFuture {
-                                let endpoint = reconnect_endpoint.clone();
-                                let identity = std::sync::Arc::clone(&reconnect_identity);
-                                let network_id = reconnect_network_id.clone();
-                                let coordinator_url = reconnect_coordinator_url.clone();
-                                let peer = reconnect_peer.clone();
-                                Box::pin(async move {
-                                    connect_mesh_peer(
-                                        &endpoint,
-                                        &network_id,
-                                        &coordinator_url,
-                                        &identity,
-                                        &peer,
-                                        relay_server,
-                                        force_reliable,
-                                    )
-                                    .await
-                                    .map(|(channel, _)| channel)
-                                })
-                            });
-                            let probe_endpoint = endpoint.clone();
-                            let probe_identity = std::sync::Arc::clone(&identity);
-                            let probe_network_id = network_id.clone();
-                            let probe_coordinator_url = coordinator_url.clone();
-                            let probe_peer = peer.clone();
-                            let probe = std::sync::Arc::new(
-                                move |_| -> mini_tunnel_agent::tunnel::PeerConnectFuture {
-                                    let endpoint = probe_endpoint.clone();
-                                    let identity = std::sync::Arc::clone(&probe_identity);
-                                    let network_id = probe_network_id.clone();
-                                    let coordinator_url = probe_coordinator_url.clone();
-                                    let peer = probe_peer.clone();
-                                    Box::pin(async move {
-                                        let (channel, _) = connect_mesh_peer(
-                                            &endpoint,
-                                            &network_id,
-                                            &coordinator_url,
-                                            &identity,
-                                            &peer,
-                                            None,
-                                            false,
-                                        )
-                                        .await?;
-                                        let rtt =
-                                            channel.probe_health(3, Duration::from_secs(2)).await?;
-                                        if rtt > Duration::from_millis(350) {
-                                            return Err(
-                                                mini_tunnel_agent::IdentityError::Transport(
-                                                    "direct path probe exceeded RTT threshold"
-                                                        .to_owned(),
-                                                ),
-                                            );
-                                        }
-                                        Ok(channel)
-                                    })
-                                },
-                            );
-                            (connector, probe)
-                        } else {
-                            let receiver =
-                                std::sync::Arc::new(tokio::sync::Mutex::new(accepted_peer_rx));
-                            let connector_receiver = std::sync::Arc::clone(&receiver);
-                            let connector = std::sync::Arc::new(move |force_reliable| -> mini_tunnel_agent::tunnel::PeerConnectFuture {
-                                let receiver = std::sync::Arc::clone(&connector_receiver);
-                                let identity = std::sync::Arc::clone(&reconnect_identity);
-                                let coordinator_url = reconnect_coordinator_url.clone();
-                                let network_id = reconnect_network_id.clone();
-                                let peer = reconnect_peer.clone();
-                                Box::pin(async move {
-                                    let direct_wait = if force_reliable { 35 } else { 65 };
-                                    if let Ok(Some(channel)) = tokio::time::timeout(
-                                        Duration::from_secs(direct_wait),
-                                        async { receiver.lock().await.recv().await },
-                                    )
-                                    .await
-                                    {
-                                        return Ok(channel);
-                                    }
-                                    let relay = relay_server.ok_or_else(|| {
-                                        mini_tunnel_agent::IdentityError::Transport(
-                                            "timed out waiting for peer redial".to_owned(),
-                                        )
-                                    })?;
-                                    connect_mesh_peer_via_relay(
-                                        relay,
-                                        &coordinator_url,
-                                        &network_id,
-                                        &identity,
-                                        &peer,
-                                    )
-                                    .await
-                                })
-                            });
-                            let probe_receiver = std::sync::Arc::clone(&receiver);
-                            let probe = std::sync::Arc::new(
-                                move |_| -> mini_tunnel_agent::tunnel::PeerConnectFuture {
-                                    let receiver = std::sync::Arc::clone(&probe_receiver);
-                                    Box::pin(async move {
-                                        let deadline =
-                                            tokio::time::Instant::now() + Duration::from_secs(35);
-                                        loop {
-                                            let channel =
-                                                tokio::time::timeout_at(deadline, async {
-                                                    receiver.lock().await.recv().await
-                                                })
-                                                .await
-                                                .map_err(|_| {
-                                                    mini_tunnel_agent::IdentityError::Transport(
-                                                        "timed out waiting for direct probe"
-                                                            .to_owned(),
-                                                    )
-                                                })?
-                                                .ok_or_else(|| {
-                                                    mini_tunnel_agent::IdentityError::Transport(
-                                                        "peer accept dispatcher stopped".to_owned(),
-                                                    )
-                                                })?;
-                                            match channel
-                                                .probe_health(3, Duration::from_secs(2))
-                                                .await
-                                            {
-                                                Ok(rtt) if rtt <= Duration::from_millis(350) => {
-                                                    return Ok(channel);
-                                                }
-                                                Ok(_) | Err(_) => continue,
-                                            }
-                                        }
-                                    })
-                                },
-                            );
-                            (connector, probe)
-                        };
                         peer_connectors.insert(peer.device_id.clone(), connector);
                         peer_probes.insert(peer.device_id.clone(), probe);
                         let endpoint = endpoint.clone();
@@ -742,34 +604,40 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         });
                     }
                     let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::channel(64);
+                    let allowed_members = peers
+                        .iter()
+                        .map(|peer| {
+                            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
+                                peer.device_id.clone(),
+                                decode_peer_key(&peer.public_key)?,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let (allowlist_tx, allowlist_rx) = tokio::sync::watch::channel(allowed_members);
+                    let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(peers.clone());
                     let mut accept_tasks = vec![{
                         let endpoint = endpoint.clone();
                         let identity = std::sync::Arc::clone(&identity);
                         let network_id = network_id.clone();
                         let local_device_id = local_device_id.clone();
                         let accepted_tx = accepted_tx.clone();
+                        let allowlist_rx = allowlist_rx.clone();
+                        let snapshot_rx = snapshot_rx.clone();
                         tokio::spawn(async move {
-                            let allowed = inbound_peers
-                                .iter()
-                                .map(|peer| {
-                                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
-                                        peer.device_id.clone(),
-                                        decode_peer_key(&peer.public_key)?,
-                                    ))
-                                })
-                                .collect::<Result<Vec<_>, _>>()?;
                             loop {
-                                let Ok((device_id, channel)) = mini_tunnel_agent::accept_peer_any(
-                                    &endpoint,
-                                    &network_id,
-                                    &identity,
-                                    &allowed,
-                                )
-                                .await
+                                let Ok((device_id, channel)) =
+                                    mini_tunnel_agent::accept_peer_any_dynamic(
+                                        &endpoint,
+                                        &network_id,
+                                        &identity,
+                                        allowlist_rx.clone(),
+                                    )
+                                    .await
                                 else {
                                     break;
                                 };
-                                if let Some(peer) = inbound_peers
+                                let current_peers = snapshot_rx.borrow().clone();
+                                if let Some(peer) = current_peers
                                     .iter()
                                     .find(|peer| peer.device_id == device_id)
                                     .cloned()
@@ -791,34 +659,27 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         })
                     }];
                     if let Some(listener) = tcp_listener {
-                        let tcp_inbound_peers = peers.clone();
                         let identity = std::sync::Arc::clone(&identity);
                         let network_id = network_id.clone();
                         let local_device_id = local_device_id.clone();
                         let accepted_tx = accepted_tx.clone();
+                        let allowlist_rx = allowlist_rx.clone();
+                        let snapshot_rx = snapshot_rx.clone();
                         accept_tasks.push(tokio::spawn(async move {
-                            let allowed = tcp_inbound_peers
-                                .iter()
-                                .map(|peer| {
-                                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
-                                        peer.device_id.clone(),
-                                        decode_peer_key(&peer.public_key)?,
-                                    ))
-                                })
-                                .collect::<Result<Vec<_>, _>>()?;
                             loop {
                                 let Ok((device_id, channel)) =
-                                    mini_tunnel_agent::accept_tcp_peer_any(
+                                    mini_tunnel_agent::accept_tcp_peer_any_dynamic(
                                         &listener,
                                         &network_id,
                                         &identity,
-                                        &allowed,
+                                        allowlist_rx.clone(),
                                     )
                                     .await
                                 else {
                                     break;
                                 };
-                                if let Some(peer) = tcp_inbound_peers
+                                let current_peers = snapshot_rx.borrow().clone();
+                                if let Some(peer) = current_peers
                                     .iter()
                                     .find(|peer| peer.device_id == device_id)
                                     .cloned()
@@ -849,6 +710,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let startup_deadline = tokio::time::Instant::now() + Duration::from_secs(45);
                     let mut first_peer_at = None;
                     loop {
+                        if attempts.is_empty() && peers.is_empty() {
+                            break;
+                        }
                         if attempts.is_empty() && accept_finished {
                             break;
                         }
@@ -900,10 +764,24 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             _ = tokio::time::sleep_until(startup_deadline), if first_peer_at.is_none() => break,
                         }
                     }
-                    let mut reconnect_senders = accepted_peer_senders;
-                    tokio::spawn(async move {
+                    if connected.is_empty() {
+                        println!(
+                            "No mesh peers are connected yet; waiting for membership updates."
+                        );
+                    }
+                    let tun = create_tun(local_ipv4, prefix_len, mtu)?;
+                    let initially_connected = connected
+                        .iter()
+                        .map(|(peer, _, _, _, _)| peer.clone())
+                        .collect::<Vec<_>>();
+                    let (mesh_updates_tx, mesh_updates_rx) = tokio::sync::mpsc::channel(64);
+                    let registry =
+                        std::sync::Arc::new(tokio::sync::RwLock::new(accepted_peer_senders));
+                    let accepted_registry = std::sync::Arc::clone(&registry);
+                    let accepted_dispatcher = tokio::spawn(async move {
                         while let Some((peer, channel, _remote)) = accepted_rx.recv().await {
-                            if let Some(sender) = reconnect_senders.get_mut(&peer.device_id) {
+                            let registry = accepted_registry.read().await;
+                            if let Some(sender) = registry.get(&peer.device_id) {
                                 if let Err(error) = sender.try_send(channel) {
                                     error.into_inner().close();
                                 }
@@ -912,15 +790,26 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             }
                         }
                     });
-                    drop(accept_tasks);
-                    if connected.is_empty() {
-                        return Err(
-                            "no authenticated peer connected before the 45-second startup timeout"
-                                .into(),
-                        );
+                    let refresh = spawn_mesh_membership_refresh(MeshMembershipRefresh {
+                        coordinator_url: coordinator_url.clone(),
+                        network_id: network_id.clone(),
+                        identity: std::sync::Arc::clone(&identity),
+                        endpoint: endpoint.clone(),
+                        relay_server,
+                        snapshot_tx,
+                        allowlist_tx,
+                        registry,
+                        updates_tx: mesh_updates_tx,
+                        initial_peers: initially_connected,
+                    });
+                    let result =
+                        run_peer_mesh(&tun, connected, manage_route, mesh_updates_rx).await;
+                    refresh.abort();
+                    accepted_dispatcher.abort();
+                    for task in accept_tasks {
+                        task.abort();
                     }
-                    let tun = create_tun(local_ipv4, prefix_len, mtu)?;
-                    run_peer_mesh(&tun, connected, manage_route).await?;
+                    result?;
                 }
             },
             PeerCommand::Connect {
@@ -1263,6 +1152,13 @@ async fn connect_mesh_peer(
     reliable_only: bool,
 ) -> Result<(mini_tunnel_agent::PeerChannel, SocketAddr), mini_tunnel_agent::IdentityError> {
     let mut peer = peer.clone();
+    if let Ok(current) = discover_peer(coordinator_url, network_id, &peer.device_id, identity).await
+    {
+        if current.public_key != peer.public_key || current.assigned_ipv4 != peer.assigned_ipv4 {
+            return Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer);
+        }
+        peer = current;
+    }
     for _ in 0..10 {
         if !peer.candidates.is_empty() {
             break;
@@ -1303,6 +1199,358 @@ async fn connect_mesh_peer(
             Ok((channel, remote))
         }
     }
+}
+
+fn build_mesh_peer_connectors(
+    endpoint: quinn::Endpoint,
+    identity: std::sync::Arc<mini_tunnel_agent::Identity>,
+    network_id: String,
+    coordinator_url: String,
+    peer: PeerInfo,
+    relay_server: Option<SocketAddr>,
+) -> (
+    mini_tunnel_agent::tunnel::PeerConnector,
+    mini_tunnel_agent::tunnel::PeerConnector,
+    tokio::sync::mpsc::Sender<mini_tunnel_agent::PeerChannel>,
+) {
+    let keep_outbound = identity.device_id() < peer.device_id;
+    let (accepted_tx, accepted_rx) = tokio::sync::mpsc::channel(2);
+    let receiver = std::sync::Arc::new(tokio::sync::Mutex::new(accepted_rx));
+    let connector: mini_tunnel_agent::tunnel::PeerConnector = if keep_outbound {
+        let endpoint = endpoint.clone();
+        let identity = std::sync::Arc::clone(&identity);
+        let network_id = network_id.clone();
+        let coordinator_url = coordinator_url.clone();
+        let peer = peer.clone();
+        std::sync::Arc::new(
+            move |force_reliable| -> mini_tunnel_agent::tunnel::PeerConnectFuture {
+                let endpoint = endpoint.clone();
+                let identity = std::sync::Arc::clone(&identity);
+                let network_id = network_id.clone();
+                let coordinator_url = coordinator_url.clone();
+                let peer = peer.clone();
+                Box::pin(async move {
+                    connect_mesh_peer(
+                        &endpoint,
+                        &network_id,
+                        &coordinator_url,
+                        &identity,
+                        &peer,
+                        relay_server,
+                        force_reliable,
+                    )
+                    .await
+                    .map(|(channel, _)| channel)
+                })
+            },
+        )
+    } else {
+        let receiver = std::sync::Arc::clone(&receiver);
+        let identity = std::sync::Arc::clone(&identity);
+        let coordinator_url = coordinator_url.clone();
+        let network_id = network_id.clone();
+        let peer = peer.clone();
+        std::sync::Arc::new(
+            move |force_reliable| -> mini_tunnel_agent::tunnel::PeerConnectFuture {
+                let receiver = std::sync::Arc::clone(&receiver);
+                let identity = std::sync::Arc::clone(&identity);
+                let coordinator_url = coordinator_url.clone();
+                let network_id = network_id.clone();
+                let peer = peer.clone();
+                Box::pin(async move {
+                    let direct_wait = if force_reliable { 35 } else { 65 };
+                    if let Ok(Some(channel)) =
+                        tokio::time::timeout(Duration::from_secs(direct_wait), async {
+                            receiver.lock().await.recv().await
+                        })
+                        .await
+                    {
+                        return Ok(channel);
+                    }
+                    let relay = relay_server.ok_or_else(|| {
+                        mini_tunnel_agent::IdentityError::Transport(
+                            "timed out waiting for peer redial".to_owned(),
+                        )
+                    })?;
+                    connect_mesh_peer_via_relay(
+                        relay,
+                        &coordinator_url,
+                        &network_id,
+                        &identity,
+                        &peer,
+                    )
+                    .await
+                })
+            },
+        )
+    };
+
+    let probe: mini_tunnel_agent::tunnel::PeerConnector = if keep_outbound {
+        let endpoint = endpoint.clone();
+        let identity = std::sync::Arc::clone(&identity);
+        let network_id = network_id.clone();
+        let coordinator_url = coordinator_url.clone();
+        let peer = peer.clone();
+        std::sync::Arc::new(move |_| -> mini_tunnel_agent::tunnel::PeerConnectFuture {
+            let endpoint = endpoint.clone();
+            let identity = std::sync::Arc::clone(&identity);
+            let network_id = network_id.clone();
+            let coordinator_url = coordinator_url.clone();
+            let peer = peer.clone();
+            Box::pin(async move {
+                let (channel, _) = connect_mesh_peer(
+                    &endpoint,
+                    &network_id,
+                    &coordinator_url,
+                    &identity,
+                    &peer,
+                    None,
+                    false,
+                )
+                .await?;
+                validate_udp_probe(channel).await
+            })
+        })
+    } else {
+        let receiver = std::sync::Arc::clone(&receiver);
+        std::sync::Arc::new(move |_| -> mini_tunnel_agent::tunnel::PeerConnectFuture {
+            let receiver = std::sync::Arc::clone(&receiver);
+            Box::pin(async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+                loop {
+                    let channel = tokio::time::timeout_at(deadline, async {
+                        receiver.lock().await.recv().await
+                    })
+                    .await
+                    .map_err(|_| {
+                        mini_tunnel_agent::IdentityError::Transport(
+                            "timed out waiting for direct probe".to_owned(),
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        mini_tunnel_agent::IdentityError::Transport(
+                            "peer accept dispatcher stopped".to_owned(),
+                        )
+                    })?;
+                    if let Ok(channel) = validate_udp_probe(channel).await {
+                        return Ok(channel);
+                    }
+                }
+            })
+        })
+    };
+    (connector, probe, accepted_tx)
+}
+
+type AcceptedPeerRegistry = std::sync::Arc<
+    tokio::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            tokio::sync::mpsc::Sender<mini_tunnel_agent::PeerChannel>,
+        >,
+    >,
+>;
+
+fn mesh_membership_diff(
+    known: &std::collections::HashMap<String, PeerInfo>,
+    snapshot: &[PeerInfo],
+) -> (Vec<(String, String)>, Vec<PeerInfo>) {
+    let next = snapshot
+        .iter()
+        .map(|peer| (peer.device_id.as_str(), peer))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut removed: Vec<(String, String)> = known
+        .iter()
+        .filter(|(device_id, peer)| {
+            next.get(device_id.as_str())
+                .is_none_or(|current| current.assigned_ipv4 != peer.assigned_ipv4)
+        })
+        .map(|(device_id, peer)| (device_id.clone(), peer.assigned_ipv4.clone()))
+        .collect();
+    removed.sort_by(|left, right| left.0.cmp(&right.0));
+    let added = snapshot
+        .iter()
+        .filter(|peer| {
+            known
+                .get(&peer.device_id)
+                .is_none_or(|previous| previous.assigned_ipv4 != peer.assigned_ipv4)
+        })
+        .cloned()
+        .collect();
+    (removed, added)
+}
+
+struct MeshMembershipRefresh {
+    coordinator_url: String,
+    network_id: String,
+    identity: std::sync::Arc<mini_tunnel_agent::Identity>,
+    endpoint: quinn::Endpoint,
+    relay_server: Option<SocketAddr>,
+    snapshot_tx: tokio::sync::watch::Sender<Vec<PeerInfo>>,
+    allowlist_tx: tokio::sync::watch::Sender<Vec<(String, [u8; 32])>>,
+    registry: AcceptedPeerRegistry,
+    updates_tx: tokio::sync::mpsc::Sender<mini_tunnel_agent::tunnel::MeshPeerUpdate>,
+    initial_peers: Vec<PeerInfo>,
+}
+
+fn spawn_mesh_membership_refresh(config: MeshMembershipRefresh) -> tokio::task::JoinHandle<()> {
+    let MeshMembershipRefresh {
+        coordinator_url,
+        network_id,
+        identity,
+        endpoint,
+        relay_server,
+        snapshot_tx,
+        allowlist_tx,
+        registry,
+        updates_tx,
+        initial_peers,
+    } = config;
+    tokio::spawn(async move {
+        let mut known = initial_peers
+            .into_iter()
+            .map(|peer| (peer.device_id.clone(), peer))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut pending = std::collections::HashMap::<String, tokio::task::JoinHandle<()>>::new();
+        let period = Duration::from_secs(30);
+        let mut refresh = tokio::time::interval(period);
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            refresh.tick().await;
+            let discovered = tokio::time::timeout(
+                Duration::from_secs(8),
+                discover_peers(&coordinator_url, &network_id, &identity),
+            )
+            .await;
+            let peers = match discovered {
+                Ok(Ok(peers)) => peers,
+                Ok(Err(error)) => {
+                    eprintln!("mesh membership refresh failed; keeping current peers: {error}");
+                    continue;
+                }
+                Err(_) => {
+                    eprintln!("mesh membership refresh timed out; keeping current peers");
+                    continue;
+                }
+            };
+            if peers.len() > 4096 {
+                eprintln!("mesh membership snapshot exceeds the local peer limit; ignoring it");
+                continue;
+            }
+            let allowed = peers
+                .iter()
+                .map(|peer| {
+                    decode_peer_key(&peer.public_key).map(|key| (peer.device_id.clone(), key))
+                })
+                .collect::<Result<Vec<_>, _>>();
+            let Ok(allowed) = allowed else {
+                eprintln!("mesh membership snapshot contains an invalid peer key; ignoring it");
+                continue;
+            };
+
+            let (removed, added) = mesh_membership_diff(&known, &peers);
+            let next = peers
+                .iter()
+                .map(|peer| (peer.device_id.clone(), peer.clone()))
+                .collect::<std::collections::HashMap<_, _>>();
+            for (device_id, address) in removed {
+                if let Some(task) = pending.remove(&device_id) {
+                    task.abort();
+                }
+                registry.write().await.remove(&device_id);
+                if let Ok(address) = address.parse() {
+                    let _ = updates_tx
+                        .send(mini_tunnel_agent::tunnel::MeshPeerUpdate::Remove(address))
+                        .await;
+                }
+                eprintln!("mesh peer {device_id} was removed or its address changed");
+            }
+
+            let mut additions = Vec::with_capacity(added.len());
+            for peer in added {
+                let address = match peer.assigned_ipv4.parse::<Ipv4Addr>() {
+                    Ok(address) => address,
+                    Err(_) => continue,
+                };
+                let (connector, probe, accepted_tx) = build_mesh_peer_connectors(
+                    endpoint.clone(),
+                    std::sync::Arc::clone(&identity),
+                    network_id.clone(),
+                    coordinator_url.clone(),
+                    peer.clone(),
+                    relay_server,
+                );
+                registry
+                    .write()
+                    .await
+                    .insert(peer.device_id.clone(), accepted_tx);
+                additions.push((peer, address, connector, probe));
+            }
+
+            if snapshot_tx.send(peers.clone()).is_err() || allowlist_tx.send(allowed).is_err() {
+                eprintln!("mesh membership dispatcher stopped");
+                return;
+            }
+            for (peer, address, connector, probe) in additions {
+                let connect = std::sync::Arc::clone(&connector);
+                let updates = updates_tx.clone();
+                let device_id = peer.device_id.clone();
+                let probe = Some(probe);
+                pending.insert(
+                    device_id.clone(),
+                    tokio::spawn(async move {
+                        let mut attempt = 0_u32;
+                        loop {
+                            match connect(false).await {
+                                Ok(channel) => {
+                                    let update = mini_tunnel_agent::tunnel::MeshPeerUpdate::Add(
+                                        mini_tunnel_agent::tunnel::ReconnectingPeer {
+                                            address,
+                                            channel: std::sync::Arc::new(channel),
+                                            connector,
+                                            probe,
+                                            probe_cooldown: Duration::from_secs(60),
+                                        },
+                                    );
+                                    if let Err(error) = updates.send(update).await
+                                        && let mini_tunnel_agent::tunnel::MeshPeerUpdate::Add(
+                                            peer,
+                                        ) = error.0
+                                    {
+                                        peer.channel.close();
+                                    }
+                                    return;
+                                }
+                                Err(error) => {
+                                    eprintln!(
+                                        "new mesh peer {device_id} connection failed: {error}"
+                                    );
+                                    tokio::time::sleep(mini_tunnel_agent::reconnect_delay(attempt))
+                                        .await;
+                                    attempt = attempt.saturating_add(1);
+                                }
+                            }
+                        }
+                    }),
+                );
+                eprintln!("discovered new mesh peer {} at {address}", peer.device_id);
+            }
+            known = next;
+        }
+    })
+}
+
+async fn validate_udp_probe(
+    channel: mini_tunnel_agent::PeerChannel,
+) -> Result<mini_tunnel_agent::PeerChannel, mini_tunnel_agent::IdentityError> {
+    let rtt = channel.probe_health(3, Duration::from_secs(2)).await?;
+    if rtt > Duration::from_millis(350) {
+        return Err(mini_tunnel_agent::IdentityError::Transport(
+            "direct path probe exceeded RTT threshold".to_owned(),
+        ));
+    }
+    Ok(channel)
 }
 
 fn candidates_for_path(candidates: &[String], reliable_only: bool) -> Vec<String> {
@@ -1368,6 +1616,7 @@ async fn run_peer_mesh(
         mini_tunnel_agent::tunnel::PeerConnector,
     )>,
     manage_routes: bool,
+    mut updates: tokio::sync::mpsc::Receiver<mini_tunnel_agent::tunnel::MeshPeerUpdate>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use mini_tunnel_agent::routing::{
         RouteLease, RoutingPlatform, SystemRouteRunner, install_peer_route,
@@ -1388,16 +1637,19 @@ async fn run_peer_mesh(
         .collect::<Result<Vec<_>, _>>()?;
     let interface = tun.name()?;
     let runner = SystemRouteRunner;
-    let mut routes: Vec<RouteLease> = Vec::new();
+    let mut routes: std::collections::HashMap<Ipv4Addr, RouteLease> =
+        std::collections::HashMap::new();
     let mut reconnecting_peers = Vec::with_capacity(prepared.len());
     for (device_id, peer_ipv4, channel, remote, connector, probe) in prepared {
         if manage_routes {
             match install_peer_route(&runner, RoutingPlatform::current(), &interface, peer_ipv4)
                 .await
             {
-                Ok(route) => routes.push(route),
+                Ok(route) => {
+                    routes.insert(peer_ipv4, route);
+                }
                 Err(error) => {
-                    for route in routes.drain(..).rev() {
+                    for route in routes.drain().map(|(_, route)| route) {
                         let _ = route.remove(&runner).await;
                     }
                     return Err(error.into());
@@ -1417,14 +1669,58 @@ async fn run_peer_mesh(
         });
     }
     println!("Mesh established on TUN interface {interface}");
-    let pump = mini_tunnel_agent::tunnel::pump_peer_mesh_reconnecting(tun, reconnecting_peers);
+    let (pump_updates_tx, pump_updates_rx) = tokio::sync::mpsc::channel(64);
+    let pump =
+        mini_tunnel_agent::tunnel::pump_peer_mesh_dynamic(tun, reconnecting_peers, pump_updates_rx);
     tokio::pin!(pump);
-    let tunnel_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = tokio::select! {
-        result = &mut pump => result.map_err(Into::into),
-        signal = tokio::signal::ctrl_c() => signal.map_err(Into::into),
+    let mut updates_open = true;
+    let tunnel_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = loop {
+        tokio::select! {
+            result = &mut pump => break result.map_err(Into::into),
+            signal = tokio::signal::ctrl_c() => break signal.map_err(Into::into),
+            update = async {
+                match updates_open {
+                    true => updates.recv().await,
+                    false => std::future::pending().await,
+                }
+            } => match update {
+                Some(mini_tunnel_agent::tunnel::MeshPeerUpdate::Add(peer)) => {
+                    let address = peer.address;
+                    if routes.contains_key(&address) {
+                        peer.channel.close();
+                        continue;
+                    }
+                    if manage_routes {
+                        match install_peer_route(&runner, RoutingPlatform::current(), &interface, address).await {
+                            Ok(route) => { routes.insert(address, route); }
+                            Err(error) => {
+                                eprintln!("could not add route for dynamic mesh peer {address}: {error}");
+                                peer.channel.close();
+                                continue;
+                            }
+                        }
+                    }
+                    if let Err(error) = pump_updates_tx.send(mini_tunnel_agent::tunnel::MeshPeerUpdate::Add(peer)).await {
+                        if let Some(route) = routes.remove(&address) {
+                            let _ = route.remove(&runner).await;
+                        }
+                        eprintln!("mesh packet pump stopped before peer {address} could be added: {error}");
+                    }
+                }
+                Some(mini_tunnel_agent::tunnel::MeshPeerUpdate::Remove(address)) => {
+                    let _ = pump_updates_tx.send(mini_tunnel_agent::tunnel::MeshPeerUpdate::Remove(address)).await;
+                    if let Some(route) = routes.remove(&address)
+                        && let Err(error) = route.remove(&runner).await
+                    {
+                        eprintln!("could not remove route for mesh peer {address}: {error}");
+                    }
+                }
+                None => updates_open = false,
+            }
+        }
     };
     let mut cleanup_error = None;
-    for route in routes.into_iter().rev() {
+    for route in routes.into_values() {
         if let Err(error) = route.remove(&runner).await {
             cleanup_error.get_or_insert(error);
         }
@@ -1632,5 +1928,40 @@ mod tests {
                 .is_err()
         );
         assert!(resolve_saved_tun_parameters(&membership, None, Some(24)).is_err());
+    }
+
+    #[test]
+    fn mesh_membership_diff_is_idempotent_and_reports_add_remove_and_address_change() {
+        let peer = |device_id: &str, assigned_ipv4: &str| PeerInfo {
+            device_id: device_id.to_owned(),
+            assigned_ipv4: assigned_ipv4.to_owned(),
+            public_key: URL_SAFE_NO_PAD.encode([1_u8; 32]),
+            candidates: Vec::new(),
+        };
+        let first = peer("peer-a", "10.77.0.2");
+        let second = peer("peer-b", "10.77.0.3");
+        let known = [
+            (first.device_id.clone(), first.clone()),
+            (second.device_id.clone(), second.clone()),
+        ]
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+
+        let (removed, added) = mesh_membership_diff(&known, &[first.clone(), second.clone()]);
+        assert!(removed.is_empty());
+        assert!(added.is_empty());
+
+        let replacement = peer("peer-b", "10.77.0.9");
+        let newcomer = peer("peer-c", "10.77.0.4");
+        let (removed, added) =
+            mesh_membership_diff(&known, &[replacement.clone(), newcomer.clone()]);
+        assert_eq!(
+            removed,
+            vec![
+                ("peer-a".to_owned(), "10.77.0.2".to_owned()),
+                ("peer-b".to_owned(), "10.77.0.3".to_owned())
+            ]
+        );
+        assert_eq!(added, vec![replacement, newcomer]);
     }
 }
