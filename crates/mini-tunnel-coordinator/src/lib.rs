@@ -30,7 +30,8 @@ use mini_tunnel_protocol::{
     RELAY_TICKET_VERSION, RelayTicketClaims, RelayTicketRequest, RelayTicketResponse,
     RevokeMemberRequest, RevokeMemberResponse, candidate_signing_bytes,
     candidate_signing_bytes_with_ice, device_id_from_public_key, issue_relay_ticket,
-    join_signing_bytes, peers_signing_bytes, relay_ticket_request_signing_bytes,
+    join_signing_bytes, overlay_ipv6_prefix, peers_signing_bytes,
+    relay_ticket_request_signing_bytes,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -434,7 +435,7 @@ impl CoordinatorState {
         }
         let network_id = loop {
             let id = Uuid::new_v4();
-            if !store.networks.contains_key(&id) {
+            if !store.networks.contains_key(&id) && ipv6_prefix_available(&store, id) {
                 break id;
             }
         };
@@ -1445,6 +1446,14 @@ fn cidrs_overlap(left: Ipv4Net, right: Ipv4Net) -> bool {
     left_start <= right_end && right_start <= left_end
 }
 
+fn ipv6_prefix_available(store: &Store, candidate: Uuid) -> bool {
+    let candidate = overlay_ipv6_prefix(&candidate.to_string());
+    store
+        .networks
+        .keys()
+        .all(|existing| overlay_ipv6_prefix(&existing.to_string()) != candidate)
+}
+
 async fn shutdown_signal() {
     if let Err(error) = tokio::signal::ctrl_c().await {
         tracing::error!(%error, "failed to listen for shutdown signal");
@@ -1457,6 +1466,25 @@ mod tests {
     use axum::{body::Body, extract::connect_info::ConnectInfo, http::Request as HttpRequest};
     use ed25519_dalek::{Signer, SigningKey};
     use tower::ServiceExt;
+
+    #[test]
+    fn network_ids_with_colliding_ula_prefixes_are_rejected() {
+        let existing = Uuid::parse_str("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let collision = Uuid::parse_str("123e4567-e89b-42d3-b456-426614174000").unwrap();
+        let unique = Uuid::parse_str("223e4567-e89b-42d3-a456-426614174000").unwrap();
+        let network = Network {
+            cidr: "10.77.0.0/24".parse().unwrap(),
+            admin_token_hash: [0; 32],
+            invites: HashMap::new(),
+            members: HashMap::new(),
+            assigned_addresses: HashSet::new(),
+        };
+        let store = Store {
+            networks: HashMap::from([(existing, network)]),
+        };
+        assert!(!ipv6_prefix_available(&store, collision));
+        assert!(ipv6_prefix_available(&store, unique));
+    }
 
     #[test]
     fn candidate_address_accepts_srflx_and_rejects_invalid_related_address() {

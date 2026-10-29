@@ -7,6 +7,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::net::{Ipv4Addr, Ipv6Addr};
+use uuid::Uuid;
 
 /// Current version of the control message envelope.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -19,6 +21,27 @@ pub fn device_id_from_public_key(public_key: &[u8; 32]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// Derive a stable locally administered ULA /64 prefix from a coordinator network UUID.
+///
+/// The coordinator checks that derived prefixes are unique among its networks. This pure mapping
+/// lets existing IPv4 lease responses remain wire-compatible while every member derives IPv6.
+#[must_use]
+pub fn overlay_ipv6_prefix(network_id: &str) -> Option<Ipv6Addr> {
+    let network_id = Uuid::parse_str(network_id).ok()?;
+    let mut octets = [0_u8; 16];
+    octets[0] = 0xfd;
+    octets[1..8].copy_from_slice(&network_id.as_bytes()[..7]);
+    Some(Ipv6Addr::from(octets))
+}
+
+/// Derive a member's stable ULA from its network UUID and unique IPv4 lease.
+#[must_use]
+pub fn overlay_ipv6_address(network_id: &str, assigned_ipv4: Ipv4Addr) -> Option<Ipv6Addr> {
+    let mut octets = overlay_ipv6_prefix(network_id)?.octets();
+    octets[12..16].copy_from_slice(&assigned_ipv4.octets());
+    Some(Ipv6Addr::from(octets))
 }
 
 fn signing_bytes(domain: &[u8], fields: &[&[u8]]) -> Vec<u8> {
@@ -433,6 +456,27 @@ pub enum ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlay_ipv6_addresses_are_stable_unique_ula_members() {
+        let network = "123e4567-e89b-42d3-a456-426614174000";
+        let first = overlay_ipv6_address(network, "10.77.0.1".parse().unwrap()).unwrap();
+        let second = overlay_ipv6_address(network, "10.77.0.2".parse().unwrap()).unwrap();
+        assert_eq!(
+            first,
+            "fd12:3e45:67e8:9b42::a4d:1".parse::<Ipv6Addr>().unwrap()
+        );
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            overlay_ipv6_address(network, "10.77.0.1".parse().unwrap()).unwrap()
+        );
+        assert_ne!(
+            overlay_ipv6_prefix(network),
+            overlay_ipv6_prefix("223e4567-e89b-42d3-a456-426614174000")
+        );
+        assert!(overlay_ipv6_prefix("not-a-uuid").is_none());
+    }
 
     fn claims() -> RelayTicketClaims {
         RelayTicketClaims {
