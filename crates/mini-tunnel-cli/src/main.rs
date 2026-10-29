@@ -19,7 +19,8 @@ use mini_tunnel_protocol::{
     CreateInviteResponse, CreateNetworkRequest, CreateNetworkResponse, JoinNetworkRequest,
     JoinNetworkResponse, PeerInfo, PeerListRequest, PeerListResponse, RelayTicketRequest,
     RelayTicketResponse, RevokeMemberRequest, RevokeMemberResponse, candidate_signing_bytes,
-    join_signing_bytes, peers_signing_bytes, relay_ticket_request_signing_bytes,
+    candidate_signing_bytes_with_ice, join_signing_bytes, peers_signing_bytes,
+    relay_ticket_request_signing_bytes,
 };
 use serde::Deserialize;
 
@@ -296,6 +297,9 @@ enum TunnelCommand {
         /// Optional RFC 8489 STUN server used to discover and publish this UDP socket's mapped address.
         #[arg(long)]
         stun_server: Option<SocketAddr>,
+        /// Enable experimental RFC 8445 checks over the same UDP socket as QUIC.
+        #[arg(long)]
+        ice: bool,
         /// Additional candidate address to publish; may be repeated.
         #[arg(long = "candidate")]
         candidates: Vec<String>,
@@ -329,6 +333,9 @@ enum TunnelCommand {
         /// Optional RFC 8489 STUN server used to discover and publish this UDP socket's mapped address.
         #[arg(long)]
         stun_server: Option<SocketAddr>,
+        /// Enable experimental RFC 8445 checks over the same UDP socket as QUIC.
+        #[arg(long)]
+        ice: bool,
         /// Additional candidate address to publish; may be repeated.
         #[arg(long = "candidate")]
         candidates: Vec<String>,
@@ -625,6 +632,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 TunnelCommand::Connect {
                     bind,
                     stun_server,
+                    ice,
                     candidates,
                     network_id,
                     peer_id,
@@ -641,6 +649,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         &identity,
                         bind,
                         stun_server,
+                        ice,
                         &candidates,
                         &network_id,
                         &coordinator_url,
@@ -654,12 +663,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 discover_peer(&coordinator_url, &network_id, &peer_id, &identity)
                                     .await?;
                             let peer_key = decode_peer_key(&peer.public_key)?;
-                            let (channel, remote) = mini_tunnel_agent::connect_peer_candidates(
+                            let (channel, remote) = connect_tunnel_peer(
                                 &endpoint,
-                                &peer.candidates,
+                                &peer,
                                 &network_id,
                                 &identity,
-                                &peer.device_id,
                                 peer_key,
                             )
                             .await?;
@@ -680,6 +688,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     bind,
                     tcp_bind,
                     stun_server,
+                    ice,
                     candidates,
                     network_id,
                     peer_id,
@@ -700,6 +709,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         &identity,
                         bind,
                         stun_server,
+                        ice,
                         &candidates,
                         &network_id,
                         &coordinator_url,
@@ -715,6 +725,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let result = async {
                             let peer = discover_peer(&coordinator_url, &network_id, &peer_id, &identity).await?;
                             let peer_key = decode_peer_key(&peer.public_key)?;
+                            let _ = select_ice_peer_address(&endpoint, &peer, &identity).await;
                             let channel = mini_tunnel_agent::accept_peer(
                                 &endpoint, &network_id, &identity, &peer.device_id, peer_key,
                             );
@@ -762,6 +773,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         &identity,
                         bind,
                         stun_server,
+                        false,
                         &candidates,
                         &network_id,
                         &coordinator_url,
@@ -780,7 +792,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     for peer in peers.iter().cloned() {
                         let keep_outbound = local_device_id < peer.device_id;
                         let (connector, probe, accepted_peer_tx) = build_mesh_peer_connectors(
-                            endpoint.clone(),
+                            endpoint.endpoint.clone(),
                             std::sync::Arc::clone(&identity),
                             network_id.clone(),
                             coordinator_url.clone(),
@@ -999,7 +1011,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         coordinator_url: coordinator_url.clone(),
                         network_id: network_id.clone(),
                         identity: std::sync::Arc::clone(&identity),
-                        endpoint: endpoint.clone(),
+                        endpoint: endpoint.endpoint.clone(),
                         relay_server,
                         snapshot_tx,
                         allowlist_tx,
@@ -1346,6 +1358,106 @@ async fn run_peer_tunnel(
         route.remove(&runner).await?;
     }
     tunnel_result
+}
+
+async fn connect_tunnel_peer(
+    endpoint: &TunnelEndpoint,
+    peer: &PeerInfo,
+    network_id: &str,
+    identity: &mini_tunnel_agent::Identity,
+    peer_key: [u8; 32],
+) -> Result<(mini_tunnel_agent::PeerChannel, SocketAddr), mini_tunnel_agent::IdentityError> {
+    if let Some(remote) = select_ice_peer_address(endpoint, peer, identity).await {
+        match mini_tunnel_agent::connect_peer(
+            &endpoint.endpoint,
+            remote,
+            network_id,
+            identity,
+            &peer.device_id,
+            peer_key,
+        )
+        .await
+        {
+            Ok(channel) => return Ok((channel, remote)),
+            Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer) => {
+                return Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer);
+            }
+            Err(error) => {
+                eprintln!("ICE selected {remote}, retrying advertised candidates: {error}")
+            }
+        }
+    }
+    mini_tunnel_agent::connect_peer_candidates(
+        &endpoint.endpoint,
+        &peer.candidates,
+        network_id,
+        identity,
+        &peer.device_id,
+        peer_key,
+    )
+    .await
+    .map_err(|error| match error {
+        mini_tunnel_agent::CandidateConnectError::UnauthorizedPeer => {
+            mini_tunnel_agent::IdentityError::UnauthorizedPeer
+        }
+        other => mini_tunnel_agent::IdentityError::Transport(other.to_string()),
+    })
+}
+
+async fn select_ice_peer_address(
+    endpoint: &TunnelEndpoint,
+    peer: &PeerInfo,
+    identity: &mini_tunnel_agent::Identity,
+) -> Option<SocketAddr> {
+    let local = endpoint.ice.as_ref()?;
+    let remote = peer.ice_credentials.as_ref()?;
+    let remote_candidates = udp_candidate_addresses(&peer.candidates);
+    if remote_candidates.is_empty() || local.local_candidates.is_empty() {
+        return None;
+    }
+    let mut datagrams = match local.router.register(local.credentials.ufrag.clone(), 32) {
+        Ok(datagrams) => datagrams,
+        Err(error) => {
+            tracing::warn!(peer_id = %peer.device_id, %error, "could not start peer ICE session");
+            return None;
+        }
+    };
+    let local_ufrag = local.credentials.ufrag.clone();
+    let controlling = identity.device_id() < peer.device_id;
+    let result = async {
+        let mut driver = mini_tunnel_agent::ice::IceAgentDriver::for_peer(
+            &local.credentials,
+            remote,
+            &local.local_candidates,
+            &remote_candidates,
+            controlling,
+            std::time::Instant::now(),
+        )
+        .map_err(|error| error.to_string())?;
+        driver
+            .run_checks(
+                &local.socket,
+                &local.router,
+                &local_ufrag,
+                &mut datagrams,
+                Duration::from_secs(5),
+            )
+            .await
+            .map(|(_, remote)| remote)
+            .map_err(|error| error.to_string())
+    }
+    .await;
+    let _ = local.router.unregister(&local_ufrag);
+    match result {
+        Ok(remote) => {
+            tracing::info!(peer_id = %peer.device_id, %remote, "ICE nominated a direct peer path");
+            Some(remote)
+        }
+        Err(error) => {
+            tracing::debug!(peer_id = %peer.device_id, %error, "ICE checks failed; using transport fallback");
+            None
+        }
+    }
 }
 
 async fn connect_mesh_peer(
@@ -1937,16 +2049,161 @@ async fn run_peer_mesh(
     tunnel_result
 }
 
+#[derive(Clone)]
+struct TunnelEndpoint {
+    endpoint: quinn::Endpoint,
+    ice: Option<TunnelIceState>,
+}
+
+#[derive(Clone)]
+struct TunnelIceState {
+    credentials: mini_tunnel_protocol::IceCredentials,
+    socket: mini_tunnel_agent::ice::IceSocketHandle,
+    router: mini_tunnel_agent::ice::IceDatagramRouterHandle,
+    local_candidates: Vec<SocketAddr>,
+}
+
+impl std::ops::Deref for TunnelEndpoint {
+    type Target = quinn::Endpoint;
+
+    fn deref(&self) -> &Self::Target {
+        &self.endpoint
+    }
+}
+
 async fn create_tunnel_endpoint(
     identity: &mini_tunnel_agent::Identity,
     bind: SocketAddr,
     stun_server: Option<SocketAddr>,
+    enable_ice: bool,
     extra_candidates: &[String],
     network_id: &str,
     coordinator_url: &str,
-) -> Result<quinn::Endpoint, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<TunnelEndpoint, Box<dyn std::error::Error + Send + Sync>> {
+    if enable_ice {
+        let (iced, mapped_address) = match stun_server {
+            Some(server) => {
+                let (endpoint, mapped) = mini_tunnel_agent::ice::peer_endpoint_with_ice_and_stun(
+                    identity, bind, server, 64,
+                )
+                .await?;
+                (endpoint, Some(mapped))
+            }
+            None => (
+                mini_tunnel_agent::ice::peer_endpoint_with_ice(identity, bind, 64)?,
+                None,
+            ),
+        };
+        let bound_address = iced.socket.local_addr()?;
+        let mut candidates = extra_candidates.to_vec();
+        if !bound_address.ip().is_unspecified() {
+            candidates.push(bound_address.to_string());
+        }
+        if let Some(mapped_address) = mapped_address {
+            candidates.push(mapped_address.to_string());
+        }
+        candidates.sort();
+        candidates.dedup();
+        if candidates.is_empty() {
+            return Err(
+                "ICE needs --stun-server, an explicit --candidate, or a concrete --bind address"
+                    .into(),
+            );
+        }
+        if candidates.len() > 8 {
+            return Err("at most eight peer candidates can be published".into());
+        }
+        let mut local_candidates = vec![bound_address];
+        local_candidates.extend(udp_candidate_addresses(&candidates));
+        local_candidates.sort();
+        local_candidates.dedup();
+        // Keep the socket's local address first; rtc-ice uses this address to match inbound checks
+        // against the local host candidate while the public mapping remains an additional pair.
+        local_candidates.sort_by_key(|address| *address != bound_address);
+        let credentials = mini_tunnel_agent::ice::generate_ice_credentials(1)?;
+        let device_id = identity.device_id();
+        let timestamp_ms = now_ms()?;
+        let request = CandidateUpdateRequest {
+            device_id: device_id.clone(),
+            timestamp_ms,
+            signature: identity.sign(&candidate_signing_bytes_with_ice(
+                network_id,
+                &device_id,
+                timestamp_ms,
+                &candidates,
+                &credentials,
+            )),
+            candidates,
+            ice_credentials: Some(credentials.clone()),
+        };
+        let path = format!("/v1/networks/{network_id}/candidates");
+        let _: CandidateUpdateResponse = post_json(coordinator_url, &path, &request).await?;
+        println!(
+            "Published ICE credentials and {} peer candidate(s)",
+            request.candidates.len()
+        );
+        let refresh_network = network_id.to_owned();
+        let refresh_url = coordinator_url.to_owned();
+        let refresh_candidates = request.candidates.clone();
+        let refresh_credentials = credentials.clone();
+        let refresh_device_id = device_id.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let identity = match mini_tunnel_agent::Identity::load_or_create() {
+                    Ok(identity) if identity.device_id() == refresh_device_id => identity,
+                    Ok(_) => {
+                        tracing::error!("device identity changed; stopping ICE credential refresh");
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "could not load identity for ICE credential refresh");
+                        continue;
+                    }
+                };
+                let timestamp_ms = match now_ms() {
+                    Ok(timestamp_ms) => timestamp_ms,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not timestamp ICE credential refresh");
+                        continue;
+                    }
+                };
+                let request = CandidateUpdateRequest {
+                    device_id: refresh_device_id.clone(),
+                    timestamp_ms,
+                    signature: identity.sign(&candidate_signing_bytes_with_ice(
+                        &refresh_network,
+                        &refresh_device_id,
+                        timestamp_ms,
+                        &refresh_candidates,
+                        &refresh_credentials,
+                    )),
+                    candidates: refresh_candidates.clone(),
+                    ice_credentials: Some(refresh_credentials.clone()),
+                };
+                let path = format!("/v1/networks/{refresh_network}/candidates");
+                if let Err(error) =
+                    post_json::<_, CandidateUpdateResponse>(&refresh_url, &path, &request).await
+                {
+                    tracing::warn!(%error, "ICE credential refresh failed; peer fallback remains available");
+                }
+            }
+        });
+        return Ok(TunnelEndpoint {
+            endpoint: iced.endpoint,
+            ice: Some(TunnelIceState {
+                credentials,
+                socket: iced.socket,
+                router: iced.ice_router,
+                local_candidates,
+            }),
+        });
+    }
     if stun_server.is_none() && extra_candidates.is_empty() {
-        return Ok(mini_tunnel_agent::peer_endpoint(identity, bind)?);
+        return Ok(TunnelEndpoint {
+            endpoint: mini_tunnel_agent::peer_endpoint(identity, bind)?,
+            ice: None,
+        });
     }
     let (endpoint, mapped_address) = match stun_server {
         Some(server) => {
@@ -1983,7 +2240,25 @@ async fn create_tunnel_endpoint(
     let path = format!("/v1/networks/{network_id}/candidates");
     let _: CandidateUpdateResponse = post_json(coordinator_url, &path, &request).await?;
     println!("Published {candidate_count} peer candidate(s)");
-    Ok(endpoint)
+    Ok(TunnelEndpoint {
+        endpoint,
+        ice: None,
+    })
+}
+
+fn udp_candidate_addresses(candidates: &[String]) -> Vec<SocketAddr> {
+    mini_tunnel_agent::candidate::CandidateChecklist::from_signaled(candidates, 8)
+        .map(|checklist| {
+            checklist
+                .checks()
+                .iter()
+                .filter(|check| {
+                    check.transport == mini_tunnel_agent::candidate::CandidateTransport::Udp
+                })
+                .map(|check| check.address)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn create_tun(
@@ -2102,6 +2377,130 @@ fn print_tunnel_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn capture_candidate_update(
+        State(requests): State<std::sync::Arc<tokio::sync::Mutex<Vec<CandidateUpdateRequest>>>>,
+        axum::Json(request): axum::Json<CandidateUpdateRequest>,
+    ) -> axum::Json<CandidateUpdateResponse> {
+        requests.lock().await.push(request);
+        axum::Json(CandidateUpdateResponse { accepted: true })
+    }
+
+    #[tokio::test]
+    async fn tunnel_cli_publishes_ice_credentials_and_connects_over_nominated_path() {
+        let requests = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock coordinator");
+        let coordinator = listener.local_addr().expect("coordinator address");
+        let app = Router::new()
+            .route(
+                "/v1/networks/test-network/candidates",
+                axum::routing::post(capture_candidate_update),
+            )
+            .with_state(std::sync::Arc::clone(&requests));
+        let coordinator_task = tokio::spawn(async move { axum::serve(listener, app).await });
+        let temp =
+            std::env::temp_dir().join(format!("mini-tunnel-cli-ice-{}", uuid::Uuid::new_v4()));
+        let identity_a = mini_tunnel_agent::Identity::load_or_create_at(temp.join("a/device.key"))
+            .expect("identity A");
+        let identity_b = mini_tunnel_agent::Identity::load_or_create_at(temp.join("b/device.key"))
+            .expect("identity B");
+        let endpoint_a = create_tunnel_endpoint(
+            &identity_a,
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            true,
+            &[],
+            "test-network",
+            &format!("http://{coordinator}"),
+        )
+        .await
+        .expect("create ICE tunnel endpoint A");
+        let endpoint_b = create_tunnel_endpoint(
+            &identity_b,
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            true,
+            &[],
+            "test-network",
+            &format!("http://{coordinator}"),
+        )
+        .await
+        .expect("create ICE tunnel endpoint B");
+        let published = requests.lock().await.clone();
+        assert_eq!(published.len(), 2);
+        for (identity, request) in [(&identity_a, &published[0]), (&identity_b, &published[1])] {
+            let credentials = request.ice_credentials.as_ref().expect("ICE credentials");
+            assert_eq!(
+                request.signature,
+                identity.sign(&candidate_signing_bytes_with_ice(
+                    "test-network",
+                    &request.device_id,
+                    request.timestamp_ms,
+                    &request.candidates,
+                    credentials,
+                ))
+            );
+        }
+        let peer_a = PeerInfo {
+            device_id: identity_a.device_id(),
+            assigned_ipv4: "10.70.0.1".to_owned(),
+            public_key: identity_a.public_key_encoded(),
+            candidates: published[0].candidates.clone(),
+            ice_credentials: published[0].ice_credentials.clone(),
+        };
+        let peer_b = PeerInfo {
+            device_id: identity_b.device_id(),
+            assigned_ipv4: "10.70.0.2".to_owned(),
+            public_key: identity_b.public_key_encoded(),
+            candidates: published[1].candidates.clone(),
+            ice_credentials: published[1].ice_credentials.clone(),
+        };
+        let server_endpoint = endpoint_b.endpoint.clone();
+        let peer_id_a = peer_a.device_id.clone();
+        let peer_key_a = identity_a.public_key();
+        let peer_key_b = identity_b.public_key();
+        let accept = mini_tunnel_agent::accept_peer(
+            &server_endpoint,
+            "test-network",
+            &identity_b,
+            &peer_id_a,
+            peer_key_a,
+        );
+        let (connected, selected_b, accepted) = tokio::join!(
+            connect_tunnel_peer(
+                &endpoint_a,
+                &peer_b,
+                "test-network",
+                &identity_a,
+                peer_key_b,
+            ),
+            select_ice_peer_address(&endpoint_b, &peer_a, &identity_b),
+            accept,
+        );
+        let (channel_a, remote) = connected.expect("connect via ICE-nominated path");
+        assert_eq!(Some(endpoint_a.endpoint.local_addr().unwrap()), selected_b);
+        assert_eq!(remote, endpoint_b.endpoint.local_addr().unwrap());
+        let channel_b = accepted.expect("accept peer");
+        channel_a
+            .send_packet(b"cli-ice-e2e")
+            .await
+            .expect("send tunnel payload");
+        assert_eq!(
+            channel_b
+                .recv_packet()
+                .await
+                .expect("receive tunnel payload"),
+            b"cli-ice-e2e"
+        );
+        channel_a.close();
+        channel_b.close();
+        endpoint_a.endpoint.close(0_u32.into(), b"test complete");
+        endpoint_b.endpoint.close(0_u32.into(), b"test complete");
+        coordinator_task.abort();
+        std::fs::remove_dir_all(temp).expect("remove test identities");
+    }
 
     #[test]
     fn relay_connection_limits_require_positive_values() {

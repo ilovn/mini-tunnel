@@ -390,6 +390,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn iced_endpoint_keeps_the_same_socket_that_was_probed_by_stun() {
+        let dir =
+            std::env::temp_dir().join(format!("mini-tunnel-ice-stun-{}", uuid::Uuid::new_v4()));
+        let identity = crate::Identity::load_or_create_at(dir.join("device.key"))
+            .expect("create test identity");
+        let server = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake STUN");
+        let server_address = server.local_addr().expect("STUN address");
+        let responder = tokio::spawn(async move {
+            let mut request = [0; HEADER_LEN];
+            let (length, peer) = server
+                .recv_from(&mut request)
+                .await
+                .expect("receive request");
+            assert_eq!(length, HEADER_LEN);
+            let transaction = request[8..20].try_into().expect("transaction ID");
+            let mapped = SocketAddr::from(([198, 51, 100, 10], peer.port()));
+            server
+                .send_to(&mapped_response(mapped, transaction), peer)
+                .await
+                .expect("send STUN response");
+            peer.port()
+        });
+        let (endpoint, mapped) = crate::ice::peer_endpoint_with_ice_and_stun(
+            &identity,
+            "127.0.0.1:0".parse().unwrap(),
+            server_address,
+            8,
+        )
+        .await
+        .expect("create ICE/STUN endpoint");
+        let queried_port = responder.await.expect("STUN responder");
+        assert_eq!(endpoint.socket.local_addr().unwrap().port(), queried_port);
+        assert_eq!(endpoint.endpoint.local_addr().unwrap().port(), queried_port);
+        assert_eq!(mapped.port(), queried_port);
+        endpoint.endpoint.close(0_u32.into(), b"test complete");
+        std::fs::remove_dir_all(dir).expect("remove test identity");
+    }
+
+    #[tokio::test]
     async fn binding_retries_with_the_same_transaction_id_after_timeout() {
         let server = UdpSocket::bind("127.0.0.1:0")
             .await

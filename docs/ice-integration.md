@@ -2,7 +2,7 @@
 
 Status: implementation in progress. The current peer path remains the existing bounded UDP candidate dialer with TCP and relay fallback; it must not be described as RFC 8445 ICE until the checks below are integrated and verified.
 
-Prototype progress: `mini-tunnel-agent::ice::IceAgentDriver` wraps the Sans-I/O agent and `peer_endpoint_with_ice` provides an optional Quinn endpoint using a same-socket demultiplexer. Its bounded per-peer router dispatches checks by the recipient ufrag and routes responses only for addresses accepted by ICE authentication. A loopback test now nominates a pair over real shared UDP sockets, then establishes the pinned QUIC peer channel over that endpoint. The candidate-update API accepts member-signed ICE credentials and serves them only to same-network peers from bounded volatile memory. The regular CLI update still publishes candidates only, and the default peer setup does not yet create/use the ICE endpoint.
+Prototype progress: `mini_tunnel_agent::ice::IceAgentDriver` wraps the Sans-I/O agent and `peer_endpoint_with_ice` provides a Quinn endpoint using a same-socket demultiplexer. Its bounded per-peer router dispatches checks by the recipient ufrag and routes responses only for addresses accepted by ICE authentication. A loopback test nominates a pair over real shared UDP sockets, then establishes the pinned QUIC peer channel over that endpoint. Single-peer tunnel Connect/Listen now offer opt-in `--ice`, publish member-signed ephemeral credentials, refresh them every 60 seconds, run checks before QUIC setup, and fall back to the candidate dialer when ICE is unavailable or fails. Mesh and the default peer setup remain on the existing path; public NAT traversal is not verified.
 
 ## Selected ICE engine
 
@@ -20,15 +20,15 @@ The socket adapter must preserve Quinn's packet metadata and readiness behavior.
 
 ## Signaling and compatibility
 
-ICE credentials (ufrag/password) and candidate generation are ephemeral per endpoint generation. They are authenticated by the enrolled device key and returned only in the same-network peer view. The coordinator keeps them in a bounded in-memory map for at most two minutes. Never write passwords to logs. Persist candidate addresses as today, but keep ICE credentials out of the coordinator's durable snapshot; restart requires peers to publish fresh credentials.
+ICE credentials (ufrag/password) and candidate generation are ephemeral per endpoint generation. They are authenticated by the enrolled device key and returned only in the same-network peer view. The coordinator keeps them in a bounded in-memory map for at most two minutes; ICE-enabled CLI endpoints refresh at 60-second intervals. Never write passwords to logs. Persist candidate addresses as today, but keep ICE credentials out of the coordinator's durable snapshot; restart requires peers to publish fresh credentials.
 
-Negotiate ICE capability during the authenticated peer handshake. A peer pair uses ICE only when both endpoints advertise the same supported capability and valid generation; otherwise it falls back to the current candidate dialer. Keep TCP and ticket-authorized relay selection after ICE failure. Device-ID ordering provides the deterministic ICE role proposal, while RFC 8445 role-conflict handling remains enabled because both processes can restart or observe stale state.
+The opt-in CLI uses ICE only when both same-network peer snapshots contain current credentials and usable UDP candidates; otherwise it falls back to the current candidate dialer. Keep TCP and ticket-authorized relay selection after ICE failure. Device-ID ordering provides the deterministic ICE role proposal, while RFC 8445 role-conflict handling remains enabled because both processes can restart or observe stale state. A capability bit in the peer handshake and mesh integration remain future work.
 
 ## Required verification before enabling by default
 
-- Deterministic Sans-I/O tests for authenticated checks, controlling/controlled roles, conflict handling, peer-reflexive candidates, nomination, timeout and ICE restart.
+- Deterministic Sans-I/O tests for authenticated checks, controlling/controlled roles and nomination. Conflict handling, peer-reflexive candidates, restart, and longer consent/timeout behavior still need dedicated tests.
 - Same-socket UDP demultiplexer tests for valid STUN, QUIC-shaped datagrams, malformed packets, multi-datagram batches and a full bounded ICE queue.
-- End-to-end loopback QUIC through the wrapped socket, proving existing peer identity/TLS pinning remains active after nomination.
+- End-to-end CLI loopback coverage publishes signed credentials, runs checks over the shared socket, nominates a pair, then transfers a packet over the pinned QUIC connection.
 - Regression tests proving older peers continue using the existing UDP/TCP/relay path.
 - A real NAT matrix covering endpoint-independent, address-dependent and address-and-port-dependent mappings, plus one-sided and symmetric NAT. Loopback tests cannot establish public NAT traversal success.
 

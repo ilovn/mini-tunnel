@@ -329,6 +329,44 @@ pub fn peer_endpoint_with_ice(
     }
     let socket = std::net::UdpSocket::bind(bind_addr)
         .map_err(|error| crate::IdentityError::Transport(error.to_string()))?;
+    iced_endpoint_from_socket(identity, socket, queue_capacity)
+}
+
+/// Probe a STUN server and create the ICE/QUIC endpoint from that exact UDP socket.
+pub async fn peer_endpoint_with_ice_and_stun(
+    identity: &crate::Identity,
+    bind_addr: SocketAddr,
+    stun_server: SocketAddr,
+    queue_capacity: usize,
+) -> Result<(IcedPeerEndpoint, SocketAddr), crate::IdentityError> {
+    if !(1..=MAX_SOCKET_QUEUE_CAPACITY).contains(&queue_capacity) {
+        return Err(crate::IdentityError::Transport(format!(
+            "ICE socket queue capacity must be between 1 and {MAX_SOCKET_QUEUE_CAPACITY}"
+        )));
+    }
+    let socket = UdpSocket::bind(bind_addr)
+        .await
+        .map_err(|error| crate::IdentityError::Transport(error.to_string()))?;
+    let mapped_address = crate::stun::discover_mapped_address(&socket, stun_server)
+        .await
+        .map_err(|error| crate::IdentityError::Transport(error.to_string()))?;
+    let socket = socket
+        .into_std()
+        .map_err(|error| crate::IdentityError::Transport(error.to_string()))?;
+    let endpoint = iced_endpoint_from_socket(identity, socket, queue_capacity)?;
+    Ok((endpoint, mapped_address))
+}
+
+fn iced_endpoint_from_socket(
+    identity: &crate::Identity,
+    socket: std::net::UdpSocket,
+    queue_capacity: usize,
+) -> Result<IcedPeerEndpoint, crate::IdentityError> {
+    if !(1..=MAX_SOCKET_QUEUE_CAPACITY).contains(&queue_capacity) {
+        return Err(crate::IdentityError::Transport(format!(
+            "ICE socket queue capacity must be between 1 and {MAX_SOCKET_QUEUE_CAPACITY}"
+        )));
+    }
     socket
         .set_nonblocking(true)
         .map_err(|error| crate::IdentityError::Transport(error.to_string()))?;
@@ -920,7 +958,7 @@ mod tests {
             IceAgentDriver::for_peer(
                 &local,
                 &remote,
-                &["127.0.0.1:41001".parse().unwrap()],
+                &["0.0.0.0:41001".parse().unwrap()],
                 &["127.0.0.1:41002".parse().unwrap()],
                 true,
                 now,

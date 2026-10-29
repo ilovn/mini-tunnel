@@ -152,7 +152,7 @@ TCP fallback 的帧格式：`u32_be frame_length | encrypted_packet`，最大 fr
 
 **阶段 2：网络兼容**：TCP 直连和 TLS/TCP relay、自动降级/恢复迟滞、Windows TUN、IPv6、服务端多副本、升级/密钥轮换。
 
-**当前实现边界（2026-10）**：已经具备 STUN 映射发现、有限候选列表、UDP 优先/TCP 次选的有界拨号、设备身份认证后选择会话，以及 ticket 中继兜底；这属于 ICE-inspired 候选检查，不是 RFC 8445 Full ICE。尚缺 ICE STUN connectivity-check 属性、controlling/controlled 角色冲突处理、peer-reflexive candidate、triggered checks 与标准 nomination。不能据此保证对称 NAT/UDP QoS 网络下的直连；中继仍是可靠兜底。
+**当前实现边界（2026-10）**：已有 STUN 映射发现、有限候选列表、UDP 优先/TCP 次选的有界拨号、多 peer mesh、链路探测和 ticket 中继兜底。单 peer Connect/Listen 提供实验性 `--ice` 路径，在同一 socket 上用 RFC 8445 Agent 执行认证 connectivity checks 和 nomination；未启用或检查失败时回退现有候选拨号。ICE 尚未接入 mesh，候选 gathering 仍有限，且缺少实网 NAT/QoS 矩阵、重启和拥塞场景验证；不能据此保证对称 NAT 下的直连，中继仍是兜底。
 
 **阶段 3：规模和策略**：子网路由、多网络、管理员策略、区域 relay 调度、可选 DNS、容量和抗滥用加强。广播、多播、L2 VLAN 桥接需单独评审，不属于首版。
 
