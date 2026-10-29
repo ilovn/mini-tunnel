@@ -63,6 +63,12 @@ pub struct ReconnectingPeer {
     pub probe_cooldown: Duration,
 }
 
+/// Runtime membership changes consumed by the mesh packet pump.
+pub enum MeshPeerUpdate {
+    Add(ReconnectingPeer),
+    Remove(Ipv4Addr),
+}
+
 struct MeshPeerRuntime {
     channel: Arc<tokio::sync::RwLock<Arc<PeerChannel>>>,
     connector: Option<PeerConnector>,
@@ -276,6 +282,7 @@ pub async fn pump_peer_mesh<T: TunnelPacketIo>(
             .into_iter()
             .map(|(address, channel)| (address, channel, None, None, Duration::from_secs(3600)))
             .collect(),
+        None,
     )
     .await
 }
@@ -298,6 +305,32 @@ pub async fn pump_peer_mesh_reconnecting<T: TunnelPacketIo>(
                 )
             })
             .collect(),
+        None,
+    )
+    .await
+}
+
+/// Run a mesh whose peer set can change without recreating the TUN interface.
+pub async fn pump_peer_mesh_dynamic<T: TunnelPacketIo>(
+    packet_io: &T,
+    peers: Vec<ReconnectingPeer>,
+    updates: tokio::sync::mpsc::Receiver<MeshPeerUpdate>,
+) -> Result<(), PeerTunnelError> {
+    pump_mesh(
+        packet_io,
+        peers
+            .into_iter()
+            .map(|peer| {
+                (
+                    peer.address,
+                    peer.channel,
+                    Some(peer.connector),
+                    peer.probe,
+                    peer.probe_cooldown,
+                )
+            })
+            .collect(),
+        Some(updates),
     )
     .await
 }
@@ -305,8 +338,9 @@ pub async fn pump_peer_mesh_reconnecting<T: TunnelPacketIo>(
 async fn pump_mesh<T: TunnelPacketIo>(
     packet_io: &T,
     peers: Vec<MeshPeerInput>,
+    mut updates: Option<tokio::sync::mpsc::Receiver<MeshPeerUpdate>>,
 ) -> Result<(), PeerTunnelError> {
-    if peers.is_empty() {
+    if peers.is_empty() && updates.is_none() {
         return Err(PeerTunnelError::NoPeers);
     }
     let mut channels = HashMap::with_capacity(peers.len());
@@ -329,26 +363,15 @@ async fn pump_mesh<T: TunnelPacketIo>(
 
     let (event_tx, mut event_rx) =
         tokio::sync::mpsc::channel(channels.len().saturating_mul(8).max(8));
-    let mut receivers = tokio::task::JoinSet::new();
+    let mut receivers = HashMap::with_capacity(channels.len());
     for (&address, runtime) in &channels {
-        let peer_address = address;
-        let channel = Arc::clone(&runtime.channel);
-        let connector = runtime.connector.clone();
-        let probe = runtime.probe.clone();
-        let probe_cooldown = runtime.probe_cooldown;
-        let event_tx = event_tx.clone();
-        receivers.spawn(receive_mesh_peer(
-            peer_address,
-            channel,
-            connector,
-            probe,
-            probe_cooldown,
-            event_tx,
-        ));
+        receivers.insert(
+            address,
+            spawn_mesh_receiver(address, runtime, event_tx.clone()),
+        );
     }
-    drop(event_tx);
 
-    while !channels.is_empty() {
+    while !channels.is_empty() || updates.is_some() {
         tokio::select! {
             outbound = packet_io.read_outbound_packet() => {
                 let packet = outbound?;
@@ -371,12 +394,75 @@ async fn pump_mesh<T: TunnelPacketIo>(
                         Ok(()) | Err(TunError::InvalidPacket(_)) => {}
                         Err(error) => return Err(error.into()),
                     },
-                    Err(_) => { channels.remove(&address); }
+                    Err(_) => {
+                        if let Some(runtime) = channels.remove(&address) {
+                            Arc::clone(&*runtime.channel.read().await).close();
+                        }
+                        if let Some(task) = receivers.remove(&address) {
+                            task.abort();
+                        }
+                    }
+                }
+            }
+            update = async {
+                match updates.as_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match update {
+                    Some(MeshPeerUpdate::Add(peer)) => {
+                        let address = peer.address;
+                        if channels.contains_key(&address) {
+                            peer.channel.close();
+                            continue;
+                        }
+                        let runtime = MeshPeerRuntime {
+                            channel: Arc::new(tokio::sync::RwLock::new(peer.channel)),
+                            connector: Some(peer.connector),
+                            probe: peer.probe,
+                            probe_cooldown: peer.probe_cooldown,
+                        };
+                        receivers.insert(address, spawn_mesh_receiver(address, &runtime, event_tx.clone()));
+                        channels.insert(address, runtime);
+                    }
+                    Some(MeshPeerUpdate::Remove(address)) => {
+                        if let Some(runtime) = channels.remove(&address) {
+                            Arc::clone(&*runtime.channel.read().await).close();
+                        }
+                        if let Some(task) = receivers.remove(&address) {
+                            task.abort();
+                        }
+                    }
+                    None => {
+                        updates = None;
+                        if channels.is_empty() {
+                            break;
+                        }
+                    }
                 }
             }
         }
     }
+    for task in receivers.into_values() {
+        task.abort();
+    }
     Err(PeerTunnelError::NoPeers)
+}
+
+fn spawn_mesh_receiver(
+    address: Ipv4Addr,
+    runtime: &MeshPeerRuntime,
+    event_tx: tokio::sync::mpsc::Sender<(Ipv4Addr, Result<Vec<u8>, IdentityError>)>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(receive_mesh_peer(
+        address,
+        Arc::clone(&runtime.channel),
+        runtime.connector.clone(),
+        runtime.probe.clone(),
+        runtime.probe_cooldown,
+        event_tx,
+    ))
 }
 
 fn ipv4_destination(packet: &[u8]) -> Option<Ipv4Addr> {
@@ -899,5 +985,95 @@ mod tests {
             .expect("mesh task joins");
         assert!(matches!(result, Err(PeerTunnelError::NoPeers)));
         fs::remove_dir_all(temp).expect("remove test identities");
+    }
+
+    #[tokio::test]
+    async fn dynamic_mesh_adds_and_removes_peers_without_restarting_packet_pump() {
+        let temp =
+            std::env::temp_dir().join(format!("mini-tunnel-dynamic-{}", uuid::Uuid::new_v4()));
+        let identity = Arc::new(Identity::load_or_create_at(temp.join("a/device.key")).unwrap());
+        let remote_identity =
+            Arc::new(Identity::load_or_create_at(temp.join("b/device.key")).unwrap());
+        let endpoint_a = peer_endpoint(
+            &identity,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        )
+        .unwrap();
+        let endpoint_b = peer_endpoint(
+            &remote_identity,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        )
+        .unwrap();
+        let remote_id = identity.device_id();
+        let remote_key = identity.public_key();
+        let accept_endpoint = endpoint_b.clone();
+        let accept_identity = Arc::clone(&remote_identity);
+        let accept = tokio::spawn(async move {
+            crate::accept_peer(
+                &accept_endpoint,
+                "dynamic-mesh",
+                &accept_identity,
+                &remote_id,
+                remote_key,
+            )
+            .await
+        });
+        let local_channel = crate::connect_peer(
+            &endpoint_a,
+            endpoint_b.local_addr().unwrap(),
+            "dynamic-mesh",
+            &identity,
+            &remote_identity.device_id(),
+            remote_identity.public_key(),
+        )
+        .await
+        .unwrap();
+        let remote_channel = accept.await.unwrap().unwrap();
+
+        let local_ip = Ipv4Addr::new(10, 71, 0, 1);
+        let peer_ip = Ipv4Addr::new(10, 71, 0, 2);
+        let (outbound_tx, outbound_rx) = mpsc::channel(2);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(2);
+        let io = MockPacketIo {
+            outbound: Mutex::new(outbound_rx),
+            inbound: inbound_tx,
+            local_ipv4: local_ip,
+            mtu: 1150,
+        };
+        let (update_tx, update_rx) = mpsc::channel(2);
+        let pump =
+            tokio::spawn(async move { pump_peer_mesh_dynamic(&io, Vec::new(), update_rx).await });
+        let connector: PeerConnector =
+            Arc::new(|_| Box::pin(async { Err(IdentityError::UnauthorizedPeer) }));
+        update_tx
+            .send(MeshPeerUpdate::Add(ReconnectingPeer {
+                address: peer_ip,
+                channel: Arc::new(local_channel),
+                connector,
+                probe: None,
+                probe_cooldown: Duration::from_secs(3600),
+            }))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        outbound_tx
+            .send(packet(local_ip, peer_ip, 28))
+            .await
+            .unwrap();
+        assert_eq!(remote_channel.recv_packet().await.unwrap().len(), 28);
+
+        update_tx
+            .send(MeshPeerUpdate::Remove(peer_ip))
+            .await
+            .unwrap();
+        drop(update_tx);
+        let result = tokio::time::timeout(Duration::from_secs(2), pump)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(PeerTunnelError::NoPeers)));
+        endpoint_a.close(0_u32.into(), b"test complete");
+        endpoint_b.close(0_u32.into(), b"test complete");
+        fs::remove_dir_all(temp).unwrap();
     }
 }
