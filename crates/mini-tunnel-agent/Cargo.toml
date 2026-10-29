@@ -10,6 +10,7 @@ base64.workspace = true
 bytes.workspace = true
 directories.workspace = true
 ed25519-dalek.workspace = true
+futures-util.workspace = true
 getrandom.workspace = true
 ipnet.workspace = true
 mini-tunnel-protocol = { path = "../mini-tunnel-protocol" }

@@ -19,6 +19,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use quinn::{Connection, Endpoint};
 use rcgen::{CertificateParams, PKCS_ED25519};
 use rustls::{
@@ -198,6 +199,7 @@ const PEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const UDP_CANDIDATE_TIMEOUT: Duration = Duration::from_secs(2);
 const TCP_CANDIDATE_TIMEOUT: Duration = Duration::from_secs(5);
 const CANDIDATE_CONNECT_BUDGET: Duration = Duration::from_secs(30);
+const UDP_CANDIDATE_PARALLELISM: usize = 4;
 const MAX_PEER_CANDIDATES: usize = 8;
 
 /// Return a full-jitter reconnect delay with exponential growth and a 30-second cap.
@@ -878,7 +880,7 @@ pub async fn accept_tcp_peer_any_dynamic(
     }
 }
 
-/// Try signed-discovery candidates in order with shorter UDP probes and a bounded TCP fallback.
+/// Race bounded batches of signed UDP candidates, then try TCP with a bounded fallback.
 pub async fn connect_peer_candidates(
     endpoint: &Endpoint,
     candidates: &[String],
@@ -905,47 +907,81 @@ pub async fn connect_peer_candidates(
     }
     let mut last_error = None;
     let deadline = tokio::time::Instant::now() + CANDIDATE_CONNECT_BUDGET;
+    let udp_candidates: Vec<_> = checklist
+        .checks()
+        .iter()
+        .enumerate()
+        .filter(|(_, check)| check.transport == candidate::CandidateTransport::Udp)
+        .map(|(index, check)| (index, check.address))
+        .collect();
+    for batch in udp_candidates.chunks(UDP_CANDIDATE_PARALLELISM) {
+        let mut attempts = FuturesUnordered::new();
+        for &(index, address) in batch {
+            checklist.mark_in_progress(index);
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let attempt_timeout = UDP_CANDIDATE_TIMEOUT.min(remaining);
+            attempts.push(async move {
+                let result = tokio::time::timeout(
+                    attempt_timeout,
+                    connect_peer(
+                        endpoint,
+                        address,
+                        network_id,
+                        identity,
+                        expected_peer_id,
+                        expected_peer_key,
+                    ),
+                )
+                .await;
+                (index, address, result)
+            });
+        }
+        while let Some((index, address, connection)) = attempts.next().await {
+            match connection {
+                Ok(Ok(channel)) => {
+                    checklist.finish(index, true);
+                    return Ok((channel, address));
+                }
+                Ok(Err(IdentityError::UnauthorizedPeer)) => {
+                    return Err(CandidateConnectError::UnauthorizedPeer);
+                }
+                Ok(Err(error)) => {
+                    checklist.finish(index, false);
+                    last_error = Some(error.to_string());
+                }
+                Err(_) => {
+                    checklist.finish(index, false);
+                    last_error = Some(format!("connection to {address} timed out"));
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+
     while let Some(index) = checklist.next_waiting() {
         checklist.mark_in_progress(index);
         let candidate = checklist.checks()[index].clone();
         let address = candidate.address;
-        let is_tcp = candidate.transport == candidate::CandidateTransport::Tcp;
+        debug_assert_eq!(candidate.transport, candidate::CandidateTransport::Tcp);
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             checklist.finish(index, false);
             break;
         }
-        let attempt_timeout = if is_tcp {
-            TCP_CANDIDATE_TIMEOUT.min(remaining)
-        } else {
-            UDP_CANDIDATE_TIMEOUT.min(remaining)
-        };
-        let connection = if is_tcp {
-            tokio::time::timeout(
-                attempt_timeout,
-                connect_tcp_peer(
-                    address,
-                    network_id,
-                    identity,
-                    expected_peer_id,
-                    expected_peer_key,
-                ),
-            )
-            .await
-        } else {
-            tokio::time::timeout(
-                attempt_timeout,
-                connect_peer(
-                    endpoint,
-                    address,
-                    network_id,
-                    identity,
-                    expected_peer_id,
-                    expected_peer_key,
-                ),
-            )
-            .await
-        };
+        let attempt_timeout = TCP_CANDIDATE_TIMEOUT.min(remaining);
+        let connection = tokio::time::timeout(
+            attempt_timeout,
+            connect_tcp_peer(
+                address,
+                network_id,
+                identity,
+                expected_peer_id,
+                expected_peer_key,
+            ),
+        )
+        .await;
         match connection {
             Ok(Ok(channel)) => {
                 checklist.finish(index, true);
@@ -1590,6 +1626,61 @@ mod tests {
         ));
         endpoint_a.close(0_u32.into(), b"test complete");
         endpoint_b.close(0_u32.into(), b"test complete");
+        fs::remove_dir_all(temp).expect("remove test identities");
+    }
+
+    #[tokio::test]
+    async fn reachable_udp_candidate_does_not_wait_for_blackholed_candidates() {
+        let temp = std::env::temp_dir().join(format!("mini-tunnel-race-{}", uuid::Uuid::new_v4()));
+        let a = Identity::load_or_create_at(temp.join("a/device.key")).expect("identity A");
+        let b = Identity::load_or_create_at(temp.join("b/device.key")).expect("identity B");
+        let endpoint_a = peer_endpoint(&a, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .expect("endpoint A");
+        let endpoint_b = peer_endpoint(&b, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .expect("endpoint B");
+        let addr_b = endpoint_b.local_addr().expect("endpoint B address");
+        let a_id = a.device_id();
+        let a_key = a.public_key();
+        let b_id = b.device_id();
+        let b_key = b.public_key();
+        let server_endpoint = endpoint_b.clone();
+        let accept = tokio::spawn(async move {
+            accept_peer(&server_endpoint, "race-net", &b, &a_id, a_key).await
+        });
+        let blackholes = [
+            tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("blackhole one"),
+            tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("blackhole two"),
+            tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("blackhole three"),
+        ];
+        let mut candidates: Vec<_> = blackholes
+            .iter()
+            .map(|socket| socket.local_addr().unwrap().to_string())
+            .collect();
+        candidates.push(addr_b.to_string());
+
+        let (channel, connected_addr) = tokio::time::timeout(
+            Duration::from_secs(1),
+            connect_peer_candidates(&endpoint_a, &candidates, "race-net", &a, &b_id, b_key),
+        )
+        .await
+        .expect("valid candidate should connect before blackhole timeout")
+        .expect("connect to reachable candidate");
+        assert_eq!(connected_addr, addr_b);
+        let accepted = accept
+            .await
+            .expect("accept task")
+            .expect("authenticated peer");
+        assert_eq!(channel.transport_name(), "QUIC/UDP");
+        drop(accepted);
+        endpoint_a.close(0_u32.into(), b"test complete");
+        endpoint_b.close(0_u32.into(), b"test complete");
+        drop(blackholes);
         fs::remove_dir_all(temp).expect("remove test identities");
     }
 
