@@ -174,6 +174,11 @@ async fn receive_mesh_peer(
                 }
             }
         };
+        if active.transport_name() == "QUIC/UDP"
+            && matches!(&failure, IdentityError::Transport(message) if message.contains("keepalive timed out") || message.contains("path quality degraded"))
+        {
+            force_reliable = true;
+        }
         if connector.is_none() {
             let _ = event_tx.send((address, Err(failure))).await;
             return;
