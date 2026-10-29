@@ -2,6 +2,7 @@
 
 pub mod membership;
 pub mod routing;
+pub mod stun;
 pub mod tun_device;
 pub mod tunnel;
 
@@ -252,6 +253,38 @@ pub fn peer_endpoint(
     identity: &Identity,
     bind_addr: SocketAddr,
 ) -> Result<Endpoint, IdentityError> {
+    Endpoint::server(peer_server_config(identity)?, bind_addr)
+        .map_err(|error| IdentityError::Transport(error.to_string()))
+}
+
+/// Discover the mapped address and pass the same bound UDP socket to the QUIC endpoint.
+pub async fn peer_endpoint_with_stun(
+    identity: &Identity,
+    bind_addr: SocketAddr,
+    stun_server: SocketAddr,
+) -> Result<(Endpoint, SocketAddr), IdentityError> {
+    let socket = tokio::net::UdpSocket::bind(bind_addr)
+        .await
+        .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    let mapped_address = stun::discover_mapped_address(&socket, stun_server)
+        .await
+        .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    let socket = socket
+        .into_std()
+        .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| IdentityError::Transport("no QUIC runtime is available".to_owned()))?;
+    let endpoint = Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(peer_server_config(identity)?),
+        socket,
+        runtime,
+    )
+    .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    Ok((endpoint, mapped_address))
+}
+
+fn peer_server_config(identity: &Identity) -> Result<quinn::ServerConfig, IdentityError> {
     let params = CertificateParams::new(vec!["mini-tunnel".to_owned()])
         .map_err(|error| IdentityError::Transport(error.to_string()))?;
     let certificate = params
@@ -273,9 +306,7 @@ pub fn peer_endpoint(
         .map_err(|error| IdentityError::Transport(error.to_string()))?;
     let mut server_config = quinn::ServerConfig::with_crypto(std::sync::Arc::new(server_crypto));
     server_config.transport = std::sync::Arc::new(peer_transport_config());
-    let endpoint = Endpoint::server(server_config, bind_addr)
-        .map_err(|error| IdentityError::Transport(error.to_string()))?;
-    Ok(endpoint)
+    Ok(server_config)
 }
 
 fn peer_client_config(

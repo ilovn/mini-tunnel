@@ -49,6 +49,8 @@ cargo run -p mini-tunnel -- network peers --network-id '<network-id>'
 
 Candidate updates are signed, limited to eight usable socket addresses, and reject timestamps outside a five-minute window or replayed updates. This only exchanges control-plane information; it does not open a tunnel or prove that a candidate is reachable. Each invite expires after one hour and can enroll one device.
 
+Tunnel commands can optionally discover and publish a server-reflexive UDP candidate using a STUN Binding server. Pass `--stun-server '<stun-ip>:3478'`; the STUN request uses the same bound UDP socket later handed to QUIC. Additional addresses can be repeated as `--candidate '<ip>:<port>'`. The STUN option is off by default and an enabled candidate update replaces this device's previous candidate list. STUN only reports the mapping observed by that server: it does not itself punch through NAT, guarantee that the mapped endpoint is reachable, or work reliably with every symmetric NAT/firewall. Direct QUIC connection remains subject to network NAT/firewall behavior; TURN/relay fallback and coordinated ICE-style checks are not implemented yet. See [RFC 8489](https://www.rfc-editor.org/rfc/rfc8489.html) for STUN's scope and protocol.
+
 The low-level authenticated QUIC/UDP diagnostic can verify a reachable peer address without creating a TUN. Each side needs the other device's ID and URL-safe base64 public key shown by the identity command. On the receiving side:
 
 ```sh

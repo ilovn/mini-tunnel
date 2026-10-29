@@ -200,6 +200,12 @@ enum TunnelCommand {
     Connect {
         #[arg(long, default_value = "0.0.0.0:0")]
         bind: SocketAddr,
+        /// Optional RFC 8489 STUN server used to discover and publish this UDP socket's mapped address.
+        #[arg(long)]
+        stun_server: Option<SocketAddr>,
+        /// Additional candidate address to publish; may be repeated.
+        #[arg(long = "candidate")]
+        candidates: Vec<String>,
         #[arg(long)]
         network_id: String,
         #[arg(long)]
@@ -224,6 +230,12 @@ enum TunnelCommand {
     Listen {
         #[arg(long, default_value = "0.0.0.0:42000")]
         bind: SocketAddr,
+        /// Optional RFC 8489 STUN server used to discover and publish this UDP socket's mapped address.
+        #[arg(long)]
+        stun_server: Option<SocketAddr>,
+        /// Additional candidate address to publish; may be repeated.
+        #[arg(long = "candidate")]
+        candidates: Vec<String>,
         #[arg(long)]
         network_id: String,
         #[arg(long)]
@@ -312,6 +324,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             PeerCommand::Tunnel { command } => match command {
                 TunnelCommand::Connect {
                     bind,
+                    stun_server,
+                    candidates,
                     network_id,
                     peer_id,
                     local_ipv4,
@@ -323,11 +337,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let identity = mini_tunnel_agent::Identity::load_or_create()?;
                     let (local_ipv4, prefix_len) =
                         resolve_tun_parameters(&network_id, &identity, local_ipv4, prefix_len)?;
+                    let endpoint = create_tunnel_endpoint(
+                        &identity,
+                        bind,
+                        stun_server,
+                        &candidates,
+                        &network_id,
+                        &coordinator_url,
+                    )
+                    .await?;
                     let peer =
                         discover_peer(&coordinator_url, &network_id, &peer_id, &identity).await?;
                     let peer_key = decode_peer_key(&peer.public_key)?;
                     let tun = create_tun(local_ipv4, prefix_len, mtu)?;
-                    let endpoint = mini_tunnel_agent::peer_endpoint(&identity, bind)?;
                     let (channel, remote) = mini_tunnel_agent::connect_peer_candidates(
                         &endpoint,
                         &peer.candidates,
@@ -341,6 +363,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 TunnelCommand::Listen {
                     bind,
+                    stun_server,
+                    candidates,
                     network_id,
                     peer_id,
                     local_ipv4,
@@ -352,11 +376,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let identity = mini_tunnel_agent::Identity::load_or_create()?;
                     let (local_ipv4, prefix_len) =
                         resolve_tun_parameters(&network_id, &identity, local_ipv4, prefix_len)?;
+                    let endpoint = create_tunnel_endpoint(
+                        &identity,
+                        bind,
+                        stun_server,
+                        &candidates,
+                        &network_id,
+                        &coordinator_url,
+                    )
+                    .await?;
                     let peer =
                         discover_peer(&coordinator_url, &network_id, &peer_id, &identity).await?;
                     let peer_key = decode_peer_key(&peer.public_key)?;
                     let tun = create_tun(local_ipv4, prefix_len, mtu)?;
-                    let endpoint = mini_tunnel_agent::peer_endpoint(&identity, bind)?;
                     println!(
                         "Waiting for authenticated peer on {}",
                         endpoint.local_addr()?
@@ -673,6 +705,54 @@ async fn run_peer_tunnel(
         route.remove(&runner).await?;
     }
     tunnel_result
+}
+
+async fn create_tunnel_endpoint(
+    identity: &mini_tunnel_agent::Identity,
+    bind: SocketAddr,
+    stun_server: Option<SocketAddr>,
+    extra_candidates: &[String],
+    network_id: &str,
+    coordinator_url: &str,
+) -> Result<quinn::Endpoint, Box<dyn std::error::Error + Send + Sync>> {
+    if stun_server.is_none() && extra_candidates.is_empty() {
+        return Ok(mini_tunnel_agent::peer_endpoint(identity, bind)?);
+    }
+    let (endpoint, mapped_address) = match stun_server {
+        Some(server) => {
+            let (endpoint, mapped) =
+                mini_tunnel_agent::peer_endpoint_with_stun(identity, bind, server).await?;
+            (endpoint, Some(mapped))
+        }
+        None => (mini_tunnel_agent::peer_endpoint(identity, bind)?, None),
+    };
+    let device_id = identity.device_id();
+    let timestamp_ms = now_ms()?;
+    let mut candidates = extra_candidates.to_vec();
+    if let Some(mapped_address) = mapped_address {
+        candidates.push(mapped_address.to_string());
+    }
+    candidates.sort();
+    candidates.dedup();
+    if candidates.len() > 8 {
+        return Err("at most eight peer candidates can be published".into());
+    }
+    let candidate_count = candidates.len();
+    let request = CandidateUpdateRequest {
+        device_id: device_id.clone(),
+        timestamp_ms,
+        signature: identity.sign(&candidate_signing_bytes(
+            network_id,
+            &device_id,
+            timestamp_ms,
+            &candidates,
+        )),
+        candidates,
+    };
+    let path = format!("/v1/networks/{network_id}/candidates");
+    let _: CandidateUpdateResponse = post_json(coordinator_url, &path, &request).await?;
+    println!("Published {candidate_count} UDP candidate(s)");
+    Ok(endpoint)
 }
 
 fn create_tun(
