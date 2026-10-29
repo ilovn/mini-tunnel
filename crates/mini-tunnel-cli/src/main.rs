@@ -313,7 +313,7 @@ enum TunnelCommand {
         prefix_len: Option<u8>,
         #[arg(long, default_value_t = 1150)]
         mtu: u16,
-        /// Install and clean up a /32 route for the authenticated peer.
+        /// Install and clean up /32 IPv4 and /128 IPv6 routes for the authenticated peer.
         #[arg(long)]
         manage_route: bool,
         #[arg(
@@ -349,7 +349,7 @@ enum TunnelCommand {
         prefix_len: Option<u8>,
         #[arg(long, default_value_t = 1150)]
         mtu: u16,
-        /// Install and clean up a /32 route for the authenticated peer.
+        /// Install and clean up /32 IPv4 and /128 IPv6 routes for the authenticated peer.
         #[arg(long)]
         manage_route: bool,
         #[arg(
@@ -359,7 +359,7 @@ enum TunnelCommand {
         )]
         coordinator_url: String,
     },
-    /// Connect all currently discoverable members into one IPv4 L3 mesh.
+    /// Connect all currently discoverable members into one dual-stack IPv4/IPv6 L3 mesh.
     Mesh {
         #[arg(long, default_value = "0.0.0.0:42000")]
         bind: SocketAddr,
@@ -386,7 +386,7 @@ enum TunnelCommand {
         prefix_len: Option<u8>,
         #[arg(long, default_value_t = 1150)]
         mtu: u16,
-        /// Install and clean up one /32 route for every authenticated peer.
+        /// Install and clean up /32 IPv4 and /128 IPv6 routes for every authenticated peer.
         #[arg(long)]
         manage_route: bool,
         #[arg(
@@ -658,7 +658,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         &coordinator_url,
                     )
                     .await?;
-                    let tun = create_tun(local_ipv4, prefix_len, mtu)?;
+                    let tun = create_tun(&network_id, local_ipv4, prefix_len, mtu)?;
                     let mut attempt = 0_u32;
                     loop {
                         let result = async {
@@ -674,7 +674,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 peer_key,
                             )
                             .await?;
-                            run_peer_tunnel(&tun, &channel, &peer, remote, manage_route).await
+                            run_peer_tunnel(
+                                &tun,
+                                &channel,
+                                &peer,
+                                &network_id,
+                                remote,
+                                manage_route,
+                            )
+                            .await
                         }
                         .await;
                         match result {
@@ -718,7 +726,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         &coordinator_url,
                     )
                     .await?;
-                    let tun = create_tun(local_ipv4, prefix_len, mtu)?;
+                    let tun = create_tun(&network_id, local_ipv4, prefix_len, mtu)?;
                     println!(
                         "Waiting for authenticated peer on {}",
                         endpoint.local_addr()?
@@ -740,7 +748,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 }
                             } else { channel.await? };
                             let remote = channel.remote_address();
-                            run_peer_tunnel(&tun, &channel, &peer, remote, manage_route).await
+                            run_peer_tunnel(&tun, &channel, &peer, &network_id, remote, manage_route).await
                         }.await;
                         match result {
                             Ok(()) => break,
@@ -990,7 +998,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             "No mesh peers are connected yet; waiting for membership updates."
                         );
                     }
-                    let tun = create_tun(local_ipv4, prefix_len, mtu)?;
+                    let tun = create_tun(&network_id, local_ipv4, prefix_len, mtu)?;
                     let initially_connected = connected
                         .iter()
                         .map(|(peer, _, _, _, _)| peer.clone())
@@ -1024,7 +1032,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         initial_peers: initially_connected,
                     });
                     let result =
-                        run_peer_mesh(&tun, connected, manage_route, mesh_updates_rx).await;
+                        run_peer_mesh(&tun, &network_id, connected, manage_route, mesh_updates_rx)
+                            .await;
                     refresh.abort();
                     accepted_dispatcher.abort();
                     for task in accept_tasks {
@@ -1217,6 +1226,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!("Joined network {}", response.network_id);
                 println!("Device: {}", response.device_id);
                 println!("Virtual IPv4: {}/{}", response.assigned_ipv4, response.cidr);
+                if let Some(address) = mini_tunnel_protocol::overlay_ipv6_address(
+                    &response.network_id,
+                    response.assigned_ipv4.parse()?,
+                ) {
+                    println!("Virtual IPv6: {address}/64");
+                }
             }
             NetworkCommand::Advertise {
                 network_id,
@@ -1336,30 +1351,62 @@ async fn run_peer_tunnel(
     tun: &mini_tunnel_agent::tun_device::TunDevice,
     channel: &mini_tunnel_agent::PeerChannel,
     peer: &PeerInfo,
+    network_id: &str,
     remote: SocketAddr,
     manage_route: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use mini_tunnel_agent::routing::{
-        RouteLease, RoutingPlatform, SystemRouteRunner, install_peer_route,
+        RouteLease, RoutingPlatform, SystemRouteRunner, install_peer_ipv6_route, install_peer_route,
     };
 
     let peer_ipv4 = peer.assigned_ipv4.parse()?;
+    let peer_ipv6 = mini_tunnel_protocol::overlay_ipv6_address(network_id, peer_ipv4)
+        .ok_or("could not derive peer IPv6 overlay address")?;
     let runner = SystemRouteRunner;
-    let route: Option<RouteLease> = if manage_route {
+    let (route, route_v6): (Option<RouteLease>, Option<RouteLease>) = if manage_route {
         let interface = tun.name()?;
-        Some(install_peer_route(&runner, RoutingPlatform::current(), &interface, peer_ipv4).await?)
+        let route =
+            install_peer_route(&runner, RoutingPlatform::current(), &interface, peer_ipv4).await?;
+        match install_peer_ipv6_route(&runner, RoutingPlatform::current(), &interface, peer_ipv6)
+            .await
+        {
+            Ok(route_v6) => (Some(route), Some(route_v6)),
+            Err(error) => {
+                let _ = route.remove(&runner).await;
+                return Err(error.into());
+            }
+        }
     } else {
-        None
+        (None, None)
     };
-    print_tunnel_ready(tun, peer, remote, channel.transport_name(), manage_route);
-    let pump = mini_tunnel_agent::tunnel::pump_peer_packets(tun, channel, peer_ipv4);
+    print_tunnel_ready(
+        tun,
+        peer,
+        network_id,
+        remote,
+        channel.transport_name(),
+        manage_route,
+    );
+    let pump =
+        mini_tunnel_agent::tunnel::pump_peer_packets(tun, channel, peer_ipv4, Some(peer_ipv6));
     tokio::pin!(pump);
     let tunnel_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = tokio::select! {
         result = &mut pump => result.map_err(Into::into),
         signal = tokio::signal::ctrl_c() => signal.map_err(Into::into),
     };
-    if let Some(route) = route {
-        route.remove(&runner).await?;
+    let mut cleanup_error = None;
+    if let Some(route_v6) = route_v6
+        && let Err(error) = route_v6.remove(&runner).await
+    {
+        cleanup_error = Some(error);
+    }
+    if let Some(route) = route
+        && let Err(error) = route.remove(&runner).await
+    {
+        cleanup_error.get_or_insert(error);
+    }
+    if let Some(error) = cleanup_error {
+        return Err(error.into());
     }
     tunnel_result
 }
@@ -1855,6 +1902,14 @@ fn spawn_mesh_membership_refresh(config: MeshMembershipRefresh) -> tokio::task::
                 return;
             }
             for (peer, address, connector, probe) in additions {
+                let ipv6_address = mini_tunnel_protocol::overlay_ipv6_address(&network_id, address);
+                let Some(ipv6_address) = ipv6_address else {
+                    eprintln!(
+                        "could not derive IPv6 overlay address for peer {}",
+                        peer.device_id
+                    );
+                    continue;
+                };
                 let connect = std::sync::Arc::clone(&connector);
                 let updates = updates_tx.clone();
                 let device_id = peer.device_id.clone();
@@ -1869,6 +1924,7 @@ fn spawn_mesh_membership_refresh(config: MeshMembershipRefresh) -> tokio::task::
                                     let update = mini_tunnel_agent::tunnel::MeshPeerUpdate::Add(
                                         mini_tunnel_agent::tunnel::ReconnectingPeer {
                                             address,
+                                            ipv6_address: Some(ipv6_address),
                                             channel: std::sync::Arc::new(channel),
                                             connector,
                                             probe,
@@ -1970,6 +2026,7 @@ async fn connect_mesh_peer_via_relay(
 
 async fn run_peer_mesh(
     tun: &mini_tunnel_agent::tun_device::TunDevice,
+    network_id: &str,
     peers: Vec<(
         PeerInfo,
         mini_tunnel_agent::PeerChannel,
@@ -1981,7 +2038,7 @@ async fn run_peer_mesh(
     mut updates: tokio::sync::mpsc::Receiver<mini_tunnel_agent::tunnel::MeshPeerUpdate>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use mini_tunnel_agent::routing::{
-        RouteLease, RoutingPlatform, SystemRouteRunner, install_peer_route,
+        RouteLease, RoutingPlatform, SystemRouteRunner, install_peer_ipv6_route, install_peer_route,
     };
 
     let prepared = peers
@@ -1990,6 +2047,11 @@ async fn run_peer_mesh(
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
                 peer.device_id,
                 peer.assigned_ipv4.parse::<Ipv4Addr>()?,
+                mini_tunnel_protocol::overlay_ipv6_address(
+                    network_id,
+                    peer.assigned_ipv4.parse::<Ipv4Addr>()?,
+                )
+                .ok_or("could not derive peer IPv6 address")?,
                 channel,
                 remote,
                 connector,
@@ -2001,8 +2063,10 @@ async fn run_peer_mesh(
     let runner = SystemRouteRunner;
     let mut routes: std::collections::HashMap<Ipv4Addr, RouteLease> =
         std::collections::HashMap::new();
+    let mut routes_v6: std::collections::HashMap<std::net::Ipv6Addr, RouteLease> =
+        std::collections::HashMap::new();
     let mut reconnecting_peers = Vec::with_capacity(prepared.len());
-    for (device_id, peer_ipv4, channel, remote, connector, probe) in prepared {
+    for (device_id, peer_ipv4, peer_ipv6, channel, remote, connector, probe) in prepared {
         if manage_routes {
             match install_peer_route(&runner, RoutingPlatform::current(), &interface, peer_ipv4)
                 .await
@@ -2011,6 +2075,33 @@ async fn run_peer_mesh(
                     routes.insert(peer_ipv4, route);
                 }
                 Err(error) => {
+                    for route in routes_v6.drain().map(|(_, route)| route) {
+                        let _ = route.remove(&runner).await;
+                    }
+                    for route in routes.drain().map(|(_, route)| route) {
+                        let _ = route.remove(&runner).await;
+                    }
+                    return Err(error.into());
+                }
+            }
+            match install_peer_ipv6_route(
+                &runner,
+                RoutingPlatform::current(),
+                &interface,
+                peer_ipv6,
+            )
+            .await
+            {
+                Ok(route) => {
+                    routes_v6.insert(peer_ipv6, route);
+                }
+                Err(error) => {
+                    if let Some(route) = routes.remove(&peer_ipv4) {
+                        let _ = route.remove(&runner).await;
+                    }
+                    for route in routes_v6.drain().map(|(_, route)| route) {
+                        let _ = route.remove(&runner).await;
+                    }
                     for route in routes.drain().map(|(_, route)| route) {
                         let _ = route.remove(&runner).await;
                     }
@@ -2019,18 +2110,19 @@ async fn run_peer_mesh(
             }
         }
         println!(
-            "Mesh peer {device_id} {peer_ipv4} via {} at {remote}",
+            "Mesh peer {device_id} {peer_ipv4} ({peer_ipv6}) via {} at {remote}",
             channel.transport_name()
         );
         reconnecting_peers.push(mini_tunnel_agent::tunnel::ReconnectingPeer {
             address: peer_ipv4,
+            ipv6_address: Some(peer_ipv6),
             channel: std::sync::Arc::new(channel),
             connector,
             probe: Some(probe),
             probe_cooldown: Duration::from_secs(60),
         });
     }
-    println!("Mesh established on TUN interface {interface}");
+    println!("Mesh established on TUN interface {interface} (IPv4/IPv6)");
     let (pump_updates_tx, pump_updates_rx) = tokio::sync::mpsc::channel(64);
     let pump =
         mini_tunnel_agent::tunnel::pump_peer_mesh_dynamic(tun, reconnecting_peers, pump_updates_rx);
@@ -2048,7 +2140,10 @@ async fn run_peer_mesh(
             } => match update {
                 Some(mini_tunnel_agent::tunnel::MeshPeerUpdate::Add(peer)) => {
                     let address = peer.address;
-                    if routes.contains_key(&address) {
+                    let peer_ipv6 = peer.ipv6_address;
+                    if routes.contains_key(&address)
+                        || peer_ipv6.is_some_and(|ipv6| routes_v6.contains_key(&ipv6))
+                    {
                         peer.channel.close();
                         continue;
                     }
@@ -2061,9 +2156,27 @@ async fn run_peer_mesh(
                                 continue;
                             }
                         }
+                        if let Some(peer_ipv6) = peer_ipv6 {
+                            match install_peer_ipv6_route(&runner, RoutingPlatform::current(), &interface, peer_ipv6).await {
+                                Ok(route) => { routes_v6.insert(peer_ipv6, route); }
+                                Err(error) => {
+                                    if let Some(route) = routes.remove(&address) {
+                                        let _ = route.remove(&runner).await;
+                                    }
+                                    eprintln!("could not add IPv6 route for dynamic mesh peer {peer_ipv6}: {error}");
+                                    peer.channel.close();
+                                    continue;
+                                }
+                            }
+                        }
                     }
                     if let Err(error) = pump_updates_tx.send(mini_tunnel_agent::tunnel::MeshPeerUpdate::Add(peer)).await {
                         if let Some(route) = routes.remove(&address) {
+                            let _ = route.remove(&runner).await;
+                        }
+                        if let Some(peer_ipv6) = peer_ipv6
+                            && let Some(route) = routes_v6.remove(&peer_ipv6)
+                        {
                             let _ = route.remove(&runner).await;
                         }
                         eprintln!("mesh packet pump stopped before peer {address} could be added: {error}");
@@ -2076,6 +2189,14 @@ async fn run_peer_mesh(
                     {
                         eprintln!("could not remove route for mesh peer {address}: {error}");
                     }
+                    if let Some(peer_ipv6) = mini_tunnel_protocol::overlay_ipv6_address(
+                        network_id,
+                        address,
+                    ) && let Some(route) = routes_v6.remove(&peer_ipv6)
+                        && let Err(error) = route.remove(&runner).await
+                    {
+                        eprintln!("could not remove IPv6 route for mesh peer {peer_ipv6}: {error}");
+                    }
                 }
                 None => updates_open = false,
             }
@@ -2083,6 +2204,11 @@ async fn run_peer_mesh(
     };
     let mut cleanup_error = None;
     for route in routes.into_values() {
+        if let Err(error) = route.remove(&runner).await {
+            cleanup_error.get_or_insert(error);
+        }
+    }
+    for route in routes_v6.into_values() {
         if let Err(error) = route.remove(&runner).await {
             cleanup_error.get_or_insert(error);
         }
@@ -2403,11 +2529,15 @@ fn udp_ice_candidates(
 }
 
 fn create_tun(
+    network_id: &str,
     local_ipv4: Ipv4Addr,
     prefix_len: u8,
     mtu: u16,
 ) -> Result<mini_tunnel_agent::tun_device::TunDevice, Box<dyn std::error::Error + Send + Sync>> {
+    let local_ipv6 = mini_tunnel_protocol::overlay_ipv6_address(network_id, local_ipv4)
+        .ok_or("network ID must be a UUID to derive the IPv6 overlay address")?;
     let mut config = mini_tunnel_agent::tun_device::TunConfig::ipv4(local_ipv4, prefix_len);
+    config = config.with_ipv6(local_ipv6, 64);
     config.mtu = mtu;
     Ok(mini_tunnel_agent::tun_device::TunDevice::create(config)?)
 }
@@ -2487,6 +2617,7 @@ async fn discover_peers(
 fn print_tunnel_ready(
     tun: &mini_tunnel_agent::tun_device::TunDevice,
     peer: &PeerInfo,
+    network_id: &str,
     remote: SocketAddr,
     transport: &str,
     managed_route: bool,
@@ -2501,14 +2632,27 @@ fn print_tunnel_ready(
         peer.device_id,
         peer.assigned_ipv4
     );
+    if let Some(local_ipv6) = tun.local_ipv6() {
+        let peer_ipv6 = peer
+            .assigned_ipv4
+            .parse::<Ipv4Addr>()
+            .ok()
+            .and_then(|peer_ipv4| {
+                mini_tunnel_protocol::overlay_ipv6_address(network_id, peer_ipv4)
+            });
+        println!(
+            "IPv6 overlay: local {local_ipv6} -> peer {}",
+            peer_ipv6.map_or_else(|| "(unavailable)".to_owned(), |address| address.to_string())
+        );
+    }
     if managed_route {
         println!(
-            "Managed /32 route installed for peer {}.",
+            "Managed /32 IPv4 and /128 IPv6 routes installed for peer {}.",
             peer.assigned_ipv4
         );
     } else {
         println!(
-            "No explicit peer route was added; check whether the OS routed {} through this TUN interface.",
+            "No explicit peer route was added; check whether the OS routed {} and its derived IPv6 address through this TUN interface.",
             peer.assigned_ipv4
         );
         println!("If needed, add a host route for this peer and remove it manually when stopping.");

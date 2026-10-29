@@ -1,7 +1,12 @@
 //! Bidirectional bridge between a validated L3 packet device and an authenticated peer channel.
 
 use std::{
-    collections::HashMap, future::Future, net::Ipv4Addr, pin::Pin, sync::Arc, time::Duration,
+    collections::HashMap,
+    future::Future,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
 };
 
 use thiserror::Error;
@@ -55,6 +60,7 @@ impl PathQualityTracker {
 
 pub struct ReconnectingPeer {
     pub address: Ipv4Addr,
+    pub ipv6_address: Option<Ipv6Addr>,
     pub channel: Arc<PeerChannel>,
     pub connector: PeerConnector,
     /// Direct-only candidate probe used to migrate a healthy TCP/relay session back to UDP.
@@ -70,6 +76,7 @@ pub enum MeshPeerUpdate {
 }
 
 struct MeshPeerRuntime {
+    ipv6_address: Option<Ipv6Addr>,
     channel: Arc<tokio::sync::RwLock<Arc<PeerChannel>>>,
     connector: Option<PeerConnector>,
     probe: Option<PeerConnector>,
@@ -78,6 +85,7 @@ struct MeshPeerRuntime {
 
 type MeshPeerInput = (
     Ipv4Addr,
+    Option<Ipv6Addr>,
     Arc<PeerChannel>,
     Option<PeerConnector>,
     Option<PeerConnector>,
@@ -92,7 +100,7 @@ pub enum PeerTunnelError {
     Peer(#[from] IdentityError),
     #[error("no authenticated peers remain connected")]
     NoPeers,
-    #[error("multiple authenticated peers claim the same overlay IPv4 address")]
+    #[error("multiple authenticated peers claim the same overlay IP address")]
     DuplicatePeerAddress,
 }
 
@@ -105,6 +113,24 @@ pub trait TunnelPacketIo: Sync {
         packet: &[u8],
         expected_peer_ipv4: Ipv4Addr,
     ) -> Result<(), TunError>;
+
+    async fn write_inbound_ip_packet(
+        &self,
+        packet: &[u8],
+        expected_peer_ipv4: Ipv4Addr,
+        expected_peer_ipv6: Option<Ipv6Addr>,
+    ) -> Result<(), TunError> {
+        let (source, _) = crate::tun_device::packet_addresses(packet)?;
+        match source {
+            IpAddr::V4(source) if source == expected_peer_ipv4 => {
+                self.write_inbound_packet(packet, expected_peer_ipv4).await
+            }
+            IpAddr::V6(source) if Some(source) == expected_peer_ipv6 => {
+                Err(crate::tun_device::IpPacketError::UnexpectedSource.into())
+            }
+            _ => Err(crate::tun_device::IpPacketError::UnexpectedSource.into()),
+        }
+    }
 }
 
 impl TunnelPacketIo for crate::tun_device::TunDevice {
@@ -119,6 +145,21 @@ impl TunnelPacketIo for crate::tun_device::TunDevice {
     ) -> Result<(), TunError> {
         crate::tun_device::TunDevice::write_inbound_packet(self, packet, expected_peer_ipv4).await
     }
+
+    async fn write_inbound_ip_packet(
+        &self,
+        packet: &[u8],
+        expected_peer_ipv4: Ipv4Addr,
+        expected_peer_ipv6: Option<Ipv6Addr>,
+    ) -> Result<(), TunError> {
+        let (source, _) = crate::tun_device::packet_addresses(packet)?;
+        let expected_peer = match source {
+            IpAddr::V4(source) if source == expected_peer_ipv4 => IpAddr::V4(source),
+            IpAddr::V6(source) if Some(source) == expected_peer_ipv6 => IpAddr::V6(source),
+            _ => return Err(crate::tun_device::IpPacketError::UnexpectedSource.into()),
+        };
+        crate::tun_device::TunDevice::write_inbound_ip_packet(self, packet, expected_peer).await
+    }
 }
 
 /// Forward validated IPv4 packets in both directions until the TUN or peer fails.
@@ -129,6 +170,7 @@ pub async fn pump_peer_packets<T: TunnelPacketIo>(
     packet_io: &T,
     peer: &PeerChannel,
     peer_ipv4: Ipv4Addr,
+    peer_ipv6: Option<Ipv6Addr>,
 ) -> Result<(), PeerTunnelError> {
     let mut keepalive = tokio::time::interval(Duration::from_secs(10));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -144,7 +186,9 @@ pub async fn pump_peer_packets<T: TunnelPacketIo>(
                 let packet = result.map_err(|_| IdentityError::Transport("peer keepalive timed out".to_owned()))??;
                 last_received = tokio::time::Instant::now();
                 if !packet.is_empty() {
-                    packet_io.write_inbound_packet(&packet, peer_ipv4).await?;
+                    packet_io
+                        .write_inbound_ip_packet(&packet, peer_ipv4, peer_ipv6)
+                        .await?;
                 }
                 inbound = Box::pin(peer.recv_packet());
             }
@@ -326,7 +370,16 @@ pub async fn pump_peer_mesh<T: TunnelPacketIo>(
         packet_io,
         peers
             .into_iter()
-            .map(|(address, channel)| (address, channel, None, None, Duration::from_secs(3600)))
+            .map(|(address, channel)| {
+                (
+                    address,
+                    None,
+                    channel,
+                    None,
+                    None,
+                    Duration::from_secs(3600),
+                )
+            })
             .collect(),
         None,
     )
@@ -344,6 +397,7 @@ pub async fn pump_peer_mesh_reconnecting<T: TunnelPacketIo>(
             .map(|peer| {
                 (
                     peer.address,
+                    peer.ipv6_address,
                     peer.channel,
                     Some(peer.connector),
                     peer.probe,
@@ -369,6 +423,7 @@ pub async fn pump_peer_mesh_dynamic<T: TunnelPacketIo>(
             .map(|peer| {
                 (
                     peer.address,
+                    peer.ipv6_address,
                     peer.channel,
                     Some(peer.connector),
                     peer.probe,
@@ -390,11 +445,18 @@ async fn pump_mesh<T: TunnelPacketIo>(
         return Err(PeerTunnelError::NoPeers);
     }
     let mut channels = HashMap::with_capacity(peers.len());
-    for (address, channel, connector, probe, probe_cooldown) in peers {
+    let mut ipv6_routes = HashMap::new();
+    for (address, ipv6_address, channel, connector, probe, probe_cooldown) in peers {
+        if let Some(ipv6_address) = ipv6_address
+            && ipv6_routes.insert(ipv6_address, address).is_some()
+        {
+            return Err(PeerTunnelError::DuplicatePeerAddress);
+        }
         if channels
             .insert(
                 address,
                 MeshPeerRuntime {
+                    ipv6_address,
                     channel: Arc::new(tokio::sync::RwLock::new(channel)),
                     connector,
                     probe,
@@ -421,13 +483,19 @@ async fn pump_mesh<T: TunnelPacketIo>(
         tokio::select! {
             outbound = packet_io.read_outbound_packet() => {
                 let packet = outbound?;
-                let Some(destination) = ipv4_destination(&packet) else {
+                let Ok((_, destination)) = crate::tun_device::packet_addresses(&packet) else {
                     continue;
                 };
-                if let Some(runtime) = channels.get(&destination) {
+                let peer_key = match destination {
+                    IpAddr::V4(address) => Some(address),
+                    IpAddr::V6(address) => ipv6_routes.get(&address).copied(),
+                };
+                if let Some(peer_key) = peer_key
+                    && let Some(runtime) = channels.get(&peer_key)
+                {
                     let current = Arc::clone(&*runtime.channel.read().await);
                     if current.send_packet(&packet).await.is_err() && runtime.connector.is_none() {
-                        channels.remove(&destination);
+                        channels.remove(&peer_key);
                     }
                 }
             }
@@ -436,12 +504,22 @@ async fn pump_mesh<T: TunnelPacketIo>(
                     return Err(PeerTunnelError::NoPeers);
                 };
                 match result {
-                    Ok(packet) => match packet_io.write_inbound_packet(&packet, address).await {
+                    Ok(packet) => {
+                        let Some(runtime) = channels.get(&address) else { continue };
+                        match packet_io.write_inbound_ip_packet(
+                            &packet,
+                            address,
+                            runtime.ipv6_address,
+                        ).await {
                         Ok(()) | Err(TunError::InvalidPacket(_)) => {}
                         Err(error) => return Err(error.into()),
-                    },
+                        }
+                    }
                     Err(_) => {
                         if let Some(runtime) = channels.remove(&address) {
+                            if let Some(ipv6_address) = runtime.ipv6_address {
+                                ipv6_routes.remove(&ipv6_address);
+                            }
                             Arc::clone(&*runtime.channel.read().await).close();
                         }
                         if let Some(task) = receivers.remove(&address) {
@@ -459,11 +537,21 @@ async fn pump_mesh<T: TunnelPacketIo>(
                 match update {
                     Some(MeshPeerUpdate::Add(peer)) => {
                         let address = peer.address;
+                        if channels.contains_key(&address)
+                            || peer.ipv6_address.is_some_and(|ipv6| ipv6_routes.contains_key(&ipv6))
+                        {
+                            peer.channel.close();
+                            return Err(PeerTunnelError::DuplicatePeerAddress);
+                        }
+                        if let Some(ipv6_address) = peer.ipv6_address {
+                            ipv6_routes.insert(ipv6_address, address);
+                        }
                         if channels.contains_key(&address) {
                             peer.channel.close();
                             continue;
                         }
                         let runtime = MeshPeerRuntime {
+                            ipv6_address: peer.ipv6_address,
                             channel: Arc::new(tokio::sync::RwLock::new(peer.channel)),
                             connector: Some(peer.connector),
                             probe: peer.probe,
@@ -474,6 +562,9 @@ async fn pump_mesh<T: TunnelPacketIo>(
                     }
                     Some(MeshPeerUpdate::Remove(address)) => {
                         if let Some(runtime) = channels.remove(&address) {
+                            if let Some(ipv6_address) = runtime.ipv6_address {
+                                ipv6_routes.remove(&ipv6_address);
+                            }
                             Arc::clone(&*runtime.channel.read().await).close();
                         }
                         if let Some(task) = receivers.remove(&address) {
@@ -509,11 +600,6 @@ fn spawn_mesh_receiver(
         runtime.probe_cooldown,
         event_tx,
     ))
-}
-
-fn ipv4_destination(packet: &[u8]) -> Option<Ipv4Addr> {
-    let octets: [u8; 4] = packet.get(16..20)?.try_into().ok()?;
-    Some(Ipv4Addr::from(octets))
 }
 
 #[cfg(test)]
@@ -566,6 +652,7 @@ mod tests {
         outbound: Mutex<mpsc::Receiver<Vec<u8>>>,
         inbound: mpsc::Sender<Vec<u8>>,
         local_ipv4: Ipv4Addr,
+        local_ipv6: Option<Ipv6Addr>,
         mtu: usize,
     }
 
@@ -577,7 +664,12 @@ mod tests {
                     "mock TUN closed",
                 ))
             })?;
-            crate::tun_device::validate_outbound_ipv4(&packet, self.local_ipv4, self.mtu)?;
+            crate::tun_device::validate_outbound_packet(
+                &packet,
+                self.local_ipv4,
+                self.local_ipv6,
+                self.mtu,
+            )?;
             Ok(packet)
         }
 
@@ -599,6 +691,32 @@ mod tests {
                 ))
             })
         }
+
+        async fn write_inbound_ip_packet(
+            &self,
+            packet: &[u8],
+            expected_peer_ipv4: Ipv4Addr,
+            expected_peer_ipv6: Option<Ipv6Addr>,
+        ) -> Result<(), TunError> {
+            let expected_peer = match crate::tun_device::packet_addresses(packet)?.0 {
+                IpAddr::V4(address) if address == expected_peer_ipv4 => IpAddr::V4(address),
+                IpAddr::V6(address) if Some(address) == expected_peer_ipv6 => IpAddr::V6(address),
+                _ => return Err(crate::tun_device::IpPacketError::UnexpectedSource.into()),
+            };
+            crate::tun_device::validate_inbound_packet(
+                packet,
+                IpAddr::V4(self.local_ipv4),
+                self.local_ipv6.map(IpAddr::V6),
+                expected_peer,
+                self.mtu,
+            )?;
+            self.inbound.send(packet.to_vec()).await.map_err(|_| {
+                TunError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "mock TUN receiver closed",
+                ))
+            })
+        }
     }
 
     fn packet(source: Ipv4Addr, destination: Ipv4Addr, size: usize) -> Vec<u8> {
@@ -609,6 +727,17 @@ mod tests {
         packet[9] = 17;
         packet[12..16].copy_from_slice(&source.octets());
         packet[16..20].copy_from_slice(&destination.octets());
+        packet
+    }
+
+    fn ipv6_packet(source: Ipv6Addr, destination: Ipv6Addr, payload_length: usize) -> Vec<u8> {
+        let mut packet = vec![0; 40 + payload_length];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&(payload_length as u16).to_be_bytes());
+        packet[6] = 17;
+        packet[7] = 64;
+        packet[8..24].copy_from_slice(&source.octets());
+        packet[24..40].copy_from_slice(&destination.octets());
         packet
     }
 
@@ -656,12 +785,15 @@ mod tests {
         };
         let local_ip = Ipv4Addr::new(10, 0, 0, 1);
         let peer_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let local_ipv6: Ipv6Addr = "fd00::1".parse().unwrap();
+        let peer_ipv6: Ipv6Addr = "fd00::2".parse().unwrap();
         let (outbound_tx, outbound_rx) = mpsc::channel(4);
         let (inbound_tx, _inbound_rx) = mpsc::channel(4);
         let io = Arc::new(MockPacketIo {
             outbound: Mutex::new(outbound_rx),
             inbound: inbound_tx,
             local_ipv4: local_ip,
+            local_ipv6: Some(local_ipv6),
             mtu: 1500,
         });
         let pump_io = Arc::clone(&io);
@@ -670,6 +802,7 @@ mod tests {
                 &*pump_io,
                 vec![ReconnectingPeer {
                     address: peer_ip,
+                    ipv6_address: Some(peer_ipv6),
                     channel: Arc::new(initial),
                     connector,
                     probe: None,
@@ -695,6 +828,15 @@ mod tests {
                 .unwrap()
                 .len(),
             28
+        );
+        let outbound_ipv6 = ipv6_packet(local_ipv6, peer_ipv6, 8);
+        outbound_tx.send(outbound_ipv6.clone()).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), recovered.recv_packet())
+                .await
+                .unwrap()
+                .unwrap(),
+            outbound_ipv6
         );
         pump.abort();
         drop(recovered);
@@ -792,6 +934,7 @@ mod tests {
             outbound: Mutex::new(outbound_rx),
             inbound: inbound_tx,
             local_ipv4: local_ip,
+            local_ipv6: None,
             mtu: 1500,
         });
         let pump_io = Arc::clone(&io);
@@ -800,6 +943,7 @@ mod tests {
                 &*pump_io,
                 vec![ReconnectingPeer {
                     address: peer_ip,
+                    ipv6_address: None,
                     channel: Arc::new(initial),
                     connector,
                     probe: Some(probe),
@@ -868,16 +1012,20 @@ mod tests {
             outbound: Mutex::new(a_out_rx),
             inbound: a_in_tx,
             local_ipv4: a_ip,
+            local_ipv6: None,
             mtu: 1150,
         };
         let io_b = MockPacketIo {
             outbound: Mutex::new(b_out_rx),
             inbound: b_in_tx,
             local_ipv4: b_ip,
+            local_ipv6: None,
             mtu: 1150,
         };
-        let pump_a = tokio::spawn(async move { pump_peer_packets(&io_a, &channel_a, b_ip).await });
-        let pump_b = tokio::spawn(async move { pump_peer_packets(&io_b, &channel_b, a_ip).await });
+        let pump_a =
+            tokio::spawn(async move { pump_peer_packets(&io_a, &channel_a, b_ip, None).await });
+        let pump_b =
+            tokio::spawn(async move { pump_peer_packets(&io_b, &channel_b, a_ip, None).await });
 
         let packet_a = packet(a_ip, b_ip, 28);
         a_out_tx
@@ -969,18 +1117,40 @@ mod tests {
         let a_ip = Ipv4Addr::new(10, 88, 0, 2);
         let b_ip = Ipv4Addr::new(10, 88, 0, 3);
         let c_ip = Ipv4Addr::new(10, 88, 0, 4);
+        let a_ipv6: Ipv6Addr = "fd88::2".parse().unwrap();
+        let b_ipv6: Ipv6Addr = "fd88::3".parse().unwrap();
+        let c_ipv6: Ipv6Addr = "fd88::4".parse().unwrap();
         let (outbound_tx, outbound_rx) = mpsc::channel(8);
-        let (inbound_tx, _inbound_rx) = mpsc::channel(8);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(8);
         let io = MockPacketIo {
             outbound: Mutex::new(outbound_rx),
             inbound: inbound_tx,
             local_ipv4: a_ip,
+            local_ipv6: Some(a_ipv6),
             mtu: 1150,
         };
         let pump = tokio::spawn(async move {
-            pump_peer_mesh(
+            pump_mesh(
                 &io,
-                vec![(b_ip, Arc::new(channel_b)), (c_ip, Arc::new(channel_c))],
+                vec![
+                    (
+                        b_ip,
+                        Some(b_ipv6),
+                        Arc::new(channel_b),
+                        None,
+                        None,
+                        Duration::from_secs(3600),
+                    ),
+                    (
+                        c_ip,
+                        Some(c_ipv6),
+                        Arc::new(channel_c),
+                        None,
+                        None,
+                        Duration::from_secs(3600),
+                    ),
+                ],
+                None,
             )
             .await
         });
@@ -996,6 +1166,31 @@ mod tests {
                 .expect("B packet timeout")
                 .expect("receive B packet"),
             to_b
+        );
+
+        let to_b_ipv6 = ipv6_packet(a_ipv6, b_ipv6, 8);
+        outbound_tx
+            .send(to_b_ipv6.clone())
+            .await
+            .expect("inject B IPv6 packet");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), remote_b.recv_packet())
+                .await
+                .expect("B IPv6 packet timeout")
+                .expect("receive B IPv6 packet"),
+            to_b_ipv6
+        );
+        let inbound_ipv6 = ipv6_packet(b_ipv6, a_ipv6, 8);
+        remote_b
+            .send_packet(&inbound_ipv6)
+            .await
+            .expect("send inbound IPv6");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), inbound_rx.recv())
+                .await
+                .expect("inbound IPv6 TUN write timeout")
+                .expect("inbound IPv6 packet"),
+            inbound_ipv6
         );
 
         outbound_tx
@@ -1021,6 +1216,19 @@ mod tests {
                 .expect("C packet timeout")
                 .expect("receive C packet"),
             to_c
+        );
+
+        let to_c_ipv6 = ipv6_packet(a_ipv6, c_ipv6, 8);
+        outbound_tx
+            .send(to_c_ipv6.clone())
+            .await
+            .expect("inject C IPv6 packet");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), remote_c.recv_packet())
+                .await
+                .expect("C IPv6 packet timeout")
+                .expect("receive C IPv6 packet"),
+            to_c_ipv6
         );
 
         endpoint_a.close(0_u32.into(), b"mesh test complete");
@@ -1084,6 +1292,7 @@ mod tests {
             outbound: Mutex::new(outbound_rx),
             inbound: inbound_tx,
             local_ipv4: local_ip,
+            local_ipv6: None,
             mtu: 1150,
         };
         let (update_tx, update_rx) = mpsc::channel(2);
@@ -1094,6 +1303,7 @@ mod tests {
         update_tx
             .send(MeshPeerUpdate::Add(ReconnectingPeer {
                 address: peer_ip,
+                ipv6_address: None,
                 channel: Arc::new(local_channel),
                 connector,
                 probe: None,

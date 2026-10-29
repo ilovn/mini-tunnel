@@ -1,30 +1,18 @@
-//! Platform TUN adapter and the IPv4 boundary used by peer packet forwarding.
+//! Platform TUN adapter and the dual-stack IP boundary used by peer packet forwarding.
 
-use std::{io, net::Ipv4Addr};
+use std::{
+    io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+};
 
 use thiserror::Error;
 
 const IPV4_MIN_HEADER_LEN: usize = 20;
+const IPV6_MIN_HEADER_LEN: usize = 40;
 const IPV4_MAX_PACKET_LEN: usize = u16::MAX as usize;
 const DEFAULT_TUN_MTU: u16 = (super::MAX_PACKET_PAYLOAD - super::FRAME_HEADER_LEN) as u16;
 
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum Ipv4PacketError {
-    #[error("IPv4 packet is shorter than its minimum header")]
-    TruncatedHeader,
-    #[error("packet is not IPv4")]
-    WrongVersion,
-    #[error("IPv4 header length is invalid")]
-    InvalidHeaderLength,
-    #[error("IPv4 total length does not match the packet length")]
-    InvalidTotalLength,
-    #[error("IPv4 packet exceeds the configured MTU")]
-    MtuExceeded,
-    #[error("IPv4 source address does not match the authenticated peer")]
-    UnexpectedSource,
-    #[error("IPv4 destination address does not match this device")]
-    UnexpectedDestination,
-}
+pub type Ipv4PacketError = IpPacketError;
 
 #[derive(Debug, Error)]
 pub enum TunError {
@@ -36,12 +24,14 @@ pub enum TunError {
     IncompleteWrite,
 }
 
-/// Parameters for creating a Layer 3 IPv4 TUN interface.
+/// Parameters for creating a Layer 3 IPv4 TUN interface with an optional IPv6 overlay address.
 #[derive(Debug, Clone)]
 pub struct TunConfig {
     pub name: Option<String>,
     pub local_ipv4: Ipv4Addr,
     pub prefix_len: u8,
+    pub local_ipv6: Option<Ipv6Addr>,
+    pub ipv6_prefix_len: u8,
     pub mtu: u16,
 }
 
@@ -53,8 +43,17 @@ impl TunConfig {
             name: None,
             local_ipv4,
             prefix_len,
+            local_ipv6: None,
+            ipv6_prefix_len: 64,
             mtu: DEFAULT_TUN_MTU,
         }
+    }
+
+    #[must_use]
+    pub fn with_ipv6(mut self, local_ipv6: Ipv6Addr, prefix_len: u8) -> Self {
+        self.local_ipv6 = Some(local_ipv6);
+        self.ipv6_prefix_len = prefix_len;
+        self
     }
 
     pub fn validate(&self) -> io::Result<()> {
@@ -62,6 +61,12 @@ impl TunConfig {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "IPv4 prefix length must be between 0 and 32",
+            ));
+        }
+        if self.local_ipv6.is_some() && self.ipv6_prefix_len > 128 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "IPv6 prefix length must be between 0 and 128",
             ));
         }
         if !(576..=DEFAULT_TUN_MTU).contains(&self.mtu) {
@@ -78,11 +83,12 @@ impl TunConfig {
 pub struct TunDevice {
     device: tun_rs::AsyncDevice,
     local_ipv4: Ipv4Addr,
+    local_ipv6: Option<Ipv6Addr>,
     mtu: usize,
 }
 
 impl TunDevice {
-    /// Create a TUN device and assign its local overlay IPv4 address.
+    /// Create a TUN device and assign its local overlay IPv4 and optional IPv6 addresses.
     ///
     /// This requires platform permission to create/configure network interfaces. It does not call
     /// an explicit route-management API; the OS may create a connected route from the assigned
@@ -93,6 +99,9 @@ impl TunDevice {
             .layer(tun_rs::Layer::L3)
             .ipv4(config.local_ipv4, config.prefix_len, None)
             .mtu(config.mtu);
+        if let Some(local_ipv6) = config.local_ipv6 {
+            builder = builder.ipv6(local_ipv6, config.ipv6_prefix_len);
+        }
         if let Some(name) = config.name {
             builder = builder.name(name);
         }
@@ -119,6 +128,7 @@ impl TunDevice {
         Ok(Self {
             device: builder.build_async()?,
             local_ipv4: config.local_ipv4,
+            local_ipv6: config.local_ipv6,
             mtu: usize::from(config.mtu),
         })
     }
@@ -126,6 +136,11 @@ impl TunDevice {
     #[must_use]
     pub fn local_ipv4(&self) -> Ipv4Addr {
         self.local_ipv4
+    }
+
+    #[must_use]
+    pub fn local_ipv6(&self) -> Option<Ipv6Addr> {
+        self.local_ipv6
     }
 
     #[must_use]
@@ -137,12 +152,12 @@ impl TunDevice {
         self.device.name()
     }
 
-    /// Read one local-originated IPv4 packet, rejecting malformed packets and spoofed sources.
+    /// Read one local-originated IPv4 or IPv6 packet, rejecting malformed packets and spoofed sources.
     pub async fn read_outbound_packet(&self) -> Result<Vec<u8>, TunError> {
         let mut packet = vec![0; self.mtu];
         let length = self.device.recv(&mut packet).await?;
         packet.truncate(length);
-        validate_outbound_ipv4(&packet, self.local_ipv4, self.mtu)?;
+        validate_outbound_packet(&packet, self.local_ipv4, self.local_ipv6, self.mtu)?;
         Ok(packet)
     }
 
@@ -152,12 +167,46 @@ impl TunDevice {
         packet: &[u8],
         expected_peer_ipv4: Ipv4Addr,
     ) -> Result<(), TunError> {
-        validate_inbound_ipv4(packet, self.local_ipv4, expected_peer_ipv4, self.mtu)?;
+        self.write_inbound_ip_packet(packet, IpAddr::V4(expected_peer_ipv4))
+            .await
+    }
+
+    pub async fn write_inbound_ip_packet(
+        &self,
+        packet: &[u8],
+        expected_peer: IpAddr,
+    ) -> Result<(), TunError> {
+        validate_inbound_packet(
+            packet,
+            IpAddr::V4(self.local_ipv4),
+            self.local_ipv6.map(IpAddr::V6),
+            expected_peer,
+            self.mtu,
+        )?;
         if self.device.send(packet).await? != packet.len() {
             return Err(TunError::IncompleteWrite);
         }
         Ok(())
     }
+}
+
+/// IPv4 and IPv6 packet boundary errors.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum IpPacketError {
+    #[error("IP packet is shorter than its minimum header")]
+    TruncatedHeader,
+    #[error("packet has an unsupported IP version")]
+    WrongVersion,
+    #[error("IPv4 header length is invalid")]
+    InvalidHeaderLength,
+    #[error("IP packet length does not match its header")]
+    InvalidTotalLength,
+    #[error("IP packet exceeds the configured MTU")]
+    MtuExceeded,
+    #[error("IP source address does not match the authenticated peer or local device")]
+    UnexpectedSource,
+    #[error("IP destination address does not match this device")]
+    UnexpectedDestination,
 }
 
 fn validate_ipv4_header(packet: &[u8], mtu: usize) -> Result<(), Ipv4PacketError> {
@@ -186,11 +235,7 @@ pub fn validate_outbound_ipv4(
     local_ipv4: Ipv4Addr,
     mtu: usize,
 ) -> Result<(), Ipv4PacketError> {
-    validate_ipv4_header(packet, mtu)?;
-    if ipv4_source(packet) != local_ipv4 {
-        return Err(Ipv4PacketError::UnexpectedSource);
-    }
-    Ok(())
+    validate_outbound_packet(packet, local_ipv4, None, mtu)
 }
 
 pub fn validate_inbound_ipv4(
@@ -199,14 +244,94 @@ pub fn validate_inbound_ipv4(
     expected_peer_ipv4: Ipv4Addr,
     mtu: usize,
 ) -> Result<(), Ipv4PacketError> {
-    validate_ipv4_header(packet, mtu)?;
-    if ipv4_source(packet) != expected_peer_ipv4 {
-        return Err(Ipv4PacketError::UnexpectedSource);
-    }
-    if ipv4_destination(packet) != local_ipv4 {
-        return Err(Ipv4PacketError::UnexpectedDestination);
+    validate_inbound_packet(
+        packet,
+        IpAddr::V4(local_ipv4),
+        None,
+        IpAddr::V4(expected_peer_ipv4),
+        mtu,
+    )
+}
+
+pub fn validate_outbound_packet(
+    packet: &[u8],
+    local_ipv4: Ipv4Addr,
+    local_ipv6: Option<Ipv6Addr>,
+    mtu: usize,
+) -> Result<(), IpPacketError> {
+    validate_ip_header(packet, mtu)?;
+    let (source, _) = packet_addresses(packet)?;
+    let local_matches = match source {
+        IpAddr::V4(source) => source == local_ipv4,
+        IpAddr::V6(source) => Some(source) == local_ipv6,
+    };
+    if !local_matches {
+        return Err(IpPacketError::UnexpectedSource);
     }
     Ok(())
+}
+
+pub fn validate_inbound_packet(
+    packet: &[u8],
+    local_ipv4: IpAddr,
+    local_ipv6: Option<IpAddr>,
+    expected_peer: IpAddr,
+    mtu: usize,
+) -> Result<(), IpPacketError> {
+    validate_ip_header(packet, mtu)?;
+    let (source, destination) = packet_addresses(packet)?;
+    if source != expected_peer {
+        return Err(IpPacketError::UnexpectedSource);
+    }
+    let expected_local = match destination {
+        IpAddr::V4(_) => Some(local_ipv4),
+        IpAddr::V6(_) => local_ipv6,
+    };
+    if expected_local != Some(destination) {
+        return Err(IpPacketError::UnexpectedDestination);
+    }
+    Ok(())
+}
+
+pub fn packet_addresses(packet: &[u8]) -> Result<(IpAddr, IpAddr), IpPacketError> {
+    match packet.first().map(|version| version >> 4) {
+        Some(4) if packet.len() >= IPV4_MIN_HEADER_LEN => Ok((
+            IpAddr::V4(ipv4_source(packet)),
+            IpAddr::V4(ipv4_destination(packet)),
+        )),
+        Some(6) if packet.len() >= IPV6_MIN_HEADER_LEN => Ok((
+            IpAddr::V6(Ipv6Addr::from(
+                <[u8; 16]>::try_from(&packet[8..24]).map_err(|_| IpPacketError::TruncatedHeader)?,
+            )),
+            IpAddr::V6(Ipv6Addr::from(
+                <[u8; 16]>::try_from(&packet[24..40])
+                    .map_err(|_| IpPacketError::TruncatedHeader)?,
+            )),
+        )),
+        Some(4 | 6) => Err(IpPacketError::TruncatedHeader),
+        _ => Err(IpPacketError::WrongVersion),
+    }
+}
+
+fn validate_ip_header(packet: &[u8], mtu: usize) -> Result<(), IpPacketError> {
+    match packet.first().map(|version| version >> 4) {
+        Some(4) => validate_ipv4_header(packet, mtu),
+        Some(6) => {
+            if packet.len() < IPV6_MIN_HEADER_LEN {
+                return Err(IpPacketError::TruncatedHeader);
+            }
+            let payload_length = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
+            let total_length = IPV6_MIN_HEADER_LEN + payload_length;
+            if total_length != packet.len() {
+                return Err(IpPacketError::InvalidTotalLength);
+            }
+            if total_length > mtu {
+                return Err(IpPacketError::MtuExceeded);
+            }
+            Ok(())
+        }
+        _ => Err(IpPacketError::WrongVersion),
+    }
 }
 
 fn ipv4_source(packet: &[u8]) -> Ipv4Addr {
@@ -229,6 +354,17 @@ mod tests {
         packet[9] = 17;
         packet[12..16].copy_from_slice(&source.octets());
         packet[16..20].copy_from_slice(&destination.octets());
+        packet
+    }
+
+    fn ipv6_packet(source: Ipv6Addr, destination: Ipv6Addr, payload_length: usize) -> Vec<u8> {
+        let mut packet = vec![0; IPV6_MIN_HEADER_LEN + payload_length];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&(payload_length as u16).to_be_bytes());
+        packet[6] = 17;
+        packet[7] = 64;
+        packet[8..24].copy_from_slice(&source.octets());
+        packet[24..40].copy_from_slice(&destination.octets());
         packet
     }
 
@@ -305,6 +441,67 @@ mod tests {
         assert_eq!(
             config.validate().expect_err("bad MTU").kind(),
             io::ErrorKind::InvalidInput
+        );
+        config.mtu = 1150;
+        let config = config.with_ipv6("fd12:3456::1".parse().unwrap(), 129);
+        assert_eq!(
+            config.validate().expect_err("bad IPv6 prefix").kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn ipv6_packet_boundary_checks_length_mtu_and_peer_addresses() {
+        let local: Ipv6Addr = "fd12:3456::2".parse().unwrap();
+        let peer: Ipv6Addr = "fd12:3456::3".parse().unwrap();
+        let valid = ipv6_packet(peer, local, 8);
+        validate_outbound_packet(
+            &ipv6_packet(local, peer, 8),
+            Ipv4Addr::LOCALHOST,
+            Some(local),
+            1280,
+        )
+        .expect("valid local IPv6 packet");
+        validate_inbound_packet(
+            &valid,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Some(IpAddr::V6(local)),
+            IpAddr::V6(peer),
+            1280,
+        )
+        .expect("valid peer IPv6 packet");
+        assert_eq!(
+            packet_addresses(&valid).unwrap(),
+            (IpAddr::V6(peer), IpAddr::V6(local))
+        );
+        assert_eq!(
+            validate_ip_header(&valid, 40),
+            Err(IpPacketError::MtuExceeded)
+        );
+        let mut bad_length = valid.clone();
+        bad_length[5] = 7;
+        assert_eq!(
+            validate_ip_header(&bad_length, 1280),
+            Err(IpPacketError::InvalidTotalLength)
+        );
+        assert_eq!(
+            validate_outbound_packet(
+                &ipv6_packet(peer, local, 8),
+                Ipv4Addr::LOCALHOST,
+                Some(local),
+                1280
+            ),
+            Err(IpPacketError::UnexpectedSource)
+        );
+        assert_eq!(
+            validate_inbound_packet(
+                &ipv6_packet(local, peer, 8),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                Some(IpAddr::V6(local)),
+                IpAddr::V6(peer),
+                1280,
+            ),
+            Err(IpPacketError::UnexpectedSource)
         );
     }
 }

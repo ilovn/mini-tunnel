@@ -1,7 +1,13 @@
 //! Explicit, narrowly scoped host-route management for peer tunnels.
 
 use std::{
-    ffi::OsString, future::Future, io, net::Ipv4Addr, path::PathBuf, pin::Pin, process::Output,
+    ffi::OsString,
+    future::Future,
+    io,
+    net::{Ipv4Addr, Ipv6Addr},
+    path::PathBuf,
+    pin::Pin,
+    process::Output,
 };
 
 use thiserror::Error;
@@ -108,6 +114,20 @@ pub async fn install_peer_route(
     Ok(RouteLease { remove })
 }
 
+/// Install one peer `/128` IPv6 route and return a lease for that exact route.
+pub async fn install_peer_ipv6_route(
+    runner: &dyn RouteRunner,
+    platform: RoutingPlatform,
+    interface: &str,
+    peer: Ipv6Addr,
+) -> Result<RouteLease, RouteError> {
+    validate_interface(interface)?;
+    let add = build_ipv6_command(platform, RouteAction::Add, interface, peer)?;
+    let remove = build_ipv6_command(platform, RouteAction::Delete, interface, peer)?;
+    execute(runner, &add, "add").await?;
+    Ok(RouteLease { remove })
+}
+
 fn validate_interface(interface: &str) -> Result<(), RouteError> {
     if interface.is_empty() || interface.len() > 64 || interface.as_bytes().contains(&0) {
         return Err(RouteError::InvalidInterface);
@@ -151,6 +171,52 @@ fn build_command(
                     action.into(),
                     "-host".into(),
                     peer.to_string().into(),
+                    "-interface".into(),
+                    interface.into(),
+                ],
+            )
+        }
+        RoutingPlatform::Unsupported => return Err(RouteError::UnsupportedPlatform),
+    };
+    Ok(RouteCommand { program, args })
+}
+
+fn build_ipv6_command(
+    platform: RoutingPlatform,
+    action: RouteAction,
+    interface: &str,
+    peer: Ipv6Addr,
+) -> Result<RouteCommand, RouteError> {
+    let (program, args) = match platform {
+        RoutingPlatform::Linux => {
+            let action = match action {
+                RouteAction::Add => "add",
+                RouteAction::Delete => "del",
+            };
+            (
+                PathBuf::from("ip"),
+                vec![
+                    "-6".into(),
+                    "route".into(),
+                    action.into(),
+                    format!("{peer}/128").into(),
+                    "dev".into(),
+                    interface.into(),
+                ],
+            )
+        }
+        RoutingPlatform::MacOs => {
+            let action = match action {
+                RouteAction::Add => "add",
+                RouteAction::Delete => "delete",
+            };
+            (
+                PathBuf::from("/sbin/route"),
+                vec![
+                    "-n".into(),
+                    action.into(),
+                    "-inet6".into(),
+                    format!("{peer}/128").into(),
                     "-interface".into(),
                     interface.into(),
                 ],
@@ -268,6 +334,78 @@ mod tests {
                     args: ["-4", "route", "del", "10.77.0.3/32", "dev", "tun7"]
                         .map(OsString::from)
                         .to_vec(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ipv6_routes_use_peer_host_prefix_and_are_removed_by_lease() {
+        let runner = FakeRunner::default();
+        let peer: Ipv6Addr = "fd12:3456::3".parse().unwrap();
+        let lease = install_peer_ipv6_route(&runner, RoutingPlatform::Linux, "tun7", peer)
+            .await
+            .expect("install IPv6 route");
+        lease.remove(&runner).await.expect("remove IPv6 route");
+        assert_eq!(
+            runner.calls(),
+            vec![
+                RouteCommand {
+                    program: "ip".into(),
+                    args: ["-6", "route", "add", "fd12:3456::3/128", "dev", "tun7"]
+                        .map(OsString::from)
+                        .to_vec(),
+                },
+                RouteCommand {
+                    program: "ip".into(),
+                    args: ["-6", "route", "del", "fd12:3456::3/128", "dev", "tun7"]
+                        .map(OsString::from)
+                        .to_vec(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn macos_ipv6_host_route_is_bound_to_tun_interface() {
+        let runner = FakeRunner::default();
+        let lease = install_peer_ipv6_route(
+            &runner,
+            RoutingPlatform::MacOs,
+            "utun8",
+            "fd12:3456::3".parse().unwrap(),
+        )
+        .await
+        .expect("install IPv6 route");
+        lease.remove(&runner).await.expect("remove IPv6 route");
+        assert_eq!(
+            runner.calls(),
+            vec![
+                RouteCommand {
+                    program: "/sbin/route".into(),
+                    args: [
+                        "-n",
+                        "add",
+                        "-inet6",
+                        "fd12:3456::3/128",
+                        "-interface",
+                        "utun8"
+                    ]
+                    .map(OsString::from)
+                    .to_vec(),
+                },
+                RouteCommand {
+                    program: "/sbin/route".into(),
+                    args: [
+                        "-n",
+                        "delete",
+                        "-inet6",
+                        "fd12:3456::3/128",
+                        "-interface",
+                        "utun8"
+                    ]
+                    .map(OsString::from)
+                    .to_vec(),
                 },
             ]
         );
