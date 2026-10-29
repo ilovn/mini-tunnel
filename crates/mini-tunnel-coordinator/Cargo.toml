@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 axum.workspace = true
 base64.workspace = true
+ed25519-dalek.workspace = true
 getrandom.workspace = true
 ipnet.workspace = true
 mini-tunnel-protocol = { path = "../mini-tunnel-protocol" }

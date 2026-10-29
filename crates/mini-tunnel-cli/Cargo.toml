@@ -11,7 +11,9 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+base64.workspace = true
 mini-tunnel-coordinator = { path = "../mini-tunnel-coordinator" }
+mini-tunnel-agent = { path = "../mini-tunnel-agent" }
 mini-tunnel-protocol = { path = "../mini-tunnel-protocol" }
 reqwest.workspace = true
 serde.workspace = true

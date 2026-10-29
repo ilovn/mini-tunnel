@@ -1,9 +1,12 @@
 use std::{net::SocketAddr, process::ExitCode, time::Duration};
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand};
 use mini_tunnel_protocol::{
-    ApiErrorResponse, CreateInviteRequest, CreateInviteResponse, CreateNetworkRequest,
-    CreateNetworkResponse, JoinNetworkRequest, JoinNetworkResponse,
+    ApiErrorResponse, CandidateUpdateRequest, CandidateUpdateResponse, CreateInviteRequest,
+    CreateInviteResponse, CreateNetworkRequest, CreateNetworkResponse, JoinNetworkRequest,
+    JoinNetworkResponse, PeerListRequest, PeerListResponse, candidate_signing_bytes,
+    join_signing_bytes, peers_signing_bytes,
 };
 use serde::Deserialize;
 
@@ -26,6 +29,8 @@ enum Command {
         #[command(subcommand)]
         command: NetworkCommand,
     },
+    /// Display this device's stable public identity.
+    Identity,
 }
 
 #[derive(Debug, Subcommand)]
@@ -92,6 +97,30 @@ enum NetworkCommand {
         )]
         coordinator_url: String,
     },
+    /// Publish signed direct-connect candidates for this device.
+    Advertise {
+        #[arg(long)]
+        network_id: String,
+        #[arg(long = "candidate", required = true)]
+        candidates: Vec<String>,
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_COORDINATOR_URL",
+            default_value = "http://127.0.0.1:8080"
+        )]
+        coordinator_url: String,
+    },
+    /// List signed same-network peer snapshots.
+    Peers {
+        #[arg(long)]
+        network_id: String,
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_COORDINATOR_URL",
+            default_value = "http://127.0.0.1:8080"
+        )]
+        coordinator_url: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,6 +171,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 );
             }
         },
+        Command::Identity => {
+            let identity = mini_tunnel_agent::Identity::load_or_create()?;
+            println!("Device ID: {}", identity.device_id());
+            println!("Public key: {}", identity.public_key_encoded());
+            if let Some(path) = mini_tunnel_agent::default_identity_path() {
+                println!("Private key: {}", path.display());
+            }
+        }
         Command::Network { command } => match command {
             NetworkCommand::Create {
                 name,
@@ -180,10 +217,23 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             } => {
                 let invite_token = std::env::var("MINI_TUNNEL_INVITE_TOKEN")
                     .map_err(|_| "set MINI_TUNNEL_INVITE_TOKEN before joining")?;
-                let device_id = device_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let identity = mini_tunnel_agent::Identity::load_or_create()?;
+                let device_id = device_id.unwrap_or_else(|| identity.device_id());
+                if device_id != identity.device_id() {
+                    return Err("device_id must match this device's public key".into());
+                }
+                let public_key = identity.public_key();
+                let signature = identity.sign(&join_signing_bytes(
+                    &network_id,
+                    &device_id,
+                    &public_key,
+                    &invite_token,
+                ));
                 let request = JoinNetworkRequest {
                     invite_token,
                     device_id,
+                    public_key: URL_SAFE_NO_PAD.encode(public_key),
+                    signature,
                 };
                 let path = format!("/v1/networks/{network_id}/join");
                 let response: JoinNetworkResponse =
@@ -192,9 +242,69 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!("Device: {}", response.device_id);
                 println!("Virtual IPv4: {}/{}", response.assigned_ipv4, response.cidr);
             }
+            NetworkCommand::Advertise {
+                network_id,
+                mut candidates,
+                coordinator_url,
+            } => {
+                candidates.sort();
+                let identity = mini_tunnel_agent::Identity::load_or_create()?;
+                let timestamp_ms = now_ms()?;
+                let request = CandidateUpdateRequest {
+                    device_id: identity.device_id(),
+                    timestamp_ms,
+                    candidates: candidates.clone(),
+                    signature: identity.sign(&candidate_signing_bytes(
+                        &network_id,
+                        &identity.device_id(),
+                        timestamp_ms,
+                        &candidates,
+                    )),
+                };
+                let path = format!("/v1/networks/{network_id}/candidates");
+                let _: CandidateUpdateResponse =
+                    post_json(&coordinator_url, &path, &request).await?;
+                println!("Published {} candidate address(es)", candidates.len());
+            }
+            NetworkCommand::Peers {
+                network_id,
+                coordinator_url,
+            } => {
+                let identity = mini_tunnel_agent::Identity::load_or_create()?;
+                let timestamp_ms = now_ms()?;
+                let device_id = identity.device_id();
+                let request = PeerListRequest {
+                    device_id: device_id.clone(),
+                    timestamp_ms,
+                    signature: identity.sign(&peers_signing_bytes(
+                        &network_id,
+                        &device_id,
+                        timestamp_ms,
+                    )),
+                };
+                let path = format!("/v1/networks/{network_id}/peers");
+                let response: PeerListResponse =
+                    post_json(&coordinator_url, &path, &request).await?;
+                for peer in response.peers {
+                    println!(
+                        "{} {} key={} candidates={}",
+                        peer.device_id,
+                        peer.assigned_ipv4,
+                        peer.public_key,
+                        peer.candidates.join(",")
+                    );
+                }
+            }
         },
     }
     Ok(())
+}
+
+fn now_ms() -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis()
+        .try_into()?)
 }
 
 async fn post_json<Request, Response>(

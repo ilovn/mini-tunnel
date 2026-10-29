@@ -4,9 +4,9 @@ A minimal, peer-to-peer virtual network tunnel. The design baseline is in [`docs
 
 ## Current status
 
-Implemented: a Rust workspace, local coordinator health endpoint, in-memory network creation, admin capability tokens, one-time join invites, and IPv4 allocation.
+Implemented: a Rust workspace, local coordinator health endpoint, in-memory network creation, admin capability tokens, one-time join invites, IPv4 allocation, stable Ed25519 device identities, signed enrollment, candidate publication, and signed same-network peer discovery.
 
-Not implemented yet: persistent storage, device-key authentication, peer discovery, TUN devices, encrypted peer transport, UDP/QUIC direct links, TCP fallback, and packet relay. The control API is a local development prototype and has no production authentication or rate limiting. **Do not expose it to untrusted networks.** The coordinator binds to loopback by default.
+Not implemented yet: persistent storage, TUN devices, encrypted peer transport, UDP/QUIC direct links, TCP fallback, and packet relay. The control API is a local development prototype and has no production rate limiting. **Do not expose it to untrusted networks.** The coordinator binds to loopback by default.
 
 ## Quick start
 
@@ -36,7 +36,16 @@ export MINI_TUNNEL_INVITE_TOKEN='<invite-token>'
 cargo run -p mini-tunnel -- network join --network-id '<network-id>'
 ```
 
-The current coordinator state is in memory. Restarting it removes networks, tokens, and address assignments. Each invite expires after one hour and can enroll one device. The CLI prints a generated device ID and assigned address, but does not yet configure an OS interface.
+The CLI creates a stable Ed25519 identity at the OS user configuration directory (`device.key`; Unix permissions are restricted to the current user). Inspect the public identity with `cargo run -p mini-tunnel -- identity`. Joining signs the invite proof with this key; the private key is never sent.
+
+Members publish socket candidates and request same-network peers:
+
+```sh
+cargo run -p mini-tunnel -- network advertise --network-id '<network-id>' --candidate '203.0.113.10:42000'
+cargo run -p mini-tunnel -- network peers --network-id '<network-id>'
+```
+
+Candidate updates are signed, limited to eight usable socket addresses, and reject timestamps outside a five-minute window or replayed updates. This only exchanges control-plane information; it does not open a tunnel or prove that a candidate is reachable. The current coordinator state is in memory. Restarting it removes networks, tokens, identities, candidates, and address assignments. Each invite expires after one hour and can enroll one device.
 
 ## Development
 

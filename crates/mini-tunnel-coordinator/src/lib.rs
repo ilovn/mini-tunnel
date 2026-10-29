@@ -13,11 +13,14 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use ed25519_dalek::{Signature, VerifyingKey};
 use getrandom::fill as random_fill;
 use ipnet::Ipv4Net;
 use mini_tunnel_protocol::{
-    ApiErrorResponse, CreateInviteRequest, CreateInviteResponse, CreateNetworkRequest,
-    CreateNetworkResponse, JoinNetworkRequest, JoinNetworkResponse,
+    ApiErrorResponse, CandidateUpdateRequest, CandidateUpdateResponse, CreateInviteRequest,
+    CreateInviteResponse, CreateNetworkRequest, CreateNetworkResponse, JoinNetworkRequest,
+    JoinNetworkResponse, PeerInfo, PeerListRequest, PeerListResponse, candidate_signing_bytes,
+    device_id_from_public_key, join_signing_bytes, peers_signing_bytes,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -30,6 +33,8 @@ const MAX_NETWORKS: usize = 128;
 const MAX_INVITES_PER_NETWORK: usize = 1024;
 const MAX_DEVICE_ID_BYTES: usize = 128;
 const INVITE_TTL: Duration = Duration::from_secs(60 * 60);
+const SIGNATURE_CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
+const MAX_CANDIDATES: usize = 8;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthResponse {
@@ -52,8 +57,15 @@ struct Network {
     cidr: Ipv4Net,
     admin_token_hash: [u8; 32],
     invites: HashMap<[u8; 32], Invite>,
-    members: HashMap<String, Ipv4Addr>,
+    members: HashMap<String, Member>,
     assigned_addresses: HashSet<Ipv4Addr>,
+}
+
+struct Member {
+    address: Ipv4Addr,
+    public_key: [u8; 32],
+    candidates: Vec<String>,
+    last_candidate_timestamp_ms: u64,
 }
 
 struct Invite {
@@ -196,6 +208,21 @@ impl CoordinatorState {
         network_id: Uuid,
         request: JoinNetworkRequest,
     ) -> Result<JoinNetworkResponse, ApiError> {
+        let public_key = decode_exact::<32>(&request.public_key).ok_or(ApiError::Unauthorized)?;
+        if request.device_id != device_id_from_public_key(&public_key)
+            || !verify_signature(
+                &public_key,
+                &join_signing_bytes(
+                    &network_id.to_string(),
+                    &request.device_id,
+                    &public_key,
+                    &request.invite_token,
+                ),
+                &request.signature,
+            )
+        {
+            return Err(ApiError::Unauthorized);
+        }
         if request.device_id.trim().is_empty()
             || request.device_id.len() > MAX_DEVICE_ID_BYTES
             || request.device_id.chars().any(char::is_control)
@@ -232,6 +259,8 @@ impl CoordinatorState {
             let assigned_ipv4 = network
                 .members
                 .get(&request.device_id)
+                .filter(|member| member.public_key == public_key)
+                .map(|member| member.address)
                 .ok_or(ApiError::Unauthorized)?;
             return Ok(JoinNetworkResponse {
                 network_id: network_id.to_string(),
@@ -250,9 +279,15 @@ impl CoordinatorState {
             .find(|address| !network.assigned_addresses.contains(address))
             .ok_or(ApiError::Conflict("network has no free IPv4 addresses"))?;
         network.assigned_addresses.insert(assigned_ipv4);
-        network
-            .members
-            .insert(request.device_id.clone(), assigned_ipv4);
+        network.members.insert(
+            request.device_id.clone(),
+            Member {
+                address: assigned_ipv4,
+                public_key,
+                candidates: Vec::new(),
+                last_candidate_timestamp_ms: 0,
+            },
+        );
         invite.consumed_by = Some(request.device_id.clone());
 
         Ok(JoinNetworkResponse {
@@ -261,6 +296,105 @@ impl CoordinatorState {
             assigned_ipv4: assigned_ipv4.to_string(),
             cidr: network.cidr.to_string(),
         })
+    }
+
+    async fn update_candidates(
+        &self,
+        network_id: Uuid,
+        request: CandidateUpdateRequest,
+    ) -> Result<CandidateUpdateResponse, ApiError> {
+        let now = unix_time_ms().ok_or(ApiError::Internal)?;
+        if request.timestamp_ms.abs_diff(now) > SIGNATURE_CLOCK_SKEW_MS
+            || request.candidates.len() > MAX_CANDIDATES
+        {
+            return Err(ApiError::InvalidRequest(
+                "timestamp is outside the allowed window or too many candidates",
+            ));
+        }
+        let mut canonical = request.candidates.clone();
+        canonical.sort();
+        if canonical.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(ApiError::InvalidRequest(
+                "candidate addresses must be unique",
+            ));
+        }
+        for candidate in &canonical {
+            let address = candidate
+                .parse::<SocketAddr>()
+                .map_err(|_| ApiError::InvalidRequest("candidate must be a socket address"))?;
+            if address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {
+                return Err(ApiError::InvalidRequest("candidate address is not usable"));
+            }
+        }
+        let mut store = self.inner.write().await;
+        let network = store
+            .networks
+            .get_mut(&network_id)
+            .ok_or(ApiError::NotFound)?;
+        let member = network
+            .members
+            .get_mut(&request.device_id)
+            .ok_or(ApiError::Unauthorized)?;
+        if request.timestamp_ms <= member.last_candidate_timestamp_ms {
+            return Err(ApiError::Conflict("candidate update replay detected"));
+        }
+        if !verify_signature(
+            &member.public_key,
+            &candidate_signing_bytes(
+                &network_id.to_string(),
+                &request.device_id,
+                request.timestamp_ms,
+                &canonical,
+            ),
+            &request.signature,
+        ) {
+            return Err(ApiError::Unauthorized);
+        }
+        member.candidates = canonical;
+        member.last_candidate_timestamp_ms = request.timestamp_ms;
+        Ok(CandidateUpdateResponse { accepted: true })
+    }
+
+    async fn list_peers(
+        &self,
+        network_id: Uuid,
+        request: PeerListRequest,
+    ) -> Result<PeerListResponse, ApiError> {
+        let now = unix_time_ms().ok_or(ApiError::Internal)?;
+        if request.timestamp_ms.abs_diff(now) > SIGNATURE_CLOCK_SKEW_MS {
+            return Err(ApiError::InvalidRequest(
+                "timestamp is outside the allowed window",
+            ));
+        }
+        let store = self.inner.read().await;
+        let network = store.networks.get(&network_id).ok_or(ApiError::NotFound)?;
+        let requester = network
+            .members
+            .get(&request.device_id)
+            .ok_or(ApiError::Unauthorized)?;
+        if !verify_signature(
+            &requester.public_key,
+            &peers_signing_bytes(
+                &network_id.to_string(),
+                &request.device_id,
+                request.timestamp_ms,
+            ),
+            &request.signature,
+        ) {
+            return Err(ApiError::Unauthorized);
+        }
+        let peers = network
+            .members
+            .iter()
+            .filter(|(id, _)| *id != &request.device_id)
+            .map(|(device_id, member)| PeerInfo {
+                device_id: device_id.clone(),
+                assigned_ipv4: member.address.to_string(),
+                public_key: URL_SAFE_NO_PAD.encode(member.public_key),
+                candidates: member.candidates.clone(),
+            })
+            .collect();
+        Ok(PeerListResponse { peers })
     }
 }
 
@@ -274,6 +408,11 @@ pub fn router_with_state(state: CoordinatorState) -> Router {
         .route("/v1/networks", post(create_network))
         .route("/v1/networks/{network_id}/invites", post(create_invite))
         .route("/v1/networks/{network_id}/join", post(join_network))
+        .route(
+            "/v1/networks/{network_id}/candidates",
+            post(update_candidates),
+        )
+        .route("/v1/networks/{network_id}/peers", post(list_peers))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(state)
 }
@@ -311,6 +450,50 @@ async fn join_network(
     let network_id = Uuid::parse_str(&network_id)
         .map_err(|_| ApiError::InvalidRequest("network_id must be a UUID"))?;
     state.join_network(network_id, request).await.map(Json)
+}
+
+async fn update_candidates(
+    State(state): State<CoordinatorState>,
+    Path(network_id): Path<String>,
+    Json(request): Json<CandidateUpdateRequest>,
+) -> Result<Json<CandidateUpdateResponse>, ApiError> {
+    let network_id = Uuid::parse_str(&network_id)
+        .map_err(|_| ApiError::InvalidRequest("network_id must be a UUID"))?;
+    state.update_candidates(network_id, request).await.map(Json)
+}
+
+async fn list_peers(
+    State(state): State<CoordinatorState>,
+    Path(network_id): Path<String>,
+    Json(request): Json<PeerListRequest>,
+) -> Result<Json<PeerListResponse>, ApiError> {
+    let network_id = Uuid::parse_str(&network_id)
+        .map_err(|_| ApiError::InvalidRequest("network_id must be a UUID"))?;
+    state.list_peers(network_id, request).await.map(Json)
+}
+
+fn decode_exact<const N: usize>(encoded: &str) -> Option<[u8; N]> {
+    URL_SAFE_NO_PAD.decode(encoded).ok()?.try_into().ok()
+}
+
+fn verify_signature(public_key: &[u8; 32], message: &[u8], signature: &str) -> bool {
+    let Ok(key) = VerifyingKey::from_bytes(public_key) else {
+        return false;
+    };
+    let Some(signature) = decode_exact::<64>(signature) else {
+        return false;
+    };
+    key.verify_strict(message, &Signature::from_bytes(&signature))
+        .is_ok()
+}
+
+fn unix_time_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis()
+        .try_into()
+        .ok()
 }
 
 pub async fn serve(address: SocketAddr) -> std::io::Result<()> {
@@ -353,6 +536,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
 
     fn create_request(name: &str, cidr: &str) -> CreateNetworkRequest {
         CreateNetworkRequest {
@@ -363,6 +547,24 @@ mod tests {
 
     fn network_uuid(response: &CreateNetworkResponse) -> Uuid {
         Uuid::parse_str(&response.network_id).expect("coordinator returns a UUID")
+    }
+
+    fn signed_join(network_id: Uuid, invite_token: String, seed: u8) -> JoinNetworkRequest {
+        let key = SigningKey::from_bytes(&[seed; 32]);
+        let public_key = key.verifying_key().to_bytes();
+        let device_id = device_id_from_public_key(&public_key);
+        let signature = key.sign(&join_signing_bytes(
+            &network_id.to_string(),
+            &device_id,
+            &public_key,
+            &invite_token,
+        ));
+        JoinNetworkRequest {
+            invite_token,
+            device_id,
+            public_key: URL_SAFE_NO_PAD.encode(public_key),
+            signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+        }
     }
 
     #[tokio::test]
@@ -380,10 +582,7 @@ mod tests {
             .create_invite(network_id, admin.clone())
             .await
             .expect("admin can issue invite");
-        let first_join = JoinNetworkRequest {
-            invite_token: first_invite.invite_token.clone(),
-            device_id: "device-a".to_owned(),
-        };
+        let first_join = signed_join(network_id, first_invite.invite_token.clone(), 1);
         let first = state
             .join_network(network_id, first_join.clone())
             .await
@@ -402,10 +601,7 @@ mod tests {
         let second = state
             .join_network(
                 network_id,
-                JoinNetworkRequest {
-                    invite_token: second_invite.invite_token,
-                    device_id: "device-b".to_owned(),
-                },
+                signed_join(network_id, second_invite.invite_token, 2),
             )
             .await
             .expect("second device should enroll");
@@ -443,21 +639,12 @@ mod tests {
         state
             .join_network(
                 network_id,
-                JoinNetworkRequest {
-                    invite_token: invite.invite_token.clone(),
-                    device_id: "device-a".to_owned(),
-                },
+                signed_join(network_id, invite.invite_token.clone(), 3),
             )
             .await
             .expect("first use should succeed");
         let replay = state
-            .join_network(
-                network_id,
-                JoinNetworkRequest {
-                    invite_token: invite.invite_token,
-                    device_id: "device-b".to_owned(),
-                },
-            )
+            .join_network(network_id, signed_join(network_id, invite.invite_token, 4))
             .await
             .expect_err("an invite must not enroll a second device");
         assert!(matches!(replay, ApiError::Unauthorized));
@@ -481,5 +668,145 @@ mod tests {
             .await
             .expect_err("overlapping networks must be rejected");
         assert!(matches!(overlap, ApiError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn signed_candidates_reject_replay_and_peer_queries_are_network_scoped() {
+        let state = CoordinatorState::default();
+        let one = state
+            .create_network(create_request("one", "10.80.0.0/16"))
+            .await
+            .expect("network");
+        let two = state
+            .create_network(create_request("two", "10.81.0.0/16"))
+            .await
+            .expect("network");
+        let network_id = network_uuid(&one);
+        let invite_a = state
+            .create_invite(
+                network_id,
+                CreateInviteRequest {
+                    admin_token: one.admin_token.clone(),
+                },
+            )
+            .await
+            .expect("invite");
+        let invite_b = state
+            .create_invite(
+                network_id,
+                CreateInviteRequest {
+                    admin_token: one.admin_token,
+                },
+            )
+            .await
+            .expect("invite");
+        let join_a = signed_join(network_id, invite_a.invite_token, 11);
+        let join_b = signed_join(network_id, invite_b.invite_token, 12);
+        state
+            .join_network(network_id, join_a.clone())
+            .await
+            .expect("join A");
+        state
+            .join_network(network_id, join_b.clone())
+            .await
+            .expect("join B");
+        let key_a = SigningKey::from_bytes(&[11; 32]);
+        let mut candidates = vec!["198.51.100.8:42000".to_owned()];
+        candidates.sort();
+        let timestamp_ms = unix_time_ms().expect("clock");
+        let signature = key_a.sign(&candidate_signing_bytes(
+            &network_id.to_string(),
+            &join_a.device_id,
+            timestamp_ms,
+            &candidates,
+        ));
+        let update = CandidateUpdateRequest {
+            device_id: join_a.device_id.clone(),
+            timestamp_ms,
+            candidates,
+            signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+        };
+        state
+            .update_candidates(network_id, update.clone())
+            .await
+            .expect("signed candidate update");
+        assert!(matches!(
+            state.update_candidates(network_id, update).await,
+            Err(ApiError::Conflict(_))
+        ));
+
+        let timestamp_ms = unix_time_ms().expect("clock");
+        let key_b = SigningKey::from_bytes(&[12; 32]);
+        let signature = key_b.sign(&peers_signing_bytes(
+            &network_id.to_string(),
+            &join_b.device_id,
+            timestamp_ms,
+        ));
+        let snapshot = state
+            .list_peers(
+                network_id,
+                PeerListRequest {
+                    device_id: join_b.device_id.clone(),
+                    timestamp_ms,
+                    signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+                },
+            )
+            .await
+            .expect("same-network peers");
+        assert_eq!(snapshot.peers.len(), 1);
+        assert_eq!(snapshot.peers[0].candidates, ["198.51.100.8:42000"]);
+
+        let timestamp_ms = unix_time_ms().expect("clock");
+        let signature = key_b.sign(&peers_signing_bytes(
+            &two.network_id,
+            &join_b.device_id,
+            timestamp_ms,
+        ));
+        let cross_network = state
+            .list_peers(
+                network_uuid(&two),
+                PeerListRequest {
+                    device_id: join_b.device_id,
+                    timestamp_ms,
+                    signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+                },
+            )
+            .await;
+        assert!(matches!(cross_network, Err(ApiError::Unauthorized)));
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_candidate_and_forged_enrollment_proof() {
+        let state = CoordinatorState::default();
+        let network = state
+            .create_network(create_request("lab", "10.82.0.0/16"))
+            .await
+            .expect("network");
+        let network_id = network_uuid(&network);
+        let invite = state
+            .create_invite(
+                network_id,
+                CreateInviteRequest {
+                    admin_token: network.admin_token,
+                },
+            )
+            .await
+            .expect("invite");
+        let mut forged = signed_join(network_id, invite.invite_token, 21);
+        forged.signature = URL_SAFE_NO_PAD.encode([0_u8; 64]);
+        assert!(matches!(
+            state.join_network(network_id, forged).await,
+            Err(ApiError::Unauthorized)
+        ));
+        let invalid = CandidateUpdateRequest {
+            device_id: "unknown".into(),
+            timestamp_ms: unix_time_ms().expect("clock"),
+            candidates: vec!["0.0.0.0:0".into()],
+            signature: String::new(),
+        };
+        assert!(matches!(
+            state.update_candidates(network_id, invalid).await,
+            Err(ApiError::InvalidRequest(_))
+        ));
     }
 }
