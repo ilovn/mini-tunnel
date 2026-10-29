@@ -197,9 +197,9 @@ enum TunnelCommand {
         #[arg(long)]
         peer_id: String,
         #[arg(long)]
-        local_ipv4: Ipv4Addr,
+        local_ipv4: Option<Ipv4Addr>,
         #[arg(long)]
-        prefix_len: u8,
+        prefix_len: Option<u8>,
         #[arg(long, default_value_t = 1150)]
         mtu: u16,
         #[arg(
@@ -218,9 +218,9 @@ enum TunnelCommand {
         #[arg(long)]
         peer_id: String,
         #[arg(long)]
-        local_ipv4: Ipv4Addr,
+        local_ipv4: Option<Ipv4Addr>,
         #[arg(long)]
-        prefix_len: u8,
+        prefix_len: Option<u8>,
         #[arg(long, default_value_t = 1150)]
         mtu: u16,
         #[arg(
@@ -300,6 +300,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     coordinator_url,
                 } => {
                     let identity = mini_tunnel_agent::Identity::load_or_create()?;
+                    let (local_ipv4, prefix_len) =
+                        resolve_tun_parameters(&network_id, &identity, local_ipv4, prefix_len)?;
                     let peer =
                         discover_peer(&coordinator_url, &network_id, &peer_id, &identity).await?;
                     let peer_key = decode_peer_key(&peer.public_key)?;
@@ -332,6 +334,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     coordinator_url,
                 } => {
                     let identity = mini_tunnel_agent::Identity::load_or_create()?;
+                    let (local_ipv4, prefix_len) =
+                        resolve_tun_parameters(&network_id, &identity, local_ipv4, prefix_len)?;
                     let peer =
                         discover_peer(&coordinator_url, &network_id, &peer_id, &identity).await?;
                     let peer_key = decode_peer_key(&peer.public_key)?;
@@ -510,6 +514,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let path = format!("/v1/networks/{network_id}/join");
                 let response: JoinNetworkResponse =
                     post_json(&coordinator_url, &path, &request).await?;
+                let membership = mini_tunnel_agent::membership::NetworkMembership::new(
+                    response.network_id.clone(),
+                    response.device_id.clone(),
+                    response.assigned_ipv4.clone(),
+                    response.cidr.clone(),
+                )?;
+                mini_tunnel_agent::membership::MembershipStore::for_current_user()?
+                    .save(&membership)
+                    .map_err(|error| {
+                        format!("joined the network, but couldn't save local membership: {error}")
+                    })?;
                 println!("Joined network {}", response.network_id);
                 println!("Device: {}", response.device_id);
                 println!("Virtual IPv4: {}/{}", response.assigned_ipv4, response.cidr);
@@ -628,6 +643,48 @@ fn create_tun(
     Ok(mini_tunnel_agent::tun_device::TunDevice::create(config)?)
 }
 
+fn resolve_tun_parameters(
+    network_id: &str,
+    identity: &mini_tunnel_agent::Identity,
+    local_ipv4_override: Option<Ipv4Addr>,
+    prefix_override: Option<u8>,
+) -> Result<(Ipv4Addr, u8), Box<dyn std::error::Error + Send + Sync>> {
+    use mini_tunnel_agent::membership::MembershipError;
+
+    let store = mini_tunnel_agent::membership::MembershipStore::for_current_user()?;
+    match store.load(network_id, &identity.device_id()) {
+        Ok(membership) => {
+            resolve_saved_tun_parameters(&membership, local_ipv4_override, prefix_override)
+        }
+        Err(MembershipError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            match (local_ipv4_override, prefix_override) {
+                (Some(address), Some(prefix)) => Ok((address, prefix)),
+                _ => Err(
+                    "no saved membership found; run network join again or supply both --local-ipv4 and --prefix-len".into(),
+                ),
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn resolve_saved_tun_parameters(
+    membership: &mini_tunnel_agent::membership::NetworkMembership,
+    local_ipv4_override: Option<Ipv4Addr>,
+    prefix_override: Option<u8>,
+) -> Result<(Ipv4Addr, u8), Box<dyn std::error::Error + Send + Sync>> {
+    let saved_ip = membership.assigned_ip()?;
+    let saved_prefix = membership.prefix_len()?;
+    if local_ipv4_override.is_some_and(|address| address != saved_ip)
+        || prefix_override.is_some_and(|prefix| prefix != saved_prefix)
+    {
+        return Err(
+            "explicit TUN address/prefix conflicts with the saved network membership".into(),
+        );
+    }
+    Ok((saved_ip, saved_prefix))
+}
+
 async fn discover_peer(
     coordinator_url: &str,
     network_id: &str,
@@ -671,4 +728,30 @@ fn print_tunnel_ready(
         peer.assigned_ipv4
     );
     println!("If needed, add a host route for this peer and remove it manually when stopping.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_tun_overrides_must_match_saved_membership() {
+        let membership = mini_tunnel_agent::membership::NetworkMembership::new(
+            "3a50e2e2-037f-4e0f-9f5c-a0b23e3cf543",
+            "0123456789abcdef0123456789abcdef",
+            "10.77.0.2",
+            "10.77.0.0/16",
+        )
+        .expect("valid membership");
+        assert_eq!(
+            resolve_saved_tun_parameters(&membership, Some(Ipv4Addr::new(10, 77, 0, 2)), Some(16))
+                .expect("matching overrides"),
+            (Ipv4Addr::new(10, 77, 0, 2), 16)
+        );
+        assert!(
+            resolve_saved_tun_parameters(&membership, Some(Ipv4Addr::new(10, 77, 0, 99)), Some(16))
+                .is_err()
+        );
+        assert!(resolve_saved_tun_parameters(&membership, None, Some(24)).is_err());
+    }
 }

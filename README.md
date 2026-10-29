@@ -36,7 +36,7 @@ export MINI_TUNNEL_INVITE_TOKEN='<invite-token>'
 cargo run -p mini-tunnel -- network join --network-id '<network-id>'
 ```
 
-The CLI creates a stable Ed25519 identity at the OS user configuration directory (`device.key`; Unix permissions are restricted to the current user). Inspect the public identity with `cargo run -p mini-tunnel -- identity`. Joining signs the invite proof with this key; the private key is never sent.
+The CLI creates a stable Ed25519 identity at the OS user configuration directory (`device.key`; Unix permissions are restricted to the current user). Inspect the public identity with `cargo run -p mini-tunnel -- identity`. Joining signs the invite proof with this key; the private key is never sent. After a successful join, the CLI atomically saves the network ID, device ID, assigned IPv4 address, and CIDR under the user's configuration directory (`networks/<network-id>.json`, mode 0600 on Unix). Invite tokens, admin tokens, and private keys are not included. Existing members can run `network join` again with a valid invite to create/update the local copy; or pass both local IPv4 and prefix explicitly to tunnel commands until a membership file exists.
 
 Members publish socket candidates and request same-network peers:
 
@@ -78,13 +78,13 @@ The tunnel commands keep one authenticated peer session open and pump IPv4 packe
 ```sh
 # Peer B: publish the listener's reachable UDP candidate, then wait for peer A
 cargo run -p mini-tunnel -- network advertise --network-id '<network-id>' --candidate '203.0.113.20:42000'
-cargo run -p mini-tunnel -- peer tunnel listen --network-id '<network-id>' --peer-id '<peer-a-device-id>' --local-ipv4 10.77.0.3 --prefix-len 16 --bind 0.0.0.0:42000
+cargo run -p mini-tunnel -- peer tunnel listen --network-id '<network-id>' --peer-id '<peer-a-device-id>' --bind 0.0.0.0:42000
 
 # Peer A: discover B from the signed snapshot and connect
-cargo run -p mini-tunnel -- peer tunnel connect --network-id '<network-id>' --peer-id '<peer-b-device-id>' --local-ipv4 10.77.0.2 --prefix-len 16
+cargo run -p mini-tunnel -- peer tunnel connect --network-id '<network-id>' --peer-id '<peer-b-device-id>'
 ```
 
-Use each device's allocated virtual IP and the network's actual prefix. Both commands require TUN privileges. The program does not explicitly add or remove host routes; inspect the OS route table after startup and add a host route for the remote peer via the printed TUN interface if needed (for example, macOS `route -n add -host <peer-ip> -interface <utun-name>` or Linux `ip route add <peer-ip>/32 dev <tun-name>`). This single-peer prototype does not configure routes transactionally or restore them on exit. Stop the tunnel with Ctrl-C; remove any route you added manually.
+Both commands use the membership saved by `network join`; optional `--local-ipv4` and `--prefix-len` values are accepted only if they match that saved configuration. Without a saved membership, provide both values explicitly. Both commands require TUN privileges. The program does not explicitly add or remove host routes; inspect the OS route table after startup and add a host route for the remote peer via the printed TUN interface if needed (for example, macOS `route -n add -host <peer-ip> -interface <utun-name>` or Linux `ip route add <peer-ip>/32 dev <tun-name>`). This single-peer prototype does not configure routes transactionally or restore them on exit. Stop the tunnel with Ctrl-C; remove any route you added manually.
 
 ## Development
 
