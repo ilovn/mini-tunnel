@@ -74,7 +74,7 @@ impl TunConfig {
     }
 }
 
-/// Async L3 TUN interface. Route installation is intentionally left to a later, explicit step.
+/// Async L3 TUN interface. Explicit overlay route management is left to a later step.
 pub struct TunDevice {
     device: tun_rs::AsyncDevice,
     local_ipv4: Ipv4Addr,
@@ -84,9 +84,9 @@ pub struct TunDevice {
 impl TunDevice {
     /// Create a TUN device and assign its local overlay IPv4 address.
     ///
-    /// This requires platform permission to create/configure network interfaces. It does not
-    /// install the overlay CIDR route. macOS/BSD library-level automatic route management is
-    /// explicitly disabled.
+    /// This requires platform permission to create/configure network interfaces. It does not call
+    /// an explicit route-management API; the OS may create a connected route from the assigned
+    /// address and prefix. macOS/BSD library-level automatic route management is disabled.
     pub fn create(config: TunConfig) -> io::Result<Self> {
         config.validate()?;
         let mut builder = tun_rs::DeviceBuilder::new()
@@ -131,6 +131,10 @@ impl TunDevice {
     #[must_use]
     pub fn mtu(&self) -> usize {
         self.mtu
+    }
+
+    pub fn name(&self) -> io::Result<String> {
+        self.device.name()
     }
 
     /// Read one local-originated IPv4 packet, rejecting malformed packets and spoofed sources.

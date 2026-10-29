@@ -1,6 +1,7 @@
 //! Local device identity and signing helpers used by the CLI and tunnel agent.
 
 pub mod tun_device;
+pub mod tunnel;
 
 use std::{fs, io, net::SocketAddr, path::PathBuf, sync::Mutex, time::Duration};
 
@@ -193,6 +194,11 @@ pub struct PeerChannel {
 }
 
 impl PeerChannel {
+    #[must_use]
+    pub fn remote_address(&self) -> SocketAddr {
+        self.connection.remote_address()
+    }
+
     /// Send one bounded, unreliable QUIC DATAGRAM.
     pub fn send_packet(&self, payload: &[u8]) -> Result<(), IdentityError> {
         if payload.len() > MAX_PACKET_PAYLOAD {

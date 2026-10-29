@@ -6,7 +6,7 @@ A minimal, peer-to-peer virtual network tunnel. The design baseline is in [`docs
 
 Implemented: a Rust workspace, local coordinator health endpoint, in-memory network creation, admin capability tokens, one-time join invites, IPv4 allocation, stable Ed25519 device identities, signed enrollment and peer discovery, candidate publication, and authenticated encrypted QUIC/UDP peer datagrams.
 
-Not implemented yet: persistent storage, connecting TUN packets to long-running peer sessions, overlay route installation, NAT traversal, TCP fallback, and packet relay. The control API is a local development prototype and has no production rate limiting. **Do not expose it to untrusted networks.** The coordinator binds to loopback by default.
+Not implemented yet: persistent storage, transactional overlay route management/cleanup, NAT traversal, TCP fallback, and packet relay. The current tunnel command supports one directly reachable peer session at a time. The control API is a local development prototype and has no production rate limiting. **Do not expose it to untrusted networks.** The coordinator binds to loopback by default.
 
 ## Quick start
 
@@ -47,7 +47,7 @@ cargo run -p mini-tunnel -- network peers --network-id '<network-id>'
 
 Candidate updates are signed, limited to eight usable socket addresses, and reject timestamps outside a five-minute window or replayed updates. This only exchanges control-plane information; it does not open a tunnel or prove that a candidate is reachable. The current coordinator state is in memory. Restarting it removes networks, tokens, identities, candidates, and address assignments. Each invite expires after one hour and can enroll one device.
 
-An authenticated QUIC/UDP diagnostic can verify a reachable peer address before TUN support exists. Each side needs the other device's ID and URL-safe base64 public key shown by the identity command. On the receiving side:
+The low-level authenticated QUIC/UDP diagnostic can verify a reachable peer address without creating a TUN. Each side needs the other device's ID and URL-safe base64 public key shown by the identity command. On the receiving side:
 
 ```sh
 cargo run -p mini-tunnel -- peer listen --bind 0.0.0.0:42000 --network-id '<network-id>' --peer-id '<sender-device-id>' --peer-key '<sender-public-key>'
@@ -59,7 +59,7 @@ On the sending side:
 cargo run -p mini-tunnel -- peer send --remote '<receiver-ip>:42000' --network-id '<network-id>' --peer-id '<receiver-device-id>' --peer-key '<receiver-public-key>' --message 'hello'
 ```
 
-This diagnostic requires a directly reachable UDP address and an explicitly opened inbound UDP port. QUIC encrypts the datagram; TLS pins the receiver key and the receiver verifies a fresh Ed25519 proof from the sender. Datagrams are bounded and have an application replay window. It is not NAT traversal, does not use advertised candidates automatically, and does not yet carry IP packets from a TUN interface.
+This diagnostic requires a directly reachable UDP address and an explicitly opened inbound UDP port. QUIC encrypts the datagram; TLS pins the receiver key and the receiver verifies a fresh Ed25519 proof from the sender. Datagrams are bounded and have an application replay window. It is not NAT traversal and does not use advertised candidates automatically; use `peer tunnel` below for a sustained TUN data path.
 
 With both devices enrolled and their reachable UDP addresses advertised, the sender can fetch the signed same-network peer snapshot and try the selected peer's candidates automatically:
 
@@ -69,7 +69,22 @@ cargo run -p mini-tunnel -- peer connect --network-id '<network-id>' --peer-id '
 
 The command checks the peer key from that signed snapshot, tries at most eight candidates in order (five seconds per attempt), then sends one authenticated datagram. It reports a missing peer, absent/unusable candidates, identity mismatch, and unreachable candidates as separate errors. The coordinator supplies discovery data only; the QUIC datagram travels directly between the devices.
 
-The agent crate now exposes an async Layer 3 IPv4 TUN adapter (`mini_tunnel_agent::tun_device::TunDevice`) with a default MTU of 1150 bytes, capped to fit the current QUIC datagram framing. It validates IPv4 header/length/MTU and enforces the local and authenticated peer IP boundary on packets. Creating a TUN assigns its local address and requires OS network-interface privileges; Linux may require the `tun` module and root or `CAP_NET_ADMIN`, macOS/BSD may require elevated permissions, and Windows requires Administrator privileges plus the matching `wintun.dll`. The adapter deliberately does not install the overlay CIDR route, and disables tun-rs automatic route management on macOS/BSD. This is a library API only: the CLI does not yet create a TUN or pump packets through peer sessions.
+The agent crate exposes an async Layer 3 IPv4 TUN adapter (`mini_tunnel_agent::tun_device::TunDevice`) with a default MTU of 1150 bytes, capped to fit the current QUIC datagram framing. It validates IPv4 header/length/MTU and enforces the local and authenticated peer IP boundary on packets. Creating a TUN assigns its local address and requires OS network-interface privileges; Linux may require the `tun` module and root or `CAP_NET_ADMIN`, macOS/BSD may require elevated permissions, and Windows requires Administrator privileges plus the matching `wintun.dll`. The adapter does not call an explicit route-management API and disables tun-rs automatic route management on macOS/BSD; the OS may still create a connected route from the configured interface address and prefix. The tunnel CLI below uses this adapter and pumps packets over one authenticated peer session.
+
+## Run a two-device IPv4 tunnel
+
+The tunnel commands keep one authenticated peer session open and pump IPv4 packets both ways. The listener must advertise its reachable UDP address first and start before the connector:
+
+```sh
+# Peer B: publish the listener's reachable UDP candidate, then wait for peer A
+cargo run -p mini-tunnel -- network advertise --network-id '<network-id>' --candidate '203.0.113.20:42000'
+cargo run -p mini-tunnel -- peer tunnel listen --network-id '<network-id>' --peer-id '<peer-a-device-id>' --local-ipv4 10.77.0.3 --prefix-len 16 --bind 0.0.0.0:42000
+
+# Peer A: discover B from the signed snapshot and connect
+cargo run -p mini-tunnel -- peer tunnel connect --network-id '<network-id>' --peer-id '<peer-b-device-id>' --local-ipv4 10.77.0.2 --prefix-len 16
+```
+
+Use each device's allocated virtual IP and the network's actual prefix. Both commands require TUN privileges. The program does not explicitly add or remove host routes; inspect the OS route table after startup and add a host route for the remote peer via the printed TUN interface if needed (for example, macOS `route -n add -host <peer-ip> -interface <utun-name>` or Linux `ip route add <peer-ip>/32 dev <tun-name>`). This single-peer prototype does not configure routes transactionally or restore them on exit. Stop the tunnel with Ctrl-C; remove any route you added manually.
 
 ## Development
 

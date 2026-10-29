@@ -1,11 +1,15 @@
-use std::{net::SocketAddr, process::ExitCode, time::Duration};
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    process::ExitCode,
+    time::Duration,
+};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand};
 use mini_tunnel_protocol::{
     ApiErrorResponse, CandidateUpdateRequest, CandidateUpdateResponse, CreateInviteRequest,
     CreateInviteResponse, CreateNetworkRequest, CreateNetworkResponse, JoinNetworkRequest,
-    JoinNetworkResponse, PeerListRequest, PeerListResponse, candidate_signing_bytes,
+    JoinNetworkResponse, PeerInfo, PeerListRequest, PeerListResponse, candidate_signing_bytes,
     join_signing_bytes, peers_signing_bytes,
 };
 use serde::Deserialize;
@@ -130,6 +134,11 @@ enum NetworkCommand {
 
 #[derive(Debug, Subcommand)]
 enum PeerCommand {
+    /// Create a TUN and keep a bidirectional authenticated peer tunnel running.
+    Tunnel {
+        #[command(subcommand)]
+        command: TunnelCommand,
+    },
     /// Discover an authorized peer from the signed snapshot and send one diagnostic datagram.
     Connect {
         #[arg(long, default_value = "0.0.0.0:0")]
@@ -174,6 +183,52 @@ enum PeerCommand {
         peer_key: String,
         #[arg(long)]
         message: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TunnelCommand {
+    /// Discover and connect to a peer, then pump IPv4 packets over QUIC.
+    Connect {
+        #[arg(long, default_value = "0.0.0.0:0")]
+        bind: SocketAddr,
+        #[arg(long)]
+        network_id: String,
+        #[arg(long)]
+        peer_id: String,
+        #[arg(long)]
+        local_ipv4: Ipv4Addr,
+        #[arg(long)]
+        prefix_len: u8,
+        #[arg(long, default_value_t = 1150)]
+        mtu: u16,
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_COORDINATOR_URL",
+            default_value = "http://127.0.0.1:8080"
+        )]
+        coordinator_url: String,
+    },
+    /// Accept one authorized peer, then pump IPv4 packets over QUIC.
+    Listen {
+        #[arg(long, default_value = "0.0.0.0:42000")]
+        bind: SocketAddr,
+        #[arg(long)]
+        network_id: String,
+        #[arg(long)]
+        peer_id: String,
+        #[arg(long)]
+        local_ipv4: Ipv4Addr,
+        #[arg(long)]
+        prefix_len: u8,
+        #[arg(long, default_value_t = 1150)]
+        mtu: u16,
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_COORDINATOR_URL",
+            default_value = "http://127.0.0.1:8080"
+        )]
+        coordinator_url: String,
     },
 }
 
@@ -234,6 +289,76 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
         Command::Peer { command } => match command {
+            PeerCommand::Tunnel { command } => match command {
+                TunnelCommand::Connect {
+                    bind,
+                    network_id,
+                    peer_id,
+                    local_ipv4,
+                    prefix_len,
+                    mtu,
+                    coordinator_url,
+                } => {
+                    let identity = mini_tunnel_agent::Identity::load_or_create()?;
+                    let peer =
+                        discover_peer(&coordinator_url, &network_id, &peer_id, &identity).await?;
+                    let peer_key = decode_peer_key(&peer.public_key)?;
+                    let tun = create_tun(local_ipv4, prefix_len, mtu)?;
+                    let endpoint = mini_tunnel_agent::peer_endpoint(&identity, bind)?;
+                    let (channel, remote) = mini_tunnel_agent::connect_peer_candidates(
+                        &endpoint,
+                        &peer.candidates,
+                        &network_id,
+                        &identity,
+                        &peer.device_id,
+                        peer_key,
+                    )
+                    .await?;
+                    print_tunnel_ready(&tun, &peer, remote);
+                    mini_tunnel_agent::tunnel::pump_peer_packets(
+                        &tun,
+                        &channel,
+                        peer.assigned_ipv4.parse()?,
+                    )
+                    .await?;
+                }
+                TunnelCommand::Listen {
+                    bind,
+                    network_id,
+                    peer_id,
+                    local_ipv4,
+                    prefix_len,
+                    mtu,
+                    coordinator_url,
+                } => {
+                    let identity = mini_tunnel_agent::Identity::load_or_create()?;
+                    let peer =
+                        discover_peer(&coordinator_url, &network_id, &peer_id, &identity).await?;
+                    let peer_key = decode_peer_key(&peer.public_key)?;
+                    let tun = create_tun(local_ipv4, prefix_len, mtu)?;
+                    let endpoint = mini_tunnel_agent::peer_endpoint(&identity, bind)?;
+                    println!(
+                        "Waiting for authenticated peer on {}",
+                        endpoint.local_addr()?
+                    );
+                    let channel = mini_tunnel_agent::accept_peer(
+                        &endpoint,
+                        &network_id,
+                        &identity,
+                        &peer.device_id,
+                        peer_key,
+                    )
+                    .await?;
+                    let remote = channel.remote_address();
+                    print_tunnel_ready(&tun, &peer, remote);
+                    mini_tunnel_agent::tunnel::pump_peer_packets(
+                        &tun,
+                        &channel,
+                        peer.assigned_ipv4.parse()?,
+                    )
+                    .await?;
+                }
+            },
             PeerCommand::Connect {
                 bind,
                 network_id,
@@ -491,4 +616,59 @@ where
             message: format!("coordinator returned HTTP {status}"),
         });
     Err(format!("{}: {}", error.error, error.message).into())
+}
+
+fn create_tun(
+    local_ipv4: Ipv4Addr,
+    prefix_len: u8,
+    mtu: u16,
+) -> Result<mini_tunnel_agent::tun_device::TunDevice, Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = mini_tunnel_agent::tun_device::TunConfig::ipv4(local_ipv4, prefix_len);
+    config.mtu = mtu;
+    Ok(mini_tunnel_agent::tun_device::TunDevice::create(config)?)
+}
+
+async fn discover_peer(
+    coordinator_url: &str,
+    network_id: &str,
+    peer_id: &str,
+    identity: &mini_tunnel_agent::Identity,
+) -> Result<PeerInfo, Box<dyn std::error::Error + Send + Sync>> {
+    let device_id = identity.device_id();
+    let timestamp_ms = now_ms()?;
+    let request = PeerListRequest {
+        device_id: device_id.clone(),
+        timestamp_ms,
+        signature: identity.sign(&peers_signing_bytes(network_id, &device_id, timestamp_ms)),
+    };
+    let path = format!("/v1/networks/{network_id}/peers");
+    let snapshot: PeerListResponse = post_json(coordinator_url, &path, &request).await?;
+    snapshot
+        .peers
+        .into_iter()
+        .find(|peer| peer.device_id == peer_id)
+        .ok_or_else(|| "peer is not present in the signed same-network snapshot".into())
+}
+
+fn print_tunnel_ready(
+    tun: &mini_tunnel_agent::tun_device::TunDevice,
+    peer: &PeerInfo,
+    remote: SocketAddr,
+) {
+    match tun.name() {
+        Ok(name) => println!("TUN interface: {name}"),
+        Err(error) => eprintln!("could not query TUN interface name: {error}"),
+    }
+    println!(
+        "Tunnel established: local {} -> peer {} ({}, UDP {})",
+        tun.local_ipv4(),
+        peer.device_id,
+        peer.assigned_ipv4,
+        remote
+    );
+    println!(
+        "No explicit peer route was added; check whether the OS routed {} through this TUN interface.",
+        peer.assigned_ipv4
+    );
+    println!("If needed, add a host route for this peer and remove it manually when stopping.");
 }
