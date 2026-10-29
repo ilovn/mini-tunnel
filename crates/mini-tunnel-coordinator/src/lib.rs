@@ -1082,12 +1082,18 @@ async fn limit_requests(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(remote)| *remote);
-    let loopback_metrics = request.uri().path() == "/metrics"
-        && remote.is_some_and(|remote| remote.ip().is_loopback());
-    if !loopback_metrics
-        && let Some(remote) = remote
-        && !state.request_limiter.allow(remote.ip(), Instant::now())
-    {
+    let Some(remote) = remote else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiErrorResponse {
+                error: "client_address_unavailable".to_owned(),
+                message: "request source address is unavailable".to_owned(),
+            }),
+        )
+            .into_response();
+    };
+    let loopback_metrics = request.uri().path() == "/metrics" && remote.ip().is_loopback();
+    if !loopback_metrics && !state.request_limiter.allow(remote.ip(), Instant::now()) {
         state
             .request_limiter
             .rejected_total
@@ -1711,6 +1717,17 @@ mod tests {
                 .status(),
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    async fn router_rejects_request_without_source_address() {
+        let app = router_with_state(CoordinatorState::default());
+        let request = HttpRequest::builder()
+            .uri("/healthz")
+            .body(Body::empty())
+            .expect("valid request");
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
