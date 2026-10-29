@@ -1415,7 +1415,11 @@ async fn select_ice_peer_address(
     if remote_candidates.is_empty() || local.local_candidates.is_empty() {
         return None;
     }
-    let mut datagrams = match local.router.register(local.credentials.ufrag.clone(), 32) {
+    let mut datagrams = match local.router.register(
+        local.credentials.ufrag.clone(),
+        remote.ufrag.clone(),
+        32,
+    ) {
         Ok(datagrams) => datagrams,
         Err(error) => {
             tracing::warn!(peer_id = %peer.device_id, %error, "could not start peer ICE session");
@@ -1439,6 +1443,7 @@ async fn select_ice_peer_address(
                 &local.socket,
                 &local.router,
                 &local_ufrag,
+                &remote.ufrag,
                 &mut datagrams,
                 Duration::from_secs(5),
             )
@@ -1447,7 +1452,7 @@ async fn select_ice_peer_address(
             .map_err(|error| error.to_string())
     }
     .await;
-    let _ = local.router.unregister(&local_ufrag);
+    let _ = local.router.unregister(&local_ufrag, &remote.ufrag);
     match result {
         Ok(remote) => {
             tracing::info!(peer_id = %peer.device_id, %remote, "ICE nominated a direct peer path");

@@ -120,23 +120,25 @@ impl IceDatagramRouterHandle {
     pub fn register(
         &self,
         local_ufrag: String,
+        remote_ufrag: String,
         queue_capacity: usize,
     ) -> Result<mpsc::Receiver<IceDatagram>, IceRouterError> {
         self.router
             .lock()
             .map_err(|_| IceRouterError::Poisoned)?
-            .register(local_ufrag, queue_capacity)
+            .register(local_ufrag, remote_ufrag, queue_capacity)
     }
 
     pub fn associate_authenticated_peer(
         &self,
         local_ufrag: &str,
+        remote_ufrag: &str,
         peer_addr: SocketAddr,
     ) -> Result<(), IceRouterError> {
         self.router
             .lock()
             .map_err(|_| IceRouterError::Poisoned)?
-            .associate_authenticated_peer(local_ufrag, peer_addr)
+            .associate_authenticated_peer(local_ufrag, remote_ufrag, peer_addr)
     }
 
     /// Deliver a routed datagram to its ICE agent and bind the source address only when the
@@ -144,6 +146,7 @@ impl IceDatagramRouterHandle {
     pub fn handle_datagram(
         &self,
         local_ufrag: &str,
+        remote_ufrag: &str,
         driver: &mut IceAgentDriver,
         datagram: IceDatagram,
         now: Instant,
@@ -152,17 +155,21 @@ impl IceDatagramRouterHandle {
             .handle_datagram(now, datagram.peer_addr, None, &datagram.payload)
             .map_err(|error| IceRouterError::AgentRejected(error.to_string()))?;
         if accepted {
-            self.associate_authenticated_peer(local_ufrag, datagram.peer_addr)?;
+            self.associate_authenticated_peer(local_ufrag, remote_ufrag, datagram.peer_addr)?;
         }
         Ok(accepted)
     }
 
-    pub fn unregister(&self, local_ufrag: &str) -> Result<bool, IceRouterError> {
+    pub fn unregister(
+        &self,
+        local_ufrag: &str,
+        remote_ufrag: &str,
+    ) -> Result<bool, IceRouterError> {
         Ok(self
             .router
             .lock()
             .map_err(|_| IceRouterError::Poisoned)?
-            .unregister(local_ufrag))
+            .unregister(local_ufrag, remote_ufrag))
     }
 
     fn route(&self, datagram: IceDatagram) {
@@ -177,37 +184,49 @@ struct IceRoute {
     peer_addresses: HashSet<SocketAddr>,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct IceSessionKey {
+    local_ufrag: String,
+    remote_ufrag: String,
+}
+
 /// Bounded dispatcher for the STUN receive queue of one shared Quinn socket.
 ///
-/// Binding requests are routed by the first (recipient) ufrag in USERNAME. Responses without USERNAME
-/// are routed only after the owning agent confirms an authenticated request via
-/// `associate_authenticated_peer`.
+/// Binding requests are routed by both ufrags in USERNAME, which allows one local ufrag to serve
+/// multiple peer sessions. Responses without USERNAME are routed only after the owning agent
+/// confirms an authenticated request via `associate_authenticated_peer`.
 #[derive(Default)]
 pub struct IceDatagramRouter {
-    sessions: HashMap<String, IceRoute>,
-    peer_sessions: HashMap<SocketAddr, String>,
+    sessions: HashMap<IceSessionKey, IceRoute>,
+    peer_sessions: HashMap<SocketAddr, IceSessionKey>,
 }
 
 impl IceDatagramRouter {
     pub fn register(
         &mut self,
         local_ufrag: String,
+        remote_ufrag: String,
         queue_capacity: usize,
     ) -> Result<mpsc::Receiver<IceDatagram>, IceRouterError> {
         if !valid_ice_ufrag(&local_ufrag)
+            || !valid_ice_ufrag(&remote_ufrag)
             || !(1..=MAX_SOCKET_QUEUE_CAPACITY).contains(&queue_capacity)
         {
             return Err(IceRouterError::InvalidRegistration);
         }
+        let key = IceSessionKey {
+            local_ufrag,
+            remote_ufrag,
+        };
+        if self.sessions.contains_key(&key) {
+            return Err(IceRouterError::DuplicateSession);
+        }
         if self.sessions.len() >= MAX_ICE_SESSIONS {
             return Err(IceRouterError::SessionLimit);
         }
-        if self.sessions.contains_key(&local_ufrag) {
-            return Err(IceRouterError::DuplicateUfrag);
-        }
         let (sender, receiver) = mpsc::channel(queue_capacity);
         self.sessions.insert(
-            local_ufrag,
+            key,
             IceRoute {
                 sender,
                 peer_addresses: HashSet::new(),
@@ -220,29 +239,34 @@ impl IceDatagramRouter {
     pub fn associate_authenticated_peer(
         &mut self,
         local_ufrag: &str,
+        remote_ufrag: &str,
         peer_addr: SocketAddr,
     ) -> Result<(), IceRouterError> {
         if peer_addr.port() == 0 || peer_addr.ip().is_unspecified() || peer_addr.ip().is_multicast()
         {
             return Err(IceRouterError::InvalidPeerAddress);
         }
+        let key = IceSessionKey {
+            local_ufrag: local_ufrag.to_owned(),
+            remote_ufrag: remote_ufrag.to_owned(),
+        };
         let route = self
             .sessions
-            .get(local_ufrag)
+            .get(&key)
             .ok_or(IceRouterError::UnknownUfrag)?;
         if !route.peer_addresses.contains(&peer_addr)
             && route.peer_addresses.len() >= MAX_SESSION_PEER_ADDRESSES
         {
             return Err(IceRouterError::PeerAddressLimit);
         }
-        if let Some(previous) = self.peer_sessions.insert(peer_addr, local_ufrag.to_owned())
-            && previous != local_ufrag
+        if let Some(previous) = self.peer_sessions.insert(peer_addr, key.clone())
+            && previous != key
             && let Some(previous_route) = self.sessions.get_mut(&previous)
         {
             previous_route.peer_addresses.remove(&peer_addr);
         }
         self.sessions
-            .get_mut(local_ufrag)
+            .get_mut(&key)
             .ok_or(IceRouterError::UnknownUfrag)?
             .peer_addresses
             .insert(peer_addr);
@@ -250,15 +274,19 @@ impl IceDatagramRouter {
     }
 
     /// Remove a peer session and all authenticated address bindings it owned.
-    pub fn unregister(&mut self, local_ufrag: &str) -> bool {
-        let Some(route) = self.sessions.remove(local_ufrag) else {
+    pub fn unregister(&mut self, local_ufrag: &str, remote_ufrag: &str) -> bool {
+        let key = IceSessionKey {
+            local_ufrag: local_ufrag.to_owned(),
+            remote_ufrag: remote_ufrag.to_owned(),
+        };
+        let Some(route) = self.sessions.remove(&key) else {
             return false;
         };
         for address in route.peer_addresses {
             if self
                 .peer_sessions
                 .get(&address)
-                .is_some_and(|owner| owner == local_ufrag)
+                .is_some_and(|owner| owner == &key)
             {
                 self.peer_sessions.remove(&address);
             }
@@ -268,14 +296,17 @@ impl IceDatagramRouter {
 
     /// Route one demultiplexed STUN datagram without blocking the shared UDP receive loop.
     pub fn route(&self, datagram: IceDatagram) -> bool {
-        let target = crate::stun::ice_username(&datagram.payload)
-            .and_then(ice_recipient_ufrag)
-            .filter(|ufrag| self.sessions.contains_key(*ufrag))
-            .map(str::to_owned)
-            .or_else(|| self.peer_sessions.get(&datagram.peer_addr).cloned());
-        target
-            .and_then(|ufrag| self.sessions.get(&ufrag))
-            .is_some_and(|route| route.sender.try_send(datagram).is_ok())
+        let route = if let Some(username) = crate::stun::ice_username(&datagram.payload) {
+            let Some(key) = ice_session_key(username) else {
+                return false;
+            };
+            self.sessions.get(&key)
+        } else {
+            self.peer_sessions
+                .get(&datagram.peer_addr)
+                .and_then(|key| self.sessions.get(key))
+        };
+        route.is_some_and(|route| route.sender.try_send(datagram).is_ok())
     }
 }
 
@@ -285,8 +316,8 @@ pub enum IceRouterError {
     InvalidRegistration,
     #[error("maximum ICE session count reached")]
     SessionLimit,
-    #[error("ICE ufrag is already registered")]
-    DuplicateUfrag,
+    #[error("ICE peer session is already registered")]
+    DuplicateSession,
     #[error("ICE ufrag is not registered")]
     UnknownUfrag,
     #[error("maximum authenticated peer addresses reached for ICE session")]
@@ -299,10 +330,13 @@ pub enum IceRouterError {
     AgentRejected(String),
 }
 
-fn ice_recipient_ufrag(username: &str) -> Option<&str> {
-    let (recipient, remote) = username.split_once(':')?;
-    (valid_ice_ufrag(recipient) && valid_ice_ufrag(remote) && !remote.contains(':'))
-        .then_some(recipient)
+fn ice_session_key(username: &str) -> Option<IceSessionKey> {
+    let (local_ufrag, remote_ufrag) = username.split_once(':')?;
+    (valid_ice_ufrag(local_ufrag) && valid_ice_ufrag(remote_ufrag) && !remote_ufrag.contains(':'))
+        .then(|| IceSessionKey {
+            local_ufrag: local_ufrag.to_owned(),
+            remote_ufrag: remote_ufrag.to_owned(),
+        })
 }
 
 fn valid_ice_ufrag(ufrag: &str) -> bool {
@@ -778,6 +812,7 @@ impl IceAgentDriver {
         socket: &IceSocketHandle,
         router: &IceDatagramRouterHandle,
         local_ufrag: &str,
+        remote_ufrag: &str,
         datagrams: &mut mpsc::Receiver<IceDatagram>,
         timeout: Duration,
     ) -> Result<(SocketAddr, SocketAddr), IceDriverError> {
@@ -804,7 +839,7 @@ impl IceAgentDriver {
                 datagram = datagrams.recv() => {
                     let datagram = datagram.ok_or_else(|| IceDriverError::Router("peer datagram queue closed".to_owned()))?;
                     router
-                        .handle_datagram(local_ufrag, self, datagram, Instant::now())
+                        .handle_datagram(local_ufrag, remote_ufrag, self, datagram, Instant::now())
                         .map_err(|error| IceDriverError::Router(error.to_string()))?;
                 }
                 () = tokio::time::sleep_until(tokio::time::Instant::from_std(next_deadline)) => {
@@ -982,23 +1017,35 @@ mod tests {
     #[tokio::test]
     async fn ice_router_dispatches_by_recipient_ufrag_and_authenticated_peer_address() {
         let mut router = IceDatagramRouter::default();
-        let mut session_a = router.register("localA".to_owned(), 2).unwrap();
-        let mut session_b = router.register("localB".to_owned(), 2).unwrap();
+        let mut session_a = router
+            .register("localA".to_owned(), "remoteA".to_owned(), 2)
+            .unwrap();
+        let mut session_b = router
+            .register("localB".to_owned(), "remoteB".to_owned(), 2)
+            .unwrap();
+        let mut session_a_peer_c = router
+            .register("localA".to_owned(), "remoteC".to_owned(), 2)
+            .unwrap();
         let peer_a: SocketAddr = "127.0.0.1:42001".parse().unwrap();
         let peer_b: SocketAddr = "127.0.0.1:42002".parse().unwrap();
 
-        assert!(router.route(ice_packet("localA:remote", peer_a)));
-        assert!(router.route(ice_packet("localB:remote", peer_b)));
+        assert!(router.route(ice_packet("localA:remoteA", peer_a)));
+        assert!(router.route(ice_packet("localB:remoteB", peer_b)));
         assert_eq!(session_a.recv().await.unwrap().peer_addr, peer_a);
         assert_eq!(session_b.recv().await.unwrap().peer_addr, peer_b);
 
+        let peer_c: SocketAddr = "127.0.0.1:42004".parse().unwrap();
+        assert!(router.route(ice_packet("localA:remoteC", peer_c)));
+        assert_eq!(session_a_peer_c.recv().await.unwrap().peer_addr, peer_c);
+
         assert!(!router.route(ice_packet_without_username(peer_a)));
         router
-            .associate_authenticated_peer("localA", peer_a)
+            .associate_authenticated_peer("localA", "remoteA", peer_a)
             .unwrap();
         assert!(router.route(ice_packet_without_username(peer_a)));
         assert_eq!(session_a.recv().await.unwrap().peer_addr, peer_a);
-        assert!(router.unregister("localA"));
+        assert!(!router.route(ice_packet("localB:unknownR", peer_a)));
+        assert!(router.unregister("localA", "remoteA"));
         assert!(!router.route(ice_packet_without_username(peer_a)));
     }
 
@@ -1006,13 +1053,19 @@ mod tests {
     async fn ice_router_bounds_sessions_and_does_not_block_on_a_full_peer_queue() {
         let mut router = IceDatagramRouter::default();
         assert_eq!(
-            router.register("bad-ufrag".to_owned(), 1).err(),
+            router
+                .register("bad-ufrag".to_owned(), "remote".to_owned(), 1)
+                .err(),
             Some(IceRouterError::InvalidRegistration)
         );
-        let mut receiver = router.register("local".to_owned(), 1).unwrap();
+        let mut receiver = router
+            .register("local".to_owned(), "remote".to_owned(), 1)
+            .unwrap();
         assert_eq!(
-            router.register("local".to_owned(), 1).err(),
-            Some(IceRouterError::DuplicateUfrag)
+            router
+                .register("local".to_owned(), "remote".to_owned(), 1)
+                .err(),
+            Some(IceRouterError::DuplicateSession)
         );
         let peer = "127.0.0.1:42003".parse().unwrap();
         assert!(router.route(ice_packet("local:remote", peer)));
@@ -1073,11 +1126,11 @@ mod tests {
         let credentials_b = generate_ice_credentials(1).expect("ICE credentials B");
         let mut ice_messages_a = endpoint_a
             .ice_router
-            .register(credentials_a.ufrag.clone(), 8)
+            .register(credentials_a.ufrag.clone(), credentials_b.ufrag.clone(), 8)
             .expect("register A ICE session");
         let mut ice_messages = endpoint_b
             .ice_router
-            .register(credentials_b.ufrag.clone(), 8)
+            .register(credentials_b.ufrag.clone(), credentials_a.ufrag.clone(), 8)
             .expect("register B ICE session");
         let mut driver_a = IceAgentDriver::for_peer(
             &credentials_a,
@@ -1102,6 +1155,7 @@ mod tests {
                 &endpoint_a.socket,
                 &endpoint_a.ice_router,
                 &credentials_a.ufrag,
+                &credentials_b.ufrag,
                 &mut ice_messages_a,
                 Duration::from_secs(3),
             ),
@@ -1109,6 +1163,7 @@ mod tests {
                 &endpoint_b.socket,
                 &endpoint_b.ice_router,
                 &credentials_b.ufrag,
+                &credentials_a.ufrag,
                 &mut ice_messages,
                 Duration::from_secs(3),
             ),
@@ -1172,15 +1227,15 @@ mod tests {
         let sender = UdpSocket::bind("127.0.0.1:0").await.expect("sender socket");
         let mut ice_messages = endpoint
             .ice_router
-            .register("localq".to_owned(), 1)
+            .register("localq".to_owned(), "remoteq".to_owned(), 1)
             .expect("register ICE test session");
         let first_request = ice_packet(
-            "localq:remote",
+            "localq:remoteq",
             sender.local_addr().expect("sender address"),
         )
         .payload;
         let second_request = ice_packet(
-            "localq:remote",
+            "localq:remoteq",
             sender.local_addr().expect("sender address"),
         )
         .payload;
