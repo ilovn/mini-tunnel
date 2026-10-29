@@ -1,5 +1,7 @@
 //! Local device identity and signing helpers used by the CLI and tunnel agent.
 
+pub mod tun_device;
+
 use std::{fs, io, net::SocketAddr, path::PathBuf, sync::Mutex, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};

@@ -6,7 +6,7 @@ A minimal, peer-to-peer virtual network tunnel. The design baseline is in [`docs
 
 Implemented: a Rust workspace, local coordinator health endpoint, in-memory network creation, admin capability tokens, one-time join invites, IPv4 allocation, stable Ed25519 device identities, signed enrollment and peer discovery, candidate publication, and authenticated encrypted QUIC/UDP peer datagrams.
 
-Not implemented yet: persistent storage, TUN devices, NAT traversal, TCP fallback, and packet relay. The control API is a local development prototype and has no production rate limiting. **Do not expose it to untrusted networks.** The coordinator binds to loopback by default.
+Not implemented yet: persistent storage, connecting TUN packets to long-running peer sessions, overlay route installation, NAT traversal, TCP fallback, and packet relay. The control API is a local development prototype and has no production rate limiting. **Do not expose it to untrusted networks.** The coordinator binds to loopback by default.
 
 ## Quick start
 
@@ -68,6 +68,8 @@ cargo run -p mini-tunnel -- peer connect --network-id '<network-id>' --peer-id '
 ```
 
 The command checks the peer key from that signed snapshot, tries at most eight candidates in order (five seconds per attempt), then sends one authenticated datagram. It reports a missing peer, absent/unusable candidates, identity mismatch, and unreachable candidates as separate errors. The coordinator supplies discovery data only; the QUIC datagram travels directly between the devices.
+
+The agent crate now exposes an async Layer 3 IPv4 TUN adapter (`mini_tunnel_agent::tun_device::TunDevice`) with a default MTU of 1150 bytes, capped to fit the current QUIC datagram framing. It validates IPv4 header/length/MTU and enforces the local and authenticated peer IP boundary on packets. Creating a TUN assigns its local address and requires OS network-interface privileges; Linux may require the `tun` module and root or `CAP_NET_ADMIN`, macOS/BSD may require elevated permissions, and Windows requires Administrator privileges plus the matching `wintun.dll`. The adapter deliberately does not install the overlay CIDR route, and disables tun-rs automatic route management on macOS/BSD. This is a library API only: the CLI does not yet create a TUN or pump packets through peer sessions.
 
 ## Development
 
