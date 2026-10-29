@@ -1164,6 +1164,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "clap",
+ "directories",
  "mini-tunnel-agent",
  "mini-tunnel-coordinator",
  "mini-tunnel-protocol",
@@ -1209,6 +1210,7 @@ dependencies = [
  "ipnet",
  "mini-tunnel-protocol",
  "serde",
+ "serde_json",
  "sha2",
  "subtle",
  "tokio",
@@ -2344,6 +2346,7 @@ checksum = "4a0e2d11620c50695fe12bbbfde96b3477fe606e7284c22d505c12ce51214514"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

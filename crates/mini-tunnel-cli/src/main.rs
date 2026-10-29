@@ -1,5 +1,6 @@
 use std::{
     net::{Ipv4Addr, SocketAddr},
+    path::PathBuf,
     process::ExitCode,
     time::Duration,
 };
@@ -53,6 +54,13 @@ enum CoordinatorCommand {
             default_value = "127.0.0.1:8080"
         )]
         listen: SocketAddr,
+        /// Coordinator state snapshot path.
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_COORDINATOR_STATE",
+            default_value_os_t = default_coordinator_state_path()
+        )]
+        state_file: PathBuf,
     },
     /// Check a running coordinator's health endpoint.
     Health {
@@ -254,17 +262,23 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn default_coordinator_state_path() -> PathBuf {
+    directories::ProjectDirs::from("org", "ilovn", "mini-tunnel")
+        .map(|dirs| dirs.data_local_dir().join("coordinator-state.json"))
+        .unwrap_or_else(|| PathBuf::from("mini-tunnel-state.json"))
+}
+
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match cli.command {
         Command::Coordinator { command } => match command {
-            CoordinatorCommand::Serve { listen } => {
+            CoordinatorCommand::Serve { listen, state_file } => {
                 tracing_subscriber::fmt()
                     .with_env_filter(
                         tracing_subscriber::EnvFilter::try_from_default_env()
                             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
                     )
                     .init();
-                mini_tunnel_coordinator::serve(listen).await?;
+                mini_tunnel_coordinator::serve_with_state_file(listen, state_file).await?;
             }
             CoordinatorCommand::Health { url } => {
                 let endpoint = format!("{}/healthz", url.trim_end_matches('/'));

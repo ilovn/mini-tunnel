@@ -4,9 +4,9 @@ A minimal, peer-to-peer virtual network tunnel. The design baseline is in [`docs
 
 ## Current status
 
-Implemented: a Rust workspace, local coordinator health endpoint, in-memory network creation, admin capability tokens, one-time join invites, IPv4 allocation, stable Ed25519 device identities, signed enrollment and peer discovery, candidate publication, and authenticated encrypted QUIC/UDP peer datagrams.
+Implemented: a Rust workspace, coordinator health endpoint, atomic persistent coordinator state, network creation, admin capability tokens, one-time join invites, IPv4 allocation, stable Ed25519 device identities, signed enrollment and peer discovery, candidate publication, and authenticated encrypted QUIC/UDP peer datagrams.
 
-Not implemented yet: persistent coordinator storage, NAT traversal, TCP fallback, and packet relay. The current tunnel command supports one directly reachable peer session at a time. The control API is a local development prototype and has no production rate limiting. **Do not expose it to untrusted networks.** The coordinator binds to loopback by default.
+Not implemented yet: NAT traversal, TCP fallback, and packet relay. The current tunnel command supports one directly reachable peer session at a time. The control API is a local development prototype and has no production rate limiting. **Do not expose it to untrusted networks.** The coordinator binds to loopback by default.
 
 ## Quick start
 
@@ -38,6 +38,8 @@ cargo run -p mini-tunnel -- network join --network-id '<network-id>'
 
 The CLI creates a stable Ed25519 identity at the OS user configuration directory (`device.key`; Unix permissions are restricted to the current user). Inspect the public identity with `cargo run -p mini-tunnel -- identity`. Joining signs the invite proof with this key; the private key is never sent. After a successful join, the CLI atomically saves the network ID, device ID, assigned IPv4 address, and CIDR under the user's configuration directory (`networks/<network-id>.json`, mode 0600 on Unix). Invite tokens, admin tokens, and private keys are not included. Existing members can run `network join` again with a valid invite to create/update the local copy; or pass both local IPv4 and prefix explicitly to tunnel commands until a membership file exists.
 
+The coordinator persists network/member/address/candidate/invite state at the per-user data directory's `coordinator-state.json`. Override it with `--state-file <path>` or `MINI_TUNNEL_COORDINATOR_STATE`. The file is written atomically with Unix mode 0600; startup rejects symlinks, unsafe permissions, corrupt content, and unknown schema versions instead of silently resetting state. Only hashes of admin and invite tokens are stored. Back up this file before moving or upgrading the coordinator. This is a single-process snapshot store; do not share it among multiple coordinator processes or use it as a multi-region database.
+
 Members publish socket candidates and request same-network peers:
 
 ```sh
@@ -45,7 +47,7 @@ cargo run -p mini-tunnel -- network advertise --network-id '<network-id>' --cand
 cargo run -p mini-tunnel -- network peers --network-id '<network-id>'
 ```
 
-Candidate updates are signed, limited to eight usable socket addresses, and reject timestamps outside a five-minute window or replayed updates. This only exchanges control-plane information; it does not open a tunnel or prove that a candidate is reachable. The current coordinator state is in memory. Restarting it removes networks, tokens, identities, candidates, and address assignments. Each invite expires after one hour and can enroll one device.
+Candidate updates are signed, limited to eight usable socket addresses, and reject timestamps outside a five-minute window or replayed updates. This only exchanges control-plane information; it does not open a tunnel or prove that a candidate is reachable. Each invite expires after one hour and can enroll one device.
 
 The low-level authenticated QUIC/UDP diagnostic can verify a reachable peer address without creating a TUN. Each side needs the other device's ID and URL-safe base64 public key shown by the identity command. On the receiving side:
 
