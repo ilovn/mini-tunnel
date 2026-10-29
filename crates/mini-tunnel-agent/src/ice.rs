@@ -107,7 +107,69 @@ impl IceSocketHandle {
 pub struct IcedPeerEndpoint {
     pub endpoint: quinn::Endpoint,
     pub socket: IceSocketHandle,
-    pub ice_datagrams: mpsc::Receiver<IceDatagram>,
+    pub ice_router: IceDatagramRouterHandle,
+}
+
+/// Cloneable registration handle for the endpoint's live ICE datagram dispatcher.
+#[derive(Clone, Default)]
+pub struct IceDatagramRouterHandle {
+    router: Arc<Mutex<IceDatagramRouter>>,
+}
+
+impl IceDatagramRouterHandle {
+    pub fn register(
+        &self,
+        local_ufrag: String,
+        queue_capacity: usize,
+    ) -> Result<mpsc::Receiver<IceDatagram>, IceRouterError> {
+        self.router
+            .lock()
+            .map_err(|_| IceRouterError::Poisoned)?
+            .register(local_ufrag, queue_capacity)
+    }
+
+    pub fn associate_authenticated_peer(
+        &self,
+        local_ufrag: &str,
+        peer_addr: SocketAddr,
+    ) -> Result<(), IceRouterError> {
+        self.router
+            .lock()
+            .map_err(|_| IceRouterError::Poisoned)?
+            .associate_authenticated_peer(local_ufrag, peer_addr)
+    }
+
+    /// Deliver a routed datagram to its ICE agent and bind the source address only when the
+    /// agent accepts the authenticated STUN check.
+    pub fn handle_datagram(
+        &self,
+        local_ufrag: &str,
+        driver: &mut IceAgentDriver,
+        datagram: IceDatagram,
+        now: Instant,
+    ) -> Result<bool, IceRouterError> {
+        let accepted = driver
+            .handle_datagram(now, datagram.peer_addr, None, &datagram.payload)
+            .map_err(|error| IceRouterError::AgentRejected(error.to_string()))?;
+        if accepted {
+            self.associate_authenticated_peer(local_ufrag, datagram.peer_addr)?;
+        }
+        Ok(accepted)
+    }
+
+    pub fn unregister(&self, local_ufrag: &str) -> Result<bool, IceRouterError> {
+        Ok(self
+            .router
+            .lock()
+            .map_err(|_| IceRouterError::Poisoned)?
+            .unregister(local_ufrag))
+    }
+
+    fn route(&self, datagram: IceDatagram) {
+        if let Ok(router) = self.router.lock() {
+            let _ = router.route(datagram);
+        }
+    }
 }
 
 struct IceRoute {
@@ -231,6 +293,10 @@ pub enum IceRouterError {
     PeerAddressLimit,
     #[error("peer address is not usable")]
     InvalidPeerAddress,
+    #[error("ICE datagram router lock is poisoned")]
+    Poisoned,
+    #[error("ICE agent rejected routed datagram: {0}")]
+    AgentRejected(String),
 }
 
 fn ice_recipient_ufrag(username: &str) -> Option<&str> {
@@ -265,7 +331,7 @@ pub fn peer_endpoint_with_ice(
     socket
         .set_nonblocking(true)
         .map_err(|error| crate::IdentityError::Transport(error.to_string()))?;
-    let (runtime, socket_handle, ice_datagrams) = IcedQuinnRuntime::new(queue_capacity);
+    let (runtime, socket_handle, mut ice_datagrams) = IcedQuinnRuntime::new(queue_capacity);
     let endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         Some(super::peer_server_config(identity)?),
@@ -273,10 +339,17 @@ pub fn peer_endpoint_with_ice(
         Arc::new(runtime),
     )
     .map_err(|error| crate::IdentityError::Transport(error.to_string()))?;
+    let ice_router = IceDatagramRouterHandle::default();
+    let dispatch_router = ice_router.clone();
+    tokio::spawn(async move {
+        while let Some(datagram) = ice_datagrams.recv().await {
+            dispatch_router.route(datagram);
+        }
+    });
     Ok(IcedPeerEndpoint {
         endpoint,
         socket: socket_handle,
-        ice_datagrams,
+        ice_router,
     })
 }
 
@@ -885,14 +958,6 @@ mod tests {
         }
     }
 
-    fn binding_request(transaction: u8) -> [u8; 20] {
-        let mut request = [0; 20];
-        request[..2].copy_from_slice(&1_u16.to_be_bytes());
-        request[4..8].copy_from_slice(&0x2112_A442_u32.to_be_bytes());
-        request[8..].fill(transaction);
-        request
-    }
-
     #[tokio::test]
     async fn iced_quinn_socket_demultiplexes_stun_and_keeps_quic_working() {
         let temp =
@@ -904,13 +969,17 @@ mod tests {
         let endpoint_a =
             super::peer_endpoint_with_ice(&identity_a, "127.0.0.1:0".parse().unwrap(), 8)
                 .expect("ICE endpoint A");
-        let mut endpoint_b =
+        let endpoint_b =
             super::peer_endpoint_with_ice(&identity_b, "127.0.0.1:0".parse().unwrap(), 8)
                 .expect("ICE endpoint B");
         let address_b = endpoint_b
             .endpoint
             .local_addr()
             .expect("endpoint B address");
+        let mut ice_messages = endpoint_b
+            .ice_router
+            .register("localb".to_owned(), 8)
+            .expect("register B ICE session");
         let identity_a_id = identity_a.device_id();
         let identity_a_key = identity_a.public_key();
         let identity_b_id = identity_b.device_id();
@@ -938,17 +1007,16 @@ mod tests {
         .expect("QUIC handshake through demux socket");
         let channel_b = accept.await.expect("accept task").expect("accept QUIC");
 
-        let request = binding_request(42);
+        let request = ice_packet("remote:localb", address_b).payload;
         endpoint_a
             .socket
             .send_to(&request, address_b)
             .await
             .expect("send an ICE STUN datagram");
-        let ice_message =
-            tokio::time::timeout(Duration::from_secs(1), endpoint_b.ice_datagrams.recv())
-                .await
-                .expect("STUN reaches ICE queue")
-                .expect("ICE queue remains open");
+        let ice_message = tokio::time::timeout(Duration::from_secs(1), ice_messages.recv())
+            .await
+            .expect("STUN reaches ICE queue")
+            .expect("ICE queue remains open");
         assert_eq!(ice_message.local_addr, address_b);
         assert_eq!(
             ice_message.peer_addr,
@@ -979,28 +1047,40 @@ mod tests {
             std::env::temp_dir().join(format!("mini-tunnel-ice-queue-{}", uuid::Uuid::new_v4()));
         let identity =
             crate::Identity::load_or_create_at(temp.join("device.key")).expect("identity");
-        let mut endpoint =
-            super::peer_endpoint_with_ice(&identity, "127.0.0.1:0".parse().unwrap(), 1)
-                .expect("ICE endpoint");
+        let endpoint = super::peer_endpoint_with_ice(&identity, "127.0.0.1:0".parse().unwrap(), 1)
+            .expect("ICE endpoint");
         let address = endpoint.endpoint.local_addr().expect("endpoint address");
         let sender = UdpSocket::bind("127.0.0.1:0").await.expect("sender socket");
+        let mut ice_messages = endpoint
+            .ice_router
+            .register("localq".to_owned(), 1)
+            .expect("register ICE test session");
+        let first_request = ice_packet(
+            "remote:localq",
+            sender.local_addr().expect("sender address"),
+        )
+        .payload;
+        let second_request = ice_packet(
+            "remote:localq",
+            sender.local_addr().expect("sender address"),
+        )
+        .payload;
         sender
-            .send_to(&binding_request(1), address)
+            .send_to(&first_request, address)
             .await
             .expect("send first STUN datagram");
         sender
-            .send_to(&binding_request(2), address)
+            .send_to(&second_request, address)
             .await
             .expect("send second STUN datagram");
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let first = endpoint
-            .ice_datagrams
+        let first = ice_messages
             .recv()
             .await
             .expect("first STUN datagram queued");
-        assert_eq!(first.payload, binding_request(1));
-        assert!(endpoint.ice_datagrams.try_recv().is_err());
+        assert_eq!(first.payload, first_request);
+        assert!(ice_messages.try_recv().is_err());
         endpoint.endpoint.close(0_u32.into(), b"test complete");
         let _ = fs::remove_dir_all(temp);
     }
