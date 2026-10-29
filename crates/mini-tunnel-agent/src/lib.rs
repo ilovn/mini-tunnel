@@ -301,7 +301,7 @@ fn peer_server_config(identity: &Identity) -> Result<quinn::ServerConfig, Identi
         .with_no_client_auth()
         .with_single_cert(vec![certificate_der], server_key)
         .map_err(|error| IdentityError::Transport(error.to_string()))?;
-    server_tls.alpn_protocols = vec![b"mini-tunnel-peer/1".to_vec()];
+    server_tls.alpn_protocols = vec![b"mini-tunnel-peer/2".to_vec()];
     let server_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(server_tls)
         .map_err(|error| IdentityError::Transport(error.to_string()))?;
     let mut server_config = quinn::ServerConfig::with_crypto(std::sync::Arc::new(server_crypto));
@@ -322,7 +322,7 @@ fn peer_client_config(
             expected_key,
         }))
         .with_no_client_auth();
-    tls.alpn_protocols = vec![b"mini-tunnel-peer/1".to_vec()];
+    tls.alpn_protocols = vec![b"mini-tunnel-peer/2".to_vec()];
     let mut config = quinn::ClientConfig::new(std::sync::Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls)
             .map_err(|error| IdentityError::Transport(error.to_string()))?,
@@ -443,11 +443,42 @@ pub async fn accept_peer(
         &connection,
         network_id,
         identity,
-        expected_peer_id,
-        &expected_peer_key,
+        Some((expected_peer_id, expected_peer_key)),
+        None,
     )
     .await?;
     Ok(new_channel(connection, network_id))
+}
+
+/// Accept the next authenticated member from an allowlist, returning its identity for demux.
+pub async fn accept_peer_any(
+    endpoint: &Endpoint,
+    network_id: &str,
+    identity: &Identity,
+    allowed_peers: &[(String, [u8; 32])],
+) -> Result<(String, PeerChannel), IdentityError> {
+    if allowed_peers.is_empty()
+        || allowed_peers.iter().any(|(device_id, public_key)| {
+            device_id != &mini_tunnel_protocol::device_id_from_public_key(public_key)
+        })
+    {
+        return Err(IdentityError::UnauthorizedPeer);
+    }
+    loop {
+        let Some(incoming) = endpoint.accept().await else {
+            return Err(IdentityError::Transport("endpoint closed".to_owned()));
+        };
+        let connection = match tokio::time::timeout(PEER_HANDSHAKE_TIMEOUT, incoming).await {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(_)) | Err(_) => continue,
+        };
+        match server_authenticate(&connection, network_id, identity, None, Some(allowed_peers))
+            .await
+        {
+            Ok((device_id, _)) => return Ok((device_id, new_channel(connection, network_id))),
+            Err(_) => connection.close(0_u32.into(), b"peer authentication rejected"),
+        }
+    }
 }
 
 fn new_channel(connection: Connection, network_id: &str) -> PeerChannel {
@@ -564,7 +595,10 @@ async fn client_authenticate(
         .map_err(|error| IdentityError::Transport(error.to_string()))?;
     let mut nonce = [0_u8; 32];
     getrandom::fill(&mut nonce).map_err(|_| IdentityError::Random)?;
-    // Client sends the nonce first so the server can answer without waiting for a stream read.
+    // Announce the signing key so a multi-peer listener can demultiplex incoming connections.
+    send.write_all(&identity.public_key())
+        .await
+        .map_err(|error| IdentityError::Transport(error.to_string()))?;
     send.write_all(&nonce)
         .await
         .map_err(|error| IdentityError::Transport(error.to_string()))?;
@@ -601,13 +635,29 @@ async fn server_authenticate(
     connection: &Connection,
     network_id: &str,
     identity: &Identity,
-    client_id: &str,
-    client_key: &[u8; 32],
-) -> Result<(), IdentityError> {
+    expected_peer: Option<(&str, [u8; 32])>,
+    allowed_peers: Option<&[(String, [u8; 32])]>,
+) -> Result<(String, [u8; 32]), IdentityError> {
     let (mut send, mut recv) = tokio::time::timeout(PEER_HANDSHAKE_TIMEOUT, connection.accept_bi())
         .await
         .map_err(|error| IdentityError::Transport(error.to_string()))?
         .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    let mut client_key = [0_u8; 32];
+    tokio::time::timeout(PEER_HANDSHAKE_TIMEOUT, recv.read_exact(&mut client_key))
+        .await
+        .map_err(|error| IdentityError::Transport(error.to_string()))?
+        .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    let client_id = mini_tunnel_protocol::device_id_from_public_key(&client_key);
+    if expected_peer.is_some_and(|(expected_id, expected_key)| {
+        expected_id != client_id || expected_key != client_key
+    }) || allowed_peers.is_some_and(|allowed| {
+        !allowed
+            .iter()
+            .any(|(allowed_id, allowed_key)| allowed_id == &client_id && allowed_key == &client_key)
+    }) {
+        let _ = send.write_all(&[0]).await;
+        return Err(IdentityError::UnauthorizedPeer);
+    }
     let mut client_nonce = [0_u8; 32];
     tokio::time::timeout(PEER_HANDSHAKE_TIMEOUT, recv.read_exact(&mut client_nonce))
         .await
@@ -625,18 +675,18 @@ async fn server_authenticate(
         .map_err(|error| IdentityError::Transport(error.to_string()))?;
     let proof = auth_bytes(
         network_id,
-        client_id,
+        &client_id,
         &identity.device_id(),
         &client_nonce,
         &server_nonce,
     );
-    let key = VerifyingKey::from_bytes(client_key).map_err(|_| IdentityError::UnauthorizedPeer)?;
+    let key = VerifyingKey::from_bytes(&client_key).map_err(|_| IdentityError::UnauthorizedPeer)?;
     key.verify_strict(&proof, &Signature::from_bytes(&signature))
         .map_err(|_| IdentityError::UnauthorizedPeer)?;
     send.write_all(&[1])
         .await
         .map_err(|error| IdentityError::Transport(error.to_string()))?;
-    Ok(())
+    Ok((client_id, client_key))
 }
 
 fn auth_bytes(
@@ -876,6 +926,90 @@ mod tests {
             Err(CandidateConnectError::UnauthorizedPeer)
         ));
         endpoint.close(0_u32.into(), b"test complete");
+        fs::remove_dir_all(temp).expect("remove test identities");
+    }
+
+    #[tokio::test]
+    async fn accept_peer_any_demultiplexes_multiple_authenticated_members() {
+        let temp =
+            std::env::temp_dir().join(format!("mini-tunnel-accept-any-{}", uuid::Uuid::new_v4()));
+        let a = Identity::load_or_create_at(temp.join("a/device.key")).expect("identity A");
+        let b = Identity::load_or_create_at(temp.join("b/device.key")).expect("identity B");
+        let c = Identity::load_or_create_at(temp.join("c/device.key")).expect("identity C");
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let endpoint_a = peer_endpoint(&a, bind).expect("endpoint A");
+        let endpoint_b = peer_endpoint(&b, bind).expect("endpoint B");
+        let endpoint_c = peer_endpoint(&c, bind).expect("endpoint C");
+        let a_id = a.device_id();
+        let a_key = a.public_key();
+        let b_id = b.device_id();
+        let b_key = b.public_key();
+        let c_id = c.device_id();
+        let c_key = c.public_key();
+        let allowed = vec![(a_id.clone(), a_key), (b_id.clone(), b_key)];
+        let c_identity = std::sync::Arc::new(c);
+        let accepting_endpoint = endpoint_c.clone();
+        let accepting_identity = std::sync::Arc::clone(&c_identity);
+        let allowed_first = allowed.clone();
+        let accept_a = tokio::spawn(async move {
+            accept_peer_any(
+                &accepting_endpoint,
+                "office",
+                &accepting_identity,
+                &allowed_first,
+            )
+            .await
+        });
+        let a_channel = connect_peer(
+            &endpoint_a,
+            endpoint_c.local_addr().expect("C address"),
+            "office",
+            &a,
+            &c_id,
+            c_key,
+        )
+        .await
+        .expect("A connects to C");
+        let (accepted_a, c_channel_a) = accept_a.await.expect("accept A task").expect("accept A");
+        assert_eq!(accepted_a, a_id);
+        a_channel.send_packet(b"from A").expect("send from A");
+        assert_eq!(
+            c_channel_a.recv_packet().await.expect("receive A"),
+            b"from A"
+        );
+
+        let accepting_endpoint = endpoint_c.clone();
+        let accepting_identity = std::sync::Arc::clone(&c_identity);
+        let allowed_b = vec![(b_id.clone(), b_key)];
+        let accept_b = tokio::spawn(async move {
+            accept_peer_any(
+                &accepting_endpoint,
+                "office",
+                &accepting_identity,
+                &allowed_b,
+            )
+            .await
+        });
+        let b_channel = connect_peer(
+            &endpoint_b,
+            endpoint_c.local_addr().expect("C address"),
+            "office",
+            &b,
+            &c_id,
+            c_key,
+        )
+        .await
+        .expect("B connects to C");
+        let (accepted_b, c_channel_b) = accept_b.await.expect("accept B task").expect("accept B");
+        assert_eq!(accepted_b, b_id);
+        b_channel.send_packet(b"from B").expect("send from B");
+        assert_eq!(
+            c_channel_b.recv_packet().await.expect("receive B"),
+            b"from B"
+        );
+        endpoint_a.close(0_u32.into(), b"test complete");
+        endpoint_b.close(0_u32.into(), b"test complete");
+        endpoint_c.close(0_u32.into(), b"test complete");
         fs::remove_dir_all(temp).expect("remove test identities");
     }
 

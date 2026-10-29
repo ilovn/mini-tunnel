@@ -256,6 +256,34 @@ enum TunnelCommand {
         )]
         coordinator_url: String,
     },
+    /// Connect all currently discoverable members into one IPv4 L3 mesh.
+    Mesh {
+        #[arg(long, default_value = "0.0.0.0:42000")]
+        bind: SocketAddr,
+        /// Optional RFC 8489 STUN server used to discover and publish this UDP socket's mapped address.
+        #[arg(long)]
+        stun_server: Option<SocketAddr>,
+        /// Additional candidate address to publish; may be repeated.
+        #[arg(long = "candidate")]
+        candidates: Vec<String>,
+        #[arg(long)]
+        network_id: String,
+        #[arg(long)]
+        local_ipv4: Option<Ipv4Addr>,
+        #[arg(long)]
+        prefix_len: Option<u8>,
+        #[arg(long, default_value_t = 1150)]
+        mtu: u16,
+        /// Install and clean up one /32 route for every authenticated peer.
+        #[arg(long)]
+        manage_route: bool,
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_COORDINATOR_URL",
+            default_value = "http://127.0.0.1:8080"
+        )]
+        coordinator_url: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -403,6 +431,124 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .await?;
                     let remote = channel.remote_address();
                     run_peer_tunnel(&tun, &channel, &peer, remote, manage_route).await?;
+                }
+                TunnelCommand::Mesh {
+                    bind,
+                    stun_server,
+                    candidates,
+                    network_id,
+                    local_ipv4,
+                    prefix_len,
+                    mtu,
+                    manage_route,
+                    coordinator_url,
+                } => {
+                    let identity = mini_tunnel_agent::Identity::load_or_create()?;
+                    let (local_ipv4, prefix_len) =
+                        resolve_tun_parameters(&network_id, &identity, local_ipv4, prefix_len)?;
+                    let endpoint = create_tunnel_endpoint(
+                        &identity,
+                        bind,
+                        stun_server,
+                        &candidates,
+                        &network_id,
+                        &coordinator_url,
+                    )
+                    .await?;
+                    let peers = discover_peers(&coordinator_url, &network_id, &identity).await?;
+                    if peers.is_empty() {
+                        return Err("no other enrolled peers are available in this network".into());
+                    }
+                    let local_device_id = identity.device_id();
+                    let identity = std::sync::Arc::new(identity);
+                    let mut attempts = tokio::task::JoinSet::new();
+                    let mut inbound_peers = Vec::new();
+                    for peer in peers {
+                        if local_device_id > peer.device_id {
+                            inbound_peers.push(peer);
+                            continue;
+                        }
+                        let endpoint = endpoint.clone();
+                        let identity = std::sync::Arc::clone(&identity);
+                        let network_id = network_id.clone();
+                        let coordinator_url = coordinator_url.clone();
+                        attempts.spawn(async move {
+                            let result = connect_mesh_peer(
+                                &endpoint,
+                                &network_id,
+                                &coordinator_url,
+                                &identity,
+                                &peer,
+                            )
+                            .await;
+                            (peer, result)
+                        });
+                    }
+                    let accept_task = if inbound_peers.is_empty() {
+                        None
+                    } else {
+                        let endpoint = endpoint.clone();
+                        let identity = std::sync::Arc::clone(&identity);
+                        let network_id = network_id.clone();
+                        Some(tokio::spawn(async move {
+                            let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+                            let mut connected = Vec::new();
+                            while !inbound_peers.is_empty() {
+                                let allowed = inbound_peers
+                                    .iter()
+                                    .map(|peer| {
+                                        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
+                                            peer.device_id.clone(),
+                                            decode_peer_key(&peer.public_key)?,
+                                        ))
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                let accepted = tokio::time::timeout_at(
+                                    deadline,
+                                    mini_tunnel_agent::accept_peer_any(
+                                        &endpoint,
+                                        &network_id,
+                                        &identity,
+                                        &allowed,
+                                    ),
+                                )
+                                .await;
+                                let Ok(Ok((device_id, channel))) = accepted else {
+                                    break;
+                                };
+                                if let Some(index) = inbound_peers
+                                    .iter()
+                                    .position(|peer| peer.device_id == device_id)
+                                {
+                                    let peer = inbound_peers.remove(index);
+                                    let remote = channel.remote_address();
+                                    connected.push((peer, channel, remote));
+                                }
+                            }
+                            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(connected)
+                        }))
+                    };
+                    let mut connected = Vec::new();
+                    while let Some(result) = attempts.join_next().await {
+                        let (peer, result) = result?;
+                        match result {
+                            Ok((channel, remote)) => {
+                                println!("Connected mesh peer {} at {remote}", peer.device_id);
+                                connected.push((peer, channel, remote));
+                            }
+                            Err(error) => {
+                                eprintln!("Peer {} unavailable: {error}", peer.device_id);
+                            }
+                        }
+                    }
+                    if let Some(accept_task) = accept_task {
+                        connected.extend(accept_task.await??);
+                    }
+                    if connected.is_empty() {
+                        return Err("could not establish any authenticated peer sessions".into());
+                    }
+                    let tun = create_tun(local_ipv4, prefix_len, mtu)?;
+                    run_peer_mesh(&tun, connected, manage_route).await?;
                 }
             },
             PeerCommand::Connect {
@@ -707,6 +853,96 @@ async fn run_peer_tunnel(
     tunnel_result
 }
 
+async fn connect_mesh_peer(
+    endpoint: &quinn::Endpoint,
+    network_id: &str,
+    coordinator_url: &str,
+    identity: &mini_tunnel_agent::Identity,
+    peer: &PeerInfo,
+) -> Result<(mini_tunnel_agent::PeerChannel, SocketAddr), String> {
+    let mut peer = peer.clone();
+    for _ in 0..10 {
+        if !peer.candidates.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        peer = discover_peer(coordinator_url, network_id, &peer.device_id, identity)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    let peer_key = decode_peer_key(&peer.public_key).map_err(|error| error.to_string())?;
+    mini_tunnel_agent::connect_peer_candidates(
+        endpoint,
+        &peer.candidates,
+        network_id,
+        identity,
+        &peer.device_id,
+        peer_key,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+async fn run_peer_mesh(
+    tun: &mini_tunnel_agent::tun_device::TunDevice,
+    peers: Vec<(PeerInfo, mini_tunnel_agent::PeerChannel, SocketAddr)>,
+    manage_routes: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use mini_tunnel_agent::routing::{
+        RouteLease, RoutingPlatform, SystemRouteRunner, install_peer_route,
+    };
+
+    let prepared = peers
+        .into_iter()
+        .map(|(peer, channel, remote)| {
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
+                peer.device_id,
+                peer.assigned_ipv4.parse::<Ipv4Addr>()?,
+                channel,
+                remote,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let interface = tun.name()?;
+    let runner = SystemRouteRunner;
+    let mut routes: Vec<RouteLease> = Vec::new();
+    let mut channels = Vec::with_capacity(prepared.len());
+    for (device_id, peer_ipv4, channel, remote) in prepared {
+        if manage_routes {
+            match install_peer_route(&runner, RoutingPlatform::current(), &interface, peer_ipv4)
+                .await
+            {
+                Ok(route) => routes.push(route),
+                Err(error) => {
+                    for route in routes.drain(..).rev() {
+                        let _ = route.remove(&runner).await;
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+        println!("Mesh peer {device_id} {peer_ipv4} at {remote}");
+        channels.push((peer_ipv4, std::sync::Arc::new(channel)));
+    }
+    println!("Mesh established on TUN interface {interface}");
+    let pump = mini_tunnel_agent::tunnel::pump_peer_mesh(tun, channels);
+    tokio::pin!(pump);
+    let tunnel_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = tokio::select! {
+        result = &mut pump => result.map_err(Into::into),
+        signal = tokio::signal::ctrl_c() => signal.map_err(Into::into),
+    };
+    let mut cleanup_error = None;
+    for route in routes.into_iter().rev() {
+        if let Err(error) = route.remove(&runner).await {
+            cleanup_error.get_or_insert(error);
+        }
+    }
+    if let Some(error) = cleanup_error {
+        return Err(error.into());
+    }
+    tunnel_result
+}
+
 async fn create_tunnel_endpoint(
     identity: &mini_tunnel_agent::Identity,
     bind: SocketAddr,
@@ -813,6 +1049,18 @@ async fn discover_peer(
     peer_id: &str,
     identity: &mini_tunnel_agent::Identity,
 ) -> Result<PeerInfo, Box<dyn std::error::Error + Send + Sync>> {
+    discover_peers(coordinator_url, network_id, identity)
+        .await?
+        .into_iter()
+        .find(|peer| peer.device_id == peer_id)
+        .ok_or_else(|| "peer is not present in the signed same-network snapshot".into())
+}
+
+async fn discover_peers(
+    coordinator_url: &str,
+    network_id: &str,
+    identity: &mini_tunnel_agent::Identity,
+) -> Result<Vec<PeerInfo>, Box<dyn std::error::Error + Send + Sync>> {
     let device_id = identity.device_id();
     let timestamp_ms = now_ms()?;
     let request = PeerListRequest {
@@ -822,11 +1070,7 @@ async fn discover_peer(
     };
     let path = format!("/v1/networks/{network_id}/peers");
     let snapshot: PeerListResponse = post_json(coordinator_url, &path, &request).await?;
-    snapshot
-        .peers
-        .into_iter()
-        .find(|peer| peer.device_id == peer_id)
-        .ok_or_else(|| "peer is not present in the signed same-network snapshot".into())
+    Ok(snapshot.peers)
 }
 
 fn print_tunnel_ready(

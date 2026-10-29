@@ -4,9 +4,9 @@ A minimal, peer-to-peer virtual network tunnel. The design baseline is in [`docs
 
 ## Current status
 
-Implemented: a Rust workspace, coordinator health endpoint, atomic persistent coordinator state, network creation, admin capability tokens, one-time join invites, IPv4 allocation, stable Ed25519 device identities, signed enrollment and peer discovery, candidate publication, and authenticated encrypted QUIC/UDP peer datagrams.
+Implemented: a Rust workspace, coordinator health endpoint and atomic state, network creation/invites/IPv4 allocation, stable Ed25519 device identities, signed discovery candidates, authenticated QUIC/UDP peer channels, STUN mapped-candidate discovery, and a multi-peer IPv4 TUN mesh.
 
-Not implemented yet: NAT traversal, TCP fallback, and packet relay. The current tunnel command supports one directly reachable peer session at a time. The control API is a local development prototype and has no production rate limiting. **Do not expose it to untrusted networks.** The coordinator binds to loopback by default.
+Not implemented yet: coordinated NAT hole punching, TCP fallback, and packet relay. The control API is a local development prototype and has no production rate limiting. **Do not expose it to untrusted networks.** The coordinator binds to loopback by default.
 
 ## Quick start
 
@@ -73,7 +73,7 @@ cargo run -p mini-tunnel -- peer connect --network-id '<network-id>' --peer-id '
 
 The command checks the peer key from that signed snapshot, tries at most eight candidates in order (five seconds per attempt), then sends one authenticated datagram. It reports a missing peer, absent/unusable candidates, identity mismatch, and unreachable candidates as separate errors. The coordinator supplies discovery data only; the QUIC datagram travels directly between the devices.
 
-The agent crate exposes an async Layer 3 IPv4 TUN adapter (`mini_tunnel_agent::tun_device::TunDevice`) with a default MTU of 1150 bytes, capped to fit the current QUIC datagram framing. It validates IPv4 header/length/MTU and enforces the local and authenticated peer IP boundary on packets. Creating a TUN assigns its local address and requires OS network-interface privileges; Linux may require the `tun` module and root or `CAP_NET_ADMIN`, macOS/BSD may require elevated permissions, and Windows requires Administrator privileges plus the matching `wintun.dll`. The adapter does not call an explicit route-management API and disables tun-rs automatic route management on macOS/BSD; the OS may still create a connected route from the configured interface address and prefix. The tunnel CLI below uses this adapter and pumps packets over one authenticated peer session.
+The agent crate exposes an async Layer 3 IPv4 TUN adapter (`mini_tunnel_agent::tun_device::TunDevice`) with a default MTU of 1150 bytes, capped to fit the current QUIC datagram framing. It validates IPv4 header/length/MTU and enforces the local and authenticated peer IP boundary on packets. Creating a TUN assigns its local address and requires OS network-interface privileges; Linux may require the `tun` module and root or `CAP_NET_ADMIN`, macOS/BSD may require elevated permissions, and Windows requires Administrator privileges plus the matching `wintun.dll`. The adapter does not call an explicit route-management API and disables tun-rs automatic route management on macOS/BSD; the OS may still create a connected route from the configured interface address and prefix. Tunnel commands can use this adapter for one peer or a multi-peer mesh.
 
 ## Run a two-device IPv4 tunnel
 
@@ -89,6 +89,14 @@ cargo run -p mini-tunnel -- peer tunnel connect --network-id '<network-id>' --pe
 ```
 
 Both commands use the membership saved by `network join`; optional `--local-ipv4` and `--prefix-len` values are accepted only if they match that saved configuration. Without a saved membership, provide both values explicitly. Both commands require TUN privileges. By default, the program leaves system routes untouched; inspect the OS route table and add a host route manually if needed. On Linux and macOS you can opt in to managing exactly the authenticated peer IPv4 `/32` route with `--manage-route` on either tunnel command. The route is added only after peer authentication and before forwarding starts; an existing-route conflict, unsupported platform, missing route utility, or insufficient privileges aborts startup. A successfully added route is removed when the peer disconnects or you press Ctrl-C. Other platforms are not supported by `--manage-route`. Abrupt termination (for example, SIGKILL or power loss) cannot run cleanup; check the route table and remove a leftover route manually. The option never replaces or flushes routes.
+
+For multiple enrolled devices, run `peer tunnel mesh` on each device with the same mini-tunnel protocol version. Each process fetches the same-network peer snapshot and uses device ID ordering to choose one QUIC dialer per pair. One TUN routes each IPv4 packet to the authenticated peer matching its destination address. Pass `--stun-server` or publish manual candidates first. Example on each device:
+
+```sh
+cargo run -p mini-tunnel -- peer tunnel mesh --network-id '<network-id>' --bind 0.0.0.0:42000 --stun-server '<stun-ip>:3478' --manage-route
+```
+
+Mesh startup keeps reachable authenticated peers and reports unavailable peers; at least one peer must connect. The peer list is a startup snapshot, so newly joined devices require restarting mesh. STUN candidates may still be unreachable behind restrictive or symmetric NATs; coordinated hole punching is not implemented yet.
 
 ## Development
 
