@@ -59,6 +59,7 @@ pub struct HealthResponse {
 pub struct CoordinatorState {
     inner: Arc<RwLock<Store>>,
     persistence: Option<Arc<PathBuf>>,
+    _state_lock: Option<Arc<fs::File>>,
     request_limiter: RequestRateLimiter,
     relay_ticket_key: Option<Arc<[u8; 32]>>,
     relay_pairs: Arc<Mutex<RelayPairStore>>,
@@ -247,6 +248,7 @@ impl CoordinatorState {
     /// Load persisted state, or start with an empty store when the file does not exist.
     pub fn load(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
+        let state_lock = acquire_state_file_lock(&path)?;
         let store = match fs::symlink_metadata(&path) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -277,6 +279,7 @@ impl CoordinatorState {
         Ok(Self {
             inner: Arc::new(RwLock::new(store)),
             persistence: Some(Arc::new(path)),
+            _state_lock: Some(state_lock),
             request_limiter: RequestRateLimiter::default(),
             ..Self::default()
         })
@@ -713,6 +716,57 @@ impl CoordinatorState {
             .collect();
         Ok(PeerListResponse { peers })
     }
+}
+
+fn acquire_state_file_lock(path: &FsPath) -> io::Result<Arc<fs::File>> {
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "coordinator state path has no filename",
+        )
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(FsPath::new("."));
+    fs::create_dir_all(parent)?;
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".lock");
+    let lock_path = path.with_file_name(lock_name);
+    if let Ok(metadata) = fs::symlink_metadata(&lock_path) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "coordinator state lock path must be a regular non-symlink file",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "coordinator state lock permissions must be 0600 or stricter",
+                ));
+            }
+        }
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options.open(&lock_path)?;
+    lock.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "coordinator state is already locked by another process",
+        ),
+        std::fs::TryLockError::Error(error) => error,
+    })?;
+    Ok(Arc::new(lock))
 }
 
 impl Store {
@@ -1974,7 +2028,58 @@ mod tests {
                 .await,
             Err(ApiError::Unauthorized)
         ));
+        drop(restored);
         fs::remove_dir_all(dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn persistent_state_lock_rejects_a_second_process_and_releases_on_drop() {
+        let dir = std::env::temp_dir().join(format!("mini-tunnel-state-lock-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create test directory");
+        let path = dir.join("coordinator.json");
+        let state = CoordinatorState::load(&path).expect("first process acquires lock");
+        let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("tests::persistent_state_lock_child_process")
+            .env("MINI_TUNNEL_STATE_LOCK_CHILD", &path)
+            .status()
+            .expect("start lock verification process");
+        assert!(child.success(), "child process must observe the held lock");
+        let error = match CoordinatorState::load(&path) {
+            Ok(_) => panic!("second process must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("already locked"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let lock_path = dir.join("coordinator.json.lock");
+            assert_eq!(
+                fs::metadata(lock_path)
+                    .expect("lock metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        drop(state);
+        let restarted = CoordinatorState::load(&path).expect("lock releases when state drops");
+        drop(restarted);
+        fs::remove_dir_all(dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn persistent_state_lock_child_process() {
+        let Ok(path) = std::env::var("MINI_TUNNEL_STATE_LOCK_CHILD") else {
+            return;
+        };
+        let error = match CoordinatorState::load(path) {
+            Ok(_) => panic!("another process must not acquire the held state lock"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     }
 
     #[tokio::test]
@@ -2018,6 +2123,7 @@ mod tests {
                 .await,
             Err(ApiError::Unauthorized)
         ));
+        drop(restored);
         fs::remove_dir_all(dir).expect("remove test directory");
     }
 
@@ -2073,6 +2179,7 @@ mod tests {
             Err(ApiError::Persistence)
         ));
         assert!(state.inner.read().await.networks.is_empty());
+        drop(state);
         fs::remove_dir_all(dir).expect("remove test directory");
     }
 }
