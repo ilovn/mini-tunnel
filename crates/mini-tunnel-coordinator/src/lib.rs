@@ -1190,11 +1190,28 @@ pub async fn serve_with_state_file_and_relay_key_tls(
     relay_ticket_key: Option<[u8; 32]>,
     tls_files: Option<(PathBuf, PathBuf)>,
 ) -> std::io::Result<()> {
+    serve_with_state_file_and_relay_key_tls_and_reload_interval(
+        address,
+        state_file,
+        relay_ticket_key,
+        tls_files,
+        Duration::from_secs(30),
+    )
+    .await
+}
+
+pub async fn serve_with_state_file_and_relay_key_tls_and_reload_interval(
+    address: SocketAddr,
+    state_file: impl Into<PathBuf>,
+    relay_ticket_key: Option<[u8; 32]>,
+    tls_files: Option<(PathBuf, PathBuf)>,
+    tls_reload_interval: Duration,
+) -> std::io::Result<()> {
     let mut state = CoordinatorState::load(state_file)?;
     if let Some(key) = relay_ticket_key {
         state = state.with_relay_ticket_key(key);
     }
-    serve_with_state_and_tls(address, state, tls_files).await
+    serve_with_state_and_tls(address, state, tls_files, tls_reload_interval).await
 }
 
 async fn serve_with_state(address: SocketAddr, state: CoordinatorState) -> std::io::Result<()> {
@@ -1213,15 +1230,25 @@ async fn serve_with_state_and_tls(
     address: SocketAddr,
     state: CoordinatorState,
     tls_files: Option<(PathBuf, PathBuf)>,
+    tls_reload_interval: Duration,
 ) -> std::io::Result<()> {
     validate_listener_security(address, tls_files.is_some())?;
     let Some((certificate, private_key)) = tls_files else {
         return serve_with_state(address, state).await;
     };
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(certificate, private_key)
+    let (loaded_fingerprint, certificate_pem, private_key_pem) =
+        read_tls_pair(&certificate, &private_key).await?;
+    let config = axum_server::tls_rustls::RustlsConfig::from_pem(certificate_pem, private_key_pem)
         .await
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let reloader = tokio::spawn(reload_tls_certificate(
+        config.clone(),
+        certificate,
+        private_key,
+        tls_reload_interval,
+        loaded_fingerprint,
+    ));
     let handle = axum_server::Handle::new();
     let shutdown_handle = handle.clone();
     let shutdown = tokio::spawn(async move {
@@ -1233,7 +1260,60 @@ async fn serve_with_state_and_tls(
         .serve(router_with_state(state).into_make_service_with_connect_info::<SocketAddr>())
         .await;
     shutdown.abort();
+    reloader.abort();
     result
+}
+
+async fn reload_tls_certificate(
+    config: axum_server::tls_rustls::RustlsConfig,
+    certificate: PathBuf,
+    private_key: PathBuf,
+    interval: Duration,
+    mut loaded_fingerprint: [u8; 32],
+) {
+    loop {
+        tokio::time::sleep(interval).await;
+        let (fingerprint, certificate_pem, private_key_pem) = match read_tls_pair(
+            &certificate,
+            &private_key,
+        )
+        .await
+        {
+            Ok(pair) => pair,
+            Err(error) => {
+                tracing::warn!(%error, "could not read coordinator TLS certificate files; keeping current certificate");
+                continue;
+            }
+        };
+        if fingerprint == loaded_fingerprint {
+            continue;
+        }
+        match config
+            .reload_from_pem(certificate_pem, private_key_pem)
+            .await
+        {
+            Ok(()) => {
+                loaded_fingerprint = fingerprint;
+                tracing::info!("reloaded coordinator TLS certificate");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not reload coordinator TLS certificate; keeping current certificate")
+            }
+        }
+    }
+}
+
+async fn read_tls_pair(
+    certificate: &FsPath,
+    private_key: &FsPath,
+) -> io::Result<([u8; 32], Vec<u8>, Vec<u8>)> {
+    let certificate_pem = tokio::fs::read(certificate).await?;
+    let private_key_pem = tokio::fs::read(private_key).await?;
+    let mut hasher = Sha256::new();
+    hasher.update((certificate_pem.len() as u64).to_be_bytes());
+    hasher.update(&certificate_pem);
+    hasher.update(&private_key_pem);
+    Ok((hasher.finalize().into(), certificate_pem, private_key_pem))
 }
 
 fn validate_listener_security(address: SocketAddr, tls_enabled: bool) -> io::Result<()> {
@@ -1312,11 +1392,12 @@ mod tests {
         let listener = TcpListener::bind(address).await.unwrap();
         drop(listener);
 
-        let server = tokio::spawn(serve_with_state_file_and_relay_key_tls(
+        let server = tokio::spawn(serve_with_state_file_and_relay_key_tls_and_reload_interval(
             address,
             state_path,
             None,
             Some((certificate_path, key_path)),
+            Duration::from_millis(25),
         ));
         let root = reqwest::Certificate::from_pem(certificate_pem.as_bytes()).unwrap();
         let client = reqwest::Client::builder()
@@ -1340,6 +1421,58 @@ mod tests {
             "ok"
         );
         assert!(reqwest::Client::new().get(&url).send().await.is_err());
+
+        fs::write(temporary.join("certificate.pem"), "invalid certificate").unwrap();
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let still_old_client = reqwest::Client::builder()
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(certificate_pem.as_bytes()).unwrap(),
+            )
+            .build()
+            .unwrap();
+        assert_eq!(
+            still_old_client.get(&url).send().await.unwrap().status(),
+            StatusCode::OK,
+            "a failed rotation must keep serving the currently loaded certificate"
+        );
+
+        let renewed = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
+        let renewed_certificate_pem = renewed.cert.pem();
+        fs::write(temporary.join("certificate.pem"), &renewed_certificate_pem).unwrap();
+        fs::write(
+            temporary.join("private-key.pem"),
+            renewed.signing_key.serialize_pem(),
+        )
+        .unwrap();
+        let renewed_client = reqwest::Client::builder()
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(renewed_certificate_pem.as_bytes()).unwrap(),
+            )
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let mut renewed_response = None;
+        for _ in 0..40 {
+            if let Ok(result) = renewed_client.get(&url).send().await
+                && result.status() == StatusCode::OK
+            {
+                renewed_response = Some(result);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            renewed_response.is_some(),
+            "the running server should serve the rotated certificate without restart"
+        );
+        let old_client_after_rotation = reqwest::Client::builder()
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(certificate_pem.as_bytes()).unwrap(),
+            )
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert!(old_client_after_rotation.get(&url).send().await.is_err());
         server.abort();
         fs::remove_dir_all(temporary).unwrap();
     }

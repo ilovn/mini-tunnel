@@ -73,6 +73,14 @@ enum CoordinatorCommand {
         /// PEM private key used to serve HTTPS. Required with --tls-cert.
         #[arg(long, env = "MINI_TUNNEL_COORDINATOR_TLS_KEY")]
         tls_key: Option<PathBuf>,
+        /// Seconds between checking the certificate and private key for rotation.
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_COORDINATOR_TLS_RELOAD_INTERVAL_SECONDS",
+            default_value_t = 30,
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        tls_reload_interval_seconds: u64,
     },
     /// Check a running coordinator's health endpoint.
     Health {
@@ -386,6 +394,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 state_file,
                 tls_cert,
                 tls_key,
+                tls_reload_interval_seconds,
             } => {
                 let relay_key = std::env::var("MINI_TUNNEL_RELAY_TICKET_KEY")
                     .ok()
@@ -405,8 +414,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         "non-loopback coordinator listeners require TLS; configure --tls-cert and --tls-key".into(),
                     );
                 }
-                mini_tunnel_coordinator::serve_with_state_file_and_relay_key_tls(
-                    listen, state_file, relay_key, tls_files,
+                mini_tunnel_coordinator::serve_with_state_file_and_relay_key_tls_and_reload_interval(
+                    listen,
+                    state_file,
+                    relay_key,
+                    tls_files,
+                    Duration::from_secs(tls_reload_interval_seconds),
                 )
                 .await?;
             }

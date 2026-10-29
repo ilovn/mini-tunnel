@@ -24,6 +24,8 @@ MINI_TUNNEL_COORDINATOR_TLS_KEY='/etc/letsencrypt/live/tunnel.example/privkey.pe
 cargo run -p mini-tunnel -- coordinator serve --listen '0.0.0.0:8443'
 ```
 
+The Coordinator checks the configured certificate and private key every 30 seconds and reloads them without restarting when either file changes. Set `MINI_TUNNEL_COORDINATOR_TLS_RELOAD_INTERVAL_SECONDS` or pass `--tls-reload-interval-seconds` to change the interval (minimum 1 second). If a renewal temporarily leaves the files mismatched or invalid, the running server keeps its current certificate and retries on the next check.
+
 On clients, set `MINI_TUNNEL_COORDINATOR_URL='https://tunnel.example:8443'`. Clients validate the certificate chain and hostname; the CLI has no insecure TLS bypass. A reverse proxy that terminates TLS is also supported while the coordinator remains bound to loopback.
 
 Coordinator exposes basic Prometheus metrics at `/metrics` for loopback scrapes only. The endpoint reports configured networks, enrolled members, and rate-limited requests; when using a reverse proxy, keep `/metrics` off its public routes.
