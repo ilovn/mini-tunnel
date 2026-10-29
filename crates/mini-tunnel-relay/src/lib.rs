@@ -30,6 +30,7 @@ const MAX_TICKET_LENGTH: usize = 2048;
 const MAX_CONNECTIONS: usize = 256;
 const MAX_PENDING_SESSIONS: usize = 128;
 const MAX_USED_TICKETS: usize = 16_384;
+const MAX_SESSION_BYTES: u64 = 1024 * 1024 * 1024;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const PAIR_TIMEOUT: Duration = Duration::from_secs(25);
 const MAX_TICKET_LIFETIME_MS: u64 = 120_000;
@@ -43,6 +44,8 @@ pub struct RelayConfig {
     pub max_connections: usize,
     pub max_pending_sessions: usize,
     pub pair_timeout: Duration,
+    /// Aggregate bytes forwarded in both directions before a paired session is closed.
+    pub max_session_bytes: u64,
 }
 
 impl RelayConfig {
@@ -54,6 +57,7 @@ impl RelayConfig {
             max_connections: MAX_CONNECTIONS,
             max_pending_sessions: MAX_PENDING_SESSIONS,
             pair_timeout: PAIR_TIMEOUT,
+            max_session_bytes: MAX_SESSION_BYTES,
         }
     }
 
@@ -63,6 +67,13 @@ impl RelayConfig {
         if key != self.ticket_key {
             self.previous_ticket_key = Some(key);
         }
+        self
+    }
+
+    /// Set the aggregate bidirectional byte budget for each paired session.
+    #[must_use]
+    pub fn with_max_session_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_session_bytes = max_bytes.max(1);
         self
     }
 }
@@ -284,18 +295,78 @@ async fn pair_session(
         second.stream.write_u8(RELAY_READY),
     );
     if ready.is_ok() {
-        let _ = tokio::time::timeout(
-            Duration::from_secs(24 * 60 * 60),
-            tokio::io::copy_bidirectional_with_sizes(
-                &mut first.stream,
-                &mut second.stream,
-                COPY_BUFFER_SIZE,
-                COPY_BUFFER_SIZE,
-            ),
-        )
-        .await;
+        let total_bytes = AtomicU64::new(0);
+        let copy = async {
+            let (mut first_reader, mut first_writer) = tokio::io::split(&mut first.stream);
+            let (mut second_reader, mut second_writer) = tokio::io::split(&mut second.stream);
+            tokio::try_join!(
+                copy_session_bytes(
+                    &mut first_reader,
+                    &mut second_writer,
+                    &total_bytes,
+                    inner.config.max_session_bytes,
+                ),
+                copy_session_bytes(
+                    &mut second_reader,
+                    &mut first_writer,
+                    &total_bytes,
+                    inner.config.max_session_bytes,
+                ),
+            )
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(24 * 60 * 60), copy).await;
     }
     remove_session(&inner, &key, generation).await;
+}
+
+async fn copy_session_bytes<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    total_bytes: &AtomicU64,
+    max_bytes: u64,
+) -> io::Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buffer = vec![0; COPY_BUFFER_SIZE];
+    let mut copied = 0_u64;
+    loop {
+        let remaining = max_bytes.saturating_sub(total_bytes.load(Ordering::Relaxed));
+        if remaining == 0 {
+            return Err(io::Error::other("relay session byte limit reached"));
+        }
+        let read_limit = remaining.min(buffer.len() as u64) as usize;
+        let length = tokio::io::AsyncReadExt::read(reader, &mut buffer[..read_limit]).await?;
+        if length == 0 {
+            tokio::io::AsyncWriteExt::shutdown(writer).await?;
+            return Ok(copied);
+        }
+        let allowed = reserve_session_bytes(total_bytes, length as u64, max_bytes);
+        if allowed > 0 {
+            tokio::io::AsyncWriteExt::write_all(writer, &buffer[..allowed]).await?;
+            copied = copied.saturating_add(allowed as u64);
+        }
+        if allowed < length {
+            return Err(io::Error::other("relay session byte limit reached"));
+        }
+    }
+}
+
+fn reserve_session_bytes(total_bytes: &AtomicU64, requested: u64, limit: u64) -> usize {
+    let mut current = total_bytes.load(Ordering::Relaxed);
+    loop {
+        let reserved = requested.min(limit.saturating_sub(current));
+        match total_bytes.compare_exchange_weak(
+            current,
+            current + reserved,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return reserved as usize,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 async fn remove_session(inner: &RelayInner, key: &SessionKey, generation: u64) {
@@ -469,6 +540,19 @@ mod tests {
         let mut from_b = [0; 13];
         stream_a.read_exact(&mut from_b).await.expect("read B");
         assert_eq!(&from_b, b"opaque-from-B");
+        stream_a.shutdown().await.expect("half-close A write side");
+        let mut eof = [0; 1];
+        assert_eq!(stream_b.read(&mut eof).await.expect("observe A EOF"), 0);
+        stream_b
+            .write_all(b"response-after-half-close")
+            .await
+            .expect("B can still send after A half-close");
+        let mut response = [0; 25];
+        stream_a
+            .read_exact(&mut response)
+            .await
+            .expect("A receives response after half-close");
+        assert_eq!(&response, b"response-after-half-close");
         drop(stream_a);
         drop(stream_b);
         relay_task.abort();
@@ -529,6 +613,51 @@ mod tests {
                 .is_err()
         );
         drop(legitimate_b);
+        relay_task.abort();
+    }
+
+    #[tokio::test]
+    async fn enforces_one_aggregate_byte_budget_across_both_directions() {
+        let key = [7; 32];
+        let a = identity(6);
+        let b = identity(7);
+        let ticket_a = issue_relay_ticket(&key, &claims(&a, &b, 30)).expect("ticket A");
+        let ticket_b = issue_relay_ticket(&key, &claims(&b, &a, 31)).expect("ticket B");
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind relay");
+        let address = listener.local_addr().expect("relay address");
+        let mut config = RelayConfig::new(key).with_max_session_bytes(8);
+        config.pair_timeout = Duration::from_secs(2);
+        let relay = RelayServer::new(config);
+        let relay_task = tokio::spawn(async move { relay.run(listener).await });
+
+        let mut stream_a = connect_and_authenticate(address, &ticket_a, &a).await;
+        let mut stream_b = connect_and_authenticate(address, &ticket_b, &b).await;
+        assert_eq!(stream_a.read_u8().await.expect("A ready"), RELAY_READY);
+        assert_eq!(stream_b.read_u8().await.expect("B ready"), RELAY_READY);
+        stream_a.write_all(b"four").await.expect("A writes four");
+        let mut from_a = [0; 4];
+        stream_b
+            .read_exact(&mut from_a)
+            .await
+            .expect("B reads four");
+        assert_eq!(&from_a, b"four");
+        stream_b.write_all(b"also").await.expect("B writes four");
+        let mut from_b = [0; 4];
+        stream_a
+            .read_exact(&mut from_b)
+            .await
+            .expect("A reads four");
+        assert_eq!(&from_b, b"also");
+
+        stream_a.write_all(b"x").await.expect("A writes over limit");
+        let mut over_limit = [0; 1];
+        let result =
+            tokio::time::timeout(Duration::from_secs(1), stream_b.read_exact(&mut over_limit))
+                .await
+                .expect("relay should close when shared budget is exhausted");
+        assert!(result.is_err());
         relay_task.abort();
     }
 }

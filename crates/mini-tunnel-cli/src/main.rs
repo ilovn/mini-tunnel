@@ -98,6 +98,13 @@ enum RelayCommand {
         /// Previous ticket key accepted during rotation. Tickets still expire normally.
         #[arg(long, env = "MINI_TUNNEL_RELAY_PREVIOUS_TICKET_KEY")]
         previous_ticket_key: Option<String>,
+        /// Maximum aggregate bytes forwarded in both directions per relay session.
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_RELAY_MAX_SESSION_BYTES",
+            default_value_t = 1_073_741_824
+        )]
+        max_session_bytes: u64,
     },
 }
 
@@ -420,6 +427,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             RelayCommand::Serve {
                 listen,
                 previous_ticket_key,
+                max_session_bytes,
             } => {
                 let key = std::env::var("MINI_TUNNEL_RELAY_TICKET_KEY")
                     .map_err(|_| "MINI_TUNNEL_RELAY_TICKET_KEY is required for relay service")?;
@@ -427,15 +435,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let key: [u8; 32] = key
                     .try_into()
                     .map_err(|_| "relay ticket key must decode to exactly 32 bytes")?;
-                let config = if let Some(previous) = previous_ticket_key {
+                let mut config = mini_tunnel_relay::RelayConfig::new(key)
+                    .with_max_session_bytes(max_session_bytes);
+                if let Some(previous) = previous_ticket_key {
                     let previous = URL_SAFE_NO_PAD.decode(previous)?;
                     let previous: [u8; 32] = previous
                         .try_into()
                         .map_err(|_| "previous relay ticket key must decode to exactly 32 bytes")?;
-                    mini_tunnel_relay::RelayConfig::new(key).with_previous_ticket_key(previous)
-                } else {
-                    mini_tunnel_relay::RelayConfig::new(key)
-                };
+                    config = config.with_previous_ticket_key(previous);
+                }
                 let listener = tokio::net::TcpListener::bind(listen).await?;
                 eprintln!("relay listening on {}", listener.local_addr()?);
                 mini_tunnel_relay::RelayServer::new(config)

@@ -121,6 +121,8 @@ On each mesh device, set `MINI_TUNNEL_RELAY_SERVER='<relay-host>:42001'` (or pas
 
 Relay ticket keys support a short overlap during rotation. Generate a new random 32-byte key. First deploy relays with the new key in `MINI_TUNNEL_RELAY_TICKET_KEY` and the old key in `MINI_TUNNEL_RELAY_PREVIOUS_TICKET_KEY`, while the coordinator continues signing with the old key. Then switch the coordinator to the new key and wait at least the maximum ticket lifetime (currently two minutes) plus deployment margin. Finally restart relays with the new key and unset the previous-key variable. Both variables use URL-safe base64 without padding. Keep their values in a secret manager; do not put key values in command-line arguments or logs.
 
+Each paired relay session has a default aggregate traffic budget of 1 GiB shared between both directions. Set `MINI_TUNNEL_RELAY_MAX_SESSION_BYTES` to change the limit; once exhausted, the relay closes the session.
+
 ## Development
 
 Requirements: stable Rust and Cargo (see `rust-toolchain.toml`).
