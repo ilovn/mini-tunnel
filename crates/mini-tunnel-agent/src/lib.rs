@@ -407,15 +407,13 @@ impl PeerChannel {
                 .ok_or(IdentityError::InvalidFrame)?,
             PeerTransport::Tcp(_) => FRAME_HEADER_LEN + MAX_PACKET_PAYLOAD,
         };
-        let single_capacity = transport_limit.saturating_sub(FRAME_HEADER_LEN);
+        let single_capacity = single_frame_payload_limit(transport_limit);
         if payload.len() <= single_capacity {
             let sequence = self.reserve_sequences(1)?;
             let frame = encode_frame(self.network_tag, sequence, payload);
             return self.send_frame(frame).await;
         }
-        let fragment_capacity = transport_limit
-            .saturating_sub(FRAME_HEADER_LEN + FRAGMENT_HEADER_LEN)
-            .min(MAX_PACKET_PAYLOAD - FRAGMENT_HEADER_LEN);
+        let fragment_capacity = fragment_payload_limit(transport_limit);
         if fragment_capacity == 0 {
             return Err(IdentityError::InvalidFrame);
         }
@@ -1639,6 +1637,18 @@ fn encode_frame(network_tag: [u8; 16], sequence: u64, payload: &[u8]) -> Vec<u8>
     frame
 }
 
+fn single_frame_payload_limit(transport_limit: usize) -> usize {
+    transport_limit
+        .saturating_sub(FRAME_HEADER_LEN)
+        .min(MAX_PACKET_PAYLOAD)
+}
+
+fn fragment_payload_limit(transport_limit: usize) -> usize {
+    transport_limit
+        .saturating_sub(FRAME_HEADER_LEN + FRAGMENT_HEADER_LEN)
+        .min(MAX_PACKET_PAYLOAD - FRAGMENT_HEADER_LEN)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_fragment_frame(
     network_tag: [u8; 16],
@@ -2413,6 +2423,24 @@ mod tests {
         assert!(window.accept(43));
         assert!(window.accept(200));
         assert!(!window.accept(44));
+    }
+
+    #[test]
+    fn payload_fragment_limits_respect_wire_cap_and_small_path_sizes() {
+        assert_eq!(single_frame_payload_limit(65_535), MAX_PACKET_PAYLOAD);
+        assert_eq!(
+            fragment_payload_limit(65_535),
+            MAX_PACKET_PAYLOAD - FRAGMENT_HEADER_LEN
+        );
+        assert_eq!(single_frame_payload_limit(FRAME_HEADER_LEN + 900), 900);
+        assert_eq!(
+            fragment_payload_limit(FRAME_HEADER_LEN + FRAGMENT_HEADER_LEN + 700),
+            700
+        );
+        assert_eq!(
+            fragment_payload_limit(FRAME_HEADER_LEN + FRAGMENT_HEADER_LEN),
+            0
+        );
     }
 
     #[test]
