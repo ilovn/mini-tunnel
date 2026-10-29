@@ -1168,6 +1168,7 @@ dependencies = [
  "mini-tunnel-agent",
  "mini-tunnel-coordinator",
  "mini-tunnel-protocol",
+ "quinn",
  "reqwest",
  "serde",
  "tokio",
