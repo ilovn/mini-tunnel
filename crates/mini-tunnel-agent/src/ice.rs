@@ -17,12 +17,45 @@ use sansio::Protocol;
 use thiserror::Error;
 use tokio::{io::Interest, net::UdpSocket, sync::mpsc};
 
+use mini_tunnel_protocol::IceCredentials;
+
 use crate::stun::is_stun_datagram;
 
 /// Maximum ICE checks drained during one socket-driver turn.
 pub const MAX_ICE_TRANSMITS_PER_TURN: usize = 64;
 const MAX_SOCKET_QUEUE_CAPACITY: usize = 128;
 const MAX_UDP_DATAGRAM_SIZE: usize = u16::MAX as usize;
+
+/// Generate an ephemeral ICE credential pair suitable for both rtc-ice and coordinator signaling.
+/// The coordinator accepts the RFC 8445 alphanumeric, `+`, and `/` alphabet; credentials are
+/// intentionally returned to the caller and are never persisted by the agent.
+pub fn generate_ice_credentials(generation: u64) -> Result<IceCredentials, crate::IdentityError> {
+    if generation == 0 {
+        return Err(crate::IdentityError::Transport(
+            "ICE generation must be greater than zero".to_owned(),
+        ));
+    }
+    let mut ufrag = [0_u8; 18];
+    let mut password = [0_u8; 24];
+    getrandom::fill(&mut ufrag).map_err(|_| crate::IdentityError::Random)?;
+    getrandom::fill(&mut password).map_err(|_| crate::IdentityError::Random)?;
+    use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
+    Ok(IceCredentials {
+        ufrag: STANDARD_NO_PAD.encode(ufrag),
+        password: STANDARD_NO_PAD.encode(password),
+        generation,
+    })
+}
+
+/// Create the rtc-ice configuration using the exact credentials published to peers.
+#[must_use]
+pub fn agent_config(credentials: &IceCredentials) -> rtc_ice::AgentConfig {
+    rtc_ice::AgentConfig {
+        local_ufrag: credentials.ufrag.clone(),
+        local_pwd: credentials.password.clone(),
+        ..Default::default()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct IceDatagram {
@@ -443,6 +476,31 @@ mod tests {
     use super::*;
     use rtc_ice::candidate::{CandidateConfig, candidate_host::CandidateHostConfig};
 
+    #[test]
+    fn generated_credentials_match_the_agent_config_and_are_valid_for_signaling() {
+        let credentials = generate_ice_credentials(1).expect("generate ICE credentials");
+        assert_eq!(credentials.ufrag.len(), 24);
+        assert_eq!(credentials.password.len(), 32);
+        assert!(credentials.ufrag.bytes().all(valid_ice_char));
+        assert!(credentials.password.bytes().all(valid_ice_char));
+        let config = agent_config(&credentials);
+        assert_eq!(config.local_ufrag, credentials.ufrag);
+        assert_eq!(config.local_pwd, credentials.password);
+    }
+
+    #[test]
+    fn generated_credentials_are_fresh_and_generation_must_be_nonzero() {
+        let first = generate_ice_credentials(1).expect("first credentials");
+        let second = generate_ice_credentials(2).expect("second credentials");
+        assert_ne!(first.ufrag, second.ufrag);
+        assert_ne!(first.password, second.password);
+        assert!(generate_ice_credentials(0).is_err());
+    }
+
+    fn valid_ice_char(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/'
+    }
+
     fn driver() -> IceAgentDriver {
         let crypto = rtc_ice::crypto::default_provider().expect("ring ICE crypto provider");
         let agent = Agent::new(
@@ -473,15 +531,17 @@ mod tests {
     #[test]
     fn two_sans_io_agents_authenticate_checks_and_nominate_a_candidate_pair() {
         let provider = rtc_ice::crypto::default_provider().expect("ring ICE crypto provider");
+        let advertised_a = generate_ice_credentials(1).expect("A signaling credentials");
+        let advertised_b = generate_ice_credentials(1).expect("B signaling credentials");
         let mut agent_a = Agent::new(
             Instant::now(),
-            Arc::new(rtc_ice::AgentConfig::default()),
+            Arc::new(agent_config(&advertised_a)),
             Arc::clone(&provider),
         )
         .expect("construct A ICE agent");
         let mut agent_b = Agent::new(
             Instant::now(),
-            Arc::new(rtc_ice::AgentConfig::default()),
+            Arc::new(agent_config(&advertised_b)),
             provider,
         )
         .expect("construct B ICE agent");
