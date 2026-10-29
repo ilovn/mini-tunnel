@@ -1214,6 +1214,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     device_id: identity.device_id(),
                     timestamp_ms,
                     candidates: candidates.clone(),
+                    ice_credentials: None,
                     signature: identity.sign(&candidate_signing_bytes(
                         &network_id,
                         &identity.device_id(),
@@ -1977,6 +1978,7 @@ async fn create_tunnel_endpoint(
             &candidates,
         )),
         candidates,
+        ice_credentials: None,
     };
     let path = format!("/v1/networks/{network_id}/candidates");
     let _: CandidateUpdateResponse = post_json(coordinator_url, &path, &request).await?;
@@ -2194,6 +2196,7 @@ mod tests {
             assigned_ipv4: assigned_ipv4.to_owned(),
             public_key: URL_SAFE_NO_PAD.encode([1_u8; 32]),
             candidates: Vec::new(),
+            ice_credentials: None,
         };
         let first = peer("peer-a", "10.77.0.2");
         let second = peer("peer-b", "10.77.0.3");

@@ -2,7 +2,7 @@
 
 Status: implementation in progress. The current peer path remains the existing bounded UDP candidate dialer with TCP and relay fallback; it must not be described as RFC 8445 ICE until the checks below are integrated and verified.
 
-Prototype progress: `mini-tunnel-agent::ice::IceAgentDriver` wraps the Sans-I/O agent and `peer_endpoint_with_ice` provides an optional Quinn endpoint using a same-socket demultiplexer. Loopback tests verify authenticated nomination in the driver, STUN queue bounds, and QUIC/TLS peer data over the demultiplexed endpoint. The default peer endpoint and coordinator signaling do not use this prototype yet.
+Prototype progress: `mini-tunnel-agent::ice::IceAgentDriver` wraps the Sans-I/O agent and `peer_endpoint_with_ice` provides an optional Quinn endpoint using a same-socket demultiplexer. The candidate-update API now accepts member-signed ICE credentials and serves them only to same-network peers from bounded volatile memory. The regular CLI update still publishes candidates only, and the default peer setup does not yet create/use the ICE endpoint. Loopback tests verify authenticated nomination in the driver, STUN queue bounds, and QUIC/TLS peer data over the demultiplexed endpoint.
 
 ## Selected ICE engine
 
@@ -20,7 +20,7 @@ The socket adapter must preserve Quinn's packet metadata and readiness behavior.
 
 ## Signaling and compatibility
 
-ICE credentials (ufrag/password) and candidate generation are ephemeral per endpoint generation. They must be authenticated by the enrolled device key and returned only in the same-network peer view. Never write passwords to logs. Persist candidate addresses as today, but keep ICE credentials out of the coordinator's durable snapshot; restart requires peers to publish fresh credentials.
+ICE credentials (ufrag/password) and candidate generation are ephemeral per endpoint generation. They are authenticated by the enrolled device key and returned only in the same-network peer view. The coordinator keeps them in a bounded in-memory map for at most two minutes. Never write passwords to logs. Persist candidate addresses as today, but keep ICE credentials out of the coordinator's durable snapshot; restart requires peers to publish fresh credentials.
 
 Negotiate ICE capability during the authenticated peer handshake. A peer pair uses ICE only when both endpoints advertise the same supported capability and valid generation; otherwise it falls back to the current candidate dialer. Keep TCP and ticket-authorized relay selection after ICE failure. Device-ID ordering provides the deterministic ICE role proposal, while RFC 8445 role-conflict handling remains enabled because both processes can restart or observe stale state.
 

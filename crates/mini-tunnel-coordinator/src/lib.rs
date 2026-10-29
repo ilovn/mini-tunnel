@@ -25,10 +25,11 @@ use getrandom::fill as random_fill;
 use ipnet::Ipv4Net;
 use mini_tunnel_protocol::{
     ApiErrorResponse, CandidateUpdateRequest, CandidateUpdateResponse, CreateInviteRequest,
-    CreateInviteResponse, CreateNetworkRequest, CreateNetworkResponse, JoinNetworkRequest,
-    JoinNetworkResponse, PeerInfo, PeerListRequest, PeerListResponse, RELAY_TICKET_VERSION,
-    RelayTicketClaims, RelayTicketRequest, RelayTicketResponse, RevokeMemberRequest,
-    RevokeMemberResponse, candidate_signing_bytes, device_id_from_public_key, issue_relay_ticket,
+    CreateInviteResponse, CreateNetworkRequest, CreateNetworkResponse, IceCredentials,
+    JoinNetworkRequest, JoinNetworkResponse, PeerInfo, PeerListRequest, PeerListResponse,
+    RELAY_TICKET_VERSION, RelayTicketClaims, RelayTicketRequest, RelayTicketResponse,
+    RevokeMemberRequest, RevokeMemberResponse, candidate_signing_bytes,
+    candidate_signing_bytes_with_ice, device_id_from_public_key, issue_relay_ticket,
     join_signing_bytes, peers_signing_bytes, relay_ticket_request_signing_bytes,
 };
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,8 @@ const MAX_CANDIDATES: usize = 8;
 const MAX_REQUESTS_PER_MINUTE_PER_IP: usize = 600;
 const MAX_RATE_LIMIT_CLIENTS: usize = 8192;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const ICE_CREDENTIAL_TTL_MS: u64 = 120_000;
+const MAX_EPHEMERAL_ICE_CREDENTIALS: usize = 8192;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthResponse {
@@ -63,6 +66,14 @@ pub struct CoordinatorState {
     request_limiter: RequestRateLimiter,
     relay_ticket_key: Option<Arc<[u8; 32]>>,
     relay_pairs: Arc<Mutex<RelayPairStore>>,
+    ice_credentials: Arc<RwLock<HashMap<(Uuid, String), EphemeralIceCredentials>>>,
+}
+
+#[derive(Clone)]
+struct EphemeralIceCredentials {
+    credentials: IceCredentials,
+    updated_at_ms: u64,
+    request_timestamp_ms: u64,
 }
 
 type RelayPairStore = HashMap<(Uuid, String, String), RelayPair>;
@@ -512,6 +523,11 @@ impl CoordinatorState {
             .ok_or(ApiError::NotFound)?;
         network.assigned_addresses.remove(&member.address);
         self.persist_or_restore(&mut store, previous)?;
+        drop(store);
+        self.ice_credentials
+            .write()
+            .await
+            .remove(&(network_id, request.device_id));
         Ok(RevokeMemberResponse {
             revoked: true,
             released_ipv4: member.address.to_string(),
@@ -629,6 +645,13 @@ impl CoordinatorState {
                 "timestamp is outside the allowed window or too many candidates",
             ));
         }
+        if request
+            .ice_credentials
+            .as_ref()
+            .is_some_and(|credentials| !valid_ice_credentials(credentials))
+        {
+            return Err(ApiError::InvalidRequest("invalid ICE credentials"));
+        }
         let mut canonical = request.candidates.clone();
         canonical.sort();
         if canonical.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -657,21 +680,67 @@ impl CoordinatorState {
         if request.timestamp_ms <= member.last_candidate_timestamp_ms {
             return Err(ApiError::Conflict("candidate update replay detected"));
         }
-        if !verify_signature(
-            &member.public_key,
-            &candidate_signing_bytes(
+        let signing_bytes = match request.ice_credentials.as_ref() {
+            Some(credentials) => candidate_signing_bytes_with_ice(
+                &network_id.to_string(),
+                &request.device_id,
+                request.timestamp_ms,
+                &canonical,
+                credentials,
+            ),
+            None => candidate_signing_bytes(
                 &network_id.to_string(),
                 &request.device_id,
                 request.timestamp_ms,
                 &canonical,
             ),
-            &request.signature,
-        ) {
+        };
+        if !verify_signature(&member.public_key, &signing_bytes, &request.signature) {
             return Err(ApiError::Unauthorized);
         }
         member.candidates = canonical;
         member.last_candidate_timestamp_ms = request.timestamp_ms;
         self.persist_or_restore(&mut store, previous)?;
+        drop(store);
+
+        let key = (network_id, request.device_id);
+        let mut ephemeral = self.ice_credentials.write().await;
+        ephemeral
+            .retain(|_, value| value.updated_at_ms.saturating_add(ICE_CREDENTIAL_TTL_MS) > now);
+        match request.ice_credentials {
+            Some(credentials) => {
+                if let Some(existing) = ephemeral.get(&key)
+                    && existing.request_timestamp_ms >= request.timestamp_ms
+                {
+                    return Ok(CandidateUpdateResponse { accepted: true });
+                }
+                if !ephemeral.contains_key(&key)
+                    && ephemeral.len() >= MAX_EPHEMERAL_ICE_CREDENTIALS
+                    && let Some(oldest) = ephemeral
+                        .iter()
+                        .min_by_key(|(_, value)| value.updated_at_ms)
+                        .map(|(key, _)| key.clone())
+                {
+                    ephemeral.remove(&oldest);
+                }
+                ephemeral.insert(
+                    key,
+                    EphemeralIceCredentials {
+                        credentials,
+                        updated_at_ms: now,
+                        request_timestamp_ms: request.timestamp_ms,
+                    },
+                );
+            }
+            None => {
+                if ephemeral
+                    .get(&key)
+                    .is_some_and(|value| value.request_timestamp_ms < request.timestamp_ms)
+                {
+                    ephemeral.remove(&key);
+                }
+            }
+        }
         Ok(CandidateUpdateResponse { accepted: true })
     }
 
@@ -703,6 +772,9 @@ impl CoordinatorState {
         ) {
             return Err(ApiError::Unauthorized);
         }
+        let mut ephemeral = self.ice_credentials.write().await;
+        ephemeral
+            .retain(|_, value| value.updated_at_ms.saturating_add(ICE_CREDENTIAL_TTL_MS) > now);
         let peers = network
             .members
             .iter()
@@ -712,6 +784,9 @@ impl CoordinatorState {
                 assigned_ipv4: member.address.to_string(),
                 public_key: URL_SAFE_NO_PAD.encode(member.public_key),
                 candidates: member.candidates.clone(),
+                ice_credentials: ephemeral
+                    .get(&(network_id, device_id.clone()))
+                    .map(|entry| entry.credentials.clone()),
             })
             .collect();
         Ok(PeerListResponse { peers })
@@ -1139,6 +1214,19 @@ fn candidate_socket_address(candidate: &str) -> Option<SocketAddr> {
         .unwrap_or(candidate)
         .parse::<SocketAddr>()
         .ok()
+}
+
+fn valid_ice_credentials(credentials: &IceCredentials) -> bool {
+    let valid_chars = |value: &str| {
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/')
+    };
+    (4..=256).contains(&credentials.ufrag.len())
+        && (22..=256).contains(&credentials.password.len())
+        && credentials.generation > 0
+        && valid_chars(&credentials.ufrag)
+        && valid_chars(&credentials.password)
 }
 
 fn verify_signature(public_key: &[u8; 32], message: &[u8], signature: &str) -> bool {
@@ -1952,6 +2040,7 @@ mod tests {
             device_id: join_a.device_id.clone(),
             timestamp_ms,
             candidates,
+            ice_credentials: None,
             signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
         };
         state
@@ -1986,6 +2075,105 @@ mod tests {
             snapshot.peers[0].candidates,
             ["198.51.100.8:42000", "tcp://198.51.100.8:42001"]
         );
+
+        let ice_credentials = IceCredentials {
+            ufrag: "abcdefghijklmnop".to_owned(),
+            password: "abcdefghijklmnopqrstuvwxyzABCDEF".to_owned(),
+            generation: 1,
+        };
+        let timestamp_ms = unix_time_ms().expect("clock");
+        let signature = key_a.sign(&candidate_signing_bytes_with_ice(
+            &network_id.to_string(),
+            &join_a.device_id,
+            timestamp_ms,
+            &[
+                "198.51.100.8:42000".to_owned(),
+                "tcp://198.51.100.8:42001".to_owned(),
+            ],
+            &ice_credentials,
+        ));
+        let mut forged_ice_credentials = ice_credentials.clone();
+        forged_ice_credentials.password.push('A');
+        assert!(matches!(
+            state
+                .update_candidates(
+                    network_id,
+                    CandidateUpdateRequest {
+                        device_id: join_a.device_id.clone(),
+                        timestamp_ms,
+                        candidates: vec![
+                            "198.51.100.8:42000".to_owned(),
+                            "tcp://198.51.100.8:42001".to_owned(),
+                        ],
+                        ice_credentials: Some(forged_ice_credentials),
+                        signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+                    },
+                )
+                .await,
+            Err(ApiError::Unauthorized)
+        ));
+        state
+            .update_candidates(
+                network_id,
+                CandidateUpdateRequest {
+                    device_id: join_a.device_id.clone(),
+                    timestamp_ms,
+                    candidates: vec![
+                        "198.51.100.8:42000".to_owned(),
+                        "tcp://198.51.100.8:42001".to_owned(),
+                    ],
+                    ice_credentials: Some(ice_credentials.clone()),
+                    signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+                },
+            )
+            .await
+            .expect("publish signed ephemeral ICE credentials");
+        let timestamp_ms = unix_time_ms().expect("clock");
+        let signature = key_b.sign(&peers_signing_bytes(
+            &network_id.to_string(),
+            &join_b.device_id,
+            timestamp_ms,
+        ));
+        let snapshot = state
+            .list_peers(
+                network_id,
+                PeerListRequest {
+                    device_id: join_b.device_id.clone(),
+                    timestamp_ms,
+                    signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+                },
+            )
+            .await
+            .expect("read ICE credentials from same-network peer list");
+        assert_eq!(snapshot.peers[0].ice_credentials, Some(ice_credentials));
+        if let Some(credentials) = state
+            .ice_credentials
+            .write()
+            .await
+            .get_mut(&(network_id, join_a.device_id.clone()))
+        {
+            credentials.updated_at_ms = unix_time_ms()
+                .expect("clock")
+                .saturating_sub(ICE_CREDENTIAL_TTL_MS + 1);
+        }
+        let timestamp_ms = unix_time_ms().expect("clock");
+        let signature = key_b.sign(&peers_signing_bytes(
+            &network_id.to_string(),
+            &join_b.device_id,
+            timestamp_ms,
+        ));
+        let snapshot = state
+            .list_peers(
+                network_id,
+                PeerListRequest {
+                    device_id: join_b.device_id.clone(),
+                    timestamp_ms,
+                    signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+                },
+            )
+            .await
+            .expect("read peers after ICE credential expiry");
+        assert!(snapshot.peers[0].ice_credentials.is_none());
 
         let timestamp_ms = unix_time_ms().expect("clock");
         let signature = key_b.sign(&peers_signing_bytes(
@@ -2033,11 +2221,27 @@ mod tests {
             device_id: "unknown".into(),
             timestamp_ms: unix_time_ms().expect("clock"),
             candidates: vec!["0.0.0.0:0".into()],
+            ice_credentials: None,
             signature: String::new(),
         };
         assert!(matches!(
             state.update_candidates(network_id, invalid).await,
             Err(ApiError::InvalidRequest(_))
+        ));
+        let invalid_ice = CandidateUpdateRequest {
+            device_id: "unknown".into(),
+            timestamp_ms: unix_time_ms().expect("clock"),
+            candidates: Vec::new(),
+            ice_credentials: Some(IceCredentials {
+                ufrag: "x".into(),
+                password: "short".into(),
+                generation: 0,
+            }),
+            signature: String::new(),
+        };
+        assert!(matches!(
+            state.update_candidates(network_id, invalid_ice).await,
+            Err(ApiError::InvalidRequest("invalid ICE credentials"))
         ));
     }
 
@@ -2085,11 +2289,17 @@ mod tests {
         let key_b = SigningKey::from_bytes(&[32; 32]);
         let timestamp_ms = unix_time_ms().expect("clock");
         let candidates = vec!["198.51.100.22:42000".to_owned()];
-        let signature = key_b.sign(&candidate_signing_bytes(
+        let ice_credentials = IceCredentials {
+            ufrag: "qrstuvwxyzABCDEF".to_owned(),
+            password: "ZYXWVUTSRQPONMLKJIHGFEDCBAzyxwvu".to_owned(),
+            generation: 1,
+        };
+        let signature = key_b.sign(&candidate_signing_bytes_with_ice(
             &network_id.to_string(),
             &join_b.device_id,
             timestamp_ms,
             &candidates,
+            &ice_credentials,
         ));
         state
             .update_candidates(
@@ -2098,6 +2308,7 @@ mod tests {
                     device_id: join_b.device_id.clone(),
                     timestamp_ms,
                     candidates,
+                    ice_credentials: Some(ice_credentials.clone()),
                     signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
                 },
             )
@@ -2109,6 +2320,7 @@ mod tests {
         assert!(!contents.contains(&network.admin_token));
         assert!(!contents.contains(&invite_a.invite_token));
         assert!(!contents.contains(&invite_b.invite_token));
+        assert!(!contents.contains(&ice_credentials.password));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2142,6 +2354,7 @@ mod tests {
             .expect("list restored peers");
         assert_eq!(peers.peers.len(), 1);
         assert_eq!(peers.peers[0].candidates, ["198.51.100.22:42000"]);
+        assert!(peers.peers[0].ice_credentials.is_none());
         assert_eq!(peers.peers[0].assigned_ipv4, enrolled_b.assigned_ipv4);
         assert_eq!(enrolled_a.assigned_ipv4, "10.83.0.1");
         assert_eq!(

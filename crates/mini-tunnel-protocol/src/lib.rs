@@ -69,6 +69,30 @@ pub fn candidate_signing_bytes(
 }
 
 #[must_use]
+pub fn candidate_signing_bytes_with_ice(
+    network_id: &str,
+    device_id: &str,
+    timestamp_ms: u64,
+    candidates: &[String],
+    credentials: &IceCredentials,
+) -> Vec<u8> {
+    let timestamp_bytes = timestamp_ms.to_be_bytes();
+    let generation_bytes = credentials.generation.to_be_bytes();
+    let mut fields = vec![
+        network_id.as_bytes(),
+        device_id.as_bytes(),
+        &timestamp_bytes,
+    ];
+    fields.extend(candidates.iter().map(String::as_bytes));
+    fields.extend([
+        credentials.ufrag.as_bytes(),
+        credentials.password.as_bytes(),
+        &generation_bytes,
+    ]);
+    signing_bytes(b"mini-tunnel/candidates-ice/v1", &fields)
+}
+
+#[must_use]
 pub fn peers_signing_bytes(network_id: &str, device_id: &str, timestamp_ms: u64) -> Vec<u8> {
     signing_bytes(
         b"mini-tunnel/peers/v1",
@@ -332,7 +356,28 @@ pub struct CandidateUpdateRequest {
     pub device_id: String,
     pub timestamp_ms: u64,
     pub candidates: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ice_credentials: Option<IceCredentials>,
     pub signature: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IceCredentials {
+    pub ufrag: String,
+    pub password: String,
+    pub generation: u64,
+}
+
+impl std::fmt::Debug for IceCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IceCredentials")
+            .field("ufrag", &self.ufrag)
+            .field("password", &"[REDACTED]")
+            .field("generation", &self.generation)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -354,6 +399,8 @@ pub struct PeerInfo {
     pub assigned_ipv4: String,
     pub public_key: String,
     pub candidates: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ice_credentials: Option<IceCredentials>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -397,6 +444,42 @@ mod tests {
             ticket_id: [8; 16],
             expires_at_ms: 5000,
         }
+    }
+
+    #[test]
+    fn ice_credentials_are_bound_into_signature_and_redacted_from_debug() {
+        let candidates = ["198.51.100.4:42000".to_owned()];
+        let credentials = IceCredentials {
+            ufrag: "abcdefghijklmnop".to_owned(),
+            password: "abcdefghijklmnopqrstuvwxyzABCDEF".to_owned(),
+            generation: 1,
+        };
+        let signature = candidate_signing_bytes_with_ice(
+            "network-1",
+            "device-1",
+            42,
+            &candidates,
+            &credentials,
+        );
+        let mut changed = credentials.clone();
+        changed.password.push('A');
+        assert_ne!(
+            signature,
+            candidate_signing_bytes_with_ice("network-1", "device-1", 42, &candidates, &changed,)
+        );
+        assert!(!format!("{credentials:?}").contains(&credentials.password));
+        assert!(format!("{credentials:?}").contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn old_candidate_updates_without_ice_credentials_still_deserialize() {
+        let request: CandidateUpdateRequest = serde_json::from_str(
+            r#"{"device_id":"device-1","timestamp_ms":42,"candidates":[],"signature":"sig"}"#,
+        )
+        .expect("legacy candidate update");
+        assert!(request.ice_credentials.is_none());
+        let serialized = serde_json::to_string(&request).expect("serialize legacy update");
+        assert!(!serialized.contains("ice_credentials"));
     }
 
     #[test]
