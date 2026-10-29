@@ -411,9 +411,9 @@ impl IceAgentDriver {
         controlling: bool,
         now: Instant,
     ) -> Result<Self, IceDriverError> {
-        if local_credentials.generation != remote_credentials.generation {
+        if local_credentials.generation == 0 || remote_credentials.generation == 0 {
             return Err(IceDriverError::Agent(
-                "peer ICE generations do not match".to_owned(),
+                "ICE credential generations must be greater than zero".to_owned(),
             ));
         }
         if local_candidates.is_empty() || remote_candidates.is_empty() {
@@ -648,12 +648,24 @@ mod tests {
     }
 
     #[test]
-    fn peer_session_rejects_mismatched_generations_and_empty_candidates() {
+    fn peer_session_allows_independent_generations_and_rejects_empty_candidates() {
         let local = generate_ice_credentials(1).expect("local credentials");
         let mut remote = generate_ice_credentials(1).expect("remote credentials");
         let now = Instant::now();
         assert!(IceAgentDriver::for_peer(&local, &remote, &[], &[], true, now).is_err());
         remote.generation = 2;
+        assert!(
+            IceAgentDriver::for_peer(
+                &local,
+                &remote,
+                &["127.0.0.1:41001".parse().unwrap()],
+                &["127.0.0.1:41002".parse().unwrap()],
+                true,
+                now,
+            )
+            .is_ok()
+        );
+        remote.generation = 0;
         assert!(
             IceAgentDriver::for_peer(
                 &local,
