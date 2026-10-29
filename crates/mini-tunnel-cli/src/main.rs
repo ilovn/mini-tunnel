@@ -10,8 +10,9 @@ use clap::{Parser, Subcommand};
 use mini_tunnel_protocol::{
     ApiErrorResponse, CandidateUpdateRequest, CandidateUpdateResponse, CreateInviteRequest,
     CreateInviteResponse, CreateNetworkRequest, CreateNetworkResponse, JoinNetworkRequest,
-    JoinNetworkResponse, PeerInfo, PeerListRequest, PeerListResponse, candidate_signing_bytes,
-    join_signing_bytes, peers_signing_bytes,
+    JoinNetworkResponse, PeerInfo, PeerListRequest, PeerListResponse, RelayTicketRequest,
+    RelayTicketResponse, candidate_signing_bytes, join_signing_bytes, peers_signing_bytes,
+    relay_ticket_request_signing_bytes,
 };
 use serde::Deserialize;
 
@@ -28,6 +29,11 @@ enum Command {
     Coordinator {
         #[command(subcommand)]
         command: CoordinatorCommand,
+    },
+    /// Run the opaque ticket-authorized TCP relay service.
+    Relay {
+        #[command(subcommand)]
+        command: RelayCommand,
     },
     /// Create a virtual network, issue an invite, or join with an invite.
     Network {
@@ -71,6 +77,18 @@ enum CoordinatorCommand {
             default_value = "http://127.0.0.1:8080"
         )]
         url: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RelayCommand {
+    Serve {
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_RELAY_LISTEN",
+            default_value = "0.0.0.0:42001"
+        )]
+        listen: SocketAddr,
     },
 }
 
@@ -266,6 +284,9 @@ enum TunnelCommand {
         /// Optional TLS/TCP listener for fallback candidates such as tcp://198.51.100.2:443.
         #[arg(long)]
         tcp_bind: Option<SocketAddr>,
+        /// Optional ticket-authorized relay TCP endpoint used after direct UDP/TCP attempts fail.
+        #[arg(long, env = "MINI_TUNNEL_RELAY_SERVER")]
+        relay_server: Option<SocketAddr>,
         /// Optional RFC 8489 STUN server used to discover and publish this UDP socket's mapped address.
         #[arg(long)]
         stun_server: Option<SocketAddr>,
@@ -324,7 +345,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
                     )
                     .init();
-                mini_tunnel_coordinator::serve_with_state_file(listen, state_file).await?;
+                let relay_key = std::env::var("MINI_TUNNEL_RELAY_TICKET_KEY")
+                    .ok()
+                    .map(|value| {
+                        URL_SAFE_NO_PAD.decode(value).ok()
+                            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                            .ok_or_else(|| "MINI_TUNNEL_RELAY_TICKET_KEY must be base64url encoding of exactly 32 bytes".to_owned())
+                    })
+                    .transpose()?;
+                mini_tunnel_coordinator::serve_with_state_file_and_relay_key(
+                    listen, state_file, relay_key,
+                )
+                .await?;
             }
             CoordinatorCommand::Health { url } => {
                 let endpoint = format!("{}/healthz", url.trim_end_matches('/'));
@@ -344,6 +376,21 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     "{} {}: {}",
                     response.service, response.version, response.status
                 );
+            }
+        },
+        Command::Relay { command } => match command {
+            RelayCommand::Serve { listen } => {
+                let key = std::env::var("MINI_TUNNEL_RELAY_TICKET_KEY")
+                    .map_err(|_| "MINI_TUNNEL_RELAY_TICKET_KEY is required for relay service")?;
+                let key = URL_SAFE_NO_PAD.decode(key)?;
+                let key: [u8; 32] = key
+                    .try_into()
+                    .map_err(|_| "relay ticket key must decode to exactly 32 bytes")?;
+                let listener = tokio::net::TcpListener::bind(listen).await?;
+                eprintln!("relay listening on {}", listener.local_addr()?);
+                mini_tunnel_relay::RelayServer::new(mini_tunnel_relay::RelayConfig::new(key))
+                    .run(listener)
+                    .await?;
             }
         },
         Command::Identity => {
@@ -459,6 +506,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 TunnelCommand::Mesh {
                     bind,
                     tcp_bind,
+                    relay_server,
                     stun_server,
                     candidates,
                     network_id,
@@ -508,6 +556,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 &coordinator_url,
                                 &identity,
                                 &peer,
+                                relay_server,
                             )
                             .await;
                             (peer, keep_outbound, result)
@@ -649,7 +698,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 let (peer, keep_outbound, result) = result?;
                                 match result {
                                     Ok((channel, remote)) => {
-                                        if keep_outbound {
+                                        if keep_outbound || channel.transport_name() == "Relay/TLS" {
                                             if connected.iter().any(|known| known.0.device_id == peer.device_id) {
                                                 channel.close();
                                             } else {
@@ -992,6 +1041,7 @@ async fn connect_mesh_peer(
     coordinator_url: &str,
     identity: &mini_tunnel_agent::Identity,
     peer: &PeerInfo,
+    relay_server: Option<SocketAddr>,
 ) -> Result<(mini_tunnel_agent::PeerChannel, SocketAddr), String> {
     let mut peer = peer.clone();
     for _ in 0..10 {
@@ -1004,7 +1054,7 @@ async fn connect_mesh_peer(
             .map_err(|error| error.to_string())?;
     }
     let peer_key = decode_peer_key(&peer.public_key).map_err(|error| error.to_string())?;
-    mini_tunnel_agent::connect_peer_candidates(
+    match mini_tunnel_agent::connect_peer_candidates(
         endpoint,
         &peer.candidates,
         network_id,
@@ -1013,7 +1063,44 @@ async fn connect_mesh_peer(
         peer_key,
     )
     .await
-    .map_err(|error| error.to_string())
+    {
+        Ok(connection) => Ok(connection),
+        Err(direct_error) => {
+            let relay = relay_server.ok_or_else(|| direct_error.to_string())?;
+            let device_id = identity.device_id();
+            let timestamp_ms = now_ms().map_err(|error| error.to_string())?;
+            let request = RelayTicketRequest {
+                device_id: device_id.clone(),
+                peer_id: peer.device_id.clone(),
+                timestamp_ms,
+                signature: identity.sign(&relay_ticket_request_signing_bytes(
+                    network_id,
+                    &device_id,
+                    &peer.device_id,
+                    timestamp_ms,
+                )),
+            };
+            let ticket: RelayTicketResponse = post_json(
+                coordinator_url,
+                &format!("/v1/networks/{network_id}/relay-ticket"),
+                &request,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            let channel = mini_tunnel_agent::connect_relay_peer(
+                relay,
+                &ticket.ticket,
+                network_id,
+                identity,
+                &peer.device_id,
+                peer_key,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            let remote = channel.remote_address();
+            Ok((channel, remote))
+        }
+    }
 }
 
 async fn run_peer_mesh(

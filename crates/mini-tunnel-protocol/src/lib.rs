@@ -4,6 +4,7 @@
 //! protocol. Breaking changes are expected until protocol version 1 is frozen.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -77,6 +78,146 @@ pub fn peers_signing_bytes(network_id: &str, device_id: &str, timestamp_ms: u64)
             &timestamp_ms.to_be_bytes(),
         ],
     )
+}
+
+pub const RELAY_TICKET_VERSION: u16 = 1;
+const RELAY_TICKET_DOMAIN: &[u8] = b"mini-tunnel/relay-ticket/v1\0";
+const RELAY_AUTH_DOMAIN: &[u8] = b"mini-tunnel/relay-auth/v1\0";
+const MAX_RELAY_TICKET_BYTES: usize = 2048;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayTicketRequest {
+    pub device_id: String,
+    pub peer_id: String,
+    pub timestamp_ms: u64,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayTicketResponse {
+    pub ticket: String,
+    pub expires_at_ms: u64,
+}
+
+/// MAC-authenticated claim carried from the coordinator to one relay node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayTicketClaims {
+    pub version: u16,
+    pub network_id: String,
+    pub source_device_id: String,
+    pub target_device_id: String,
+    pub session_id: [u8; 16],
+    pub ticket_id: [u8; 16],
+    pub expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RelayTicketError {
+    #[error("relay ticket is malformed or has an unsupported version")]
+    Invalid,
+    #[error("relay ticket has expired")]
+    Expired,
+}
+
+#[must_use]
+pub fn relay_ticket_request_signing_bytes(
+    network_id: &str,
+    device_id: &str,
+    peer_id: &str,
+    timestamp_ms: u64,
+) -> Vec<u8> {
+    signing_bytes(
+        b"mini-tunnel/relay-ticket-request/v1",
+        &[
+            network_id.as_bytes(),
+            device_id.as_bytes(),
+            peer_id.as_bytes(),
+            &timestamp_ms.to_be_bytes(),
+        ],
+    )
+}
+
+/// Issue a compact ticket authenticated by the coordinator/relay shared secret.
+pub fn issue_relay_ticket(
+    secret: &[u8; 32],
+    claims: &RelayTicketClaims,
+) -> Result<String, RelayTicketError> {
+    validate_relay_ticket_claims(claims)?;
+    let payload = serde_json::to_vec(claims).map_err(|_| RelayTicketError::Invalid)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).map_err(|_| RelayTicketError::Invalid)?;
+    mac.update(RELAY_TICKET_DOMAIN);
+    mac.update(&payload);
+    let mut token = payload;
+    token.extend_from_slice(&mac.finalize().into_bytes());
+    let encoded = URL_SAFE_NO_PAD.encode(token);
+    if encoded.len() > MAX_RELAY_TICKET_BYTES {
+        return Err(RelayTicketError::Invalid);
+    }
+    Ok(encoded)
+}
+
+/// Verify MAC, claim structure and expiry before a relay allocates a session.
+pub fn verify_relay_ticket(
+    secret: &[u8; 32],
+    token: &str,
+    now_ms: u64,
+) -> Result<RelayTicketClaims, RelayTicketError> {
+    if token.len() > MAX_RELAY_TICKET_BYTES {
+        return Err(RelayTicketError::Invalid);
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| RelayTicketError::Invalid)?;
+    if bytes.len() <= 32 {
+        return Err(RelayTicketError::Invalid);
+    }
+    let (payload, tag) = bytes.split_at(bytes.len() - 32);
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).map_err(|_| RelayTicketError::Invalid)?;
+    mac.update(RELAY_TICKET_DOMAIN);
+    mac.update(payload);
+    mac.verify_slice(tag)
+        .map_err(|_| RelayTicketError::Invalid)?;
+    let claims: RelayTicketClaims =
+        serde_json::from_slice(payload).map_err(|_| RelayTicketError::Invalid)?;
+    validate_relay_ticket_claims(&claims)?;
+    if claims.expires_at_ms <= now_ms {
+        return Err(RelayTicketError::Expired);
+    }
+    Ok(claims)
+}
+
+#[must_use]
+pub fn relay_auth_signing_bytes(
+    ticket: &str,
+    challenge: &[u8; 32],
+    public_key: &[u8; 32],
+) -> Vec<u8> {
+    signing_bytes(
+        RELAY_AUTH_DOMAIN,
+        &[ticket.as_bytes(), challenge, public_key],
+    )
+}
+
+fn validate_relay_ticket_claims(claims: &RelayTicketClaims) -> Result<(), RelayTicketError> {
+    let valid_device_id = |id: &str| {
+        id.len() == 32
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if claims.version != RELAY_TICKET_VERSION
+        || claims.network_id.is_empty()
+        || claims.network_id.len() > 128
+        || !valid_device_id(&claims.source_device_id)
+        || !valid_device_id(&claims.target_device_id)
+        || claims.source_device_id == claims.target_device_id
+        || claims.expires_at_ms == 0
+    {
+        return Err(RelayTicketError::Invalid);
+    }
+    Ok(())
 }
 
 #[must_use]
@@ -227,4 +368,66 @@ pub enum ProtocolError {
     UnsupportedVersion(u16),
     #[error("request_id must not be empty")]
     MissingRequestId,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn claims() -> RelayTicketClaims {
+        RelayTicketClaims {
+            version: RELAY_TICKET_VERSION,
+            network_id: "network-1".to_owned(),
+            source_device_id: "0123456789abcdef0123456789abcdef".to_owned(),
+            target_device_id: "fedcba9876543210fedcba9876543210".to_owned(),
+            session_id: [7; 16],
+            ticket_id: [8; 16],
+            expires_at_ms: 5000,
+        }
+    }
+
+    #[test]
+    fn relay_ticket_authenticates_claims_and_expiry() {
+        let secret = [3; 32];
+        let ticket = issue_relay_ticket(&secret, &claims()).expect("issue ticket");
+        let verified = verify_relay_ticket(&secret, &ticket, 4999).expect("verify ticket");
+        assert_eq!(verified, claims());
+        assert_eq!(
+            verify_relay_ticket(&secret, &ticket, 5000),
+            Err(RelayTicketError::Expired)
+        );
+        assert_eq!(
+            verify_relay_ticket(&[4; 32], &ticket, 4999),
+            Err(RelayTicketError::Invalid)
+        );
+        let mut tampered = ticket.into_bytes();
+        let last = tampered.len() - 1;
+        tampered[last] = if tampered[last] == b'A' { b'B' } else { b'A' };
+        let tampered = String::from_utf8(tampered).expect("base64 token is utf8");
+        assert_eq!(
+            verify_relay_ticket(&secret, &tampered, 4999),
+            Err(RelayTicketError::Invalid)
+        );
+    }
+
+    #[test]
+    fn relay_ticket_rejects_invalid_pair_and_unknown_fields() {
+        let secret = [3; 32];
+        let mut invalid = claims();
+        invalid.target_device_id = invalid.source_device_id.clone();
+        assert_eq!(
+            issue_relay_ticket(&secret, &invalid),
+            Err(RelayTicketError::Invalid)
+        );
+        let future = br#"{"version":1,"network_id":"network-1","source_device_id":"0123456789abcdef0123456789abcdef","target_device_id":"fedcba9876543210fedcba9876543210","session_id":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7],"ticket_id":[8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8],"expires_at_ms":5000,"admin":true}"#;
+        let mut mac = Hmac::<Sha256>::new_from_slice(&secret).expect("HMAC key");
+        mac.update(RELAY_TICKET_DOMAIN);
+        mac.update(future);
+        let mut bytes = future.to_vec();
+        bytes.extend_from_slice(&mac.finalize().into_bytes());
+        assert_eq!(
+            verify_relay_ticket(&secret, &URL_SAFE_NO_PAD.encode(bytes), 4999),
+            Err(RelayTicketError::Invalid)
+        );
+    }
 }

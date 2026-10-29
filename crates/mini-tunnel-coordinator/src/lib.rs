@@ -23,8 +23,10 @@ use ipnet::Ipv4Net;
 use mini_tunnel_protocol::{
     ApiErrorResponse, CandidateUpdateRequest, CandidateUpdateResponse, CreateInviteRequest,
     CreateInviteResponse, CreateNetworkRequest, CreateNetworkResponse, JoinNetworkRequest,
-    JoinNetworkResponse, PeerInfo, PeerListRequest, PeerListResponse, candidate_signing_bytes,
-    device_id_from_public_key, join_signing_bytes, peers_signing_bytes,
+    JoinNetworkResponse, PeerInfo, PeerListRequest, PeerListResponse, RELAY_TICKET_VERSION,
+    RelayTicketClaims, RelayTicketRequest, RelayTicketResponse, candidate_signing_bytes,
+    device_id_from_public_key, issue_relay_ticket, join_signing_bytes, peers_signing_bytes,
+    relay_ticket_request_signing_bytes,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -55,6 +57,17 @@ pub struct CoordinatorState {
     inner: Arc<RwLock<Store>>,
     persistence: Option<Arc<PathBuf>>,
     request_limiter: RequestRateLimiter,
+    relay_ticket_key: Option<Arc<[u8; 32]>>,
+    relay_pairs: Arc<Mutex<RelayPairStore>>,
+}
+
+type RelayPairStore = HashMap<(Uuid, String, String), RelayPair>;
+
+#[derive(Clone)]
+struct RelayPair {
+    session_id: [u8; 16],
+    expires_at_ms: u64,
+    first_device: String,
 }
 
 #[derive(Clone)]
@@ -219,6 +232,13 @@ impl IntoResponse for ApiError {
 }
 
 impl CoordinatorState {
+    /// Enable ticket issuance with the secret shared only with trusted relay nodes.
+    #[must_use]
+    pub fn with_relay_ticket_key(mut self, key: [u8; 32]) -> Self {
+        self.relay_ticket_key = Some(Arc::new(key));
+        self
+    }
+
     /// Load persisted state, or start with an empty store when the file does not exist.
     pub fn load(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
@@ -253,6 +273,97 @@ impl CoordinatorState {
             inner: Arc::new(RwLock::new(store)),
             persistence: Some(Arc::new(path)),
             request_limiter: RequestRateLimiter::default(),
+            ..Self::default()
+        })
+    }
+
+    async fn relay_ticket(
+        &self,
+        network_id: Uuid,
+        request: RelayTicketRequest,
+    ) -> Result<RelayTicketResponse, ApiError> {
+        let key = self.relay_ticket_key.as_ref().ok_or(ApiError::Internal)?;
+        let now = unix_time_ms().ok_or(ApiError::Internal)?;
+        if request.device_id == request.peer_id
+            || request.timestamp_ms.abs_diff(now) > SIGNATURE_CLOCK_SKEW_MS
+        {
+            return Err(ApiError::InvalidRequest("invalid peer or timestamp"));
+        }
+        let store = self.inner.read().await;
+        let network = store.networks.get(&network_id).ok_or(ApiError::NotFound)?;
+        let source = network
+            .members
+            .get(&request.device_id)
+            .ok_or(ApiError::Unauthorized)?;
+        network
+            .members
+            .get(&request.peer_id)
+            .ok_or(ApiError::Unauthorized)?;
+        if !verify_signature(
+            &source.public_key,
+            &relay_ticket_request_signing_bytes(
+                &network_id.to_string(),
+                &request.device_id,
+                &request.peer_id,
+                request.timestamp_ms,
+            ),
+            &request.signature,
+        ) {
+            return Err(ApiError::Unauthorized);
+        }
+        drop(store);
+        let mut pair_key = (
+            network_id,
+            request.device_id.clone(),
+            request.peer_id.clone(),
+        );
+        if pair_key.1 > pair_key.2 {
+            std::mem::swap(&mut pair_key.1, &mut pair_key.2);
+        }
+        let expires_at_ms = now.saturating_add(45_000);
+        let session_id = {
+            let mut pairs = self.relay_pairs.lock().map_err(|_| ApiError::Internal)?;
+            pairs.retain(|_, pair| pair.expires_at_ms > now);
+            if pairs.len() >= 8192 && !pairs.contains_key(&pair_key) {
+                return Err(ApiError::Conflict("relay pairing capacity reached"));
+            }
+            if let Some(pair) = pairs.get(&pair_key) {
+                if pair.first_device != request.device_id {
+                    let id = pair.session_id;
+                    pairs.remove(&pair_key);
+                    id
+                } else {
+                    pair.session_id
+                }
+            } else {
+                let mut session_id = [0_u8; 16];
+                random_fill(&mut session_id).map_err(|_| ApiError::Internal)?;
+                pairs.insert(
+                    pair_key,
+                    RelayPair {
+                        session_id,
+                        expires_at_ms,
+                        first_device: request.device_id.clone(),
+                    },
+                );
+                session_id
+            }
+        };
+        let mut ticket_id = [0_u8; 16];
+        random_fill(&mut ticket_id).map_err(|_| ApiError::Internal)?;
+        let claims = RelayTicketClaims {
+            version: RELAY_TICKET_VERSION,
+            network_id: network_id.to_string(),
+            source_device_id: request.device_id,
+            target_device_id: request.peer_id,
+            session_id,
+            ticket_id,
+            expires_at_ms,
+        };
+        let ticket = issue_relay_ticket(key, &claims).map_err(|_| ApiError::Internal)?;
+        Ok(RelayTicketResponse {
+            ticket,
+            expires_at_ms,
         })
     }
 
@@ -775,6 +886,7 @@ pub fn router_with_state(state: CoordinatorState) -> Router {
             post(update_candidates),
         )
         .route("/v1/networks/{network_id}/peers", post(list_peers))
+        .route("/v1/networks/{network_id}/relay-ticket", post(relay_ticket))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(from_fn_with_state(state.clone(), limit_requests))
         .with_state(state)
@@ -859,6 +971,16 @@ async fn list_peers(
     state.list_peers(network_id, request).await.map(Json)
 }
 
+async fn relay_ticket(
+    State(state): State<CoordinatorState>,
+    Path(network_id): Path<String>,
+    Json(request): Json<RelayTicketRequest>,
+) -> Result<Json<RelayTicketResponse>, ApiError> {
+    let network_id = Uuid::parse_str(&network_id)
+        .map_err(|_| ApiError::InvalidRequest("network_id must be a UUID"))?;
+    state.relay_ticket(network_id, request).await.map(Json)
+}
+
 fn decode_exact<const N: usize>(encoded: &str) -> Option<[u8; N]> {
     URL_SAFE_NO_PAD.decode(encoded).ok()?.try_into().ok()
 }
@@ -900,6 +1022,18 @@ pub async fn serve_with_state_file(
     state_file: impl Into<PathBuf>,
 ) -> std::io::Result<()> {
     serve_with_state(address, CoordinatorState::load(state_file)?).await
+}
+
+pub async fn serve_with_state_file_and_relay_key(
+    address: SocketAddr,
+    state_file: impl Into<PathBuf>,
+    relay_ticket_key: Option<[u8; 32]>,
+) -> std::io::Result<()> {
+    let mut state = CoordinatorState::load(state_file)?;
+    if let Some(key) = relay_ticket_key {
+        state = state.with_relay_ticket_key(key);
+    }
+    serve_with_state(address, state).await
 }
 
 async fn serve_with_state(address: SocketAddr, state: CoordinatorState) -> std::io::Result<()> {
@@ -1053,6 +1187,82 @@ mod tests {
             public_key: URL_SAFE_NO_PAD.encode(public_key),
             signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
         }
+    }
+
+    #[tokio::test]
+    async fn relay_tickets_require_network_members_and_pair_opposite_requests() {
+        let key_a = SigningKey::from_bytes(&[31; 32]);
+        let key_b = SigningKey::from_bytes(&[32; 32]);
+        let id_a = device_id_from_public_key(&key_a.verifying_key().to_bytes());
+        let id_b = device_id_from_public_key(&key_b.verifying_key().to_bytes());
+        let network_id = Uuid::new_v4();
+        let mut network = Network {
+            cidr: "10.8.0.0/24".parse().unwrap(),
+            admin_token_hash: [0; 32],
+            invites: HashMap::new(),
+            members: HashMap::new(),
+            assigned_addresses: HashSet::new(),
+        };
+        network.members.insert(
+            id_a.clone(),
+            Member {
+                address: "10.8.0.1".parse().unwrap(),
+                public_key: key_a.verifying_key().to_bytes(),
+                candidates: Vec::new(),
+                last_candidate_timestamp_ms: 0,
+            },
+        );
+        network.members.insert(
+            id_b.clone(),
+            Member {
+                address: "10.8.0.2".parse().unwrap(),
+                public_key: key_b.verifying_key().to_bytes(),
+                candidates: Vec::new(),
+                last_candidate_timestamp_ms: 0,
+            },
+        );
+        let state = CoordinatorState::default().with_relay_ticket_key([9; 32]);
+        state
+            .inner
+            .write()
+            .await
+            .networks
+            .insert(network_id, network);
+        let now = unix_time_ms().unwrap();
+        let make = |signer: &SigningKey, source: &str, target: &str| {
+            let sig = signer.sign(&relay_ticket_request_signing_bytes(
+                &network_id.to_string(),
+                source,
+                target,
+                now,
+            ));
+            RelayTicketRequest {
+                device_id: source.to_owned(),
+                peer_id: target.to_owned(),
+                timestamp_ms: now,
+                signature: URL_SAFE_NO_PAD.encode(sig.to_bytes()),
+            }
+        };
+        let ticket_a = state
+            .relay_ticket(network_id, make(&key_a, &id_a, &id_b))
+            .await
+            .unwrap();
+        let ticket_b = state
+            .relay_ticket(network_id, make(&key_b, &id_b, &id_a))
+            .await
+            .unwrap();
+        let claims_a =
+            mini_tunnel_protocol::verify_relay_ticket(&[9; 32], &ticket_a.ticket, now).unwrap();
+        let claims_b =
+            mini_tunnel_protocol::verify_relay_ticket(&[9; 32], &ticket_b.ticket, now).unwrap();
+        assert_eq!(claims_a.session_id, claims_b.session_id);
+        assert_ne!(claims_a.ticket_id, claims_b.ticket_id);
+        assert!(matches!(
+            state
+                .relay_ticket(network_id, make(&key_a, &id_a, &"f".repeat(32)))
+                .await,
+            Err(ApiError::Unauthorized)
+        ));
     }
 
     #[tokio::test]

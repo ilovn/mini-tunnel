@@ -4,9 +4,9 @@ A minimal, peer-to-peer virtual network tunnel. The design baseline is in [`docs
 
 ## Current status
 
-Implemented: a Rust workspace, coordinator health endpoint and atomic state, network creation/invites/IPv4 allocation, stable Ed25519 device identities, signed discovery candidates, authenticated QUIC/UDP peer channels, STUN mapped-candidate discovery, and a multi-peer IPv4 TUN mesh.
+Implemented: coordinator health/state and enrollment, stable Ed25519 identities, signed discovery candidates, authenticated QUIC/UDP and TLS/TCP peer channels, STUN mapped candidates, multi-peer IPv4 TUN mesh, and an optional ticket-authorized opaque TCP relay with end-to-end pinned TLS.
 
-Not implemented yet: full ICE connectivity checks, adaptive QoS-driven path switching, and packet relay. Mesh peers make simultaneous authenticated QUIC/UDP connection attempts to open NAT mappings, then elect one data connection by stable device ID. When a member advertises `tcp://` candidates and runs a TCP listener, peers fall back to TLS/TCP after UDP candidates fail. This best-effort hole-punch strategy is not full ICE; restrictive/symmetric NATs and UDP-blocking firewalls may still need a relay. The control API has a bounded 600-request/minute per-source-IP limiter and a 64 KiB body cap, but remains a development prototype without TLS termination or distributed abuse controls. **Do not expose it directly to untrusted networks.** The coordinator binds to loopback by default; use a hardened TLS reverse proxy for remote clients.
+Still in progress: full ICE connectivity checks, live QoS-driven path switching/recovery, and production operational hardening. Mesh peers make simultaneous authenticated QUIC/UDP connection attempts and use advertised TLS/TCP candidates when UDP fails. An optional coordinator-authorized relay handles restrictive NATs; the relay sees only ticket metadata and TLS ciphertext. The control API has a bounded 600-request/minute per-source-IP limiter and a 64 KiB body cap, but remains a development prototype without TLS termination or distributed abuse controls. **Do not expose it directly to untrusted networks.** The coordinator binds to loopback by default; use a hardened TLS reverse proxy for remote clients.
 
 ## Quick start
 
@@ -49,7 +49,7 @@ cargo run -p mini-tunnel -- network peers --network-id '<network-id>'
 
 Candidate updates are signed, limited to eight usable socket addresses, and reject timestamps outside a five-minute window or replayed updates. This only exchanges control-plane information; it does not open a tunnel or prove that a candidate is reachable. Each invite expires after one hour and can enroll one device.
 
-Tunnel commands can optionally discover and publish a server-reflexive UDP candidate using a STUN Binding server. Pass `--stun-server '<stun-ip>:3478'`; the STUN request uses the same bound UDP socket later handed to QUIC. Additional addresses can be repeated as `--candidate '<ip>:<port>'`. The STUN option is off by default and an enabled candidate update replaces this device's previous candidate list. Mesh peers attempt QUIC connections simultaneously over advertised candidates; device ID ordering elects one data connection while the reverse connection is discarded after authentication. This can open mappings on some NATs, but does not implement the complete ICE candidate checklist, keepalive, or nomination procedure. Symmetric NAT/firewall behavior may still prevent direct connectivity. TURN/relay and TCP fallback are not implemented. See [RFC 8489](https://www.rfc-editor.org/rfc/rfc8489.html) and [RFC 8445](https://www.rfc-editor.org/rfc/rfc8445.html) for STUN's scope and ICE connectivity checks.
+Tunnel commands can optionally discover and publish a server-reflexive UDP candidate using STUN. Pass `--stun-server '<stun-ip>:3478'`; the STUN request uses the same UDP socket later handed to QUIC. Additional addresses can be repeated as `--candidate '<ip>:<port>'`. Mesh peers attempt QUIC simultaneously; device ID ordering elects one data connection. This is best-effort hole punching, not full ICE connectivity checks, keepalives, or nomination. See [RFC 8489](https://www.rfc-editor.org/rfc/rfc8489.html) and [RFC 8445](https://www.rfc-editor.org/rfc/rfc8445.html).
 
 The low-level authenticated QUIC/UDP diagnostic can verify a reachable peer address without creating a TUN. Each side needs the other device's ID and URL-safe base64 public key shown by the identity command. On the receiving side:
 
@@ -96,7 +96,15 @@ For multiple enrolled devices, run `peer tunnel mesh` on each device with the sa
 cargo run -p mini-tunnel -- peer tunnel mesh --network-id '<network-id>' --bind 0.0.0.0:42000 --stun-server '<stun-ip>:3478' --tcp-bind 0.0.0.0:443 --candidate 'tcp://<public-ip>:443' --manage-route
 ```
 
-Configure firewall/NAT forwarding for the UDP and TCP ports you advertise. `--tcp-bind` starts the TLS/TCP fallback listener; publish its externally reachable address as a `tcp://` candidate with `--candidate`. Mesh keeps reachable authenticated peers and reports unavailable ones; at least one peer must connect. Each pair probes UDP from both ends and elects one data connection using device ID ordering. TCP is reliable and encrypted, but currently serves as connect-time fallback only; it does not switch paths after a live UDP session degrades. The peer list is a startup snapshot, so newly joined devices require restarting mesh. Simultaneous UDP probing may establish direct paths through common NATs, but restrictive or symmetric NATs can still require a relay; full ICE checks and relay forwarding are not implemented.
+For direct TCP fallback, configure forwarding for the advertised TCP port. `--tcp-bind` starts the TLS/TCP listener; publish its reachable address as a `tcp://` candidate. For relay fallback, configure the same random 32-byte key on coordinator and relay as URL-safe base64 without padding, then start the relay:
+
+```sh
+export MINI_TUNNEL_RELAY_TICKET_KEY='<base64url-32-byte-secret>'
+cargo run -p mini-tunnel -- coordinator serve
+cargo run -p mini-tunnel -- relay serve --listen 0.0.0.0:42001
+```
+
+On each mesh device, set `MINI_TUNNEL_RELAY_SERVER='<relay-host>:42001'` (or pass `--relay-server`). The mesh tries direct candidates first, requests a short-lived signed-member ticket only after those fail, then connects through the relay. The relay challenge proves possession of the device key; tickets are one use, and the two devices negotiate their own certificate-pinned TLS session through the opaque byte broker. Use HTTPS for a remotely hosted coordinator. Relay key rotation requires updating coordinator and all relay processes together. The current peer list is a startup snapshot; newly joined devices require restarting mesh. Live UDP degradation detection and switching remain unimplemented.
 
 ## Development
 

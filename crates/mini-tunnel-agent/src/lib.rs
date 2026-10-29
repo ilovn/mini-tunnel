@@ -211,6 +211,7 @@ enum PeerTransport {
 /// Authenticated QUIC or TLS/TCP connection to one authorized peer.
 pub struct PeerChannel {
     transport: PeerTransport,
+    relay: bool,
     network_tag: [u8; 16],
     next_packet: Mutex<u64>,
     replay_window: Mutex<ReplayWindow>,
@@ -227,6 +228,9 @@ impl PeerChannel {
 
     #[must_use]
     pub fn transport_name(&self) -> &'static str {
+        if self.relay {
+            return "Relay/TLS";
+        }
         match &self.transport {
             PeerTransport::Quic(_) => "QUIC/UDP",
             PeerTransport::Tcp(_) => "TLS/TCP",
@@ -494,6 +498,29 @@ pub async fn connect_tcp_peer(
     .await
     .map_err(|error| IdentityError::Transport(error.to_string()))?
     .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    connect_tcp_peer_over_stream(
+        socket,
+        remote_addr,
+        network_id,
+        identity,
+        expected_peer_id,
+        expected_peer_key,
+    )
+    .await
+}
+
+/// Establish the existing pinned TLS peer protocol over an already-connected stream.
+pub async fn connect_tcp_peer_over_stream(
+    socket: tokio::net::TcpStream,
+    remote_addr: SocketAddr,
+    network_id: &str,
+    identity: &Identity,
+    expected_peer_id: &str,
+    expected_peer_key: [u8; 32],
+) -> Result<PeerChannel, IdentityError> {
+    if expected_peer_id != mini_tunnel_protocol::device_id_from_public_key(&expected_peer_key) {
+        return Err(IdentityError::UnauthorizedPeer);
+    }
     socket
         .set_nodelay(true)
         .map_err(|error| IdentityError::Transport(error.to_string()))?;
@@ -517,6 +544,94 @@ pub async fn connect_tcp_peer(
     .await
     .map_err(|error| IdentityError::Transport(error.to_string()))??;
     Ok(new_tcp_channel(Box::new(stream), remote_addr, network_id))
+}
+
+/// Connect through an authorized relay ticket, then negotiate pinned end-to-end peer TLS.
+pub async fn connect_relay_peer(
+    relay_addr: SocketAddr,
+    ticket: &str,
+    network_id: &str,
+    identity: &Identity,
+    expected_peer_id: &str,
+    expected_peer_key: [u8; 32],
+) -> Result<PeerChannel, IdentityError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if expected_peer_id != mini_tunnel_protocol::device_id_from_public_key(&expected_peer_key)
+        || ticket.is_empty()
+        || ticket.len() > 2048
+    {
+        return Err(IdentityError::UnauthorizedPeer);
+    }
+    let mut socket = tokio::time::timeout(
+        PEER_HANDSHAKE_TIMEOUT,
+        tokio::net::TcpStream::connect(relay_addr),
+    )
+    .await
+    .map_err(|error| IdentityError::Transport(error.to_string()))?
+    .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    let ticket_len: u16 = ticket
+        .len()
+        .try_into()
+        .map_err(|_| IdentityError::UnauthorizedPeer)?;
+    socket.write_all(b"MTRELAY1").await?;
+    socket.write_u16(ticket_len).await?;
+    socket.write_all(ticket.as_bytes()).await?;
+    let public_key = identity.public_key();
+    socket.write_all(&public_key).await?;
+    if socket.read_u8().await? != 1 {
+        return Err(IdentityError::UnauthorizedPeer);
+    }
+    let mut challenge = [0_u8; 32];
+    socket.read_exact(&mut challenge).await?;
+    let proof = identity.sign(&mini_tunnel_protocol::relay_auth_signing_bytes(
+        ticket,
+        &challenge,
+        &public_key,
+    ));
+    let proof = URL_SAFE_NO_PAD
+        .decode(proof)
+        .map_err(|_| IdentityError::UnauthorizedPeer)?;
+    socket.write_all(&proof).await?;
+    if socket.read_u8().await? != 2 {
+        return Err(IdentityError::UnauthorizedPeer);
+    }
+    let remote = socket.peer_addr()?;
+    if identity.device_id().as_str() < expected_peer_id {
+        let mut channel = connect_tcp_peer_over_stream(
+            socket,
+            remote,
+            network_id,
+            identity,
+            expected_peer_id,
+            expected_peer_key,
+        )
+        .await?;
+        channel.relay = true;
+        Ok(channel)
+    } else {
+        let acceptor = tokio_rustls::TlsAcceptor::from(peer_tcp_server_config(identity)?);
+        let mut stream = tokio::time::timeout(PEER_HANDSHAKE_TIMEOUT, acceptor.accept(socket))
+            .await
+            .map_err(|error| IdentityError::Transport(error.to_string()))?
+            .map_err(|error| IdentityError::Transport(error.to_string()))?;
+        if stream.get_ref().1.alpn_protocol() != Some(b"mini-tunnel-peer-tcp/1") {
+            return Err(IdentityError::UnauthorizedPeer);
+        }
+        tokio::time::timeout(
+            PEER_HANDSHAKE_TIMEOUT,
+            tcp_server_authenticate(
+                &mut stream,
+                network_id,
+                identity,
+                &[(expected_peer_id.to_owned(), expected_peer_key)],
+            ),
+        )
+        .await
+        .map_err(|error| IdentityError::Transport(error.to_string()))??;
+        let mut channel = new_tcp_channel(Box::new(stream), remote, network_id);
+        channel.relay = true;
+        Ok(channel)
+    }
 }
 
 /// Bind a TCP listener for authenticated TCP fallback sessions.
@@ -728,6 +843,7 @@ fn new_channel(connection: Connection, network_id: &str) -> PeerChannel {
     network_tag.copy_from_slice(&hash[..16]);
     PeerChannel {
         transport: PeerTransport::Quic(connection),
+        relay: false,
         network_tag,
         next_packet: Mutex::new(0),
         replay_window: Mutex::new(ReplayWindow::default()),
@@ -749,6 +865,7 @@ fn new_tcp_channel(
             receiver: tokio::sync::Mutex::new(receiver),
             remote_address,
         }),
+        relay: false,
         network_tag,
         next_packet: Mutex::new(0),
         replay_window: Mutex::new(ReplayWindow::default()),
@@ -1313,6 +1430,78 @@ mod tests {
         ));
         fs::remove_dir_all(temp).expect("remove test identities");
         udp_endpoint.close(0_u32.into(), b"test complete");
+    }
+
+    #[tokio::test]
+    async fn relay_path_establishes_pinned_tls_and_transfers_overlay_frames() {
+        let temp =
+            std::env::temp_dir().join(format!("mini-tunnel-relay-agent-{}", uuid::Uuid::new_v4()));
+        let a = Identity::load_or_create_at(temp.join("a/device.key")).unwrap();
+        let b = Identity::load_or_create_at(temp.join("b/device.key")).unwrap();
+        let relay_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap();
+        let secret = [27_u8; 32];
+        let server =
+            mini_tunnel_relay::RelayServer::new(mini_tunnel_relay::RelayConfig::new(secret));
+        let task = tokio::spawn(async move { server.run(relay_listener).await });
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let session_id = [4_u8; 16];
+        let ticket = |source: &Identity, target: &Identity, id: u8| {
+            mini_tunnel_protocol::issue_relay_ticket(
+                &secret,
+                &mini_tunnel_protocol::RelayTicketClaims {
+                    version: mini_tunnel_protocol::RELAY_TICKET_VERSION,
+                    network_id: "relay-test".into(),
+                    source_device_id: source.device_id(),
+                    target_device_id: target.device_id(),
+                    session_id,
+                    ticket_id: [id; 16],
+                    expires_at_ms: now + 60_000,
+                },
+            )
+            .unwrap()
+        };
+        let ticket_a = ticket(&a, &b, 1);
+        let ticket_b = ticket(&b, &a, 2);
+        let a_id = a.device_id();
+        let b_id = b.device_id();
+        let (result_a, result_b) = tokio::join!(
+            connect_relay_peer(
+                relay_addr,
+                &ticket_a,
+                "relay-test",
+                &a,
+                &b_id,
+                b.public_key()
+            ),
+            connect_relay_peer(
+                relay_addr,
+                &ticket_b,
+                "relay-test",
+                &b,
+                &a_id,
+                a.public_key()
+            ),
+        );
+        let channel_a = result_a.unwrap();
+        let channel_b = result_b.unwrap();
+        channel_a
+            .send_packet(b"through opaque relay")
+            .await
+            .unwrap();
+        assert_eq!(
+            channel_b.recv_packet().await.unwrap(),
+            b"through opaque relay"
+        );
+        task.abort();
+        drop(channel_a);
+        drop(channel_b);
+        fs::remove_dir_all(temp).unwrap();
     }
 
     #[tokio::test]

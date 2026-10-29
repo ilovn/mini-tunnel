@@ -25,3 +25,6 @@ tokio-rustls.workspace = true
 tun-rs.workspace = true
 uuid.workspace = true
 x509-parser.workspace = true
+
+[dev-dependencies]
+mini-tunnel-relay = { path = "../mini-tunnel-relay" }

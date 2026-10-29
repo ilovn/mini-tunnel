@@ -6,4 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ed25519-dalek.workspace = true
+getrandom.workspace = true
 mini-tunnel-protocol = { path = "../mini-tunnel-protocol" }
+thiserror.workspace = true
+tokio.workspace = true

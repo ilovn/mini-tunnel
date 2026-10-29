@@ -16,6 +16,7 @@ directories.workspace = true
 mini-tunnel-coordinator = { path = "../mini-tunnel-coordinator" }
 mini-tunnel-agent = { path = "../mini-tunnel-agent" }
 mini-tunnel-protocol = { path = "../mini-tunnel-protocol" }
+mini-tunnel-relay = { path = "../mini-tunnel-relay" }
 quinn.workspace = true
 reqwest.workspace = true
 serde.workspace = true
