@@ -484,7 +484,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             (peer, result)
                         });
                     }
-                    let accept_task = if inbound_peers.is_empty() {
+                    let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::channel(64);
+                    let mut accept_task = if inbound_peers.is_empty() {
                         None
                     } else {
                         let endpoint = endpoint.clone();
@@ -492,7 +493,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let network_id = network_id.clone();
                         Some(tokio::spawn(async move {
                             let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
-                            let mut connected = Vec::new();
                             while !inbound_peers.is_empty() {
                                 let allowed = inbound_peers
                                     .iter()
@@ -522,30 +522,61 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 {
                                     let peer = inbound_peers.remove(index);
                                     let remote = channel.remote_address();
-                                    connected.push((peer, channel, remote));
+                                    if accepted_tx.send((peer, channel, remote)).await.is_err() {
+                                        break;
+                                    }
                                 }
                             }
-                            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(connected)
+                            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
                         }))
                     };
                     let mut connected = Vec::new();
-                    while let Some(result) = attempts.join_next().await {
-                        let (peer, result) = result?;
-                        match result {
-                            Ok((channel, remote)) => {
-                                println!("Connected mesh peer {} at {remote}", peer.device_id);
-                                connected.push((peer, channel, remote));
+                    let mut accept_finished = accept_task.is_none();
+                    let startup_deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+                    let mut first_peer_at = None;
+                    loop {
+                        if attempts.is_empty() && accept_finished {
+                            break;
+                        }
+                        let settle_deadline = first_peer_at
+                            .map(|at| at + Duration::from_secs(1))
+                            .unwrap_or(startup_deadline);
+                        tokio::select! {
+                            accepted = accepted_rx.recv(), if !accept_finished => {
+                                match accepted {
+                                    Some((peer, channel, remote)) => {
+                                        println!("Connected mesh peer {} at {remote}", peer.device_id);
+                                        connected.push((peer, channel, remote));
+                                        first_peer_at.get_or_insert_with(tokio::time::Instant::now);
+                                    }
+                                    None => accept_finished = true,
+                                }
                             }
-                            Err(error) => {
-                                eprintln!("Peer {} unavailable: {error}", peer.device_id);
+                            result = attempts.join_next(), if !attempts.is_empty() => {
+                                let Some(result) = result else { continue; };
+                                let (peer, result) = result?;
+                                match result {
+                                    Ok((channel, remote)) => {
+                                        println!("Connected mesh peer {} at {remote}", peer.device_id);
+                                        connected.push((peer, channel, remote));
+                                        first_peer_at.get_or_insert_with(tokio::time::Instant::now);
+                                    }
+                                    Err(error) => eprintln!("Peer {} unavailable: {error}", peer.device_id),
+                                }
                             }
+                            _ = tokio::time::sleep_until(settle_deadline), if first_peer_at.is_some() => break,
+                            _ = tokio::time::sleep_until(startup_deadline), if first_peer_at.is_none() => break,
                         }
                     }
-                    if let Some(accept_task) = accept_task {
-                        connected.extend(accept_task.await??);
+                    if let Some(task) = accept_task.take() {
+                        task.abort();
+                        let _ = task.await;
                     }
                     if connected.is_empty() {
-                        return Err("could not establish any authenticated peer sessions".into());
+                        return Err(
+                            "no authenticated peer connected before the 45-second startup timeout"
+                                .into(),
+                        );
                     }
                     let tun = create_tun(local_ipv4, prefix_len, mtu)?;
                     run_peer_mesh(&tun, connected, manage_route).await?;
