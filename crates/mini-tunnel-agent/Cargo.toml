@@ -17,6 +17,9 @@ mini-tunnel-protocol = { path = "../mini-tunnel-protocol" }
 quinn.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
+rtc-ice.workspace = true
+rtc-shared.workspace = true
+sansio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

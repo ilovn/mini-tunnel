@@ -1,6 +1,7 @@
 //! Local device identity and signing helpers used by the CLI and tunnel agent.
 
 pub mod candidate;
+pub mod ice;
 pub mod membership;
 pub mod routing;
 pub mod stun;
