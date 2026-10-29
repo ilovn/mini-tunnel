@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/mini-tunnel-protocol",
+    "crates/mini-tunnel-coordinator",
+    "crates/mini-tunnel-agent",
+    "crates/mini-tunnel-relay",
+    "crates/mini-tunnel-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.89"
+
+[workspace.dependencies]
+axum = "0.8.9"
+base64 = "0.23.1"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+getrandom = "0.4.3"
+ipnet = "2.12.2"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.1"
+subtle = "2.6.1"
+thiserror = "2"
+tokio = { version = "1.54.1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.29.0", features = ["v4"] }

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "gates": [
+    {
+      "name": "rust-format",
+      "argv": ["cargo", "fmt", "--all", "--", "--check"],
+      "timeout_seconds": 300
+    },
+    {
+      "name": "workspace-tests",
+      "argv": ["cargo", "test", "--workspace"],
+      "timeout_seconds": 900
+    },
+    {
+      "name": "workspace-clippy",
+      "argv": ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"],
+      "timeout_seconds": 900
+    }
+  ],
+  "loop": {
+    "max_rounds": 5,
+    "timeout_seconds": 300,
+    "stagnation_rounds": 2
+  }
+}

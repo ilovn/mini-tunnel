@@ -1,0 +1,9 @@
+[package]
+name = "mini-tunnel-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mini-tunnel-protocol = { path = "../mini-tunnel-protocol" }

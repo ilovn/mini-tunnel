@@ -1,0 +1,20 @@
+[package]
+name = "mini-tunnel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mini-tunnel"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+mini-tunnel-coordinator = { path = "../mini-tunnel-coordinator" }
+mini-tunnel-protocol = { path = "../mini-tunnel-protocol" }
+reqwest.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

@@ -1,0 +1,239 @@
+{
+  "schema_version": 1,
+  "kit_version": "0.3.1",
+  "installed_at": "2026-10-29T14:09:27.546388+00:00",
+  "updated_at": "2026-10-29T14:09:27.546399+00:00",
+  "tools": [
+    "claude",
+    "codex",
+    "opencode",
+    "trae"
+  ],
+  "files": {
+    ".harness/CONTRACT.md": {
+      "kind": "file",
+      "sha256": "fa508fe52a22d1b11a8d43eeae4468fe0687aa17b146a17e416836cfe6a00a76"
+    },
+    ".claude/commands/harness-quick.md": {
+      "kind": "file",
+      "sha256": "edb5f16a7742d9df6b4e623a7f1605558d3442f31ea3564b64f4e12878e67827"
+    },
+    ".opencode/commands/harness-quick.md": {
+      "kind": "file",
+      "sha256": "2b66f9749fe2bcee0f2f6f79dedec47ef164d5715909ef3e5c903300da848f28"
+    },
+    ".agents/skills/harness-quick/SKILL.md": {
+      "kind": "file",
+      "sha256": "4c03085e531b8b9dafc838412321ef1ce07ac4656b23d8640319fa40d0ed1640"
+    },
+    ".claude/commands/harness-complex.md": {
+      "kind": "file",
+      "sha256": "61ea7556b0a91c6c4dc2f6028c84e11998b23e55314588c665b1b5d81459e7d5"
+    },
+    ".opencode/commands/harness-complex.md": {
+      "kind": "file",
+      "sha256": "0c1912bec2789ad4ad7b4779c77ce48b7107d2f85ccce1cbe752b55a126d83bb"
+    },
+    ".agents/skills/harness-complex/SKILL.md": {
+      "kind": "file",
+      "sha256": "3805a07cce06f353cdfe90e4da6b61009238cd024a27114c3f9eeaeadb70bb9a"
+    },
+    ".claude/commands/harness-bugfix.md": {
+      "kind": "file",
+      "sha256": "07c318a3e3d6318a60a17193e631ae07396072ed95fde2df5adf20cdfa1eacef"
+    },
+    ".opencode/commands/harness-bugfix.md": {
+      "kind": "file",
+      "sha256": "4d673b7dc891626ee0de17354d1b89178126dde69a09ca5bae129ab173fd3bb3"
+    },
+    ".agents/skills/harness-bugfix/SKILL.md": {
+      "kind": "file",
+      "sha256": "0f8f947272a1ab116b9262ff5c9432a07571475615f74446b136ad43b4e9a105"
+    },
+    ".claude/commands/harness-research.md": {
+      "kind": "file",
+      "sha256": "68d1dcb50a4651bc6b94d8e89ae9f6fee3a8a1f0e8e50436dc83f92fc4c85bb8"
+    },
+    ".opencode/commands/harness-research.md": {
+      "kind": "file",
+      "sha256": "0c305d833c325ace5ef41e7ce484c1aa8a391f2170c6374cfa572bf120617a73"
+    },
+    ".agents/skills/harness-research/SKILL.md": {
+      "kind": "file",
+      "sha256": "cae8876870afa3e20e89eb6aef547a6d885520b3f9fe3c6dad5f405e7515314d"
+    },
+    ".harness/roles/lead.md": {
+      "kind": "file",
+      "sha256": "bab28433edb08c623a06d9ec6928269a50416d8624788a4e4bbe4a48dbca7a4d"
+    },
+    ".harness/roles/product.md": {
+      "kind": "file",
+      "sha256": "c3db05364bf013d0eeb48c9ed0ea0d799ac0ef40113583cedf627d1e16279e99"
+    },
+    ".harness/roles/researcher.md": {
+      "kind": "file",
+      "sha256": "af910a4e4b7ca3dda6a2eb68c0fba3c7abe5a45e718c16a93d5346470c51982d"
+    },
+    ".harness/roles/architect.md": {
+      "kind": "file",
+      "sha256": "3765caad3be2a4a551c32f98018ce70574ce6cb935f66a31658ddb65d22a3945"
+    },
+    ".harness/roles/frontend.md": {
+      "kind": "file",
+      "sha256": "4f511fe66d2e3ef75cede7704b9b977fdedc908cbc6fcb731040b013443c1419"
+    },
+    ".harness/roles/backend.md": {
+      "kind": "file",
+      "sha256": "1764389d0c193a6e2a1407778258d7dbbfbe728d08e9b37e518db0a8f516ca0e"
+    },
+    ".harness/roles/qa.md": {
+      "kind": "file",
+      "sha256": "f158d3c98199761c7d1a51d3bec75d80fe906b76eba17650b7279d1dfd2da4a4"
+    },
+    ".harness/roles/reviewer.md": {
+      "kind": "file",
+      "sha256": "48059539e7080ca344a286d569879e965381674334b6a102211334bedc13a6a9"
+    },
+    ".harness/roles/devops.md": {
+      "kind": "file",
+      "sha256": "173fad3fb41bd21c77d9c5f90829a9c129a902c5b36b3b5f084b64faf2d29041"
+    },
+    ".harness/workflows/quick.md": {
+      "kind": "file",
+      "sha256": "88b9c3bf299b56ace044b77d2edca5e9288206259a74166dc8019901802a990e"
+    },
+    ".harness/workflows/complex.md": {
+      "kind": "file",
+      "sha256": "bad150f3d5e6ad7d0e9531b38a56a7467eff923247892d7d36bfd93ab787771c"
+    },
+    ".harness/workflows/bugfix.md": {
+      "kind": "file",
+      "sha256": "eaa15deadafd0a66c84264fb9395ded041af563ff7e9e6ec78116af89049f3a0"
+    },
+    ".harness/workflows/research.md": {
+      "kind": "file",
+      "sha256": "40a5aca36c0219af0e9005c076a076debef317e14fbebe4f5da90e705abad810"
+    },
+    ".claude/agents/harness-lead.md": {
+      "kind": "file",
+      "sha256": "242fad1c43ea846452ec868e856a2372822eb1afac8bf8d5787e11f65b6acd5e"
+    },
+    ".claude/agents/harness-product.md": {
+      "kind": "file",
+      "sha256": "ce1d5f4861a0cf62506de62d23f163a24fc37ae72f8df6bb065a1f06886684dd"
+    },
+    ".claude/agents/harness-researcher.md": {
+      "kind": "file",
+      "sha256": "b742f92e8bf5535cb706ca021d2722a231866a5e73330f8d14a1b245802626c6"
+    },
+    ".claude/agents/harness-architect.md": {
+      "kind": "file",
+      "sha256": "9ef3d8100d4416fd0cc4a0b0e237f374224a91e97efee62030fc6cf74f7aa50c"
+    },
+    ".claude/agents/harness-frontend.md": {
+      "kind": "file",
+      "sha256": "e1c6e383be8e78e771f5e8a78f5e90e751be6058621d472511a8615761c2a476"
+    },
+    ".claude/agents/harness-backend.md": {
+      "kind": "file",
+      "sha256": "bf90fc1b3d9d92da546eb54fa1263de907da81bd425ddc1e928f3541c54ab2a8"
+    },
+    ".claude/agents/harness-qa.md": {
+      "kind": "file",
+      "sha256": "bfd5b6cdea027b5437b018a7669b65d50cd9629224954bbe192d7d6aececfd4c"
+    },
+    ".claude/agents/harness-reviewer.md": {
+      "kind": "file",
+      "sha256": "6f12f83d0522d52e66defc496ae797a7ec443b490ff4ae5ae52be885f177db30"
+    },
+    ".claude/agents/harness-devops.md": {
+      "kind": "file",
+      "sha256": "430d5c2731d7f0265647352f1bbcd49480506949542ab51f2604101e65d3bb65"
+    },
+    ".opencode/agents/harness-lead.md": {
+      "kind": "file",
+      "sha256": "a955e3655e73957b0557cf904bcf3d1d712f7f81d9a7c486c231c050344d2119"
+    },
+    ".opencode/agents/harness-product.md": {
+      "kind": "file",
+      "sha256": "e93a6cb5faf28bff5fb0bf9861c7911d24e36fffcac84d432712a0b523b98b32"
+    },
+    ".opencode/agents/harness-researcher.md": {
+      "kind": "file",
+      "sha256": "1829c7fb6c6c9822bd24f33f60da4dde11aa51e190a3b01d6341b16d1276b33c"
+    },
+    ".opencode/agents/harness-architect.md": {
+      "kind": "file",
+      "sha256": "b6721bbe131a5ae78795693be977c73ff239cc3ca8486873fabfde4a14c0752e"
+    },
+    ".opencode/agents/harness-frontend.md": {
+      "kind": "file",
+      "sha256": "c9b6c1e9f35020776f3f4ded58cb688e07f8853e80301cc27af13a0df7261738"
+    },
+    ".opencode/agents/harness-backend.md": {
+      "kind": "file",
+      "sha256": "3e184f8a0925120fb1a35d2b5fedc6d6ce5f3fcb2965912a5467c33ca33f311b"
+    },
+    ".opencode/agents/harness-qa.md": {
+      "kind": "file",
+      "sha256": "7f0adb3b1b2ac32adec7d5b4af20218ae354961da4000b74cd9128fffcd9cbb2"
+    },
+    ".opencode/agents/harness-reviewer.md": {
+      "kind": "file",
+      "sha256": "ff81ff81a495c80ffa0cbc572732214a5f2dbd7c9dbf9fddda2bf58ff2b44648"
+    },
+    ".opencode/agents/harness-devops.md": {
+      "kind": "file",
+      "sha256": "289a26ed96709669e6f072bca5448772d8ed48678306339f2a51ef7a7a34a0d0"
+    },
+    ".harness/adapters/trae.md": {
+      "kind": "file",
+      "sha256": "42466b21c4fb92c1a75e01d85dcdb78f6c7e5e12be59a95945c23fdb0849f061"
+    },
+    ".harness/runtime/harnesskit/__init__.py": {
+      "kind": "file",
+      "sha256": "0f5c1b2b645324c09b655e3ccd73c67c575a87d76e98956986c3a4c47c6cf435"
+    },
+    ".harness/runtime/harnesskit/__main__.py": {
+      "kind": "file",
+      "sha256": "935a1c1166b0c1ea35a82256345000bf2c73ded718d77773bc27a71ecce28f7d"
+    },
+    ".harness/runtime/harnesskit/cli.py": {
+      "kind": "file",
+      "sha256": "19b90694b2058ca85db2d5e59886b6e8e30bc6cfad84d150c403a900d892ddae"
+    },
+    ".harness/runtime/harnesskit/install.py": {
+      "kind": "file",
+      "sha256": "aef31443ff1aecb7c8cacf502bf0487ab4cd80766bfd4d142a957622a8033e83"
+    },
+    ".harness/runtime/harnesskit/storage.py": {
+      "kind": "file",
+      "sha256": "e19bc78e3e61a975147056cc20d31bb941d6345b5eeac8173d3aabbf839d5cec"
+    },
+    ".harness/runtime/harnesskit/tasks.py": {
+      "kind": "file",
+      "sha256": "fecb8ea28089ef592e53ad7f0137a58632d1d009f2c55ef66632456696e22ee7"
+    },
+    ".harness/runtime/harnesskit/templates.py": {
+      "kind": "file",
+      "sha256": "dca86e82f6b33c74e0dbd32e4f057e328a17116fb4ca7261a190f80a111aeb89"
+    },
+    ".harness/run.py": {
+      "kind": "file",
+      "sha256": "7e8dfa4f4dac0cade903225eb014cfc76933d9838e714f11440feb4b591ce3ea"
+    },
+    "AGENTS.md": {
+      "kind": "block",
+      "sha256": "424dbaf86e4fa232ebcd13d4b6afb79946dacced4cd8788a5ed0c0bc76c47f68"
+    },
+    "CLAUDE.md": {
+      "kind": "block",
+      "sha256": "424dbaf86e4fa232ebcd13d4b6afb79946dacced4cd8788a5ed0c0bc76c47f68"
+    }
+  },
+  "source": {
+    "repository": "https://github.com/ilovn/AI-Agents-Scripts.git",
+    "ref": "v0.3.1",
+    "commit": "d379b9fbe1c67e4bbac6743aa5f142e323f3b82a"
+  }
+}
