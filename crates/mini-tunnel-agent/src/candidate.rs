@@ -11,6 +11,59 @@ pub enum CandidateTransport {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CandidateType {
+    Host,
+    ServerReflexive { related_address: SocketAddr },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignaledCandidate {
+    pub address: SocketAddr,
+    pub transport: CandidateTransport,
+    pub candidate_type: CandidateType,
+}
+
+/// Parse the stable candidate string forms used by candidate publication.
+/// Bare socket addresses are UDP host candidates for wire compatibility.
+pub fn parse_signaled_candidate(value: &str) -> Option<SignaledCandidate> {
+    let (address, transport, candidate_type) = if let Some(value) = value.strip_prefix("tcp://") {
+        (
+            value.parse::<SocketAddr>().ok()?,
+            CandidateTransport::Tcp,
+            CandidateType::Host,
+        )
+    } else if let Some(value) = value.strip_prefix("srflx://") {
+        let (mapped, related) = value.split_once('|')?;
+        (
+            mapped.parse::<SocketAddr>().ok()?,
+            CandidateTransport::Udp,
+            CandidateType::ServerReflexive {
+                related_address: related.parse::<SocketAddr>().ok()?,
+            },
+        )
+    } else {
+        (
+            value.parse::<SocketAddr>().ok()?,
+            CandidateTransport::Udp,
+            CandidateType::Host,
+        )
+    };
+    if address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {
+        return None;
+    }
+    if let CandidateType::ServerReflexive { related_address } = candidate_type
+        && (related_address.port() == 0 || related_address.ip().is_multicast())
+    {
+        return None;
+    }
+    Some(SignaledCandidate {
+        address,
+        transport,
+        candidate_type,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CandidateCheckState {
     Waiting,
     InProgress,
@@ -39,23 +92,11 @@ impl CandidateChecklist {
 
         let mut checks = Vec::with_capacity(candidates.len());
         for candidate in candidates {
-            let (address, transport) = match candidate.strip_prefix("tcp://") {
-                Some(value) => {
-                    let Ok(address) = value.parse::<SocketAddr>() else {
-                        continue;
-                    };
-                    (address, CandidateTransport::Tcp)
-                }
-                None => {
-                    let Ok(address) = candidate.parse::<SocketAddr>() else {
-                        continue;
-                    };
-                    (address, CandidateTransport::Udp)
-                }
-            };
-            if address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {
+            let Some(parsed) = parse_signaled_candidate(candidate) else {
                 continue;
-            }
+            };
+            let address = parsed.address;
+            let transport = parsed.transport;
             if checks.iter().any(|check: &CandidateCheck| {
                 check.address == address && check.transport == transport
             }) {
@@ -166,6 +207,39 @@ mod tests {
         assert_eq!(
             checklist.checks()[0].address,
             "198.51.100.9:443".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn parses_server_reflexive_candidates_with_ipv4_ipv6_and_legacy_forms() {
+        let candidate = parse_signaled_candidate("srflx://203.0.113.7:5000|192.168.1.4:4000")
+            .expect("IPv4 srflx candidate");
+        assert_eq!(candidate.address, "203.0.113.7:5000".parse().unwrap());
+        assert_eq!(candidate.transport, CandidateTransport::Udp);
+        assert_eq!(
+            candidate.candidate_type,
+            CandidateType::ServerReflexive {
+                related_address: "192.168.1.4:4000".parse().unwrap(),
+            }
+        );
+        let ipv6 = parse_signaled_candidate("srflx://[2001:db8::1]:5000|[2001:db8::2]:4000")
+            .expect("IPv6 srflx candidate");
+        assert_eq!(ipv6.address, "[2001:db8::1]:5000".parse().unwrap());
+        assert_eq!(
+            parse_signaled_candidate("198.51.100.8:42000")
+                .unwrap()
+                .candidate_type,
+            CandidateType::Host
+        );
+        assert!(parse_signaled_candidate("srflx://203.0.113.7:5000|bad").is_none());
+        let checklist = CandidateChecklist::from_signaled(
+            &["srflx://203.0.113.7:5000|192.168.1.4:4000".to_owned()],
+            8,
+        )
+        .unwrap();
+        assert_eq!(
+            checklist.checks()[0].address,
+            "203.0.113.7:5000".parse().unwrap()
         );
     }
 }

@@ -1209,11 +1209,19 @@ fn decode_exact<const N: usize>(encoded: &str) -> Option<[u8; N]> {
 }
 
 fn candidate_socket_address(candidate: &str) -> Option<SocketAddr> {
-    candidate
-        .strip_prefix("tcp://")
-        .unwrap_or(candidate)
-        .parse::<SocketAddr>()
-        .ok()
+    let value = if let Some(value) = candidate.strip_prefix("srflx://") {
+        let (mapped, related) = value.split_once('|')?;
+        let related = related.parse::<SocketAddr>().ok()?;
+        if related.port() == 0 || related.ip().is_multicast() {
+            return None;
+        }
+        mapped
+    } else {
+        candidate.strip_prefix("tcp://").unwrap_or(candidate)
+    };
+    let address = value.parse::<SocketAddr>().ok()?;
+    (address.port() != 0 && !address.ip().is_unspecified() && !address.ip().is_multicast())
+        .then_some(address)
 }
 
 fn valid_ice_credentials(credentials: &IceCredentials) -> bool {
@@ -1449,6 +1457,23 @@ mod tests {
     use axum::{body::Body, extract::connect_info::ConnectInfo, http::Request as HttpRequest};
     use ed25519_dalek::{Signer, SigningKey};
     use tower::ServiceExt;
+
+    #[test]
+    fn candidate_address_accepts_srflx_and_rejects_invalid_related_address() {
+        assert_eq!(
+            candidate_socket_address("srflx://203.0.113.7:5000|192.168.1.4:4000"),
+            Some("203.0.113.7:5000".parse().unwrap())
+        );
+        assert_eq!(
+            candidate_socket_address("198.51.100.8:42000"),
+            Some("198.51.100.8:42000".parse().unwrap())
+        );
+        assert_eq!(
+            candidate_socket_address("tcp://198.51.100.8:443"),
+            Some("198.51.100.8:443".parse().unwrap())
+        );
+        assert!(candidate_socket_address("srflx://203.0.113.7:5000|broken").is_none());
+    }
 
     #[test]
     fn plaintext_coordinator_listeners_are_loopback_only() {

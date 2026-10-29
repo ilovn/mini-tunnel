@@ -20,6 +20,7 @@ use tokio::{io::Interest, net::UdpSocket, sync::mpsc};
 
 use mini_tunnel_protocol::IceCredentials;
 
+use crate::candidate::{CandidateType as SignaledCandidateType, SignaledCandidate};
 use crate::stun::is_stun_datagram;
 
 /// Maximum ICE checks drained during one socket-driver turn.
@@ -701,6 +702,43 @@ impl IceAgentDriver {
         controlling: bool,
         now: Instant,
     ) -> Result<Self, IceDriverError> {
+        let local_candidates: Vec<_> = local_candidates
+            .iter()
+            .copied()
+            .map(|address| SignaledCandidate {
+                address,
+                transport: crate::candidate::CandidateTransport::Udp,
+                candidate_type: SignaledCandidateType::Host,
+            })
+            .collect();
+        let remote_candidates: Vec<_> = remote_candidates
+            .iter()
+            .copied()
+            .map(|address| SignaledCandidate {
+                address,
+                transport: crate::candidate::CandidateTransport::Udp,
+                candidate_type: SignaledCandidateType::Host,
+            })
+            .collect();
+        Self::for_peer_with_candidates(
+            local_credentials,
+            remote_credentials,
+            &local_candidates,
+            &remote_candidates,
+            controlling,
+            now,
+        )
+    }
+
+    /// Build a session while preserving host/server-reflexive candidate metadata.
+    pub fn for_peer_with_candidates(
+        local_credentials: &IceCredentials,
+        remote_credentials: &IceCredentials,
+        local_candidates: &[SignaledCandidate],
+        remote_candidates: &[SignaledCandidate],
+        controlling: bool,
+        now: Instant,
+    ) -> Result<Self, IceDriverError> {
         if local_credentials.generation == 0 || remote_credentials.generation == 0 {
             return Err(IceDriverError::Agent(
                 "ICE credential generations must be greater than zero".to_owned(),
@@ -711,19 +749,18 @@ impl IceAgentDriver {
                 "local and remote ICE candidates are required".to_owned(),
             ));
         }
-        let local_addr = local_candidates[0];
         let crypto = rtc_ice::crypto::default_provider()
             .map_err(|error| IceDriverError::Agent(error.to_string()))?;
         let mut agent = Agent::new(now, Arc::new(agent_config(local_credentials)), crypto)
             .map_err(|error| IceDriverError::Agent(error.to_string()))?;
-        for address in local_candidates {
+        for candidate in local_candidates {
             agent
-                .add_local_candidate(host_candidate(*address)?)
+                .add_local_candidate(ice_candidate(*candidate)?)
                 .map_err(|error| IceDriverError::Agent(error.to_string()))?;
         }
-        for address in remote_candidates {
+        for candidate in remote_candidates {
             agent
-                .add_remote_candidate(host_candidate(*address)?)
+                .add_remote_candidate(ice_candidate(*candidate)?)
                 .map_err(|error| IceDriverError::Agent(error.to_string()))?;
         }
         agent
@@ -734,7 +771,7 @@ impl IceAgentDriver {
                 remote_credentials.password.clone(),
             )
             .map_err(|error| IceDriverError::Agent(error.to_string()))?;
-        Ok(Self::new(agent, local_addr))
+        Ok(Self::new(agent, local_candidates[0].address))
     }
 
     /// Feed one datagram to ICE. `false` means it was not a complete STUN message envelope.
@@ -868,6 +905,38 @@ fn host_candidate(address: SocketAddr) -> Result<rtc_ice::candidate::Candidate, 
     .map_err(|error| IceDriverError::Agent(error.to_string()))
 }
 
+fn ice_candidate(
+    candidate: SignaledCandidate,
+) -> Result<rtc_ice::candidate::Candidate, IceDriverError> {
+    if candidate.transport != crate::candidate::CandidateTransport::Udp {
+        return Err(IceDriverError::Agent(
+            "ICE connectivity checks require UDP candidates".to_owned(),
+        ));
+    }
+    match candidate.candidate_type {
+        SignaledCandidateType::Host => host_candidate(candidate.address),
+        SignaledCandidateType::ServerReflexive { related_address } => {
+            use rtc_ice::candidate::{
+                CandidateConfig, candidate_server_reflexive::CandidateServerReflexiveConfig,
+            };
+            CandidateServerReflexiveConfig {
+                base_config: CandidateConfig {
+                    network: "udp".to_owned(),
+                    address: candidate.address.ip().to_string(),
+                    port: candidate.address.port(),
+                    component: 1,
+                    ..Default::default()
+                },
+                rel_addr: related_address.ip().to_string(),
+                rel_port: related_address.port(),
+                ..Default::default()
+            }
+            .new_candidate_server_reflexive()
+            .map_err(|error| IceDriverError::Agent(error.to_string()))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, sync::Arc, thread, time::Duration};
@@ -893,6 +962,25 @@ mod tests {
         assert_ne!(first.ufrag, second.ufrag);
         assert_ne!(first.password, second.password);
         assert!(generate_ice_credentials(0).is_err());
+    }
+
+    #[test]
+    fn builds_server_reflexive_candidate_with_related_address() {
+        let candidate = SignaledCandidate {
+            address: "203.0.113.7:5000".parse().unwrap(),
+            transport: crate::candidate::CandidateTransport::Udp,
+            candidate_type: SignaledCandidateType::ServerReflexive {
+                related_address: "192.168.1.4:4000".parse().unwrap(),
+            },
+        };
+        let built = ice_candidate(candidate).expect("build srflx candidate");
+        assert_eq!(
+            built.candidate_type(),
+            rtc_ice::candidate::CandidateType::ServerReflexive
+        );
+        let related = built.related_address().expect("related address");
+        assert_eq!(related.address, "192.168.1.4");
+        assert_eq!(related.port, 4000);
     }
 
     fn valid_ice_char(byte: u8) -> bool {

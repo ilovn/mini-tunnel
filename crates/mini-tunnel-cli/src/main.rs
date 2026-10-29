@@ -1415,7 +1415,7 @@ async fn select_ice_peer_address(
 ) -> Option<SocketAddr> {
     let local = endpoint.ice.as_ref()?;
     let remote = peer.ice_credentials.as_ref()?;
-    let remote_candidates = udp_candidate_addresses(&peer.candidates);
+    let remote_candidates = udp_ice_candidates(&peer.candidates);
     if remote_candidates.is_empty() || local.local_candidates.is_empty() {
         return None;
     }
@@ -1433,7 +1433,7 @@ async fn select_ice_peer_address(
     let local_ufrag = local.credentials.ufrag.clone();
     let controlling = identity.device_id() < peer.device_id;
     let result = async {
-        let mut driver = mini_tunnel_agent::ice::IceAgentDriver::for_peer(
+        let mut driver = mini_tunnel_agent::ice::IceAgentDriver::for_peer_with_candidates(
             &local.credentials,
             remote,
             &local.local_candidates,
@@ -2102,7 +2102,7 @@ struct TunnelIceState {
     credentials: mini_tunnel_protocol::IceCredentials,
     socket: mini_tunnel_agent::ice::IceSocketHandle,
     router: mini_tunnel_agent::ice::IceDatagramRouterHandle,
-    local_candidates: Vec<SocketAddr>,
+    local_candidates: Vec<mini_tunnel_agent::candidate::SignaledCandidate>,
 }
 
 impl std::ops::Deref for TunnelEndpoint {
@@ -2137,12 +2137,18 @@ async fn create_tunnel_endpoint(
             ),
         };
         let bound_address = iced.socket.local_addr()?;
+        let related_address = match stun_server {
+            Some(server) if bound_address.ip().is_unspecified() => {
+                route_selected_local_address(server, bound_address.port())?
+            }
+            _ => bound_address,
+        };
         let mut candidates = extra_candidates.to_vec();
-        if !bound_address.ip().is_unspecified() {
-            candidates.push(bound_address.to_string());
+        if !related_address.ip().is_unspecified() {
+            candidates.push(related_address.to_string());
         }
         if let Some(mapped_address) = mapped_address {
-            candidates.push(mapped_address.to_string());
+            candidates.push(format!("srflx://{mapped_address}|{related_address}"));
         }
         candidates.sort();
         candidates.dedup();
@@ -2155,13 +2161,20 @@ async fn create_tunnel_endpoint(
         if candidates.len() > 8 {
             return Err("at most eight peer candidates can be published".into());
         }
-        let mut local_candidates = vec![bound_address];
-        local_candidates.extend(udp_candidate_addresses(&candidates));
-        local_candidates.sort();
-        local_candidates.dedup();
-        // Keep the socket's local address first; rtc-ice uses this address to match inbound checks
-        // against the local host candidate while the public mapping remains an additional pair.
-        local_candidates.sort_by_key(|address| *address != bound_address);
+        let mut local_candidates = udp_ice_candidates(&candidates);
+        if !local_candidates
+            .iter()
+            .any(|candidate| candidate.address == bound_address)
+        {
+            local_candidates.insert(
+                0,
+                mini_tunnel_agent::candidate::SignaledCandidate {
+                    address: bound_address,
+                    transport: mini_tunnel_agent::candidate::CandidateTransport::Udp,
+                    candidate_type: mini_tunnel_agent::candidate::CandidateType::Host,
+                },
+            );
+        }
         let credentials = mini_tunnel_agent::ice::generate_ice_credentials(1)?;
         let device_id = identity.device_id();
         let timestamp_ms = now_ms()?;
@@ -2288,19 +2301,32 @@ async fn create_tunnel_endpoint(
     })
 }
 
-fn udp_candidate_addresses(candidates: &[String]) -> Vec<SocketAddr> {
-    mini_tunnel_agent::candidate::CandidateChecklist::from_signaled(candidates, 8)
-        .map(|checklist| {
-            checklist
-                .checks()
-                .iter()
-                .filter(|check| {
-                    check.transport == mini_tunnel_agent::candidate::CandidateTransport::Udp
-                })
-                .map(|check| check.address)
-                .collect()
+fn route_selected_local_address(
+    remote: SocketAddr,
+    port: u16,
+) -> Result<SocketAddr, std::io::Error> {
+    let bind_address = if remote.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let probe = std::net::UdpSocket::bind(bind_address)?;
+    probe.connect(remote)?;
+    let selected = probe.local_addr()?;
+    Ok(SocketAddr::new(selected.ip(), port))
+}
+
+fn udp_ice_candidates(
+    candidates: &[String],
+) -> Vec<mini_tunnel_agent::candidate::SignaledCandidate> {
+    candidates
+        .iter()
+        .filter_map(|candidate| {
+            let parsed = mini_tunnel_agent::candidate::parse_signaled_candidate(candidate)?;
+            (parsed.transport == mini_tunnel_agent::candidate::CandidateTransport::Udp)
+                .then_some(parsed)
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 fn create_tun(
@@ -2419,6 +2445,13 @@ fn print_tunnel_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_probe_selects_local_interface_and_preserves_tunnel_port() {
+        let selected = route_selected_local_address("127.0.0.1:3478".parse().unwrap(), 42000)
+            .expect("select route address");
+        assert_eq!(selected, "127.0.0.1:42000".parse().unwrap());
+    }
 
     async fn capture_candidate_update(
         State(requests): State<std::sync::Arc<tokio::sync::Mutex<Vec<CandidateUpdateRequest>>>>,
@@ -2579,7 +2612,11 @@ mod tests {
                 credentials,
                 socket: iced.socket,
                 router: iced.ice_router,
-                local_candidates: vec![local],
+                local_candidates: vec![mini_tunnel_agent::candidate::SignaledCandidate {
+                    address: local,
+                    transport: mini_tunnel_agent::candidate::CandidateTransport::Udp,
+                    candidate_type: mini_tunnel_agent::candidate::CandidateType::Host,
+                }],
             }),
         };
         let endpoint_a = endpoint(iced_a, credentials_a.clone(), address_a);
