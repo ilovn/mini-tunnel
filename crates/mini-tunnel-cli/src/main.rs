@@ -105,6 +105,13 @@ enum RelayCommand {
             default_value_t = 1_073_741_824
         )]
         max_session_bytes: u64,
+        /// Maximum time to drain active sessions after Ctrl-C before closing them.
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_RELAY_SHUTDOWN_GRACE_SECONDS",
+            default_value_t = 15
+        )]
+        shutdown_grace_seconds: u64,
     },
 }
 
@@ -428,6 +435,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 listen,
                 previous_ticket_key,
                 max_session_bytes,
+                shutdown_grace_seconds,
             } => {
                 let key = std::env::var("MINI_TUNNEL_RELAY_TICKET_KEY")
                     .map_err(|_| "MINI_TUNNEL_RELAY_TICKET_KEY is required for relay service")?;
@@ -437,6 +445,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .map_err(|_| "relay ticket key must decode to exactly 32 bytes")?;
                 let mut config = mini_tunnel_relay::RelayConfig::new(key)
                     .with_max_session_bytes(max_session_bytes);
+                config.shutdown_grace = Duration::from_secs(shutdown_grace_seconds);
                 if let Some(previous) = previous_ticket_key {
                     let previous = URL_SAFE_NO_PAD.decode(previous)?;
                     let previous: [u8; 32] = previous
@@ -447,7 +456,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let listener = tokio::net::TcpListener::bind(listen).await?;
                 eprintln!("relay listening on {}", listener.local_addr()?);
                 mini_tunnel_relay::RelayServer::new(config)
-                    .run(listener)
+                    .run_until(listener, async {
+                        if let Err(error) = tokio::signal::ctrl_c().await {
+                            eprintln!("could not listen for shutdown signal: {error}");
+                        }
+                    })
                     .await?;
             }
         },

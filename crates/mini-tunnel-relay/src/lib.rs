@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     io,
     net::SocketAddr,
     sync::{
@@ -18,7 +19,7 @@ use mini_tunnel_protocol::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, Semaphore, mpsc},
+    sync::{Mutex, Semaphore, mpsc, watch},
 };
 
 pub use mini_tunnel_protocol as protocol;
@@ -33,6 +34,7 @@ const MAX_USED_TICKETS: usize = 16_384;
 const MAX_SESSION_BYTES: u64 = 1024 * 1024 * 1024;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const PAIR_TIMEOUT: Duration = Duration::from_secs(25);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
 const MAX_TICKET_LIFETIME_MS: u64 = 120_000;
 const COPY_BUFFER_SIZE: usize = 16 * 1024;
 
@@ -46,6 +48,8 @@ pub struct RelayConfig {
     pub pair_timeout: Duration,
     /// Aggregate bytes forwarded in both directions before a paired session is closed.
     pub max_session_bytes: u64,
+    /// Time to let established sessions finish after stopping new accepts.
+    pub shutdown_grace: Duration,
 }
 
 impl RelayConfig {
@@ -58,6 +62,7 @@ impl RelayConfig {
             max_pending_sessions: MAX_PENDING_SESSIONS,
             pair_timeout: PAIR_TIMEOUT,
             max_session_bytes: MAX_SESSION_BYTES,
+            shutdown_grace: SHUTDOWN_GRACE,
         }
     }
 
@@ -88,6 +93,7 @@ struct RelayInner {
     state: Mutex<RelayState>,
     next_generation: AtomicU64,
     connections: Arc<Semaphore>,
+    shutdown: watch::Sender<bool>,
 }
 
 #[derive(Default)]
@@ -118,30 +124,83 @@ impl RelayServer {
     #[must_use]
     pub fn new(config: RelayConfig) -> Self {
         let max_connections = config.max_connections.max(1);
+        let (shutdown, _) = watch::channel(false);
         Self {
             inner: Arc::new(RelayInner {
                 config,
                 state: Mutex::new(RelayState::default()),
                 next_generation: AtomicU64::new(1),
                 connections: Arc::new(Semaphore::new(max_connections)),
+                shutdown,
             }),
         }
     }
 
     /// Serve an already-bound TCP listener. Each accepted relay handshake is bounded by a permit.
     pub async fn run(&self, listener: TcpListener) -> io::Result<()> {
-        loop {
-            let (stream, _remote) = listener.accept().await?;
-            let Ok(permit) = Arc::clone(&self.inner.connections).try_acquire_owned() else {
-                drop(stream);
-                continue;
-            };
-            let server = self.clone();
-            tokio::spawn(async move {
-                let _permit = permit;
-                let _ = tokio::time::timeout(AUTH_TIMEOUT, server.handle_connection(stream)).await;
-            });
+        self.run_until(listener, std::future::pending::<()>()).await
+    }
+
+    /// Stop accepting when `shutdown` completes, then drain paired sessions for the configured
+    /// grace period before cancelling any that remain.
+    pub async fn run_until<F>(&self, listener: TcpListener, shutdown: F) -> io::Result<()>
+    where
+        F: Future<Output = ()> + Send,
+    {
+        tokio::pin!(shutdown);
+        let mut handlers = tokio::task::JoinSet::new();
+        let mut accept_error = None;
+        'accept: loop {
+            tokio::select! {
+                _ = &mut shutdown => break,
+                Some(_) = handlers.join_next(), if !handlers.is_empty() => {},
+                accepted = listener.accept() => {
+                    let (stream, _remote) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) => {
+                            accept_error = Some(error);
+                            break 'accept;
+                        }
+                    };
+                    let Ok(permit) = Arc::clone(&self.inner.connections).try_acquire_owned() else {
+                        drop(stream);
+                        continue;
+                    };
+                    let server = self.clone();
+                    handlers.spawn(async move {
+                        let _permit = permit;
+                        let _ = tokio::time::timeout(AUTH_TIMEOUT, server.handle_connection(stream)).await;
+                    });
+                }
+            }
         }
+
+        let handlers_done = tokio::time::timeout(AUTH_TIMEOUT + Duration::from_secs(1), async {
+            while handlers.join_next().await.is_some() {}
+        })
+        .await;
+        if handlers_done.is_err() {
+            handlers.abort_all();
+        }
+
+        let drain_deadline = tokio::time::Instant::now() + self.inner.config.shutdown_grace;
+        loop {
+            if self.inner.state.lock().await.sessions.is_empty()
+                || tokio::time::Instant::now() >= drain_deadline
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        self.inner.shutdown.send_replace(true);
+        let cancel_deadline = tokio::time::Instant::now() + AUTH_TIMEOUT;
+        while !self.inner.state.lock().await.sessions.is_empty()
+            && tokio::time::Instant::now() < cancel_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        accept_error.map_or(Ok(()), Err)
     }
 
     async fn handle_connection(&self, mut stream: TcpStream) -> Result<(), RelayError> {
@@ -254,9 +313,14 @@ async fn pair_session(
     generation: u64,
     mut receiver: mpsc::Receiver<PendingConnection>,
 ) {
-    let mut first = match tokio::time::timeout(inner.config.pair_timeout, receiver.recv()).await {
-        Ok(Some(first)) => first,
-        Ok(None) | Err(_) => {
+    let mut shutdown = inner.shutdown.subscribe();
+    let first = tokio::select! {
+        _ = wait_for_shutdown(&mut shutdown) => None,
+        result = tokio::time::timeout(inner.config.pair_timeout, receiver.recv()) => result.ok().flatten(),
+    };
+    let mut first = match first {
+        Some(first) => first,
+        None => {
             remove_session(&inner, &key, generation).await;
             return;
         }
@@ -279,6 +343,7 @@ async fn pair_session(
                     Ok(_) => break 'wait None,
                 }
             }
+            _ = wait_for_shutdown(&mut shutdown) => break 'wait None,
             _ = tokio::time::sleep_until(pair_deadline) => break 'wait None,
         }
     };
@@ -314,9 +379,20 @@ async fn pair_session(
                 ),
             )
         };
-        let _ = tokio::time::timeout(Duration::from_secs(24 * 60 * 60), copy).await;
+        tokio::select! {
+            _ = wait_for_shutdown(&mut shutdown) => {},
+            _ = tokio::time::timeout(Duration::from_secs(24 * 60 * 60), copy) => {},
+        }
     }
     remove_session(&inner, &key, generation).await;
+}
+
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 async fn copy_session_bytes<R, W>(
@@ -659,5 +735,97 @@ mod tests {
                 .expect("relay should close when shared budget is exhausted");
         assert!(result.is_err());
         relay_task.abort();
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_accepting_but_drains_established_sessions() {
+        let key = [8; 32];
+        let a = identity(8);
+        let b = identity(9);
+        let ticket_a = issue_relay_ticket(&key, &claims(&a, &b, 40)).expect("ticket A");
+        let ticket_b = issue_relay_ticket(&key, &claims(&b, &a, 41)).expect("ticket B");
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind relay");
+        let address = listener.local_addr().expect("relay address");
+        let mut config = RelayConfig::new(key);
+        config.shutdown_grace = Duration::from_secs(2);
+        config.pair_timeout = Duration::from_secs(2);
+        let relay = RelayServer::new(config);
+        let relay_for_task = relay.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let relay_task = tokio::spawn(async move {
+            relay_for_task
+                .run_until(listener, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let mut stream_a = connect_and_authenticate(address, &ticket_a, &a).await;
+        let mut stream_b = connect_and_authenticate(address, &ticket_b, &b).await;
+        assert_eq!(stream_a.read_u8().await.expect("A ready"), RELAY_READY);
+        assert_eq!(stream_b.read_u8().await.expect("B ready"), RELAY_READY);
+        shutdown_tx.send(()).expect("signal shutdown");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!relay_task.is_finished(), "active session is being drained");
+
+        stream_a
+            .write_all(b"draining-session")
+            .await
+            .expect("session remains usable during drain");
+        let mut forwarded = [0; 16];
+        stream_b
+            .read_exact(&mut forwarded)
+            .await
+            .expect("draining session forwards data");
+        assert_eq!(&forwarded, b"draining-session");
+        drop(stream_a);
+        drop(stream_b);
+        tokio::time::timeout(Duration::from_secs(1), relay_task)
+            .await
+            .expect("server exits after session drain")
+            .expect("relay task")
+            .expect("clean shutdown");
+
+        assert!(TcpStream::connect(address).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_unpaired_sessions_after_grace() {
+        let key = [10; 32];
+        let a = identity(10);
+        let b = identity(11);
+        let ticket_a = issue_relay_ticket(&key, &claims(&a, &b, 50)).expect("ticket A");
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind relay");
+        let address = listener.local_addr().expect("relay address");
+        let config = RelayConfig {
+            shutdown_grace: Duration::ZERO,
+            ..RelayConfig::new(key)
+        };
+        let relay = RelayServer::new(config);
+        let relay_for_task = relay.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let relay_task = tokio::spawn(async move {
+            relay_for_task
+                .run_until(listener, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        let mut stream = connect_and_authenticate(address, &ticket_a, &a).await;
+        shutdown_tx.send(()).expect("signal shutdown");
+        tokio::time::timeout(Duration::from_secs(1), relay_task)
+            .await
+            .expect("unpaired session is cancelled")
+            .expect("relay task")
+            .expect("clean shutdown");
+        let mut byte = [0; 1];
+        let result = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
+            .await
+            .expect("client observes shutdown");
+        assert!(result.is_err() || result.as_ref().is_ok_and(|bytes| *bytes == 0));
     }
 }

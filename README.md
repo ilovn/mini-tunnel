@@ -123,6 +123,8 @@ Relay ticket keys support a short overlap during rotation. Generate a new random
 
 Each paired relay session has a default aggregate traffic budget of 1 GiB shared between both directions. Set `MINI_TUNNEL_RELAY_MAX_SESSION_BYTES` to change the limit; once exhausted, the relay closes the session.
 
+On Ctrl-C, the relay stops accepting new connections and lets paired sessions drain for up to 15 seconds by default. Set `MINI_TUNNEL_RELAY_SHUTDOWN_GRACE_SECONDS` to change that window; remaining sessions are then closed.
+
 ## Development
 
 Requirements: stable Rust and Cargo (see `rust-toolchain.toml`).
