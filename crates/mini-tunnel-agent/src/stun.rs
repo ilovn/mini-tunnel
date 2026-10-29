@@ -11,6 +11,7 @@ const BINDING_REQUEST: u16 = 0x0001;
 const BINDING_SUCCESS: u16 = 0x0101;
 const MAPPED_ADDRESS: u16 = 0x0001;
 const XOR_MAPPED_ADDRESS: u16 = 0x0020;
+const USERNAME: u16 = 0x0006;
 const MAX_STUN_MESSAGE: usize = 1500;
 const RETRIES: usize = 3;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -38,6 +39,39 @@ pub(crate) fn is_stun_datagram(message: &[u8]) -> bool {
         && usize::from(u16::from_be_bytes([message[2], message[3]])) == message.len() - HEADER_LEN
         && message[2] & 0b0000_0011 == 0
         && message[4..8] == MAGIC_COOKIE.to_be_bytes()
+}
+
+/// Extract the ICE USERNAME attribute from a complete STUN message.
+/// The caller uses the recipient ufrag after the colon to route a request to one peer agent.
+pub(crate) fn ice_username(message: &[u8]) -> Option<&str> {
+    if !is_stun_datagram(message) {
+        return None;
+    }
+    let mut offset = HEADER_LEN;
+    let mut username = None;
+    let mut username_seen = false;
+    while offset < message.len() {
+        let attribute_type = u16::from_be_bytes([message[offset], message[offset + 1]]);
+        let length = usize::from(u16::from_be_bytes([
+            message[offset + 2],
+            message[offset + 3],
+        ]));
+        let value_start = offset + 4;
+        let value_end = value_start.checked_add(length)?;
+        let padded_end = value_start.checked_add((length + 3) & !3)?;
+        if value_end > message.len() || padded_end > message.len() {
+            return None;
+        }
+        if attribute_type == USERNAME {
+            if username_seen {
+                return None;
+            }
+            username_seen = true;
+            username = std::str::from_utf8(&message[value_start..value_end]).ok();
+        }
+        offset = padded_end;
+    }
+    username
 }
 
 /// Ask a STUN server for the address mapped from this UDP socket.
