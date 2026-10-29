@@ -117,6 +117,13 @@ impl RequestRateLimiter {
     }
 
     fn allow(&self, client: IpAddr, now: Instant) -> bool {
+        let client = match client {
+            IpAddr::V6(address) => address
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(address)),
+            address => address,
+        };
         let Ok(mut clients) = self.clients.lock() else {
             return false;
         };
@@ -1629,6 +1636,17 @@ mod tests {
         assert!(!limiter.allow(first_ip, start));
         assert!(limiter.allow(second_ip, start));
         assert!(limiter.allow(first_ip, start + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn request_limiter_unifies_ipv4_mapped_ipv6_source_addresses() {
+        let limiter = RequestRateLimiter::new(1, Duration::from_secs(10));
+        let now = Instant::now();
+        let ipv4 = Ipv4Addr::new(192, 0, 2, 17);
+        let mapped_ipv6 = IpAddr::V6(ipv4.to_ipv6_mapped());
+        assert!(limiter.allow(IpAddr::V4(ipv4), now));
+        assert!(!limiter.allow(mapped_ipv6, now));
+        assert_eq!(limiter.clients.lock().unwrap().len(), 1);
     }
 
     #[test]
