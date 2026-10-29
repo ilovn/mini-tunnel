@@ -202,6 +202,9 @@ enum TunnelCommand {
         prefix_len: Option<u8>,
         #[arg(long, default_value_t = 1150)]
         mtu: u16,
+        /// Install and clean up a /32 route for the authenticated peer.
+        #[arg(long)]
+        manage_route: bool,
         #[arg(
             long,
             env = "MINI_TUNNEL_COORDINATOR_URL",
@@ -223,6 +226,9 @@ enum TunnelCommand {
         prefix_len: Option<u8>,
         #[arg(long, default_value_t = 1150)]
         mtu: u16,
+        /// Install and clean up a /32 route for the authenticated peer.
+        #[arg(long)]
+        manage_route: bool,
         #[arg(
             long,
             env = "MINI_TUNNEL_COORDINATOR_URL",
@@ -297,6 +303,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     local_ipv4,
                     prefix_len,
                     mtu,
+                    manage_route,
                     coordinator_url,
                 } => {
                     let identity = mini_tunnel_agent::Identity::load_or_create()?;
@@ -316,13 +323,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         peer_key,
                     )
                     .await?;
-                    print_tunnel_ready(&tun, &peer, remote);
-                    mini_tunnel_agent::tunnel::pump_peer_packets(
-                        &tun,
-                        &channel,
-                        peer.assigned_ipv4.parse()?,
-                    )
-                    .await?;
+                    run_peer_tunnel(&tun, &channel, &peer, remote, manage_route).await?;
                 }
                 TunnelCommand::Listen {
                     bind,
@@ -331,6 +332,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     local_ipv4,
                     prefix_len,
                     mtu,
+                    manage_route,
                     coordinator_url,
                 } => {
                     let identity = mini_tunnel_agent::Identity::load_or_create()?;
@@ -354,13 +356,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     )
                     .await?;
                     let remote = channel.remote_address();
-                    print_tunnel_ready(&tun, &peer, remote);
-                    mini_tunnel_agent::tunnel::pump_peer_packets(
-                        &tun,
-                        &channel,
-                        peer.assigned_ipv4.parse()?,
-                    )
-                    .await?;
+                    run_peer_tunnel(&tun, &channel, &peer, remote, manage_route).await?;
                 }
             },
             PeerCommand::Connect {
@@ -633,6 +629,38 @@ where
     Err(format!("{}: {}", error.error, error.message).into())
 }
 
+async fn run_peer_tunnel(
+    tun: &mini_tunnel_agent::tun_device::TunDevice,
+    channel: &mini_tunnel_agent::PeerChannel,
+    peer: &PeerInfo,
+    remote: SocketAddr,
+    manage_route: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use mini_tunnel_agent::routing::{
+        RouteLease, RoutingPlatform, SystemRouteRunner, install_peer_route,
+    };
+
+    let peer_ipv4 = peer.assigned_ipv4.parse()?;
+    let runner = SystemRouteRunner;
+    let route: Option<RouteLease> = if manage_route {
+        let interface = tun.name()?;
+        Some(install_peer_route(&runner, RoutingPlatform::current(), &interface, peer_ipv4).await?)
+    } else {
+        None
+    };
+    print_tunnel_ready(tun, peer, remote, manage_route);
+    let pump = mini_tunnel_agent::tunnel::pump_peer_packets(tun, channel, peer_ipv4);
+    tokio::pin!(pump);
+    let tunnel_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = tokio::select! {
+        result = &mut pump => result.map_err(Into::into),
+        signal = tokio::signal::ctrl_c() => signal.map_err(Into::into),
+    };
+    if let Some(route) = route {
+        route.remove(&runner).await?;
+    }
+    tunnel_result
+}
+
 fn create_tun(
     local_ipv4: Ipv4Addr,
     prefix_len: u8,
@@ -711,6 +739,7 @@ fn print_tunnel_ready(
     tun: &mini_tunnel_agent::tun_device::TunDevice,
     peer: &PeerInfo,
     remote: SocketAddr,
+    managed_route: bool,
 ) {
     match tun.name() {
         Ok(name) => println!("TUN interface: {name}"),
@@ -723,11 +752,18 @@ fn print_tunnel_ready(
         peer.assigned_ipv4,
         remote
     );
-    println!(
-        "No explicit peer route was added; check whether the OS routed {} through this TUN interface.",
-        peer.assigned_ipv4
-    );
-    println!("If needed, add a host route for this peer and remove it manually when stopping.");
+    if managed_route {
+        println!(
+            "Managed /32 route installed for peer {}.",
+            peer.assigned_ipv4
+        );
+    } else {
+        println!(
+            "No explicit peer route was added; check whether the OS routed {} through this TUN interface.",
+            peer.assigned_ipv4
+        );
+        println!("If needed, add a host route for this peer and remove it manually when stopping.");
+    }
 }
 
 #[cfg(test)]

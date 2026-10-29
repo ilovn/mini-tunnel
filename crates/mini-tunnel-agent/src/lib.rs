@@ -1,6 +1,7 @@
 //! Local device identity and signing helpers used by the CLI and tunnel agent.
 
 pub mod membership;
+pub mod routing;
 pub mod tun_device;
 pub mod tunnel;
 

@@ -6,7 +6,7 @@ A minimal, peer-to-peer virtual network tunnel. The design baseline is in [`docs
 
 Implemented: a Rust workspace, local coordinator health endpoint, in-memory network creation, admin capability tokens, one-time join invites, IPv4 allocation, stable Ed25519 device identities, signed enrollment and peer discovery, candidate publication, and authenticated encrypted QUIC/UDP peer datagrams.
 
-Not implemented yet: persistent storage, transactional overlay route management/cleanup, NAT traversal, TCP fallback, and packet relay. The current tunnel command supports one directly reachable peer session at a time. The control API is a local development prototype and has no production rate limiting. **Do not expose it to untrusted networks.** The coordinator binds to loopback by default.
+Not implemented yet: persistent coordinator storage, NAT traversal, TCP fallback, and packet relay. The current tunnel command supports one directly reachable peer session at a time. The control API is a local development prototype and has no production rate limiting. **Do not expose it to untrusted networks.** The coordinator binds to loopback by default.
 
 ## Quick start
 
@@ -78,13 +78,13 @@ The tunnel commands keep one authenticated peer session open and pump IPv4 packe
 ```sh
 # Peer B: publish the listener's reachable UDP candidate, then wait for peer A
 cargo run -p mini-tunnel -- network advertise --network-id '<network-id>' --candidate '203.0.113.20:42000'
-cargo run -p mini-tunnel -- peer tunnel listen --network-id '<network-id>' --peer-id '<peer-a-device-id>' --bind 0.0.0.0:42000
+cargo run -p mini-tunnel -- peer tunnel listen --network-id '<network-id>' --peer-id '<peer-a-device-id>' --bind 0.0.0.0:42000 --manage-route
 
 # Peer A: discover B from the signed snapshot and connect
-cargo run -p mini-tunnel -- peer tunnel connect --network-id '<network-id>' --peer-id '<peer-b-device-id>'
+cargo run -p mini-tunnel -- peer tunnel connect --network-id '<network-id>' --peer-id '<peer-b-device-id>' --manage-route
 ```
 
-Both commands use the membership saved by `network join`; optional `--local-ipv4` and `--prefix-len` values are accepted only if they match that saved configuration. Without a saved membership, provide both values explicitly. Both commands require TUN privileges. The program does not explicitly add or remove host routes; inspect the OS route table after startup and add a host route for the remote peer via the printed TUN interface if needed (for example, macOS `route -n add -host <peer-ip> -interface <utun-name>` or Linux `ip route add <peer-ip>/32 dev <tun-name>`). This single-peer prototype does not configure routes transactionally or restore them on exit. Stop the tunnel with Ctrl-C; remove any route you added manually.
+Both commands use the membership saved by `network join`; optional `--local-ipv4` and `--prefix-len` values are accepted only if they match that saved configuration. Without a saved membership, provide both values explicitly. Both commands require TUN privileges. By default, the program leaves system routes untouched; inspect the OS route table and add a host route manually if needed. On Linux and macOS you can opt in to managing exactly the authenticated peer IPv4 `/32` route with `--manage-route` on either tunnel command. The route is added only after peer authentication and before forwarding starts; an existing-route conflict, unsupported platform, missing route utility, or insufficient privileges aborts startup. A successfully added route is removed when the peer disconnects or you press Ctrl-C. Other platforms are not supported by `--manage-route`. Abrupt termination (for example, SIGKILL or power loss) cannot run cleanup; check the route table and remove a leftover route manually. The option never replaces or flushes routes.
 
 ## Development
 
