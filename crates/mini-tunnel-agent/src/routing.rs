@@ -16,6 +16,7 @@ use thiserror::Error;
 pub enum RoutingPlatform {
     Linux,
     MacOs,
+    Windows,
     Unsupported,
 }
 
@@ -29,6 +30,10 @@ impl RoutingPlatform {
         #[cfg(target_os = "macos")]
         {
             return Self::MacOs;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            return Self::Windows;
         }
         #[allow(unreachable_code)]
         Self::Unsupported
@@ -49,7 +54,7 @@ enum RouteAction {
 
 #[derive(Debug, Error)]
 pub enum RouteError {
-    #[error("automatic peer routes are supported only on Linux and macOS")]
+    #[error("automatic peer routes are supported only on Linux, macOS, and Windows")]
     UnsupportedPlatform,
     #[error("TUN interface name is empty, too long, or contains a NUL byte")]
     InvalidInterface,
@@ -176,6 +181,21 @@ fn build_command(
                 ],
             )
         }
+        RoutingPlatform::Windows => (
+            PathBuf::from("netsh"),
+            vec![
+                "interface".into(),
+                "ipv4".into(),
+                match action {
+                    RouteAction::Add => "add".into(),
+                    RouteAction::Delete => "delete".into(),
+                },
+                "route".into(),
+                format!("{peer}/32").into(),
+                format!("interface={interface}").into(),
+                "store=active".into(),
+            ],
+        ),
         RoutingPlatform::Unsupported => return Err(RouteError::UnsupportedPlatform),
     };
     Ok(RouteCommand { program, args })
@@ -222,6 +242,21 @@ fn build_ipv6_command(
                 ],
             )
         }
+        RoutingPlatform::Windows => (
+            PathBuf::from("netsh"),
+            vec![
+                "interface".into(),
+                "ipv6".into(),
+                match action {
+                    RouteAction::Add => "add".into(),
+                    RouteAction::Delete => "delete".into(),
+                },
+                "route".into(),
+                format!("{peer}/128").into(),
+                format!("interface={interface}").into(),
+                "store=active".into(),
+            ],
+        ),
         RoutingPlatform::Unsupported => return Err(RouteError::UnsupportedPlatform),
     };
     Ok(RouteCommand { program, args })
@@ -362,6 +397,57 @@ mod tests {
                         .map(OsString::from)
                         .to_vec(),
                 },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn windows_routes_use_active_netsh_host_routes_scoped_to_tun_alias() {
+        let runner = FakeRunner::default();
+        let lease = install_peer_route(
+            &runner,
+            RoutingPlatform::Windows,
+            "mini tunnel",
+            Ipv4Addr::new(10, 77, 0, 3),
+        )
+        .await
+        .expect("install Windows IPv4 route");
+        lease
+            .remove(&runner)
+            .await
+            .expect("remove Windows IPv4 route");
+        let ipv6_lease = install_peer_ipv6_route(
+            &runner,
+            RoutingPlatform::Windows,
+            "mini tunnel",
+            "fd12:3456::3".parse().unwrap(),
+        )
+        .await
+        .expect("install Windows IPv6 route");
+        ipv6_lease
+            .remove(&runner)
+            .await
+            .expect("remove Windows IPv6 route");
+        let command = |family: &str, action: &str, prefix: &str| RouteCommand {
+            program: "netsh".into(),
+            args: [
+                "interface".into(),
+                family.into(),
+                action.into(),
+                "route".into(),
+                prefix.into(),
+                "interface=mini tunnel".into(),
+                "store=active".into(),
+            ]
+            .to_vec(),
+        };
+        assert_eq!(
+            runner.calls(),
+            vec![
+                command("ipv4", "add", "10.77.0.3/32"),
+                command("ipv4", "delete", "10.77.0.3/32"),
+                command("ipv6", "add", "fd12:3456::3/128"),
+                command("ipv6", "delete", "fd12:3456::3/128"),
             ]
         );
     }
