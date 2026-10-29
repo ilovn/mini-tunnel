@@ -1,6 +1,6 @@
 //! Bidirectional bridge between a validated L3 packet device and an authenticated peer channel.
 
-use std::{collections::HashMap, net::Ipv4Addr, sync::Arc};
+use std::{collections::HashMap, net::Ipv4Addr, sync::Arc, time::Duration};
 
 use thiserror::Error;
 
@@ -52,13 +52,63 @@ pub async fn pump_peer_packets<T: TunnelPacketIo>(
     peer: &PeerChannel,
     peer_ipv4: Ipv4Addr,
 ) -> Result<(), PeerTunnelError> {
+    let mut keepalive = tokio::time::interval(Duration::from_secs(10));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    keepalive.tick().await;
+    let mut last_received = tokio::time::Instant::now();
+    let mut inbound = Box::pin(peer.recv_packet());
     loop {
         tokio::select! {
             outbound = packet_io.read_outbound_packet() => {
                 peer.send_packet(&outbound?).await?;
             }
-            inbound = peer.recv_packet() => {
-                packet_io.write_inbound_packet(&inbound?, peer_ipv4).await?;
+            result = tokio::time::timeout_at(last_received + Duration::from_secs(30), &mut inbound) => {
+                let packet = result.map_err(|_| IdentityError::Transport("peer keepalive timed out".to_owned()))??;
+                last_received = tokio::time::Instant::now();
+                if !packet.is_empty() {
+                    packet_io.write_inbound_packet(&packet, peer_ipv4).await?;
+                }
+                inbound = Box::pin(peer.recv_packet());
+            }
+            _ = keepalive.tick() => peer.send_keepalive().await?,
+        }
+    }
+}
+
+async fn receive_mesh_peer(
+    address: Ipv4Addr,
+    channel: Arc<PeerChannel>,
+    event_tx: tokio::sync::mpsc::Sender<(Ipv4Addr, Result<Vec<u8>, IdentityError>)>,
+) {
+    let mut keepalive = tokio::time::interval(Duration::from_secs(10));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    keepalive.tick().await;
+    let mut last_received = tokio::time::Instant::now();
+    let mut inbound = Box::pin(channel.recv_packet());
+    loop {
+        tokio::select! {
+            result = tokio::time::timeout_at(last_received + Duration::from_secs(30), &mut inbound) => {
+                let result = match result {
+                    Ok(result) => result,
+                    Err(_) => Err(IdentityError::Transport("peer keepalive timed out".to_owned())),
+                };
+                if matches!(&result, Ok(packet) if packet.is_empty()) {
+                    last_received = tokio::time::Instant::now();
+                    inbound = Box::pin(channel.recv_packet());
+                    continue;
+                }
+                let disconnected = result.is_err();
+                if event_tx.send((address, result)).await.is_err() || disconnected {
+                    return;
+                }
+                last_received = tokio::time::Instant::now();
+                inbound = Box::pin(channel.recv_packet());
+            }
+            _ = keepalive.tick() => {
+                if channel.send_keepalive().await.is_err() {
+                    let _ = event_tx.send((address, Err(IdentityError::Transport("peer keepalive send failed".to_owned())))).await;
+                    return;
+                }
             }
         }
     }
@@ -89,15 +139,7 @@ pub async fn pump_peer_mesh<T: TunnelPacketIo>(
         let peer_address = address;
         let channel = Arc::clone(channel);
         let event_tx = event_tx.clone();
-        receivers.spawn(async move {
-            loop {
-                let result = channel.recv_packet().await;
-                let disconnected = result.is_err();
-                if event_tx.send((peer_address, result)).await.is_err() || disconnected {
-                    return;
-                }
-            }
-        });
+        receivers.spawn(receive_mesh_peer(peer_address, channel, event_tx));
     }
     drop(event_tx);
 

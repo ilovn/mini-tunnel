@@ -192,6 +192,19 @@ const TCP_CANDIDATE_TIMEOUT: Duration = Duration::from_secs(5);
 const CANDIDATE_CONNECT_BUDGET: Duration = Duration::from_secs(30);
 const MAX_PEER_CANDIDATES: usize = 8;
 
+/// Return a full-jitter reconnect delay with exponential growth and a 30-second cap.
+#[must_use]
+pub fn reconnect_delay(attempt: u32) -> Duration {
+    let exponent = attempt.min(6);
+    let ceiling_ms = (500_u64.saturating_mul(1_u64 << exponent)).min(30_000);
+    let mut random = [0_u8; 8];
+    if getrandom::fill(&mut random).is_err() {
+        return Duration::from_millis(ceiling_ms);
+    }
+    let sample = u64::from_be_bytes(random);
+    Duration::from_millis(sample % (ceiling_ms + 1))
+}
+
 trait AsyncPeerIo: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncPeerIo for T {}
 
@@ -283,6 +296,11 @@ impl PeerChannel {
                     .map_err(|error| IdentityError::Transport(error.to_string()))
             }
         }
+    }
+
+    /// Send an authenticated transport keepalive; receivers consume it without exposing it to TUN.
+    pub async fn send_keepalive(&self) -> Result<(), IdentityError> {
+        self.send_packet(&[]).await
     }
 
     /// Receive one authenticated frame, rejecting malformed, cross-network, and replayed data.
@@ -1266,6 +1284,13 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
+    fn reconnect_backoff_is_bounded() {
+        for attempt in 0..100 {
+            assert!(reconnect_delay(attempt) <= Duration::from_secs(30));
+        }
+    }
+
+    #[test]
     fn identity_is_stable_across_loads_and_private_file_is_created() {
         let dir =
             std::env::temp_dir().join(format!("mini-tunnel-identity-{}", uuid::Uuid::new_v4()));
@@ -1400,10 +1425,18 @@ mod tests {
             .expect("accepted TCP peer");
         assert_eq!(accepted_id, expected_a_id);
         assert_eq!(channel_a.transport_name(), "TLS/TCP");
+        channel_a.send_keepalive().await.expect("send keepalive");
         channel_a
             .send_packet(b"reliable overlay packet")
             .await
             .expect("send TCP frame");
+        assert!(
+            channel_b
+                .recv_packet()
+                .await
+                .expect("receive TCP keepalive")
+                .is_empty()
+        );
         assert_eq!(
             channel_b.recv_packet().await.expect("receive TCP frame"),
             b"reliable overlay packet"

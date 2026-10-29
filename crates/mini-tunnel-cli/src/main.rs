@@ -427,20 +427,35 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         &coordinator_url,
                     )
                     .await?;
-                    let peer =
-                        discover_peer(&coordinator_url, &network_id, &peer_id, &identity).await?;
-                    let peer_key = decode_peer_key(&peer.public_key)?;
                     let tun = create_tun(local_ipv4, prefix_len, mtu)?;
-                    let (channel, remote) = mini_tunnel_agent::connect_peer_candidates(
-                        &endpoint,
-                        &peer.candidates,
-                        &network_id,
-                        &identity,
-                        &peer.device_id,
-                        peer_key,
-                    )
-                    .await?;
-                    run_peer_tunnel(&tun, &channel, &peer, remote, manage_route).await?;
+                    let mut attempt = 0_u32;
+                    loop {
+                        let result = async {
+                            let peer =
+                                discover_peer(&coordinator_url, &network_id, &peer_id, &identity)
+                                    .await?;
+                            let peer_key = decode_peer_key(&peer.public_key)?;
+                            let (channel, remote) = mini_tunnel_agent::connect_peer_candidates(
+                                &endpoint,
+                                &peer.candidates,
+                                &network_id,
+                                &identity,
+                                &peer.device_id,
+                                peer_key,
+                            )
+                            .await?;
+                            run_peer_tunnel(&tun, &channel, &peer, remote, manage_route).await
+                        }
+                        .await;
+                        match result {
+                            Ok(()) => break,
+                            Err(error) => eprintln!("Peer session ended: {error}"),
+                        }
+                        if !wait_reconnect(attempt).await {
+                            break;
+                        }
+                        attempt = attempt.saturating_add(1);
+                    }
                 }
                 TunnelCommand::Listen {
                     bind,
@@ -471,37 +486,38 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         &coordinator_url,
                     )
                     .await?;
-                    let peer =
-                        discover_peer(&coordinator_url, &network_id, &peer_id, &identity).await?;
-                    let peer_key = decode_peer_key(&peer.public_key)?;
                     let tun = create_tun(local_ipv4, prefix_len, mtu)?;
                     println!(
                         "Waiting for authenticated peer on {}",
                         endpoint.local_addr()?
                     );
-                    let channel = mini_tunnel_agent::accept_peer(
-                        &endpoint,
-                        &network_id,
-                        &identity,
-                        &peer.device_id,
-                        peer_key,
-                    );
-                    let channel = if let Some(listener) = &tcp_listener {
-                        let allowed = vec![(peer.device_id.clone(), peer_key)];
-                        tokio::select! {
-                            result = channel => result?,
-                            result = mini_tunnel_agent::accept_tcp_peer_any(
-                                listener,
-                                &network_id,
-                                &identity,
-                                &allowed,
-                            ) => result?.1,
+                    let mut attempt = 0_u32;
+                    loop {
+                        let result = async {
+                            let peer = discover_peer(&coordinator_url, &network_id, &peer_id, &identity).await?;
+                            let peer_key = decode_peer_key(&peer.public_key)?;
+                            let channel = mini_tunnel_agent::accept_peer(
+                                &endpoint, &network_id, &identity, &peer.device_id, peer_key,
+                            );
+                            let channel = if let Some(listener) = &tcp_listener {
+                                let allowed = vec![(peer.device_id.clone(), peer_key)];
+                                tokio::select! {
+                                    result = channel => result?,
+                                    result = mini_tunnel_agent::accept_tcp_peer_any(listener, &network_id, &identity, &allowed) => result?.1,
+                                }
+                            } else { channel.await? };
+                            let remote = channel.remote_address();
+                            run_peer_tunnel(&tun, &channel, &peer, remote, manage_route).await
+                        }.await;
+                        match result {
+                            Ok(()) => break,
+                            Err(error) => eprintln!("Peer session ended: {error}"),
                         }
-                    } else {
-                        channel.await?
-                    };
-                    let remote = channel.remote_address();
-                    run_peer_tunnel(&tun, &channel, &peer, remote, manage_route).await?;
+                        if !wait_reconnect(attempt).await {
+                            break;
+                        }
+                        attempt = attempt.saturating_add(1);
+                    }
                 }
                 TunnelCommand::Mesh {
                     bind,
@@ -970,6 +986,15 @@ fn now_ms() -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis()
         .try_into()?)
+}
+
+async fn wait_reconnect(attempt: u32) -> bool {
+    let delay = mini_tunnel_agent::reconnect_delay(attempt);
+    eprintln!("Retrying peer connection in {:.2}s", delay.as_secs_f32());
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => false,
+        _ = tokio::time::sleep(delay) => true,
+    }
 }
 
 async fn post_json<Request, Response>(
