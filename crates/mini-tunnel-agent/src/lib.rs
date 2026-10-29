@@ -395,6 +395,15 @@ impl PeerChannel {
         }
     }
 
+    /// Close the peer transport, including the write half of a TLS/TCP session.
+    pub async fn close_async(&self) {
+        self.close();
+        if let PeerTransport::Tcp(transport) = &self.transport {
+            let mut sender = transport.sender.lock().await;
+            let _ = sender.shutdown().await;
+        }
+    }
+
     /// Send one bounded packet, fragmenting it when the transport frame cannot carry it whole.
     pub async fn send_packet(&self, payload: &[u8]) -> Result<(), IdentityError> {
         let _send_guard = self.send_lock.lock().await;
@@ -1795,6 +1804,21 @@ mod tests {
             );
         }
         fs::remove_dir_all(dir).expect("remove test directory");
+    }
+
+    #[tokio::test]
+    async fn async_peer_close_terminates_a_tcp_peer_read_loop() {
+        let (stream_a, stream_b) = tokio::io::duplex(128);
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42000);
+        let channel_a = new_tcp_channel(Box::new(stream_a), address, "office");
+        let channel_b = new_tcp_channel(Box::new(stream_b), address, "office");
+        channel_a.close_async().await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), channel_b.recv_packet())
+                .await
+                .expect("TCP close reaches the peer")
+                .is_err()
+        );
     }
 
     #[test]

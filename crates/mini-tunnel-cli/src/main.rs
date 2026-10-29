@@ -678,7 +678,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 &tun,
                                 &channel,
                                 &peer,
-                                &network_id,
+                                PeerSessionControl {
+                                    coordinator_url: &coordinator_url,
+                                    network_id: &network_id,
+                                    identity: &identity,
+                                },
                                 remote,
                                 manage_route,
                             )
@@ -748,7 +752,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 }
                             } else { channel.await? };
                             let remote = channel.remote_address();
-                            run_peer_tunnel(&tun, &channel, &peer, &network_id, remote, manage_route).await
+                            run_peer_tunnel(
+                                &tun,
+                                &channel,
+                                &peer,
+                                PeerSessionControl {
+                                    coordinator_url: &coordinator_url,
+                                    network_id: &network_id,
+                                    identity: &identity,
+                                },
+                                remote,
+                                manage_route,
+                            )
+                            .await
                         }.await;
                         match result {
                             Ok(()) => break,
@@ -1344,14 +1360,37 @@ where
             error: "http_error".to_owned(),
             message: format!("coordinator returned HTTP {status}"),
         });
-    Err(format!("{}: {}", error.error, error.message).into())
+    Err(Box::new(CoordinatorApiError {
+        code: error.error,
+        message: error.message,
+    }))
+}
+
+#[derive(Debug)]
+struct CoordinatorApiError {
+    code: String,
+    message: String,
+}
+
+impl std::fmt::Display for CoordinatorApiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for CoordinatorApiError {}
+
+struct PeerSessionControl<'a> {
+    coordinator_url: &'a str,
+    network_id: &'a str,
+    identity: &'a mini_tunnel_agent::Identity,
 }
 
 async fn run_peer_tunnel(
     tun: &mini_tunnel_agent::tun_device::TunDevice,
     channel: &mini_tunnel_agent::PeerChannel,
     peer: &PeerInfo,
-    network_id: &str,
+    control: PeerSessionControl<'_>,
     remote: SocketAddr,
     manage_route: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1360,7 +1399,7 @@ async fn run_peer_tunnel(
     };
 
     let peer_ipv4 = peer.assigned_ipv4.parse()?;
-    let peer_ipv6 = mini_tunnel_protocol::overlay_ipv6_address(network_id, peer_ipv4)
+    let peer_ipv6 = mini_tunnel_protocol::overlay_ipv6_address(control.network_id, peer_ipv4)
         .ok_or("could not derive peer IPv6 overlay address")?;
     let runner = SystemRouteRunner;
     let (route, route_v6): (Option<RouteLease>, Option<RouteLease>) = if manage_route {
@@ -1382,7 +1421,7 @@ async fn run_peer_tunnel(
     print_tunnel_ready(
         tun,
         peer,
-        network_id,
+        control.network_id,
         remote,
         channel.transport_name(),
         manage_route,
@@ -1390,9 +1429,21 @@ async fn run_peer_tunnel(
     let pump =
         mini_tunnel_agent::tunnel::pump_peer_packets(tun, channel, peer_ipv4, Some(peer_ipv6));
     tokio::pin!(pump);
+    let revocation = wait_for_peer_revocation(
+        control.coordinator_url.to_owned(),
+        control.network_id.to_owned(),
+        peer.device_id.clone(),
+        control.identity,
+    );
+    tokio::pin!(revocation);
     let tunnel_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = tokio::select! {
         result = &mut pump => result.map_err(Into::into),
         signal = tokio::signal::ctrl_c() => signal.map_err(Into::into),
+        () = &mut revocation => {
+            tracing::warn!(peer_id = %peer.device_id, "peer authorization was revoked; closing tunnel");
+            channel.close_async().await;
+            Ok(())
+        },
     };
     let mut cleanup_error = None;
     if let Some(route_v6) = route_v6
@@ -2614,6 +2665,42 @@ async fn discover_peers(
     Ok(snapshot.peers)
 }
 
+async fn wait_for_peer_revocation(
+    coordinator_url: String,
+    network_id: String,
+    peer_id: String,
+    identity: &mini_tunnel_agent::Identity,
+) {
+    let mut refresh = tokio::time::interval(Duration::from_secs(30));
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    refresh.tick().await;
+    loop {
+        refresh.tick().await;
+        match discover_peers(&coordinator_url, &network_id, identity).await {
+            Ok(peers) if peer_snapshot_revokes_peer(&peers, &peer_id) => return,
+            Ok(_) => {}
+            Err(error)
+                if error
+                    .downcast_ref::<CoordinatorApiError>()
+                    .is_some_and(coordinator_error_revokes_member) =>
+            {
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "peer authorization refresh failed; keeping current session");
+            }
+        }
+    }
+}
+
+fn peer_snapshot_revokes_peer(peers: &[PeerInfo], peer_id: &str) -> bool {
+    !peers.iter().any(|peer| peer.device_id == peer_id)
+}
+
+fn coordinator_error_revokes_member(error: &CoordinatorApiError) -> bool {
+    matches!(error.code.as_str(), "invalid_token" | "not_found")
+}
+
 fn print_tunnel_ready(
     tun: &mini_tunnel_agent::tun_device::TunDevice,
     peer: &PeerInfo,
@@ -3135,5 +3222,39 @@ mod tests {
             ]
         );
         assert_eq!(added, vec![replacement, newcomer]);
+    }
+
+    #[test]
+    fn single_peer_revocation_requires_authoritative_membership_failure() {
+        let peer = PeerInfo {
+            device_id: "peer-a".to_owned(),
+            assigned_ipv4: "10.77.0.2".to_owned(),
+            public_key: URL_SAFE_NO_PAD.encode([1_u8; 32]),
+            candidates: Vec::new(),
+            ice_credentials: None,
+        };
+        assert!(!peer_snapshot_revokes_peer(
+            std::slice::from_ref(&peer),
+            "peer-a"
+        ));
+        assert!(peer_snapshot_revokes_peer(
+            std::slice::from_ref(&peer),
+            "peer-b"
+        ));
+        let invalid_token = CoordinatorApiError {
+            code: "invalid_token".to_owned(),
+            message: "member revoked".to_owned(),
+        };
+        let network_removed = CoordinatorApiError {
+            code: "not_found".to_owned(),
+            message: "network removed".to_owned(),
+        };
+        let transient = CoordinatorApiError {
+            code: "persistence_error".to_owned(),
+            message: "storage unavailable".to_owned(),
+        };
+        assert!(coordinator_error_revokes_member(&invalid_token));
+        assert!(coordinator_error_revokes_member(&network_removed));
+        assert!(!coordinator_error_revokes_member(&transient));
     }
 }
