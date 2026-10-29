@@ -372,6 +372,9 @@ enum TunnelCommand {
         /// Optional RFC 8489 STUN server used to discover and publish this UDP socket's mapped address.
         #[arg(long)]
         stun_server: Option<SocketAddr>,
+        /// Enable experimental RFC 8445 checks for mesh peer sessions.
+        #[arg(long)]
+        ice: bool,
         /// Additional candidate address to publish; may be repeated.
         #[arg(long = "candidate")]
         candidates: Vec<String>,
@@ -754,6 +757,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     tcp_bind,
                     relay_server,
                     stun_server,
+                    ice,
                     candidates,
                     network_id,
                     local_ipv4,
@@ -773,7 +777,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         &identity,
                         bind,
                         stun_server,
-                        false,
+                        ice,
                         &candidates,
                         &network_id,
                         &coordinator_url,
@@ -792,7 +796,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     for peer in peers.iter().cloned() {
                         let keep_outbound = local_device_id < peer.device_id;
                         let (connector, probe, accepted_peer_tx) = build_mesh_peer_connectors(
-                            endpoint.endpoint.clone(),
+                            endpoint.clone(),
                             std::sync::Arc::clone(&identity),
                             network_id.clone(),
                             coordinator_url.clone(),
@@ -1011,7 +1015,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         coordinator_url: coordinator_url.clone(),
                         network_id: network_id.clone(),
                         identity: std::sync::Arc::clone(&identity),
-                        endpoint: endpoint.endpoint.clone(),
+                        endpoint: endpoint.clone(),
                         relay_server,
                         snapshot_tx,
                         allowlist_tx,
@@ -1466,7 +1470,7 @@ async fn select_ice_peer_address(
 }
 
 async fn connect_mesh_peer(
-    endpoint: &quinn::Endpoint,
+    endpoint: &TunnelEndpoint,
     network_id: &str,
     coordinator_url: &str,
     identity: &mini_tunnel_agent::Identity,
@@ -1493,9 +1497,30 @@ async fn connect_mesh_peer(
     }
     let peer_key = decode_peer_key(&peer.public_key)
         .map_err(|_| mini_tunnel_agent::IdentityError::UnauthorizedPeer)?;
+    if !reliable_only && let Some(remote) = select_ice_peer_address(endpoint, &peer, identity).await
+    {
+        match mini_tunnel_agent::connect_peer(
+            &endpoint.endpoint,
+            remote,
+            network_id,
+            identity,
+            &peer.device_id,
+            peer_key,
+        )
+        .await
+        {
+            Ok(channel) => return Ok((channel, remote)),
+            Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer) => {
+                return Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer);
+            }
+            Err(error) => {
+                tracing::debug!(peer_id = %peer.device_id, %error, "ICE nominated path failed QUIC setup; trying candidates")
+            }
+        }
+    }
     let candidates = candidates_for_path(&peer.candidates, reliable_only);
     match mini_tunnel_agent::connect_peer_candidates(
-        endpoint,
+        &endpoint.endpoint,
         &candidates,
         network_id,
         identity,
@@ -1525,7 +1550,7 @@ async fn connect_mesh_peer(
 }
 
 fn build_mesh_peer_connectors(
-    endpoint: quinn::Endpoint,
+    endpoint: TunnelEndpoint,
     identity: std::sync::Arc<mini_tunnel_agent::Identity>,
     network_id: String,
     coordinator_url: String,
@@ -1569,6 +1594,7 @@ fn build_mesh_peer_connectors(
         )
     } else {
         let receiver = std::sync::Arc::clone(&receiver);
+        let endpoint = endpoint.clone();
         let identity = std::sync::Arc::clone(&identity);
         let coordinator_url = coordinator_url.clone();
         let network_id = network_id.clone();
@@ -1576,11 +1602,15 @@ fn build_mesh_peer_connectors(
         std::sync::Arc::new(
             move |force_reliable| -> mini_tunnel_agent::tunnel::PeerConnectFuture {
                 let receiver = std::sync::Arc::clone(&receiver);
+                let endpoint = endpoint.clone();
                 let identity = std::sync::Arc::clone(&identity);
                 let coordinator_url = coordinator_url.clone();
                 let network_id = network_id.clone();
                 let peer = peer.clone();
                 Box::pin(async move {
+                    if !force_reliable {
+                        let _ = select_ice_peer_address(&endpoint, &peer, &identity).await;
+                    }
                     let direct_wait = if force_reliable { 35 } else { 65 };
                     if let Ok(Some(channel)) =
                         tokio::time::timeout(Duration::from_secs(direct_wait), async {
@@ -1636,9 +1666,16 @@ fn build_mesh_peer_connectors(
         })
     } else {
         let receiver = std::sync::Arc::clone(&receiver);
+        let endpoint = endpoint.clone();
+        let identity = std::sync::Arc::clone(&identity);
+        let peer = peer.clone();
         std::sync::Arc::new(move |_| -> mini_tunnel_agent::tunnel::PeerConnectFuture {
             let receiver = std::sync::Arc::clone(&receiver);
+            let endpoint = endpoint.clone();
+            let identity = std::sync::Arc::clone(&identity);
+            let peer = peer.clone();
             Box::pin(async move {
+                let _ = select_ice_peer_address(&endpoint, &peer, &identity).await;
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
                 loop {
                     let channel = tokio::time::timeout_at(deadline, async {
@@ -1707,7 +1744,7 @@ struct MeshMembershipRefresh {
     coordinator_url: String,
     network_id: String,
     identity: std::sync::Arc<mini_tunnel_agent::Identity>,
-    endpoint: quinn::Endpoint,
+    endpoint: TunnelEndpoint,
     relay_server: Option<SocketAddr>,
     snapshot_tx: tokio::sync::watch::Sender<Vec<PeerInfo>>,
     allowlist_tx: tokio::sync::watch::Sender<Vec<(String, [u8; 32])>>,
@@ -2504,6 +2541,121 @@ mod tests {
         endpoint_a.endpoint.close(0_u32.into(), b"test complete");
         endpoint_b.endpoint.close(0_u32.into(), b"test complete");
         coordinator_task.abort();
+        std::fs::remove_dir_all(temp).expect("remove test identities");
+    }
+
+    #[tokio::test]
+    async fn mesh_ice_routes_two_peer_sessions_and_transfers_over_both_quic_channels() {
+        let temp =
+            std::env::temp_dir().join(format!("mini-tunnel-mesh-ice-{}", uuid::Uuid::new_v4()));
+        let identity_a = mini_tunnel_agent::Identity::load_or_create_at(temp.join("a/device.key"))
+            .expect("identity A");
+        let identity_b = mini_tunnel_agent::Identity::load_or_create_at(temp.join("b/device.key"))
+            .expect("identity B");
+        let identity_c = mini_tunnel_agent::Identity::load_or_create_at(temp.join("c/device.key"))
+            .expect("identity C");
+        let create_endpoint = |identity: &mini_tunnel_agent::Identity| {
+            mini_tunnel_agent::ice::peer_endpoint_with_ice(
+                identity,
+                "127.0.0.1:0".parse().unwrap(),
+                16,
+            )
+            .expect("create mesh ICE endpoint")
+        };
+        let iced_a = create_endpoint(&identity_a);
+        let iced_b = create_endpoint(&identity_b);
+        let iced_c = create_endpoint(&identity_c);
+        let address_a = iced_a.endpoint.local_addr().unwrap();
+        let address_b = iced_b.endpoint.local_addr().unwrap();
+        let address_c = iced_c.endpoint.local_addr().unwrap();
+        let credentials_a = mini_tunnel_agent::ice::generate_ice_credentials(1).unwrap();
+        let credentials_b = mini_tunnel_agent::ice::generate_ice_credentials(1).unwrap();
+        let credentials_c = mini_tunnel_agent::ice::generate_ice_credentials(1).unwrap();
+        let endpoint = |iced: mini_tunnel_agent::ice::IcedPeerEndpoint,
+                        credentials: mini_tunnel_protocol::IceCredentials,
+                        local: SocketAddr| TunnelEndpoint {
+            endpoint: iced.endpoint,
+            ice: Some(TunnelIceState {
+                credentials,
+                socket: iced.socket,
+                router: iced.ice_router,
+                local_candidates: vec![local],
+            }),
+        };
+        let endpoint_a = endpoint(iced_a, credentials_a.clone(), address_a);
+        let endpoint_b = endpoint(iced_b, credentials_b.clone(), address_b);
+        let endpoint_c = endpoint(iced_c, credentials_c.clone(), address_c);
+        let peer = |identity: &mini_tunnel_agent::Identity,
+                    address: SocketAddr,
+                    credentials: &mini_tunnel_protocol::IceCredentials,
+                    assigned_ipv4: &str| PeerInfo {
+            device_id: identity.device_id(),
+            assigned_ipv4: assigned_ipv4.to_owned(),
+            public_key: identity.public_key_encoded(),
+            candidates: vec![address.to_string()],
+            ice_credentials: Some(credentials.clone()),
+        };
+        let peer_a = peer(&identity_a, address_a, &credentials_a, "10.71.0.1");
+        let peer_b = peer(&identity_b, address_b, &credentials_b, "10.71.0.2");
+        let peer_c = peer(&identity_c, address_c, &credentials_c, "10.71.0.3");
+        let (a_to_b, a_to_c, b_to_a, c_to_a) = tokio::join!(
+            select_ice_peer_address(&endpoint_a, &peer_b, &identity_a),
+            select_ice_peer_address(&endpoint_a, &peer_c, &identity_a),
+            select_ice_peer_address(&endpoint_b, &peer_a, &identity_b),
+            select_ice_peer_address(&endpoint_c, &peer_a, &identity_c),
+        );
+        assert_eq!(a_to_b, Some(address_b));
+        assert_eq!(a_to_c, Some(address_c));
+        assert_eq!(b_to_a, Some(address_a));
+        assert_eq!(c_to_a, Some(address_a));
+
+        let accept_b = mini_tunnel_agent::accept_peer(
+            &endpoint_b.endpoint,
+            "mesh-ice-test",
+            &identity_b,
+            &peer_a.device_id,
+            identity_a.public_key(),
+        );
+        let accept_c = mini_tunnel_agent::accept_peer(
+            &endpoint_c.endpoint,
+            "mesh-ice-test",
+            &identity_c,
+            &peer_a.device_id,
+            identity_a.public_key(),
+        );
+        let (connect_b, connect_c, channel_b, channel_c) = tokio::join!(
+            mini_tunnel_agent::connect_peer(
+                &endpoint_a.endpoint,
+                a_to_b.unwrap(),
+                "mesh-ice-test",
+                &identity_a,
+                &peer_b.device_id,
+                identity_b.public_key(),
+            ),
+            mini_tunnel_agent::connect_peer(
+                &endpoint_a.endpoint,
+                a_to_c.unwrap(),
+                "mesh-ice-test",
+                &identity_a,
+                &peer_c.device_id,
+                identity_c.public_key(),
+            ),
+            accept_b,
+            accept_c,
+        );
+        let channel_a_b = connect_b.expect("QUIC peer B");
+        let channel_a_c = connect_c.expect("QUIC peer C");
+        let channel_b = channel_b.expect("accept peer B");
+        let channel_c = channel_c.expect("accept peer C");
+        channel_a_b.send_packet(b"mesh-peer-b").await.unwrap();
+        channel_a_c.send_packet(b"mesh-peer-c").await.unwrap();
+        assert_eq!(channel_b.recv_packet().await.unwrap(), b"mesh-peer-b");
+        assert_eq!(channel_c.recv_packet().await.unwrap(), b"mesh-peer-c");
+        for tunnel_endpoint in [&endpoint_a, &endpoint_b, &endpoint_c] {
+            tunnel_endpoint
+                .endpoint
+                .close(0_u32.into(), b"test complete");
+        }
         std::fs::remove_dir_all(temp).expect("remove test identities");
     }
 
