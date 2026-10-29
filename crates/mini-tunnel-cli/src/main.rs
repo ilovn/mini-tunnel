@@ -1433,15 +1433,17 @@ async fn select_ice_peer_address(
     let local_ufrag = local.credentials.ufrag.clone();
     let controlling = identity.device_id() < peer.device_id;
     let result = async {
-        let mut driver = mini_tunnel_agent::ice::IceAgentDriver::for_peer_with_candidates(
-            &local.credentials,
-            remote,
-            &local.local_candidates,
-            &remote_candidates,
-            controlling,
-            std::time::Instant::now(),
-        )
-        .map_err(|error| error.to_string())?;
+        let mut driver =
+            mini_tunnel_agent::ice::IceAgentDriver::for_peer_with_candidates_on_socket(
+                local.local_socket_addr,
+                &local.credentials,
+                remote,
+                &local.local_candidates,
+                &remote_candidates,
+                controlling,
+                std::time::Instant::now(),
+            )
+            .map_err(|error| error.to_string())?;
         driver
             .run_checks(
                 &local.socket,
@@ -2102,6 +2104,7 @@ struct TunnelIceState {
     credentials: mini_tunnel_protocol::IceCredentials,
     socket: mini_tunnel_agent::ice::IceSocketHandle,
     router: mini_tunnel_agent::ice::IceDatagramRouterHandle,
+    local_socket_addr: SocketAddr,
     local_candidates: Vec<mini_tunnel_agent::candidate::SignaledCandidate>,
 }
 
@@ -2143,38 +2146,25 @@ async fn create_tunnel_endpoint(
             }
             _ => bound_address,
         };
-        let mut candidates = extra_candidates.to_vec();
-        if !related_address.ip().is_unspecified() {
-            candidates.push(related_address.to_string());
-        }
-        if let Some(mapped_address) = mapped_address {
-            candidates.push(format!("srflx://{mapped_address}|{related_address}"));
-        }
-        candidates.sort();
-        candidates.dedup();
+        let gathered_hosts = if bound_address.ip().is_unspecified() && bound_address.is_ipv4() {
+            local_interface_ipv4_candidates(bound_address.port())?
+        } else {
+            Vec::new()
+        };
+        let primary_host = (!related_address.ip().is_unspecified()).then_some(related_address);
+        let candidates = compose_ice_candidates(
+            extra_candidates,
+            primary_host,
+            mapped_address.map(|mapped| (mapped, related_address)),
+            gathered_hosts,
+        )?;
         if candidates.is_empty() {
-            return Err(
-                "ICE needs --stun-server, an explicit --candidate, or a concrete --bind address"
-                    .into(),
-            );
+            return Err("ICE needs a usable local interface, --stun-server, or --candidate".into());
         }
         if candidates.len() > 8 {
             return Err("at most eight peer candidates can be published".into());
         }
-        let mut local_candidates = udp_ice_candidates(&candidates);
-        if !local_candidates
-            .iter()
-            .any(|candidate| candidate.address == bound_address)
-        {
-            local_candidates.insert(
-                0,
-                mini_tunnel_agent::candidate::SignaledCandidate {
-                    address: bound_address,
-                    transport: mini_tunnel_agent::candidate::CandidateTransport::Udp,
-                    candidate_type: mini_tunnel_agent::candidate::CandidateType::Host,
-                },
-            );
-        }
+        let local_candidates = udp_ice_candidates(&candidates);
         let credentials = mini_tunnel_agent::ice::generate_ice_credentials(1)?;
         let device_id = identity.device_id();
         let timestamp_ms = now_ms()?;
@@ -2250,6 +2240,7 @@ async fn create_tunnel_endpoint(
                 credentials,
                 socket: iced.socket,
                 router: iced.ice_router,
+                local_socket_addr: bound_address,
                 local_candidates,
             }),
         });
@@ -2314,6 +2305,84 @@ fn route_selected_local_address(
     probe.connect(remote)?;
     let selected = probe.local_addr()?;
     Ok(SocketAddr::new(selected.ip(), port))
+}
+
+fn local_interface_ipv4_candidates(port: u16) -> std::io::Result<Vec<SocketAddr>> {
+    let interfaces = if_addrs::get_if_addrs()?;
+    let addresses = interfaces
+        .into_iter()
+        .filter(|interface| interface.is_oper_up() && !interface.is_loopback())
+        .filter_map(|interface| match interface.addr {
+            if_addrs::IfAddr::V4(address) => Some(address.ip),
+            if_addrs::IfAddr::V6(_) => None,
+        });
+    Ok(filtered_ipv4_host_candidates(addresses, port))
+}
+
+fn filtered_ipv4_host_candidates(
+    addresses: impl IntoIterator<Item = Ipv4Addr>,
+    port: u16,
+) -> Vec<SocketAddr> {
+    let mut candidates = addresses
+        .into_iter()
+        .filter(|address| {
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_multicast()
+                && !address.is_broadcast()
+        })
+        .map(|address| SocketAddr::new(address.into(), port))
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn compose_ice_candidates(
+    explicit: &[String],
+    primary_host: Option<SocketAddr>,
+    mapped: Option<(SocketAddr, SocketAddr)>,
+    other_hosts: Vec<SocketAddr>,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut candidates = Vec::new();
+    for candidate in explicit {
+        if !candidates.contains(candidate) {
+            candidates.push(candidate.clone());
+        }
+    }
+    if candidates.len() > 8 {
+        return Err("at most eight explicit peer candidates can be published".into());
+    }
+    if let Some((mapped, related)) = mapped {
+        let srflx = format!("srflx://{mapped}|{related}");
+        if !candidates.contains(&srflx) {
+            if candidates.len() == 8 {
+                return Err(
+                    "explicit candidates leave no room for the STUN mapped candidate".into(),
+                );
+            }
+            candidates.push(srflx);
+        }
+    }
+    let mut hosts = Vec::new();
+    if let Some(primary_host) = primary_host {
+        hosts.push(primary_host);
+    }
+    let mut other_hosts = other_hosts;
+    other_hosts.sort();
+    other_hosts.dedup();
+    hosts.extend(other_hosts);
+    let mut seen_hosts = std::collections::HashSet::new();
+    for host in hosts {
+        if !seen_hosts.insert(host) {
+            continue;
+        }
+        let signal = host.to_string();
+        if !candidates.contains(&signal) && candidates.len() < 8 {
+            candidates.push(signal);
+        }
+    }
+    Ok(candidates)
 }
 
 fn udp_ice_candidates(
@@ -2445,6 +2514,80 @@ fn print_tunnel_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_host_candidate_filter_is_usable_sorted_and_deduplicated() {
+        let candidates = filtered_ipv4_host_candidates(
+            [
+                Ipv4Addr::new(10, 0, 0, 9),
+                Ipv4Addr::new(192, 168, 1, 2),
+                Ipv4Addr::new(10, 0, 0, 9),
+                Ipv4Addr::LOCALHOST,
+                Ipv4Addr::UNSPECIFIED,
+                Ipv4Addr::new(224, 0, 0, 1),
+                Ipv4Addr::BROADCAST,
+            ],
+            42000,
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                "10.0.0.9:42000".parse().unwrap(),
+                "192.168.1.2:42000".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn ice_candidate_composition_preserves_priority_and_enforces_limit() {
+        let candidates = compose_ice_candidates(
+            &["198.51.100.9:42000".to_owned()],
+            Some("192.168.1.4:42000".parse().unwrap()),
+            Some((
+                "203.0.113.7:5000".parse().unwrap(),
+                "192.168.1.4:42000".parse().unwrap(),
+            )),
+            vec![
+                "192.168.1.3:42000".parse().unwrap(),
+                "192.168.1.5:42000".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            candidates,
+            vec![
+                "198.51.100.9:42000",
+                "srflx://203.0.113.7:5000|192.168.1.4:42000",
+                "192.168.1.4:42000",
+                "192.168.1.3:42000",
+                "192.168.1.5:42000",
+            ]
+        );
+        let many = (1..=12)
+            .map(|last| Ipv4Addr::new(10, 0, 0, last))
+            .collect::<Vec<_>>();
+        let truncated =
+            compose_ice_candidates(&[], None, None, filtered_ipv4_host_candidates(many, 42000))
+                .unwrap();
+        assert_eq!(truncated.len(), 8);
+        let nine_explicit = (1..=9)
+            .map(|port| format!("192.0.2.1:{port}"))
+            .collect::<Vec<_>>();
+        assert!(compose_ice_candidates(&nine_explicit, None, None, Vec::new()).is_err());
+        assert_eq!(
+            compose_ice_candidates(
+                &[
+                    "198.51.100.9:42000".to_owned(),
+                    "198.51.100.9:42000".to_owned()
+                ],
+                None,
+                None,
+                Vec::new(),
+            )
+            .unwrap(),
+            vec!["198.51.100.9:42000"]
+        );
+    }
 
     #[test]
     fn route_probe_selects_local_interface_and_preserves_tunnel_port() {
@@ -2612,6 +2755,7 @@ mod tests {
                 credentials,
                 socket: iced.socket,
                 router: iced.ice_router,
+                local_socket_addr: local,
                 local_candidates: vec![mini_tunnel_agent::candidate::SignaledCandidate {
                     address: local,
                     transport: mini_tunnel_agent::candidate::CandidateTransport::Udp,

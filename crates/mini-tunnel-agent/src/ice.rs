@@ -739,6 +739,33 @@ impl IceAgentDriver {
         controlling: bool,
         now: Instant,
     ) -> Result<Self, IceDriverError> {
+        let local_socket_addr = local_candidates
+            .first()
+            .map(|candidate| candidate.address)
+            .ok_or_else(|| {
+                IceDriverError::Agent("local and remote ICE candidates are required".to_owned())
+            })?;
+        Self::for_peer_with_candidates_on_socket(
+            local_socket_addr,
+            local_credentials,
+            remote_credentials,
+            local_candidates,
+            remote_candidates,
+            controlling,
+            now,
+        )
+    }
+
+    /// Build a session using an explicit bound socket address distinct from advertised candidates.
+    pub fn for_peer_with_candidates_on_socket(
+        local_socket_addr: SocketAddr,
+        local_credentials: &IceCredentials,
+        remote_credentials: &IceCredentials,
+        local_candidates: &[SignaledCandidate],
+        remote_candidates: &[SignaledCandidate],
+        controlling: bool,
+        now: Instant,
+    ) -> Result<Self, IceDriverError> {
         if local_credentials.generation == 0 || remote_credentials.generation == 0 {
             return Err(IceDriverError::Agent(
                 "ICE credential generations must be greater than zero".to_owned(),
@@ -753,6 +780,17 @@ impl IceAgentDriver {
             .map_err(|error| IceDriverError::Agent(error.to_string()))?;
         let mut agent = Agent::new(now, Arc::new(agent_config(local_credentials)), crypto)
             .map_err(|error| IceDriverError::Agent(error.to_string()))?;
+        if !local_candidates
+            .iter()
+            .any(|candidate| candidate.address == local_socket_addr)
+        {
+            // The socket wrapper currently reports one local address for every received packet.
+            // Keep an internal bind-address candidate so rtc-ice can associate inbound checks even
+            // when the socket is wildcard-bound; this address is never signaled to remote peers.
+            agent
+                .add_local_candidate(host_candidate(local_socket_addr)?)
+                .map_err(|error| IceDriverError::Agent(error.to_string()))?;
+        }
         for candidate in local_candidates {
             agent
                 .add_local_candidate(ice_candidate(*candidate)?)
@@ -771,7 +809,7 @@ impl IceAgentDriver {
                 remote_credentials.password.clone(),
             )
             .map_err(|error| IceDriverError::Agent(error.to_string()))?;
-        Ok(Self::new(agent, local_candidates[0].address))
+        Ok(Self::new(agent, local_socket_addr))
     }
 
     /// Feed one datagram to ICE. `false` means it was not a complete STUN message envelope.
@@ -981,6 +1019,47 @@ mod tests {
         let related = built.related_address().expect("related address");
         assert_eq!(related.address, "192.168.1.4");
         assert_eq!(related.port, 4000);
+    }
+
+    #[test]
+    fn typed_candidates_use_the_actual_socket_address_for_datagram_context() {
+        let local_credentials = generate_ice_credentials(1).expect("local credentials");
+        let remote_credentials = generate_ice_credentials(1).expect("remote credentials");
+        let local_candidate = SignaledCandidate {
+            address: "127.0.0.1:4000".parse().unwrap(),
+            transport: crate::candidate::CandidateTransport::Udp,
+            candidate_type: SignaledCandidateType::Host,
+        };
+        let remote_candidate = SignaledCandidate {
+            address: "127.0.0.1:5000".parse().unwrap(),
+            transport: crate::candidate::CandidateTransport::Udp,
+            candidate_type: SignaledCandidateType::Host,
+        };
+        let driver = IceAgentDriver::for_peer_with_candidates_on_socket(
+            "0.0.0.0:4000".parse().unwrap(),
+            &local_credentials,
+            &remote_credentials,
+            &[local_candidate],
+            &[remote_candidate],
+            true,
+            Instant::now(),
+        )
+        .expect("create ICE driver");
+        assert_eq!(driver.local_addr, "0.0.0.0:4000".parse().unwrap());
+        assert!(
+            driver
+                .agent
+                .get_local_candidates()
+                .iter()
+                .any(|candidate| { candidate.addr() == "0.0.0.0:4000".parse().unwrap() })
+        );
+        assert!(
+            driver
+                .agent
+                .get_local_candidates()
+                .iter()
+                .any(|candidate| { candidate.addr() == "127.0.0.1:4000".parse().unwrap() })
+        );
     }
 
     fn valid_ice_char(byte: u8) -> bool {
