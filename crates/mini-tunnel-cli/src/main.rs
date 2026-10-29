@@ -2146,8 +2146,8 @@ async fn create_tunnel_endpoint(
             }
             _ => bound_address,
         };
-        let gathered_hosts = if bound_address.ip().is_unspecified() && bound_address.is_ipv4() {
-            local_interface_ipv4_candidates(bound_address.port())?
+        let gathered_hosts = if bound_address.ip().is_unspecified() {
+            local_interface_host_candidates(bound_address)?
         } else {
             Vec::new()
         };
@@ -2307,20 +2307,21 @@ fn route_selected_local_address(
     Ok(SocketAddr::new(selected.ip(), port))
 }
 
-fn local_interface_ipv4_candidates(port: u16) -> std::io::Result<Vec<SocketAddr>> {
+fn local_interface_host_candidates(bound_address: SocketAddr) -> std::io::Result<Vec<SocketAddr>> {
     let interfaces = if_addrs::get_if_addrs()?;
     let addresses = interfaces
         .into_iter()
         .filter(|interface| interface.is_oper_up() && !interface.is_loopback())
-        .filter_map(|interface| match interface.addr {
-            if_addrs::IfAddr::V4(address) => Some(address.ip),
-            if_addrs::IfAddr::V6(_) => None,
+        .filter_map(|interface| match (bound_address, interface.addr) {
+            (SocketAddr::V4(_), if_addrs::IfAddr::V4(address)) => Some(address.ip.into()),
+            (SocketAddr::V6(_), if_addrs::IfAddr::V6(address)) => Some(address.ip.into()),
+            _ => None,
         });
-    Ok(filtered_ipv4_host_candidates(addresses, port))
+    Ok(filtered_host_candidates(addresses, bound_address.port()))
 }
 
-fn filtered_ipv4_host_candidates(
-    addresses: impl IntoIterator<Item = Ipv4Addr>,
+fn filtered_host_candidates(
+    addresses: impl IntoIterator<Item = std::net::IpAddr>,
     port: u16,
 ) -> Vec<SocketAddr> {
     let mut candidates = addresses
@@ -2329,9 +2330,12 @@ fn filtered_ipv4_host_candidates(
             !address.is_unspecified()
                 && !address.is_loopback()
                 && !address.is_multicast()
-                && !address.is_broadcast()
+                && match address {
+                    std::net::IpAddr::V4(address) => !address.is_broadcast(),
+                    std::net::IpAddr::V6(address) => !address.is_unicast_link_local(),
+                }
         })
-        .map(|address| SocketAddr::new(address.into(), port))
+        .map(|address| SocketAddr::new(address, port))
         .collect::<Vec<_>>();
     candidates.sort();
     candidates.dedup();
@@ -2516,16 +2520,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn local_host_candidate_filter_is_usable_sorted_and_deduplicated() {
-        let candidates = filtered_ipv4_host_candidates(
+    fn ipv4_host_candidate_filter_is_usable_sorted_and_deduplicated() {
+        let candidates = filtered_host_candidates(
             [
-                Ipv4Addr::new(10, 0, 0, 9),
-                Ipv4Addr::new(192, 168, 1, 2),
-                Ipv4Addr::new(10, 0, 0, 9),
-                Ipv4Addr::LOCALHOST,
-                Ipv4Addr::UNSPECIFIED,
-                Ipv4Addr::new(224, 0, 0, 1),
-                Ipv4Addr::BROADCAST,
+                Ipv4Addr::new(10, 0, 0, 9).into(),
+                Ipv4Addr::new(192, 168, 1, 2).into(),
+                Ipv4Addr::new(10, 0, 0, 9).into(),
+                Ipv4Addr::LOCALHOST.into(),
+                Ipv4Addr::UNSPECIFIED.into(),
+                Ipv4Addr::new(224, 0, 0, 1).into(),
+                Ipv4Addr::BROADCAST.into(),
             ],
             42000,
         );
@@ -2534,6 +2538,29 @@ mod tests {
             vec![
                 "10.0.0.9:42000".parse().unwrap(),
                 "192.168.1.2:42000".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn ipv6_host_candidate_filter_excludes_scoped_and_non_unicast_addresses() {
+        let candidates = filtered_host_candidates(
+            [
+                "2001:db8::2".parse().unwrap(),
+                "fd00::2".parse().unwrap(),
+                "2001:db8::2".parse().unwrap(),
+                "::1".parse().unwrap(),
+                "::".parse().unwrap(),
+                "ff02::1".parse().unwrap(),
+                "fe80::1".parse().unwrap(),
+            ],
+            42000,
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                "[2001:db8::2]:42000".parse().unwrap(),
+                "[fd00::2]:42000".parse().unwrap(),
             ]
         );
     }
@@ -2566,9 +2593,13 @@ mod tests {
         let many = (1..=12)
             .map(|last| Ipv4Addr::new(10, 0, 0, last))
             .collect::<Vec<_>>();
-        let truncated =
-            compose_ice_candidates(&[], None, None, filtered_ipv4_host_candidates(many, 42000))
-                .unwrap();
+        let truncated = compose_ice_candidates(
+            &[],
+            None,
+            None,
+            filtered_host_candidates(many.into_iter().map(Into::into), 42000),
+        )
+        .unwrap();
         assert_eq!(truncated.len(), 8);
         let nine_explicit = (1..=9)
             .map(|port| format!("192.0.2.1:{port}"))
