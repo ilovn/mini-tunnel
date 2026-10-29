@@ -195,7 +195,12 @@ impl rcgen::SigningKey for IdentityCertificateKey<'_> {
 }
 
 const MAX_PACKET_PAYLOAD: usize = 1175;
+const MAX_TUN_PACKET: usize = 9000;
 const FRAME_HEADER_LEN: usize = 25;
+const FRAGMENT_HEADER_LEN: usize = 16;
+const MAX_PACKET_FRAGMENTS: usize = 64;
+const MAX_INCOMPLETE_PACKETS: usize = 4;
+const FRAGMENT_TTL: Duration = Duration::from_secs(5);
 const PEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const UDP_CANDIDATE_TIMEOUT: Duration = Duration::from_secs(2);
 const TCP_CANDIDATE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -238,7 +243,9 @@ pub struct PeerChannel {
     relay: bool,
     network_tag: [u8; 16],
     next_packet: Mutex<u64>,
+    send_lock: tokio::sync::Mutex<()>,
     replay_window: Mutex<ReplayWindow>,
+    fragments: Mutex<FragmentReassembler>,
     health: Mutex<PeerHealth>,
 }
 
@@ -258,6 +265,107 @@ struct PeerHealth {
     outstanding: HashMap<u64, Instant>,
     probes_succeeded: u64,
     probes_missed: u64,
+}
+
+#[derive(Default)]
+struct FragmentReassembler {
+    packets: HashMap<u64, FragmentAssembly>,
+}
+
+struct FragmentAssembly {
+    created: Instant,
+    total_len: usize,
+    chunk_size: usize,
+    chunks: Vec<Option<Vec<u8>>>,
+    received: usize,
+}
+
+struct DecodedFrame<'a> {
+    sequence: u64,
+    payload: &'a [u8],
+    fragment: Option<DecodedFragment<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct DecodedFragment<'a> {
+    packet_id: u64,
+    index: usize,
+    count: usize,
+    total_len: usize,
+    chunk_size: usize,
+    payload: &'a [u8],
+}
+
+impl FragmentReassembler {
+    fn accept(&mut self, fragment: DecodedFragment<'_>) -> Result<Option<Vec<u8>>, IdentityError> {
+        self.packets
+            .retain(|_, packet| packet.created.elapsed() < FRAGMENT_TTL);
+        let expected_count = fragment.total_len.div_ceil(fragment.chunk_size.max(1));
+        let expected_len = if fragment.index + 1 == fragment.count {
+            fragment
+                .total_len
+                .saturating_sub(fragment.chunk_size * fragment.index)
+        } else {
+            fragment.chunk_size
+        };
+        if fragment.count < 2
+            || fragment.count > MAX_PACKET_FRAGMENTS
+            || fragment.index >= fragment.count
+            || fragment.total_len == 0
+            || fragment.total_len > MAX_TUN_PACKET
+            || fragment.chunk_size == 0
+            || expected_count != fragment.count
+            || fragment.payload.len() != expected_len
+        {
+            self.packets.remove(&fragment.packet_id);
+            return Err(IdentityError::InvalidFrame);
+        }
+        if !self.packets.contains_key(&fragment.packet_id)
+            && self.packets.len() >= MAX_INCOMPLETE_PACKETS
+            && let Some(oldest) = self
+                .packets
+                .iter()
+                .min_by_key(|(_, packet)| packet.created)
+                .map(|(id, _)| *id)
+        {
+            self.packets.remove(&oldest);
+        }
+        let assembly = self
+            .packets
+            .entry(fragment.packet_id)
+            .or_insert_with(|| FragmentAssembly {
+                created: Instant::now(),
+                total_len: fragment.total_len,
+                chunk_size: fragment.chunk_size,
+                chunks: vec![None; fragment.count],
+                received: 0,
+            });
+        if assembly.total_len != fragment.total_len
+            || assembly.chunk_size != fragment.chunk_size
+            || assembly.chunks.len() != fragment.count
+            || assembly.chunks[fragment.index].is_some()
+        {
+            self.packets.remove(&fragment.packet_id);
+            return Err(IdentityError::InvalidFrame);
+        }
+        assembly.received += fragment.payload.len();
+        assembly.chunks[fragment.index] = Some(fragment.payload.to_vec());
+        if assembly.chunks.iter().any(Option::is_none) {
+            return Ok(None);
+        }
+        let mut assembly = self
+            .packets
+            .remove(&fragment.packet_id)
+            .ok_or(IdentityError::InvalidFrame)?;
+        let mut packet = Vec::with_capacity(assembly.total_len);
+        for chunk in assembly.chunks.drain(..) {
+            packet.extend_from_slice(&chunk.ok_or(IdentityError::InvalidFrame)?);
+        }
+        if packet.len() != assembly.total_len || assembly.received != assembly.total_len {
+            return Err(IdentityError::InvalidFrame);
+        }
+        Ok(Some(packet))
+    }
 }
 
 impl PeerChannel {
@@ -287,21 +395,68 @@ impl PeerChannel {
         }
     }
 
-    /// Send one bounded packet over QUIC DATAGRAM or a length-framed TLS/TCP stream.
+    /// Send one bounded packet, fragmenting it when the transport frame cannot carry it whole.
     pub async fn send_packet(&self, payload: &[u8]) -> Result<(), IdentityError> {
-        if payload.len() > MAX_PACKET_PAYLOAD {
+        let _send_guard = self.send_lock.lock().await;
+        if payload.len() > MAX_TUN_PACKET {
             return Err(IdentityError::InvalidFrame);
         }
-        let sequence = {
-            let mut next_packet = self
-                .next_packet
-                .lock()
-                .map_err(|_| IdentityError::InvalidFrame)?;
-            let sequence = *next_packet;
-            *next_packet = sequence.checked_add(1).ok_or(IdentityError::InvalidFrame)?;
-            sequence
+        let transport_limit = match &self.transport {
+            PeerTransport::Quic(connection) => connection
+                .max_datagram_size()
+                .ok_or(IdentityError::InvalidFrame)?,
+            PeerTransport::Tcp(_) => FRAME_HEADER_LEN + MAX_PACKET_PAYLOAD,
         };
-        let frame = encode_frame(self.network_tag, sequence, payload);
+        let single_capacity = transport_limit.saturating_sub(FRAME_HEADER_LEN);
+        if payload.len() <= single_capacity {
+            let sequence = self.reserve_sequences(1)?;
+            let frame = encode_frame(self.network_tag, sequence, payload);
+            return self.send_frame(frame).await;
+        }
+        let fragment_capacity = transport_limit
+            .saturating_sub(FRAME_HEADER_LEN + FRAGMENT_HEADER_LEN)
+            .min(MAX_PACKET_PAYLOAD - FRAGMENT_HEADER_LEN);
+        if fragment_capacity == 0 {
+            return Err(IdentityError::InvalidFrame);
+        }
+        let count = payload.len().div_ceil(fragment_capacity);
+        if count > MAX_PACKET_FRAGMENTS {
+            return Err(IdentityError::InvalidFrame);
+        }
+        let first_sequence = self.reserve_sequences(count)?;
+        let total_len = u16::try_from(payload.len()).map_err(|_| IdentityError::InvalidFrame)?;
+        let chunk_size =
+            u16::try_from(fragment_capacity).map_err(|_| IdentityError::InvalidFrame)?;
+        for (index, chunk) in payload.chunks(fragment_capacity).enumerate() {
+            let sequence = first_sequence + index as u64;
+            let frame = encode_fragment_frame(
+                self.network_tag,
+                sequence,
+                first_sequence,
+                index,
+                count,
+                total_len,
+                chunk_size,
+                chunk,
+            );
+            self.send_frame(frame).await?;
+        }
+        Ok(())
+    }
+
+    fn reserve_sequences(&self, count: usize) -> Result<u64, IdentityError> {
+        let mut next_packet = self
+            .next_packet
+            .lock()
+            .map_err(|_| IdentityError::InvalidFrame)?;
+        let first = *next_packet;
+        *next_packet = next_packet
+            .checked_add(count as u64)
+            .ok_or(IdentityError::InvalidFrame)?;
+        Ok(first)
+    }
+
+    async fn send_frame(&self, frame: Vec<u8>) -> Result<(), IdentityError> {
         match &self.transport {
             PeerTransport::Quic(connection) => {
                 if connection
@@ -416,62 +571,78 @@ impl PeerChannel {
         Ok(maximum_rtt)
     }
 
-    /// Receive one authenticated frame, rejecting malformed, cross-network, and replayed data.
+    /// Receive one authenticated packet, reassembling bounded transport fragments as needed.
     pub async fn recv_packet(&self) -> Result<Vec<u8>, IdentityError> {
-        let frame = match &self.transport {
-            PeerTransport::Quic(connection) => connection
-                .read_datagram()
-                .await
-                .map_err(|error| IdentityError::Transport(error.to_string()))?
-                .to_vec(),
-            PeerTransport::Tcp(transport) => {
-                let mut receiver = transport.receiver.lock().await;
-                let frame_len = receiver
-                    .read_u32()
+        loop {
+            let frame = match &self.transport {
+                PeerTransport::Quic(connection) => connection
+                    .read_datagram()
                     .await
                     .map_err(|error| IdentityError::Transport(error.to_string()))?
-                    as usize;
-                if !(FRAME_HEADER_LEN..=FRAME_HEADER_LEN + MAX_PACKET_PAYLOAD).contains(&frame_len)
-                {
-                    return Err(IdentityError::InvalidFrame);
+                    .to_vec(),
+                PeerTransport::Tcp(transport) => {
+                    let mut receiver = transport.receiver.lock().await;
+                    let frame_len = receiver
+                        .read_u32()
+                        .await
+                        .map_err(|error| IdentityError::Transport(error.to_string()))?
+                        as usize;
+                    if !(FRAME_HEADER_LEN..=FRAME_HEADER_LEN + MAX_PACKET_PAYLOAD)
+                        .contains(&frame_len)
+                    {
+                        return Err(IdentityError::InvalidFrame);
+                    }
+                    let mut frame = vec![0; frame_len];
+                    receiver
+                        .read_exact(&mut frame)
+                        .await
+                        .map_err(|error| IdentityError::Transport(error.to_string()))?;
+                    frame
                 }
-                let mut frame = vec![0; frame_len];
-                receiver
-                    .read_exact(&mut frame)
-                    .await
-                    .map_err(|error| IdentityError::Transport(error.to_string()))?;
-                frame
-            }
-        };
-        let (sequence, payload) =
-            decode_frame(&frame, self.network_tag).ok_or(IdentityError::InvalidFrame)?;
-        if !self
-            .replay_window
-            .lock()
-            .map_err(|_| IdentityError::InvalidFrame)?
-            .accept(sequence)
-        {
-            return Err(IdentityError::InvalidFrame);
-        }
-        if payload.len() == 9 && matches!(payload[0], HEALTH_PING | HEALTH_PONG) {
-            let nonce = u64::from_be_bytes(
-                payload[1..9]
-                    .try_into()
-                    .map_err(|_| IdentityError::InvalidFrame)?,
-            );
-            if payload[0] == HEALTH_PING {
-                let mut pong = payload.to_vec();
-                pong[0] = HEALTH_PONG;
-                self.send_packet(&pong).await?;
-            } else if let Ok(mut health) = self.health.lock()
-                && let Some(sent_at) = health.outstanding.remove(&nonce)
+            };
+            let decoded =
+                decode_any_frame(&frame, self.network_tag).ok_or(IdentityError::InvalidFrame)?;
+            let sequence = decoded.sequence;
+            if !self
+                .replay_window
+                .lock()
+                .map_err(|_| IdentityError::InvalidFrame)?
+                .accept(sequence)
             {
-                health.rtt = Some(sent_at.elapsed());
-                health.probes_succeeded = health.probes_succeeded.saturating_add(1);
+                return Err(IdentityError::InvalidFrame);
             }
-            return Ok(Vec::new());
+            let payload = match decoded.fragment {
+                Some(fragment) => {
+                    let packet = self
+                        .fragments
+                        .lock()
+                        .map_err(|_| IdentityError::InvalidFrame)?
+                        .accept(fragment)?;
+                    let Some(packet) = packet else { continue };
+                    packet
+                }
+                None => decoded.payload.to_vec(),
+            };
+            if payload.len() == 9 && matches!(payload[0], HEALTH_PING | HEALTH_PONG) {
+                let nonce = u64::from_be_bytes(
+                    payload[1..9]
+                        .try_into()
+                        .map_err(|_| IdentityError::InvalidFrame)?,
+                );
+                if payload[0] == HEALTH_PING {
+                    let mut pong = payload.to_vec();
+                    pong[0] = HEALTH_PONG;
+                    self.send_packet(&pong).await?;
+                } else if let Ok(mut health) = self.health.lock()
+                    && let Some(sent_at) = health.outstanding.remove(&nonce)
+                {
+                    health.rtt = Some(sent_at.elapsed());
+                    health.probes_succeeded = health.probes_succeeded.saturating_add(1);
+                }
+                return Ok(Vec::new());
+            }
+            return Ok(payload);
         }
-        Ok(payload.to_vec())
     }
 }
 
@@ -1109,7 +1280,9 @@ fn new_channel(connection: Connection, network_id: &str) -> PeerChannel {
         relay: false,
         network_tag,
         next_packet: Mutex::new(0),
+        send_lock: tokio::sync::Mutex::new(()),
         replay_window: Mutex::new(ReplayWindow::default()),
+        fragments: Mutex::new(FragmentReassembler::default()),
         health: Mutex::new(PeerHealth::default()),
     }
 }
@@ -1132,7 +1305,9 @@ fn new_tcp_channel(
         relay: false,
         network_tag,
         next_packet: Mutex::new(0),
+        send_lock: tokio::sync::Mutex::new(()),
         replay_window: Mutex::new(ReplayWindow::default()),
+        fragments: Mutex::new(FragmentReassembler::default()),
         health: Mutex::new(PeerHealth::default()),
     }
 }
@@ -1464,18 +1639,67 @@ fn encode_frame(network_tag: [u8; 16], sequence: u64, payload: &[u8]) -> Vec<u8>
     frame
 }
 
-fn decode_frame(frame: &[u8], network_tag: [u8; 16]) -> Option<(u64, &[u8])> {
-    if frame.len() < FRAME_HEADER_LEN
-        || frame.len() > FRAME_HEADER_LEN + MAX_PACKET_PAYLOAD
-        || frame[0] != 1
-        || frame[1..17] != network_tag
-    {
+#[allow(clippy::too_many_arguments)]
+fn encode_fragment_frame(
+    network_tag: [u8; 16],
+    sequence: u64,
+    packet_id: u64,
+    index: usize,
+    count: usize,
+    total_len: u16,
+    chunk_size: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + FRAGMENT_HEADER_LEN + payload.len());
+    frame.push(2);
+    frame.extend_from_slice(&network_tag);
+    frame.extend_from_slice(&sequence.to_be_bytes());
+    frame.extend_from_slice(&packet_id.to_be_bytes());
+    frame.extend_from_slice(&(index as u16).to_be_bytes());
+    frame.extend_from_slice(&(count as u16).to_be_bytes());
+    frame.extend_from_slice(&total_len.to_be_bytes());
+    frame.extend_from_slice(&chunk_size.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+fn decode_any_frame(frame: &[u8], network_tag: [u8; 16]) -> Option<DecodedFrame<'_>> {
+    if frame.len() < FRAME_HEADER_LEN || frame[1..17] != network_tag {
         return None;
     }
-    Some((
-        u64::from_be_bytes(frame[17..25].try_into().ok()?),
-        &frame[FRAME_HEADER_LEN..],
-    ))
+    let sequence = u64::from_be_bytes(frame[17..25].try_into().ok()?);
+    match frame[0] {
+        1 if frame.len() <= FRAME_HEADER_LEN + MAX_PACKET_PAYLOAD => Some(DecodedFrame {
+            sequence,
+            payload: &frame[FRAME_HEADER_LEN..],
+            fragment: None,
+        }),
+        2 if frame.len() > FRAME_HEADER_LEN + FRAGMENT_HEADER_LEN
+            && frame.len() <= FRAME_HEADER_LEN + MAX_PACKET_PAYLOAD =>
+        {
+            let packet_id = u64::from_be_bytes(frame[25..33].try_into().ok()?);
+            let index = usize::from(u16::from_be_bytes(frame[33..35].try_into().ok()?));
+            let count = usize::from(u16::from_be_bytes(frame[35..37].try_into().ok()?));
+            let total_len = usize::from(u16::from_be_bytes(frame[37..39].try_into().ok()?));
+            let chunk_size = usize::from(u16::from_be_bytes(frame[39..41].try_into().ok()?));
+            if packet_id.checked_add(index as u64)? != sequence {
+                return None;
+            }
+            Some(DecodedFrame {
+                sequence,
+                payload: &[],
+                fragment: Some(DecodedFragment {
+                    packet_id,
+                    index,
+                    count,
+                    total_len,
+                    chunk_size,
+                    payload: &frame[FRAME_HEADER_LEN + FRAGMENT_HEADER_LEN..],
+                }),
+            })
+        }
+        _ => None,
+    }
 }
 
 #[derive(Default)]
@@ -1619,10 +1843,17 @@ mod tests {
             channel_b.recv_packet().await.expect("receive packet"),
             b"overlay-ip-packet"
         );
+        let large_packet = (0..4096).map(|byte| (byte % 251) as u8).collect::<Vec<_>>();
+        channel_a
+            .send_packet(&large_packet)
+            .await
+            .expect("send fragmented IPv6-sized packet");
+        assert_eq!(
+            channel_b.recv_packet().await.expect("reassemble packet"),
+            large_packet
+        );
         assert!(matches!(
-            channel_a
-                .send_packet(&vec![0; MAX_PACKET_PAYLOAD + 1])
-                .await,
+            channel_a.send_packet(&vec![0; MAX_TUN_PACKET + 1]).await,
             Err(IdentityError::InvalidFrame)
         ));
         endpoint_a.close(0_u32.into(), b"test complete");
@@ -1743,6 +1974,18 @@ mod tests {
             channel_b.recv_packet().await.expect("receive TCP frame"),
             b"reliable overlay packet"
         );
+        let large_packet = (0..4096).map(|byte| (byte % 239) as u8).collect::<Vec<_>>();
+        channel_a
+            .send_packet(&large_packet)
+            .await
+            .expect("send fragmented TCP packet");
+        assert_eq!(
+            channel_b
+                .recv_packet()
+                .await
+                .expect("reassemble TCP packet"),
+            large_packet
+        );
         assert!(
             channel_a
                 .recv_packet()
@@ -1752,9 +1995,7 @@ mod tests {
         );
         assert_eq!(channel_a.health_snapshot().probes_succeeded, 1);
         assert!(matches!(
-            channel_a
-                .send_packet(&vec![0; MAX_PACKET_PAYLOAD + 1])
-                .await,
+            channel_a.send_packet(&vec![0; MAX_TUN_PACKET + 1]).await,
             Err(IdentityError::InvalidFrame)
         ));
         let PeerTransport::Tcp(transport) = &channel_a.transport else {
@@ -2160,12 +2401,11 @@ mod tests {
     fn frame_decoder_rejects_cross_network_invalid_and_replayed_sequences() {
         let tag = [7_u8; 16];
         let frame = encode_frame(tag, 42, b"packet");
-        assert_eq!(
-            decode_frame(&frame, tag).expect("valid frame"),
-            (42, b"packet".as_slice())
-        );
-        assert!(decode_frame(&frame, [8_u8; 16]).is_none());
-        assert!(decode_frame(&[0; FRAME_HEADER_LEN], tag).is_none());
+        let decoded = decode_any_frame(&frame, tag).expect("valid frame");
+        assert_eq!(decoded.sequence, 42);
+        assert_eq!(decoded.payload, b"packet");
+        assert!(decode_any_frame(&frame, [8_u8; 16]).is_none());
+        assert!(decode_any_frame(&[0; FRAME_HEADER_LEN], tag).is_none());
         let mut window = ReplayWindow::default();
         assert!(window.accept(42));
         assert!(!window.accept(42));
@@ -2173,6 +2413,55 @@ mod tests {
         assert!(window.accept(43));
         assert!(window.accept(200));
         assert!(!window.accept(44));
+    }
+
+    #[test]
+    fn fragment_reassembly_is_bounded_and_rejects_duplicate_or_malformed_parts() {
+        let payload = (0..1280).map(|byte| (byte % 251) as u8).collect::<Vec<_>>();
+        let chunk_size = 700;
+        let chunks = payload.chunks(chunk_size).collect::<Vec<_>>();
+        let mut reassembler = FragmentReassembler::default();
+        let last = DecodedFragment {
+            packet_id: 100,
+            index: 1,
+            count: 2,
+            total_len: payload.len(),
+            chunk_size,
+            payload: chunks[1],
+        };
+        assert!(reassembler.accept(last).unwrap().is_none());
+        let first = DecodedFragment {
+            packet_id: 100,
+            index: 0,
+            count: 2,
+            total_len: payload.len(),
+            chunk_size,
+            payload: chunks[0],
+        };
+        assert_eq!(reassembler.accept(first).unwrap().unwrap(), payload);
+
+        let duplicate = DecodedFragment {
+            packet_id: 101,
+            index: 0,
+            count: 2,
+            total_len: payload.len(),
+            chunk_size,
+            payload: chunks[0],
+        };
+        reassembler.accept(duplicate).unwrap();
+        assert!(reassembler.accept(duplicate).is_err());
+        assert!(reassembler.packets.is_empty());
+
+        let oversized = DecodedFragment {
+            packet_id: 102,
+            index: 0,
+            count: 2,
+            total_len: MAX_TUN_PACKET + 1,
+            chunk_size,
+            payload: chunks[0],
+        };
+        assert!(reassembler.accept(oversized).is_err());
+        assert!(reassembler.packets.is_empty());
     }
 
     #[tokio::test]

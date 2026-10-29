@@ -311,7 +311,7 @@ enum TunnelCommand {
         local_ipv4: Option<Ipv4Addr>,
         #[arg(long)]
         prefix_len: Option<u8>,
-        #[arg(long, default_value_t = 1150)]
+        #[arg(long, default_value_t = 1280)]
         mtu: u16,
         /// Install and clean up /32 IPv4 and /128 IPv6 routes for the authenticated peer.
         #[arg(long)]
@@ -347,7 +347,7 @@ enum TunnelCommand {
         local_ipv4: Option<Ipv4Addr>,
         #[arg(long)]
         prefix_len: Option<u8>,
-        #[arg(long, default_value_t = 1150)]
+        #[arg(long, default_value_t = 1280)]
         mtu: u16,
         /// Install and clean up /32 IPv4 and /128 IPv6 routes for the authenticated peer.
         #[arg(long)]
@@ -384,7 +384,7 @@ enum TunnelCommand {
         local_ipv4: Option<Ipv4Addr>,
         #[arg(long)]
         prefix_len: Option<u8>,
-        #[arg(long, default_value_t = 1150)]
+        #[arg(long, default_value_t = 1280)]
         mtu: u16,
         /// Install and clean up /32 IPv4 and /128 IPv6 routes for every authenticated peer.
         #[arg(long)]

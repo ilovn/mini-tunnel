@@ -10,7 +10,8 @@ use thiserror::Error;
 const IPV4_MIN_HEADER_LEN: usize = 20;
 const IPV6_MIN_HEADER_LEN: usize = 40;
 const IPV4_MAX_PACKET_LEN: usize = u16::MAX as usize;
-const DEFAULT_TUN_MTU: u16 = (super::MAX_PACKET_PAYLOAD - super::FRAME_HEADER_LEN) as u16;
+const DEFAULT_TUN_MTU: u16 = 1280;
+const MAX_TUN_MTU: u16 = super::MAX_TUN_PACKET as u16;
 
 pub type Ipv4PacketError = IpPacketError;
 
@@ -69,10 +70,16 @@ impl TunConfig {
                 "IPv6 prefix length must be between 0 and 128",
             ));
         }
-        if !(576..=DEFAULT_TUN_MTU).contains(&self.mtu) {
+        if !(576..=MAX_TUN_MTU).contains(&self.mtu) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "TUN MTU must be between 576 and the current QUIC packet limit",
+                "TUN MTU must be between 576 and 9000 bytes",
+            ));
+        }
+        if self.local_ipv6.is_some() && self.mtu < 1280 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "IPv6 TUN MTU must be at least 1280 bytes",
             ));
         }
         Ok(())
@@ -429,11 +436,11 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
         config.prefix_len = 24;
-        config.mtu = 1151;
+        config.mtu = 9001;
         assert_eq!(
             config
                 .validate()
-                .expect_err("MTU exceeds current QUIC limit")
+                .expect_err("MTU exceeds packet safety limit")
                 .kind(),
             io::ErrorKind::InvalidInput
         );
@@ -442,10 +449,21 @@ mod tests {
             config.validate().expect_err("bad MTU").kind(),
             io::ErrorKind::InvalidInput
         );
-        config.mtu = 1150;
+        config.mtu = 1280;
         let config = config.with_ipv6("fd12:3456::1".parse().unwrap(), 129);
         assert_eq!(
             config.validate().expect_err("bad IPv6 prefix").kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let config =
+            TunConfig::ipv4(Ipv4Addr::LOCALHOST, 24).with_ipv6("fd12:3456::1".parse().unwrap(), 64);
+        let mut config = config;
+        config.mtu = 1279;
+        assert_eq!(
+            config
+                .validate()
+                .expect_err("IPv6 MTU below minimum")
+                .kind(),
             io::ErrorKind::InvalidInput
         );
     }
