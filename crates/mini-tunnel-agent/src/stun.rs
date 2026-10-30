@@ -342,7 +342,7 @@ mod tests {
             Self(fd)
         }
 
-        fn drain(&self) -> Vec<(std::net::Ipv4Addr, u16, std::net::Ipv4Addr, u16)> {
+        fn drain(&self) -> Vec<(u8, std::net::Ipv4Addr, u16, std::net::Ipv4Addr, u16)> {
             let mut packets = Vec::new();
             loop {
                 let mut packet = [0_u8; 2048];
@@ -362,25 +362,40 @@ mod tests {
                     panic!("read packet capture socket: {error}");
                 }
                 let packet = &packet[..length as usize];
-                if packet.len() < 20 || packet[0] >> 4 != 4 || packet[9] != libc::IPPROTO_UDP as u8
-                {
+                if packet.len() < 20 || packet[0] >> 4 != 4 {
                     continue;
                 }
                 let ip_header_length = usize::from(packet[0] & 0x0f) * 4;
-                if ip_header_length < 20 || packet.len() < ip_header_length + 8 {
+                if ip_header_length < 20 || packet.len() < ip_header_length {
                     continue;
                 }
                 let source =
                     std::net::Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
                 let destination =
                     std::net::Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
-                let source_port =
-                    u16::from_be_bytes([packet[ip_header_length], packet[ip_header_length + 1]]);
-                let destination_port = u16::from_be_bytes([
-                    packet[ip_header_length + 2],
-                    packet[ip_header_length + 3],
-                ]);
-                packets.push((source, source_port, destination, destination_port));
+                let (source_port, destination_port) = if packet[9] == libc::IPPROTO_UDP as u8
+                    && packet.len() >= ip_header_length + 8
+                {
+                    (
+                        u16::from_be_bytes([
+                            packet[ip_header_length],
+                            packet[ip_header_length + 1],
+                        ]),
+                        u16::from_be_bytes([
+                            packet[ip_header_length + 2],
+                            packet[ip_header_length + 3],
+                        ]),
+                    )
+                } else {
+                    (0, 0)
+                };
+                packets.push((
+                    packet[9],
+                    source,
+                    source_port,
+                    destination,
+                    destination_port,
+                ));
             }
             packets
         }
