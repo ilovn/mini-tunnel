@@ -2415,6 +2415,7 @@ mod tests {
             .await
             .expect("direct UDP health probes did not complete")
             .expect("join direct UDP accept task");
+        tokio::time::sleep(Duration::from_millis(50)).await;
         outbound_tx
             .send(packet(local_ip, peer_ip, 28))
             .await
