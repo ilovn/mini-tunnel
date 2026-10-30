@@ -1078,6 +1078,18 @@ mod tests {
 
         let selected_a = driver_a.selected_pair();
         let selected_b = driver_b.selected_pair();
+        let (send_a, send_b) = tokio::join!(
+            socket_a.send_to(b"diagnostic-from-a", mapped_b),
+            socket_b.send_to(b"diagnostic-from-b", mapped_a),
+        );
+        eprintln!("dual-SNAT raw probes sent: A={send_a:?} B={send_b:?}");
+        let mut raw_a = [0; 64];
+        let mut raw_b = [0; 64];
+        let (raw_received_a, raw_received_b) = tokio::join!(
+            tokio::time::timeout(Duration::from_millis(250), socket_a.recv_from(&mut raw_a),),
+            tokio::time::timeout(Duration::from_millis(250), socket_b.recv_from(&mut raw_b),),
+        );
+        eprintln!("dual-SNAT raw probes received: A={raw_received_a:?} B={raw_received_b:?}");
         eprintln!(
             "dual-SNAT ICE: mapped A={mapped_a} B={mapped_b}, host A={host_a} B={host_b}, sent A={sent_a} targets={targets_a:?} B={sent_b} targets={targets_b:?}, failed A={failed_candidates_a:?} B={failed_candidates_b:?}, received A={received_a:?} B={received_b:?}, selected A={selected_a:?} B={selected_b:?}"
         );
