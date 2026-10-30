@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
     process::ExitCode,
@@ -617,7 +618,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 eprintln!("relay metrics listening on {metrics_listen}");
                 let result = relay
                     .run_until(listener, async {
-                        if let Err(error) = tokio::signal::ctrl_c().await {
+                        if let Err(error) = shutdown_signal().await {
                             eprintln!("could not listen for shutdown signal: {error}");
                         }
                     })
@@ -1395,11 +1396,39 @@ fn now_ms() -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         .try_into()?)
 }
 
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let terminate_received = async move {
+            terminate.recv().await;
+            Ok(())
+        };
+        select_shutdown_signal(tokio::signal::ctrl_c(), terminate_received).await
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
+async fn select_shutdown_signal<C, T>(ctrl_c: C, terminate: T) -> std::io::Result<()>
+where
+    C: Future<Output = std::io::Result<()>>,
+    T: Future<Output = std::io::Result<()>>,
+{
+    tokio::select! {
+        result = ctrl_c => result,
+        result = terminate => result,
+    }
+}
+
 async fn wait_reconnect(attempt: u32) -> bool {
     let delay = mini_tunnel_agent::reconnect_delay(attempt);
     eprintln!("Retrying peer connection in {:.2}s", delay.as_secs_f32());
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => false,
+        _ = shutdown_signal() => false,
         _ = tokio::time::sleep(delay) => true,
     }
 }
@@ -1555,7 +1584,7 @@ async fn run_peer_tunnel(
     tokio::pin!(revocation);
     let tunnel_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = tokio::select! {
         result = &mut pump => result.map_err(Into::into),
-        signal = tokio::signal::ctrl_c() => {
+        signal = shutdown_signal() => {
             let result = signal.map_err(Into::into);
             let _ = shutdown_tx.send(mini_tunnel_agent::tunnel::MeshPeerUpdate::Remove(peer_ipv4)).await;
             drop(shutdown_tx);
@@ -2385,7 +2414,7 @@ async fn run_peer_mesh(
     let tunnel_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = loop {
         tokio::select! {
             result = &mut pump => break result.map_err(Into::into),
-            signal = tokio::signal::ctrl_c() => break signal.map_err(Into::into),
+            signal = shutdown_signal() => break signal.map_err(Into::into),
             update = async {
                 match updates_open {
                     true => updates.recv().await,
@@ -2952,6 +2981,23 @@ fn print_tunnel_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_signal_accepts_either_signal_source() {
+        let result = select_shutdown_signal(
+            std::future::pending(),
+            std::future::ready(Ok::<(), std::io::Error>(())),
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let result = select_shutdown_signal(
+            std::future::ready(Ok::<(), std::io::Error>(())),
+            std::future::pending(),
+        )
+        .await;
+        assert!(result.is_ok());
+    }
 
     #[test]
     fn single_peer_tunnel_commands_accept_optional_relay_endpoint() {
