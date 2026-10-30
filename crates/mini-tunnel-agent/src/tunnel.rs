@@ -1142,6 +1142,131 @@ mod tests {
         fs::remove_dir_all(temp).expect("remove test identities");
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires root privileges, iproute2, and tc netem"]
+    async fn privileged_linux_veth_udp_loss_triggers_mesh_tcp_fallback() {
+        let (mut link, local_address, remote_address) = TestVethPair::create();
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-veth-fallback-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let a = Arc::new(Identity::load_or_create_at(temp.join("a/device.key")).unwrap());
+        let b = Arc::new(Identity::load_or_create_at(temp.join("b/device.key")).unwrap());
+        let endpoint_a = peer_endpoint(&a, local_address).expect("endpoint A");
+        let endpoint_b = peer_endpoint(&b, remote_address).expect("endpoint B");
+        let network = "veth-loss-fallback";
+        let a_id = a.device_id();
+        let a_key = a.public_key();
+        let b_id = b.device_id();
+        let b_key = b.public_key();
+        let server_endpoint = endpoint_b.clone();
+        let server_identity = Arc::clone(&b);
+        let accept_udp = tokio::spawn(async move {
+            accept_peer(&server_endpoint, network, &server_identity, &a_id, a_key).await
+        });
+        let initial = Arc::new(
+            connect_peer(
+                &endpoint_a,
+                endpoint_b.local_addr().expect("endpoint B address"),
+                network,
+                &a,
+                &b_id,
+                b_key,
+            )
+            .await
+            .expect("establish authenticated QUIC over veth"),
+        );
+        let remote_initial = accept_udp.await.expect("join UDP accept").unwrap();
+        let remote_initial = Arc::new(remote_initial);
+        let responder_task = {
+            let remote_initial = Arc::clone(&remote_initial);
+            tokio::spawn(async move { while remote_initial.recv_packet().await.is_ok() {} })
+        };
+
+        let tcp_listener = peer_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("TCP fallback listener");
+        let tcp_address = tcp_listener.local_addr().expect("TCP listener address");
+        let allowed = vec![(a.device_id(), a.public_key())];
+        let accept_identity = Arc::clone(&b);
+        let accept_tcp = tokio::spawn(async move {
+            accept_tcp_peer_any(&tcp_listener, network, &accept_identity, &allowed).await
+        });
+        let requested_reliable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let connector: PeerConnector = {
+            let identity = Arc::clone(&a);
+            let requested_reliable = Arc::clone(&requested_reliable);
+            Arc::new(move |force_reliable| -> PeerConnectFuture {
+                let identity = Arc::clone(&identity);
+                let requested_reliable = Arc::clone(&requested_reliable);
+                Box::pin(async move {
+                    requested_reliable.store(force_reliable, Ordering::SeqCst);
+                    connect_tcp_peer(tcp_address, network, &identity, &b_id, b_key).await
+                })
+            })
+        };
+
+        let local_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let peer_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let (outbound_tx, outbound_rx) = mpsc::channel(2);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(2);
+        let packet_io = MockPacketIo {
+            outbound: Mutex::new(outbound_rx),
+            inbound: inbound_tx,
+            local_ipv4: local_ip,
+            local_ipv6: None,
+            mtu: 1500,
+        };
+        link.drop_left_egress();
+        let pump = tokio::spawn(async move {
+            pump_mesh_with_quality_interval(
+                &packet_io,
+                vec![(
+                    peer_ip,
+                    None,
+                    initial,
+                    Some(connector),
+                    None,
+                    Duration::from_secs(3600),
+                )],
+                None,
+                Duration::from_millis(100),
+            )
+            .await
+        });
+
+        let (accepted_id, recovered_remote) =
+            tokio::time::timeout(Duration::from_secs(8), accept_tcp)
+                .await
+                .expect("mesh did not reconnect over TCP after real UDP loss")
+                .expect("join TCP accept")
+                .expect("accept authenticated TCP fallback");
+        assert_eq!(accepted_id, a.device_id());
+        assert!(
+            requested_reliable.load(Ordering::SeqCst),
+            "loss-triggered fallback must filter unreliable UDP"
+        );
+
+        outbound_tx
+            .send(packet(local_ip, peer_ip, 28))
+            .await
+            .expect("queue overlay packet for recovered peer");
+        let forwarded =
+            tokio::time::timeout(Duration::from_secs(3), recovered_remote.recv_packet())
+                .await
+                .expect("recovered TCP path did not forward the packet")
+                .expect("receive forwarded overlay packet");
+        assert_eq!(forwarded, packet(local_ip, peer_ip, 28));
+
+        pump.abort();
+        responder_task.abort();
+        endpoint_a.close(0_u32.into(), b"veth fallback test complete");
+        endpoint_b.close(0_u32.into(), b"veth fallback test complete");
+        drop(link);
+        fs::remove_dir_all(temp).expect("remove test identities");
+    }
+
     #[tokio::test]
     async fn mesh_packet_delivery_drops_on_full_queue_and_reports_closed_receiver() {
         let address = Ipv4Addr::new(10, 77, 0, 2);
