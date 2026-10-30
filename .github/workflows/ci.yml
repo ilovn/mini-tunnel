@@ -11,8 +11,8 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  # A manual dispatch is the explicit recovery path for a stalled main-branch run.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
+  # Keep only the latest verification for a ref; a new run also replaces a stuck run.
+  cancel-in-progress: true
 
 jobs:
   postgres-integration:
