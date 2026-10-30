@@ -544,11 +544,16 @@ mod tests {
             &_topology.server,
             "198.18.0.2:3478".parse().expect("server address"),
         );
+        let peer = bind_udp_in_namespace(
+            &_topology.server,
+            "198.18.0.2:0".parse().expect("peer address"),
+        );
         let client = bind_udp_in_namespace(
             &_topology.client,
             "0.0.0.0:0".parse().expect("client bind address"),
         );
         let server_address = server.local_addr().expect("server socket address");
+        let peer_address = peer.local_addr().expect("peer socket address");
         let responder = tokio::spawn(async move {
             let mut request = [0; HEADER_LEN];
             let (length, peer) =
@@ -578,6 +583,109 @@ mod tests {
         );
         assert_ne!(mapped.port(), 0);
         assert_eq!(client.local_addr().expect("socket remains bound"), local);
+
+        let private_candidate: SocketAddr = format!("10.77.0.2:{}", local.port())
+            .parse()
+            .expect("private host candidate");
+        let host_candidate = crate::candidate::SignaledCandidate {
+            address: private_candidate,
+            transport: crate::candidate::CandidateTransport::Udp,
+            candidate_type: crate::candidate::CandidateType::Host,
+        };
+        let mapped_candidate = crate::candidate::SignaledCandidate {
+            address: mapped,
+            transport: crate::candidate::CandidateTransport::Udp,
+            candidate_type: crate::candidate::CandidateType::ServerReflexive {
+                related_address: private_candidate,
+            },
+        };
+        let peer_candidate = crate::candidate::SignaledCandidate {
+            address: peer_address,
+            transport: crate::candidate::CandidateTransport::Udp,
+            candidate_type: crate::candidate::CandidateType::Host,
+        };
+        let credentials_client = crate::ice::generate_ice_credentials(1).unwrap();
+        let credentials_peer = crate::ice::generate_ice_credentials(1).unwrap();
+        let mut driver_client = crate::ice::IceAgentDriver::for_peer_with_candidates_on_socket(
+            local,
+            &credentials_client,
+            &credentials_peer,
+            &[host_candidate, mapped_candidate],
+            &[peer_candidate],
+            true,
+            std::time::Instant::now(),
+        )
+        .expect("construct ICE client behind SNAT");
+        let mut driver_peer = crate::ice::IceAgentDriver::for_peer_with_candidates_on_socket(
+            peer_address,
+            &credentials_peer,
+            &credentials_client,
+            &[peer_candidate],
+            &[mapped_candidate],
+            false,
+            std::time::Instant::now(),
+        )
+        .expect("construct public ICE peer");
+
+        for _ in 0..600 {
+            let now = std::time::Instant::now();
+            driver_client.handle_timeout(now).expect("tick client ICE");
+            driver_peer
+                .handle_timeout(now)
+                .expect("tick public peer ICE");
+            for transmit in driver_client.poll_transmits() {
+                client
+                    .send_to(&transmit.message, transmit.transport.peer_addr)
+                    .await
+                    .expect("send client ICE check");
+            }
+            for transmit in driver_peer.poll_transmits() {
+                peer.send_to(&transmit.message, transmit.transport.peer_addr)
+                    .await
+                    .expect("send public peer ICE check");
+            }
+
+            let mut packet = [0; MAX_STUN_MESSAGE];
+            while let Ok((length, source)) = client.try_recv_from(&mut packet) {
+                assert!(
+                    driver_client
+                        .handle_datagram(now, source, None, &packet[..length])
+                        .expect("handle client ICE check")
+                );
+            }
+            while let Ok((length, source)) = peer.try_recv_from(&mut packet) {
+                assert!(
+                    driver_peer
+                        .handle_datagram(now, source, None, &packet[..length])
+                        .expect("handle public peer ICE check")
+                );
+            }
+            if driver_client.selected_pair().is_some() && driver_peer.selected_pair().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let client_pair = driver_client
+            .selected_pair()
+            .expect("client nominates a path through SNAT");
+        let peer_pair = driver_peer
+            .selected_pair()
+            .expect("public peer nominates the SNAT mapping");
+        assert_eq!(client_pair.1, peer_address);
+        assert_eq!(peer_pair.1, mapped);
+        client
+            .send_to(b"overlay-through-snat", client_pair.1)
+            .await
+            .expect("send overlay payload through SNAT");
+        let mut payload = [0; 64];
+        let (length, source) =
+            tokio::time::timeout(Duration::from_secs(1), peer.recv_from(&mut payload))
+                .await
+                .expect("public peer receives overlay payload")
+                .expect("read overlay payload");
+        assert_eq!(&payload[..length], b"overlay-through-snat");
+        assert_eq!(source, mapped);
     }
 
     #[tokio::test]
