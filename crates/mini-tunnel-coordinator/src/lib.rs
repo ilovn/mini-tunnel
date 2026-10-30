@@ -36,7 +36,7 @@ use mini_tunnel_protocol::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use tokio::{net::TcpListener, sync::RwLock};
+use tokio::{io::AsyncReadExt, net::TcpListener, sync::RwLock};
 use uuid::Uuid;
 
 pub const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -44,6 +44,7 @@ const MAX_NETWORKS: usize = 128;
 const MAX_INVITES_PER_NETWORK: usize = 1024;
 const MAX_TOTAL_MEMBERS: usize = 16_384;
 const MAX_STATE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_TLS_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_DEVICE_ID_BYTES: usize = 128;
 const INVITE_TTL: Duration = Duration::from_secs(60 * 60);
 const SIGNATURE_CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
@@ -1610,13 +1611,34 @@ async fn read_tls_pair(
     certificate: &FsPath,
     private_key: &FsPath,
 ) -> io::Result<([u8; 32], Vec<u8>, Vec<u8>)> {
-    let certificate_pem = tokio::fs::read(certificate).await?;
-    let private_key_pem = tokio::fs::read(private_key).await?;
+    let certificate_pem = read_bounded_tls_file(certificate).await?;
+    let private_key_pem = read_bounded_tls_file(private_key).await?;
     let mut hasher = Sha256::new();
     hasher.update((certificate_pem.len() as u64).to_be_bytes());
     hasher.update(&certificate_pem);
     hasher.update(&private_key_pem);
     Ok((hasher.finalize().into(), certificate_pem, private_key_pem))
+}
+
+async fn read_bounded_tls_file(path: &FsPath) -> io::Result<Vec<u8>> {
+    let file = tokio::fs::File::open(path).await?;
+    if !file.metadata().await?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "coordinator TLS input must be a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_TLS_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() as u64 > MAX_TLS_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "coordinator TLS input exceeds the 1 MiB size limit",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn validate_listener_security(address: SocketAddr, tls_enabled: bool) -> io::Result<()> {
@@ -1892,6 +1914,33 @@ mod tests {
         assert!(validate_listener_security("0.0.0.0:8080".parse().unwrap(), false).is_err());
         assert!(validate_listener_security("[::]:8080".parse().unwrap(), false).is_err());
         assert!(validate_listener_security("0.0.0.0:8080".parse().unwrap(), true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn tls_file_reader_caps_input_and_requires_a_regular_file() {
+        let temporary = std::env::temp_dir().join(format!(
+            "mini-tunnel-coordinator-tls-bound-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temporary).unwrap();
+        let path = temporary.join("input.pem");
+        tokio::fs::write(&path, vec![b'x'; MAX_TLS_FILE_BYTES as usize])
+            .await
+            .unwrap();
+        assert_eq!(
+            read_bounded_tls_file(&path).await.unwrap().len() as u64,
+            MAX_TLS_FILE_BYTES
+        );
+
+        tokio::fs::write(&path, vec![b'x'; MAX_TLS_FILE_BYTES as usize + 1])
+            .await
+            .unwrap();
+        let error = read_bounded_tls_file(&path)
+            .await
+            .expect_err("oversized TLS file must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(read_bounded_tls_file(&temporary).await.is_err());
+        fs::remove_dir_all(temporary).unwrap();
     }
 
     #[tokio::test]
