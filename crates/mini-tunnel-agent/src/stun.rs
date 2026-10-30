@@ -1079,6 +1079,26 @@ mod tests {
         eprintln!(
             "dual-SNAT ICE: mapped A={mapped_a} B={mapped_b}, host A={host_a} B={host_b}, sent A={sent_a} targets={targets_a:?} B={sent_b} targets={targets_b:?}, failed A={failed_candidates_a:?} B={failed_candidates_b:?}, received A={received_a:?} B={received_b:?}, selected A={selected_a:?} B={selected_b:?}"
         );
+        if selected_a.is_none() || selected_b.is_none() {
+            for namespace in [&_topology.router_a, &_topology.router_b] {
+                for (command, args) in [
+                    ("ip", &["route", "show"][..]),
+                    ("iptables", &["-nvx", "-L", "FORWARD"][..]),
+                    ("iptables", &["-t", "nat", "-nvx", "-L", "POSTROUTING"][..]),
+                ] {
+                    let result = std::process::Command::new("ip")
+                        .args(["netns", "exec", namespace, command])
+                        .args(args)
+                        .output()
+                        .expect("inspect dual-SNAT routing and firewall counters");
+                    eprintln!(
+                        "dual-SNAT diagnostic {namespace} {command} {args:?}: {}{}",
+                        String::from_utf8_lossy(&result.stdout),
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                }
+            }
+        }
         assert!(failed_candidates_a.contains(&host_b));
         assert!(failed_candidates_b.contains(&host_a));
         let pair_a = selected_a.expect("client A nominates direct pair through both NATs");
