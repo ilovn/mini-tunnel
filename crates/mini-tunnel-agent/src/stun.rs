@@ -605,7 +605,7 @@ mod tests {
             candidate_type: crate::candidate::CandidateType::Host,
         };
         let private_route_error = peer
-            .send_to(&[], private_candidate)
+            .send_to(b"x", private_candidate)
             .await
             .expect_err("public peer has no route to the private candidate");
         assert_eq!(
