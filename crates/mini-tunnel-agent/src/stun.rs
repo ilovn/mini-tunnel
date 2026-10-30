@@ -1281,25 +1281,36 @@ mod tests {
             socket_a.send_to(b"diagnostic-from-a", mapped_b),
             socket_b.send_to(b"diagnostic-from-b", mapped_a),
         );
-        eprintln!("dual-SNAT raw probes sent: A={send_a:?} B={send_b:?}");
+        assert_eq!(
+            send_a.expect("send raw probe from client A"),
+            b"diagnostic-from-a".len()
+        );
+        assert_eq!(
+            send_b.expect("send raw probe from client B"),
+            b"diagnostic-from-b".len()
+        );
         let mut raw_a = [0; 64];
         let mut raw_b = [0; 64];
         let (raw_received_a, raw_received_b) = tokio::join!(
             tokio::time::timeout(Duration::from_millis(250), socket_a.recv_from(&mut raw_a),),
             tokio::time::timeout(Duration::from_millis(250), socket_b.recv_from(&mut raw_b),),
         );
-        eprintln!("dual-SNAT raw probes received: A={raw_received_a:?} B={raw_received_b:?}");
-        eprintln!(
-            "dual-SNAT packet capture: client A={:?} client B={:?} WAN A={:?} WAN B={:?}",
-            capture_a.drain(),
-            capture_b.drain(),
-            capture_wan_a.drain(),
-            capture_wan_b.drain()
-        );
-        eprintln!(
-            "dual-SNAT ICE: mapped A={mapped_a} B={mapped_b}, host A={host_a} B={host_b}, sent A={sent_a} targets={targets_a:?} B={sent_b} targets={targets_b:?}, failed A={failed_candidates_a:?} B={failed_candidates_b:?}, received A={received_a:?} B={received_b:?}, selected A={selected_a:?} B={selected_b:?}"
-        );
-        if selected_a.is_none() || selected_b.is_none() {
+        if selected_a.is_none()
+            || selected_b.is_none()
+            || raw_received_a.is_err()
+            || raw_received_b.is_err()
+        {
+            eprintln!("dual-SNAT raw probes received: A={raw_received_a:?} B={raw_received_b:?}");
+            eprintln!(
+                "dual-SNAT packet capture: client A={:?} client B={:?} WAN A={:?} WAN B={:?}",
+                capture_a.drain(),
+                capture_b.drain(),
+                capture_wan_a.drain(),
+                capture_wan_b.drain()
+            );
+            eprintln!(
+                "dual-SNAT ICE: mapped A={mapped_a} B={mapped_b}, host A={host_a} B={host_b}, sent A={sent_a} targets={targets_a:?} B={sent_b} targets={targets_b:?}, failed A={failed_candidates_a:?} B={failed_candidates_b:?}, received A={received_a:?} B={received_b:?}, selected A={selected_a:?} B={selected_b:?}"
+            );
             for namespace in [
                 &_topology.router_a,
                 &_topology.client_a,
@@ -1328,6 +1339,16 @@ mod tests {
                 }
             }
         }
+        let (raw_length_a, raw_source_a) = raw_received_a
+            .expect("client A receives a UDP datagram through both NATs")
+            .expect("read client A raw probe");
+        assert_eq!(raw_source_a, mapped_b);
+        assert_eq!(&raw_a[..raw_length_a], b"diagnostic-from-b");
+        let (raw_length_b, raw_source_b) = raw_received_b
+            .expect("client B receives a UDP datagram through both NATs")
+            .expect("read client B raw probe");
+        assert_eq!(raw_source_b, mapped_a);
+        assert_eq!(&raw_b[..raw_length_b], b"diagnostic-from-a");
         assert!(failed_candidates_a.contains(&host_b));
         assert!(failed_candidates_b.contains(&host_a));
         let pair_a = selected_a.expect("client A nominates direct pair through both NATs");
