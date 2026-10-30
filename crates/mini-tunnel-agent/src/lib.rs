@@ -282,6 +282,7 @@ const MAX_PACKET_FRAGMENTS: usize = 64;
 const MAX_INCOMPLETE_PACKETS: usize = 4;
 const FRAGMENT_TTL: Duration = Duration::from_secs(5);
 const PEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const TCP_PEER_FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PENDING_QUIC_HANDSHAKES: usize = 32;
 const MAX_PENDING_TCP_HANDSHAKES: usize = 32;
 const UDP_CANDIDATE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -617,15 +618,7 @@ impl PeerChannel {
                     .map_err(|error| IdentityError::Transport(error.to_string()))
             }
             PeerTransport::Tcp(transport) => {
-                let mut sender = transport.sender.lock().await;
-                sender
-                    .write_u32(frame.len() as u32)
-                    .await
-                    .map_err(|error| IdentityError::Transport(error.to_string()))?;
-                sender
-                    .write_all(&frame)
-                    .await
-                    .map_err(|error| IdentityError::Transport(error.to_string()))
+                write_tcp_peer_frame(transport, &frame, TCP_PEER_FRAME_WRITE_TIMEOUT).await
             }
         }
     }
@@ -807,6 +800,32 @@ impl PeerChannel {
                 return Ok(Vec::new());
             }
             return Ok(payload);
+        }
+    }
+}
+
+async fn write_tcp_peer_frame(
+    transport: &TcpPeerTransport,
+    frame: &[u8],
+    timeout: Duration,
+) -> Result<(), IdentityError> {
+    let write_result = tokio::time::timeout(timeout, async {
+        let mut sender = transport.sender.lock().await;
+        sender.write_u32(frame.len() as u32).await?;
+        sender.write_all(frame).await
+    })
+    .await;
+    match write_result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            let mut sender = transport.sender.lock().await;
+            let _ = sender.shutdown().await;
+            Err(IdentityError::Transport(error.to_string()))
+        }
+        Err(error) => {
+            let mut sender = transport.sender.lock().await;
+            let _ = sender.shutdown().await;
+            Err(IdentityError::Transport(error.to_string()))
         }
     }
 }
@@ -2618,6 +2637,24 @@ mod tests {
         ));
         fs::remove_dir_all(temp).expect("remove test identities");
         udp_endpoint.close(0_u32.into(), b"test complete");
+    }
+
+    #[tokio::test]
+    async fn stalled_tcp_frame_write_times_out_and_closes_the_stream() {
+        let (local, mut remote) = tokio::io::duplex(1);
+        let local: BoxedPeerIo = Box::new(local);
+        let (receiver, sender) = tokio::io::split(local);
+        let transport = TcpPeerTransport {
+            sender: tokio::sync::Mutex::new(sender),
+            receiver: tokio::sync::Mutex::new(receiver),
+            remote_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+        };
+        let result =
+            write_tcp_peer_frame(&transport, &[0x5a; 128], Duration::from_millis(25)).await;
+        assert!(matches!(result, Err(IdentityError::Transport(_))));
+        let mut partial_frame = Vec::new();
+        remote.read_to_end(&mut partial_frame).await.unwrap();
+        assert!(partial_frame.len() <= 4);
     }
 
     #[tokio::test]
