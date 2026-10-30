@@ -2270,6 +2270,170 @@ mod tests {
         fs::remove_dir_all(temp).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires root privileges, iproute2, and network namespaces"]
+    async fn privileged_linux_veth_mesh_promotes_reliable_session_to_direct_udp() {
+        async fn tcp_pair(a: Arc<Identity>, b: Arc<Identity>) -> (PeerChannel, PeerChannel) {
+            let listener = peer_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let allowed = vec![(a.device_id(), a.public_key())];
+            let peer_id = b.device_id();
+            let accept = accept_tcp_peer_any(&listener, "veth-mesh-promotion", &b, &allowed);
+            let connect =
+                connect_tcp_peer(address, "veth-mesh-promotion", &a, &peer_id, b.public_key());
+            let (accepted, connected) = tokio::join!(accept, connect);
+            (connected.unwrap(), accepted.unwrap().1)
+        }
+
+        let (link, local_address, remote_address) = TestVethPair::create();
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-veth-promotion-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let a = Arc::new(Identity::load_or_create_at(temp.join("a/key")).unwrap());
+        let b = Arc::new(Identity::load_or_create_at(temp.join("b/key")).unwrap());
+        let (initial, remote_initial) = tcp_pair(Arc::clone(&a), Arc::clone(&b)).await;
+        let endpoint_a =
+            peer_endpoint_in_namespace(&a, local_address, &link.left_namespace).unwrap();
+        let endpoint_b =
+            peer_endpoint_in_namespace(&b, remote_address, &link.right_namespace).unwrap();
+        let local_endpoint_addr = endpoint_a.local_addr().unwrap();
+        let remote_endpoint_addr = endpoint_b.local_addr().unwrap();
+        assert_eq!(local_endpoint_addr.ip(), local_address.ip());
+        assert_eq!(remote_endpoint_addr.ip(), remote_address.ip());
+        let route = TestVethPair::run_in_namespace(
+            &link.left_namespace,
+            "ip",
+            &[
+                "route",
+                "get",
+                &remote_endpoint_addr.ip().to_string(),
+                "from",
+                &local_endpoint_addr.ip().to_string(),
+            ],
+        );
+        assert!(
+            route.status.success()
+                && String::from_utf8_lossy(&route.stdout).contains(&format!("dev {}", link.left)),
+            "direct candidate must route over the left veth: {}",
+            String::from_utf8_lossy(&route.stdout)
+        );
+
+        let (accepted_tx, mut accepted_rx) = mpsc::channel(1);
+        let server_endpoint = endpoint_b.clone();
+        let server_identity = Arc::clone(&b);
+        let a_id = a.device_id();
+        let a_key = a.public_key();
+        let server_task = tokio::spawn(async move {
+            let channel = Arc::new(
+                accept_peer(
+                    &server_endpoint,
+                    "veth-mesh-promotion",
+                    &server_identity,
+                    &a_id,
+                    a_key,
+                )
+                .await
+                .unwrap(),
+            );
+            accepted_tx.send(Arc::clone(&channel)).await.unwrap();
+            for _ in 0..3 {
+                channel.recv_packet().await.unwrap();
+            }
+        });
+        let reconnect: PeerConnector = Arc::new(|_| -> PeerConnectFuture {
+            Box::pin(async {
+                Err(IdentityError::Transport(
+                    "reconnect path should not run during promotion".to_owned(),
+                ))
+            })
+        });
+        let probe_endpoint = endpoint_a.clone();
+        let probe_identity = Arc::clone(&a);
+        let peer_id = b.device_id();
+        let peer_key = b.public_key();
+        let probe: PeerConnector = Arc::new(move |_| -> PeerConnectFuture {
+            let endpoint = probe_endpoint.clone();
+            let identity = Arc::clone(&probe_identity);
+            let expected_peer_id = peer_id.clone();
+            Box::pin(async move {
+                let candidate = connect_peer(
+                    &endpoint,
+                    remote_endpoint_addr,
+                    "veth-mesh-promotion",
+                    &identity,
+                    &expected_peer_id,
+                    peer_key,
+                )
+                .await?;
+                let rtt = candidate.probe_health(3, Duration::from_secs(2)).await?;
+                if rtt > Duration::from_millis(350) {
+                    return Err(IdentityError::Transport(
+                        "direct probe RTT exceeded threshold".to_owned(),
+                    ));
+                }
+                Ok(candidate)
+            })
+        });
+
+        let local_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let peer_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let (outbound_tx, outbound_rx) = mpsc::channel(2);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(2);
+        let packet_io = Arc::new(MockPacketIo {
+            outbound: Mutex::new(outbound_rx),
+            inbound: inbound_tx,
+            local_ipv4: local_ip,
+            local_ipv6: None,
+            mtu: 1500,
+        });
+        let pump_io = Arc::clone(&packet_io);
+        let pump = tokio::spawn(async move {
+            pump_peer_mesh_reconnecting(
+                &*pump_io,
+                vec![ReconnectingPeer {
+                    address: peer_ip,
+                    ipv6_address: None,
+                    channel: Arc::new(initial),
+                    connector: reconnect,
+                    probe: Some(probe),
+                    probe_cooldown: Duration::from_millis(25),
+                }],
+            )
+            .await
+        });
+
+        let remote = tokio::time::timeout(Duration::from_secs(5), accepted_rx.recv())
+            .await
+            .expect("direct UDP candidate was not accepted")
+            .expect("direct UDP accept task stopped");
+        assert_eq!(remote.transport_name(), "QUIC/UDP");
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("direct UDP health probes did not complete")
+            .expect("join direct UDP accept task");
+        outbound_tx
+            .send(packet(local_ip, peer_ip, 28))
+            .await
+            .expect("queue overlay packet after UDP promotion");
+        let delivered = tokio::time::timeout(Duration::from_secs(3), remote.recv_packet())
+            .await
+            .expect("overlay packet did not use promoted UDP channel")
+            .expect("receive overlay packet over promoted UDP channel");
+        assert_eq!(delivered, packet(local_ip, peer_ip, 28));
+
+        pump.abort();
+        remote.close_async().await;
+        remote_initial.close_async().await;
+        endpoint_a.close(0_u32.into(), b"veth promotion test complete");
+        endpoint_b.close(0_u32.into(), b"veth promotion test complete");
+        drop(link);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
     #[tokio::test]
     async fn packet_pump_forwards_both_directions_and_stops_on_disconnect() {
         let temp = std::env::temp_dir().join(format!("mini-tunnel-pump-{}", uuid::Uuid::new_v4()));

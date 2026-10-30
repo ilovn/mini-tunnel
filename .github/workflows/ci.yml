@@ -120,6 +120,7 @@ jobs:
           command -v tc
           sudo "$test_binary" --exact tunnel::tests::privileged_linux_veth_quic_probe_loss_and_recovery --ignored --nocapture
           sudo "$test_binary" --exact tunnel::tests::privileged_linux_veth_udp_loss_triggers_mesh_tcp_fallback --ignored --nocapture
+          sudo "$test_binary" --exact tunnel::tests::privileged_linux_veth_mesh_promotes_reliable_session_to_direct_udp --ignored --nocapture
 
       - name: Run privileged Windows Wintun packet round trip
         if: runner.os == 'Windows'
