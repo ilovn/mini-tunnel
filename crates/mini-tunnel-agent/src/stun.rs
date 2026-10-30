@@ -533,6 +533,22 @@ mod tests {
                 "via",
                 "10.78.1.1",
             ]);
+            run(&[
+                "-n",
+                &client_a,
+                "route",
+                "add",
+                "unreachable",
+                "10.78.1.0/24",
+            ]);
+            run(&[
+                "-n",
+                &client_b,
+                "route",
+                "add",
+                "unreachable",
+                "10.77.1.0/24",
+            ]);
 
             for (namespace, inside, outside) in [
                 (&router_a, &router_a_lan, &router_a_wan),
@@ -1000,6 +1016,10 @@ mod tests {
 
         let mut sent_a = 0_usize;
         let mut sent_b = 0_usize;
+        let mut failed_candidates_a = Vec::new();
+        let mut failed_candidates_b = Vec::new();
+        let mut targets_a = Vec::new();
+        let mut targets_b = Vec::new();
         let mut received_a = Vec::new();
         let mut received_b = Vec::new();
         for _ in 0..900 {
@@ -1007,18 +1027,28 @@ mod tests {
             driver_a.handle_timeout(now).expect("tick client A ICE");
             driver_b.handle_timeout(now).expect("tick client B ICE");
             for transmit in driver_a.poll_transmits() {
-                socket_a
+                if let Err(error) = socket_a
                     .send_to(&transmit.message, transmit.transport.peer_addr)
                     .await
-                    .expect("send client A ICE check");
-                sent_a += 1;
+                {
+                    assert!(crate::ice::is_candidate_send_error(&error));
+                    failed_candidates_a.push(transmit.transport.peer_addr);
+                } else {
+                    sent_a += 1;
+                    targets_a.push(transmit.transport.peer_addr);
+                }
             }
             for transmit in driver_b.poll_transmits() {
-                socket_b
+                if let Err(error) = socket_b
                     .send_to(&transmit.message, transmit.transport.peer_addr)
                     .await
-                    .expect("send client B ICE check");
-                sent_b += 1;
+                {
+                    assert!(crate::ice::is_candidate_send_error(&error));
+                    failed_candidates_b.push(transmit.transport.peer_addr);
+                } else {
+                    sent_b += 1;
+                    targets_b.push(transmit.transport.peer_addr);
+                }
             }
 
             let mut packet = [0; MAX_STUN_MESSAGE];
@@ -1047,8 +1077,10 @@ mod tests {
         let selected_a = driver_a.selected_pair();
         let selected_b = driver_b.selected_pair();
         eprintln!(
-            "dual-SNAT ICE: sent A={sent_a} B={sent_b}, received A={received_a:?} B={received_b:?}, selected A={selected_a:?} B={selected_b:?}"
+            "dual-SNAT ICE: mapped A={mapped_a} B={mapped_b}, host A={host_a} B={host_b}, sent A={sent_a} targets={targets_a:?} B={sent_b} targets={targets_b:?}, failed A={failed_candidates_a:?} B={failed_candidates_b:?}, received A={received_a:?} B={received_b:?}, selected A={selected_a:?} B={selected_b:?}"
         );
+        assert!(failed_candidates_a.contains(&host_b));
+        assert!(failed_candidates_b.contains(&host_a));
         let pair_a = selected_a.expect("client A nominates direct pair through both NATs");
         let pair_b = selected_b.expect("client B nominates direct pair through both NATs");
         assert_eq!(pair_a.1, mapped_b);
