@@ -148,9 +148,9 @@ TCP fallback 的帧格式：`u32_be frame_length | encrypted_packet`，最大 fr
 
 **阶段 0：原型验证**：单平台 TUN + 两端 QUIC 直连；随后加 STUN/候选交换和 TLS/TCP relay；确认数据路径与权限模型。
 
-**阶段 1：MVP**：Linux/macOS agent、Coordinator、邀请加入、设备密钥、IPv4 地址分配、UDP 直连、UDP relay、status/诊断、撤销、断线重连。未实现 TCP fallback 时显式显示路径受限，不能静默假装可用。
+**阶段 1：MVP（原始路线）**：Linux/macOS agent、Coordinator、邀请加入、设备密钥、IPv4 地址分配、UDP 直连、UDP relay、status/诊断、撤销、断线重连。此阶段是项目启动时的计划记录；当前实现进度以本节的“当前实现边界”为准。
 
-**阶段 2：网络兼容**：TCP 直连和 TLS/TCP relay、自动降级/恢复迟滞、Windows TUN、IPv6、服务端多副本、升级/密钥轮换。
+**阶段 2：网络兼容（原始路线）**：TCP 直连和 TLS/TCP relay、自动降级/恢复迟滞、Windows TUN、IPv6、服务端多副本、升级/密钥轮换。TCP/TLS fallback、IPv6 overlay、peer mesh 和路径降级/恢复现已实现；Windows TUN runtime、多副本 Coordinator 和实网互通仍未完成验收或实现。
 
 **当前实现边界（2026-10）**：已有 IPv4/IPv6 ULA overlay 地址、受当前封装 MTU 限制的双栈包验证与 mesh 路由；当前默认 TUN MTU 为 1280 bytes，peer frame 单片上限为 1175 bytes；较大包会拆分为有界认证片段并按 peer 限额重组，丢片后 5 秒过期。发送时逐包读取 Quinn 当前 `max_datagram_size()` 并据此切片，该值会随 QUIC 的路径 MTU 估算变化；真实网络的 MTU 变化和丢片场景仍待验证；IPv6 地址由 network UUID 与唯一 IPv4 lease 稳定推导，Coordinator 检查本地 ULA prefix 冲突。IPv4/IPv6 TUN 地址及 Linux/macOS peer host routes 已接入，但当前环境未执行特权真实 TUN 验收，Windows route 命令已接入；Windows 特权 TUN 和 route 实机验收仍待执行。NAT 路径已有 STUN 映射发现、host candidate gathering、UDP 优先/TCP 次选的有界拨号、多 peer mesh、链路探测和 ticket 中继兜底。单 peer Connect/Listen 和 mesh 都提供实验性 `--ice` 路径，在同一 socket 上用 RFC 8445 Agent 执行认证 connectivity checks 和 nomination；consent 以 5 秒为基准独立随机化到 4–6 秒，15 秒无响应触发断开、30 秒 consent 失效时进入路径恢复，peer channel 清理时注销 session。mesh 用双方 ufrag 分流并维持每 peer session。未启用或检查失败时回退现有候选拨号。仍缺实网 NAT/QoS 矩阵、重启和拥塞场景验证；不能据此保证对称 NAT 下的直连，中继仍是兜底。
 
