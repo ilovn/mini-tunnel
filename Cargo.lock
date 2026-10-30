@@ -1491,6 +1491,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "ipnet",
+ "libc",
  "mini-tunnel-protocol",
  "mini-tunnel-relay",
  "quinn",
@@ -1508,6 +1509,7 @@ dependencies = [
  "tracing",
  "tun-rs",
  "uuid",
+ "windows-sys 0.61.2",
  "x509-parser",
 ]
 

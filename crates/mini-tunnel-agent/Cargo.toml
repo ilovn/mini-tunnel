@@ -13,6 +13,7 @@ ed25519-dalek.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
 ipnet.workspace = true
+libc.workspace = true
 mini-tunnel-protocol = { path = "../mini-tunnel-protocol" }
 quinn.workspace = true
 rcgen.workspace = true
@@ -30,6 +31,9 @@ tokio-rustls.workspace = true
 tun-rs.workspace = true
 uuid.workspace = true
 x509-parser.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 mini-tunnel-relay = { path = "../mini-tunnel-relay" }

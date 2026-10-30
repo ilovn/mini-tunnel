@@ -10,7 +10,8 @@ pub mod tunnel;
 
 use std::{
     collections::HashMap,
-    fs, io,
+    fs,
+    io::{self, Read, Write},
     net::SocketAddr,
     path::PathBuf,
     sync::Mutex,
@@ -38,6 +39,8 @@ pub enum IdentityError {
     NoConfigDirectory,
     #[error("identity file has unsafe permissions; restrict it to the current user")]
     UnsafePermissions,
+    #[error("identity file path must be a regular file, not a symbolic link or reparse point")]
+    UnsafePath,
     #[error("identity file must contain exactly 32 bytes")]
     InvalidKey,
     #[error(transparent)]
@@ -90,59 +93,31 @@ impl Identity {
 
     pub fn load_or_create_at(path: PathBuf) -> Result<Self, IdentityError> {
         let parent = path.parent().ok_or(IdentityError::NoConfigDirectory)?;
-        fs::create_dir_all(parent)?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-            let _ = fs::DirBuilder::new()
-                .mode(0o700)
-                .recursive(true)
-                .create(parent);
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700).recursive(true).create(parent)?;
         }
-        if path.exists() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let metadata = fs::metadata(&path)?;
-                if metadata.permissions().mode() & 0o077 != 0 {
-                    return Err(IdentityError::UnsafePermissions);
-                }
-            }
-            let bytes = fs::read(path)?;
-            let seed: [u8; 32] = bytes.try_into().map_err(|_| IdentityError::InvalidKey)?;
-            return Ok(Self::from_seed(&seed));
+        #[cfg(not(unix))]
+        fs::create_dir_all(parent)?;
+
+        match read_identity_seed(&path) {
+            Ok(seed) => return Ok(Self::from_seed(&seed)),
+            Err(IdentityError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
+
         let mut seed = [0_u8; 32];
         getrandom::fill(&mut seed).map_err(|_| IdentityError::Random)?;
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        use std::io::Write;
-        let mut file = match options.open(&path) {
-            Ok(file) => file,
+        match create_identity_no_clobber(&path, &seed) {
+            Ok(()) => Ok(Self::from_seed(&seed)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let metadata = fs::metadata(&path)?;
-                    if metadata.permissions().mode() & 0o077 != 0 {
-                        return Err(IdentityError::UnsafePermissions);
-                    }
-                }
-                let bytes = fs::read(path)?;
-                let seed: [u8; 32] = bytes.try_into().map_err(|_| IdentityError::InvalidKey)?;
-                return Ok(Self::from_seed(&seed));
+                let winner = read_identity_seed(&path)?;
+                Ok(Self::from_seed(&winner))
             }
-            Err(error) => return Err(error.into()),
-        };
-        file.write_all(&seed)?;
-        file.sync_all()?;
-        Ok(Self::from_seed(&seed))
+            Err(error) => Err(error.into()),
+        }
     }
 
     #[must_use]
@@ -174,6 +149,109 @@ impl Identity {
         der.extend_from_slice(&self.signing_key.to_bytes());
         der
     }
+}
+
+fn read_identity_seed(path: &std::path::Path) -> Result<[u8; 32], IdentityError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    configure_identity_no_follow(&mut options);
+    let file = options.open(path).map_err(normalize_identity_open_error)?;
+    let metadata = file.metadata()?;
+    reject_identity_reparse_point(&metadata)?;
+    if !metadata.is_file() {
+        return Err(IdentityError::UnsafePath);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(IdentityError::UnsafePermissions);
+        }
+    }
+    let mut bytes = Vec::with_capacity(33);
+    file.take(33).read_to_end(&mut bytes)?;
+    bytes.try_into().map_err(|_| IdentityError::InvalidKey)
+}
+
+fn create_identity_no_clobber(path: &std::path::Path, seed: &[u8; 32]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "identity path has no filename")
+    })?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let temporary = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| {
+        let mut file = options.open(&temporary)?;
+        file.write_all(seed)?;
+        file.sync_all()?;
+        drop(file);
+        fs::hard_link(&temporary, path)?;
+        // The final link is the no-clobber commit point. Directory sync is best effort once it
+        // becomes visible so callers never report failure after a valid identity was published.
+        sync_identity_parent(parent);
+        Ok(())
+    })();
+    let _ = fs::remove_file(temporary);
+    result
+}
+
+fn sync_identity_parent(parent: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        let _ = fs::File::open(parent).and_then(|directory| directory.sync_all());
+    }
+    #[cfg(not(unix))]
+    let _ = parent;
+}
+
+#[cfg(unix)]
+fn configure_identity_no_follow(options: &mut fs::OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+}
+
+#[cfg(windows)]
+fn configure_identity_no_follow(options: &mut fs::OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_identity_no_follow(_options: &mut fs::OpenOptions) {}
+
+fn reject_identity_reparse_point(metadata: &fs::Metadata) -> Result<(), IdentityError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(IdentityError::UnsafePath);
+        }
+    }
+    let _ = metadata;
+    Ok(())
+}
+
+fn normalize_identity_open_error(error: io::Error) -> IdentityError {
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        return IdentityError::UnsafePath;
+    }
+    IdentityError::Io(error)
 }
 
 struct IdentityCertificateKey<'a>(&'a Identity);
@@ -1803,6 +1881,97 @@ mod tests {
                 0o600
             );
         }
+        fs::remove_dir_all(dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn identity_creation_does_not_change_existing_parent_permissions() {
+        let dir = std::env::temp_dir().join(format!(
+            "mini-tunnel-identity-parent-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).expect("create parent directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))
+                .expect("set existing parent permissions");
+        }
+        let path = dir.join("device.key");
+        Identity::load_or_create_at(path).expect("create identity in existing parent");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&dir)
+                    .expect("parent metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755
+            );
+        }
+        fs::remove_dir_all(dir).expect("remove parent directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_loader_rejects_symbolic_links_without_reading_the_target() {
+        let dir = std::env::temp_dir().join(format!(
+            "mini-tunnel-identity-symlink-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).expect("create test directory");
+        let target = dir.join("target.key");
+        fs::write(&target, [17_u8; 32]).expect("write target seed");
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))
+            .expect("set target permissions");
+        let path = dir.join("device.key");
+        symlink(&target, &path).expect("create identity symlink");
+        assert!(matches!(
+            Identity::load_or_create_at(path),
+            Err(IdentityError::UnsafePath)
+        ));
+        assert_eq!(
+            fs::read(&target).expect("target remains intact"),
+            [17_u8; 32]
+        );
+        fs::remove_dir_all(dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn concurrent_identity_creation_publishes_one_stable_seed_without_temp_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "mini-tunnel-identity-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).expect("create test directory");
+        let path = dir.join("device.key");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Identity::load_or_create_at(path)
+                        .expect("concurrent identity load or create")
+                        .device_id()
+                })
+            })
+            .collect::<Vec<_>>();
+        let ids = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("identity worker"))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(fs::metadata(&path).expect("identity file").len(), 32);
+        assert_eq!(
+            fs::read_dir(&dir).expect("identity directory").count(),
+            1,
+            "temporary seed links are cleaned after publication"
+        );
         fs::remove_dir_all(dir).expect("remove test directory");
     }
 
