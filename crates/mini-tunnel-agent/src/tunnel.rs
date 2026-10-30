@@ -1011,6 +1011,14 @@ mod tests {
             );
             self.loss_active = false;
         }
+
+        fn left_qdisc_stats(&self) -> String {
+            let output = std::process::Command::new("tc")
+                .args(["-s", "qdisc", "show", "dev", &self.left])
+                .output()
+                .expect("read veth qdisc statistics");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1247,8 +1255,9 @@ mod tests {
             Err(_) => {
                 let health = initial_for_diagnostics.health_snapshot();
                 panic!(
-                    "mesh did not reconnect over TCP after real UDP loss; health={health:?}, reliable_requested={}",
-                    requested_reliable.load(Ordering::SeqCst)
+                    "mesh did not reconnect over TCP after real UDP loss; health={health:?}, reliable_requested={}, left_qdisc={}",
+                    requested_reliable.load(Ordering::SeqCst),
+                    link.left_qdisc_stats().trim()
                 );
             }
         };
