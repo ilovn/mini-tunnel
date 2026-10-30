@@ -271,24 +271,8 @@ impl CoordinatorState {
         let path = path.into();
         let state_lock = acquire_state_file_lock(&path)?;
         let store = match fs::symlink_metadata(&path) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() || !metadata.is_file() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "coordinator state path must be a regular non-symlink file",
-                    ));
-                }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if metadata.permissions().mode() & 0o077 != 0 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "coordinator state file permissions must be 0600 or stricter",
-                        ));
-                    }
-                }
-                let state_file = fs::File::open(&path)?;
+            Ok(_) => {
+                let state_file = open_regular_state_file(&path)?;
                 validate_state_file_size(state_file.metadata()?.len())?;
                 let mut bytes = Vec::new();
                 state_file
@@ -863,8 +847,28 @@ fn acquire_state_file_lock(path: &FsPath) -> io::Result<Arc<fs::File>> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
-    let lock = options.open(&lock_path)?;
+    let lock = options
+        .open(&lock_path)
+        .map_err(|error| normalize_no_follow_error(error, "coordinator state lock path"))?;
+    let metadata = lock.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "coordinator state lock path must be a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "coordinator state lock permissions must be 0600 or stricter",
+            ));
+        }
+    }
     lock.try_lock().map_err(|error| match error {
         std::fs::TryLockError::WouldBlock => io::Error::new(
             io::ErrorKind::WouldBlock,
@@ -873,6 +877,59 @@ fn acquire_state_file_lock(path: &FsPath) -> io::Result<Arc<fs::File>> {
         std::fs::TryLockError::Error(error) => error,
     })?;
     Ok(Arc::new(lock))
+}
+
+fn open_regular_state_file(path: &FsPath) -> io::Result<fs::File> {
+    #[cfg(not(unix))]
+    {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "coordinator state path must be a regular non-symlink file",
+            ));
+        }
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| normalize_no_follow_error(error, "coordinator state path"))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "coordinator state path must be a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "coordinator state file permissions must be 0600 or stricter",
+            ));
+        }
+    }
+    Ok(file)
+}
+
+fn normalize_no_follow_error(error: io::Error, description: &'static str) -> io::Error {
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        return io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{description} must not be a symbolic link"),
+        );
+    }
+    let _ = description;
+    error
 }
 
 impl Store {
@@ -2786,6 +2843,15 @@ mod tests {
             std::os::unix::fs::symlink(&target, &path).expect("create state symlink");
             let error = match CoordinatorState::load(&path) {
                 Ok(_) => panic!("state symlink must be rejected"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            fs::remove_file(&path).expect("remove state symlink");
+            let lock_path = dir.join("coordinator.json.lock");
+            fs::remove_file(&lock_path).expect("remove state lock file");
+            std::os::unix::fs::symlink(&target, &lock_path).expect("create lock symlink");
+            let error = match CoordinatorState::load(&path) {
+                Ok(_) => panic!("state lock symlink must be rejected"),
                 Err(error) => error,
             };
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
