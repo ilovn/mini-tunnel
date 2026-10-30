@@ -1106,6 +1106,7 @@ mod tests {
                     ("iptables", &["-nvx", "-L", "FORWARD"][..]),
                     ("iptables", &["-nvx", "-L", "INPUT"][..]),
                     ("iptables", &["-t", "nat", "-nvx", "-L", "POSTROUTING"][..]),
+                    ("cat", &["/proc/net/nf_conntrack"][..]),
                     ("cat", &["/proc/net/udp"][..]),
                 ] {
                     let result = std::process::Command::new("ip")
