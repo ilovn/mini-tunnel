@@ -2276,6 +2276,42 @@ fn mesh_membership_diff(
     (removed, added)
 }
 
+async fn stop_mesh_after_membership_revocation(
+    error: &CoordinatorApiError,
+    known: &std::collections::HashMap<String, PeerInfo>,
+    pending: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+    registry: &AcceptedPeerRegistry,
+    snapshot_tx: &tokio::sync::watch::Sender<Vec<PeerInfo>>,
+    allowlist_tx: &tokio::sync::watch::Sender<Vec<(String, [u8; 32])>>,
+    updates_tx: &tokio::sync::mpsc::Sender<mini_tunnel_agent::tunnel::MeshPeerUpdate>,
+) -> bool {
+    if !coordinator_error_revokes_member(error) {
+        return false;
+    }
+    tracing::error!(code = %error.code, "local mesh membership is no longer authorized; closing all peers");
+    for (_, task) in pending.drain() {
+        task.abort();
+        let _ = task.await;
+    }
+    registry.write().await.clear();
+    let _ = snapshot_tx.send(Vec::new());
+    let _ = allowlist_tx.send(Vec::new());
+    let addresses = known
+        .values()
+        .filter_map(|peer| peer.assigned_ipv4.parse::<Ipv4Addr>().ok())
+        .collect::<std::collections::BTreeSet<_>>();
+    for address in addresses {
+        if updates_tx
+            .send(mini_tunnel_agent::tunnel::MeshPeerUpdate::Remove(address))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    true
+}
+
 struct MeshMembershipRefresh {
     coordinator_url: String,
     network_id: String,
@@ -2322,6 +2358,20 @@ fn spawn_mesh_membership_refresh(config: MeshMembershipRefresh) -> tokio::task::
             let peers = match discovered {
                 Ok(Ok(peers)) => peers,
                 Ok(Err(error)) => {
+                    if let Some(api_error) = error.downcast_ref::<CoordinatorApiError>()
+                        && stop_mesh_after_membership_revocation(
+                            api_error,
+                            &known,
+                            &mut pending,
+                            &registry,
+                            &snapshot_tx,
+                            &allowlist_tx,
+                            &updates_tx,
+                        )
+                        .await
+                    {
+                        return;
+                    }
                     eprintln!("mesh membership refresh failed; keeping current peers: {error}");
                     continue;
                 }
@@ -3956,5 +4006,97 @@ mod tests {
         assert!(coordinator_error_revokes_member(&invalid_token));
         assert!(coordinator_error_revokes_member(&network_removed));
         assert!(!coordinator_error_revokes_member(&transient));
+    }
+
+    #[tokio::test]
+    async fn mesh_authoritative_revocation_clears_sessions_but_transient_errors_do_not() {
+        let peer = |device_id: &str, assigned_ipv4: &str| PeerInfo {
+            device_id: device_id.to_owned(),
+            assigned_ipv4: assigned_ipv4.to_owned(),
+            public_key: URL_SAFE_NO_PAD.encode([1_u8; 32]),
+            candidates: Vec::new(),
+            ice_credentials: None,
+        };
+        let peers = vec![peer("peer-a", "10.77.0.2"), peer("peer-b", "10.77.0.3")];
+        let known = peers
+            .iter()
+            .cloned()
+            .map(|peer| (peer.device_id.clone(), peer))
+            .collect::<std::collections::HashMap<_, _>>();
+        let (accepted_a, _accepted_a_rx) = tokio::sync::mpsc::channel(1);
+        let (accepted_b, _accepted_b_rx) = tokio::sync::mpsc::channel(1);
+        let registry =
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::from([
+                ("peer-a".to_owned(), accepted_a),
+                ("peer-b".to_owned(), accepted_b),
+            ])));
+        let mut pending = std::collections::HashMap::new();
+        pending.insert(
+            "peer-pending".to_owned(),
+            tokio::spawn(std::future::pending::<()>()),
+        );
+        let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(peers.clone());
+        let (allowlist_tx, allowlist_rx) =
+            tokio::sync::watch::channel(vec![("peer-a".to_owned(), [1_u8; 32])]);
+        let (updates_tx, mut updates_rx) = tokio::sync::mpsc::channel(4);
+
+        let transient = CoordinatorApiError {
+            code: "persistence_error".to_owned(),
+            message: "temporary coordinator failure".to_owned(),
+        };
+        assert!(
+            !stop_mesh_after_membership_revocation(
+                &transient,
+                &known,
+                &mut pending,
+                &registry,
+                &snapshot_tx,
+                &allowlist_tx,
+                &updates_tx,
+            )
+            .await
+        );
+        assert_eq!(registry.read().await.len(), 2);
+        assert_eq!(pending.len(), 1);
+        assert!(!snapshot_rx.borrow().is_empty());
+        assert!(updates_rx.try_recv().is_err());
+
+        let revoked = CoordinatorApiError {
+            code: "invalid_token".to_owned(),
+            message: "local member revoked".to_owned(),
+        };
+        assert!(
+            stop_mesh_after_membership_revocation(
+                &revoked,
+                &known,
+                &mut pending,
+                &registry,
+                &snapshot_tx,
+                &allowlist_tx,
+                &updates_tx,
+            )
+            .await
+        );
+        assert!(registry.read().await.is_empty());
+        assert!(pending.is_empty());
+        assert!(snapshot_rx.borrow().is_empty());
+        assert!(allowlist_rx.borrow().is_empty());
+        let removed = [
+            updates_rx.recv().await.expect("peer A removal"),
+            updates_rx.recv().await.expect("peer B removal"),
+        ];
+        let removed = removed
+            .into_iter()
+            .map(|update| match update {
+                mini_tunnel_agent::tunnel::MeshPeerUpdate::Remove(address) => address,
+                mini_tunnel_agent::tunnel::MeshPeerUpdate::Add(_) => panic!("unexpected peer add"),
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            removed,
+            [Ipv4Addr::new(10, 77, 0, 2), Ipv4Addr::new(10, 77, 0, 3)]
+                .into_iter()
+                .collect()
+        );
     }
 }
