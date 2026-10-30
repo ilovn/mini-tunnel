@@ -1259,6 +1259,14 @@ async fn authenticate_tcp_candidate_dynamic(
     .await
     .ok()?
     .ok()?;
+    let latest = allowed_peers.borrow().clone();
+    if !valid_peer_allowlist(&latest)
+        || !latest
+            .iter()
+            .any(|(allowed_id, _)| allowed_id == &device_id)
+    {
+        return None;
+    }
     Some((
         device_id,
         new_tcp_channel(Box::new(stream), remote_addr, network_id),
@@ -1542,7 +1550,19 @@ async fn authenticate_quic_candidate_dynamic(
         return None;
     }
     match server_authenticate(&connection, network_id, identity, None, Some(&current)).await {
-        Ok((device_id, _)) => Some((device_id, new_channel(connection, network_id))),
+        Ok((device_id, public_key)) => {
+            let latest = allowed_peers.borrow().clone();
+            if !valid_peer_allowlist(&latest)
+                || !latest.iter().any(|(allowed_id, allowed_key)| {
+                    allowed_id == &device_id && allowed_key == &public_key
+                })
+            {
+                connection.close(0_u32.into(), b"peer is not currently authorized");
+                None
+            } else {
+                Some((device_id, new_channel(connection, network_id)))
+            }
+        }
         Err(_) => {
             connection.close(0_u32.into(), b"peer authentication rejected");
             None
@@ -3142,6 +3162,116 @@ mod tests {
         );
         endpoint_peer.close(0_u32.into(), b"test complete");
         local_endpoint.close(0_u32.into(), b"test complete");
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dynamic_accept_rechecks_membership_after_pending_authentication() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-dynamic-revoke-pending-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let peer = Identity::load_or_create_at(temp.join("peer/device.key")).unwrap();
+        let local = std::sync::Arc::new(
+            Identity::load_or_create_at(temp.join("local/device.key")).unwrap(),
+        );
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let endpoint_peer = peer_endpoint(&peer, bind).unwrap();
+        let local_endpoint = peer_endpoint(&local, bind).unwrap();
+        let peer_id = peer.device_id();
+        let local_id = local.device_id();
+        let (allowed_tx, allowed_rx) =
+            tokio::sync::watch::channel(vec![(peer_id.clone(), peer.public_key())]);
+        let accepting_endpoint = local_endpoint.clone();
+        let accepting_identity = std::sync::Arc::clone(&local);
+        let quic_accept = tokio::spawn(async move {
+            let incoming = accepting_endpoint.accept().await.expect("QUIC incoming");
+            authenticate_quic_candidate_dynamic(
+                incoming,
+                "dynamic-revoke",
+                &accepting_identity,
+                &allowed_rx,
+            )
+            .await
+        });
+        let quic_connection = endpoint_peer
+            .connect_with(
+                peer_client_config(
+                    local.public_key(),
+                    std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+                )
+                .unwrap(),
+                local_endpoint.local_addr().unwrap(),
+                "mini-tunnel",
+            )
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut quic_send, mut quic_recv) = quic_connection.open_bi().await.unwrap();
+        let quic_nonce = [7_u8; 32];
+        quic_send.write_all(&peer.public_key()).await.unwrap();
+        quic_send.write_all(&quic_nonce).await.unwrap();
+        let mut quic_server_nonce = [0_u8; 32];
+        quic_recv.read_exact(&mut quic_server_nonce).await.unwrap();
+        allowed_tx.send(Vec::new()).unwrap();
+        let quic_proof = auth_bytes(
+            "dynamic-revoke",
+            &peer_id,
+            &local_id,
+            &quic_nonce,
+            &quic_server_nonce,
+        );
+        quic_send
+            .write_all(&peer.signing_key.sign(&quic_proof).to_bytes())
+            .await
+            .unwrap();
+        assert!(quic_accept.await.unwrap().is_none());
+        quic_connection.close(0_u32.into(), b"test complete");
+        endpoint_peer.close(0_u32.into(), b"test complete");
+        local_endpoint.close(0_u32.into(), b"test complete");
+
+        let tcp_listener = peer_tcp_listener(bind).await.unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let (allowed_tx, allowed_rx) =
+            tokio::sync::watch::channel(vec![(peer_id.clone(), peer.public_key())]);
+        let tcp_acceptor = tokio_rustls::TlsAcceptor::from(peer_tcp_server_config(&local).unwrap());
+        let tcp_identity = std::sync::Arc::clone(&local);
+        let tcp_accept = tokio::spawn(async move {
+            let (socket, remote_addr) = tcp_listener.accept().await.unwrap();
+            authenticate_tcp_candidate_dynamic(
+                socket,
+                remote_addr,
+                tcp_acceptor,
+                "dynamic-revoke",
+                &tcp_identity,
+                &allowed_rx,
+            )
+            .await
+        });
+        let socket = tokio::net::TcpStream::connect(tcp_addr).await.unwrap();
+        let connector =
+            tokio_rustls::TlsConnector::from(peer_tcp_client_config(local.public_key()).unwrap());
+        let server_name = rustls::pki_types::ServerName::try_from("mini-tunnel").unwrap();
+        let mut tcp_stream = connector.connect(server_name, socket).await.unwrap();
+        let tcp_nonce = [9_u8; 32];
+        tcp_stream.write_all(&peer.public_key()).await.unwrap();
+        tcp_stream.write_all(&tcp_nonce).await.unwrap();
+        let mut tcp_server_nonce = [0_u8; 32];
+        tcp_stream.read_exact(&mut tcp_server_nonce).await.unwrap();
+        allowed_tx.send(Vec::new()).unwrap();
+        let tcp_proof = auth_bytes(
+            "dynamic-revoke",
+            &peer_id,
+            &local_id,
+            &tcp_nonce,
+            &tcp_server_nonce,
+        );
+        tcp_stream
+            .write_all(&peer.signing_key.sign(&tcp_proof).to_bytes())
+            .await
+            .unwrap();
+        assert!(tcp_accept.await.unwrap().is_none());
+
         fs::remove_dir_all(temp).unwrap();
     }
 
