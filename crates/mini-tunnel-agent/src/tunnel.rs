@@ -1087,7 +1087,7 @@ mod tests {
             let responder = Arc::clone(&responder);
             tokio::spawn(async move {
                 while let Ok(packet) = responder.recv_packet().await {
-                    if received_tx.send(packet).await.is_err() {
+                    if !packet.is_empty() && received_tx.send(packet).await.is_err() {
                         break;
                     }
                 }
