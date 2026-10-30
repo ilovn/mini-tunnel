@@ -9,7 +9,7 @@ pub mod tun_device;
 pub mod tunnel;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs,
     io::{self, Read, Write},
     net::SocketAddr,
@@ -274,6 +274,8 @@ impl rcgen::SigningKey for IdentityCertificateKey<'_> {
 
 const MAX_PACKET_PAYLOAD: usize = 1175;
 const MAX_TUN_PACKET: usize = 9000;
+const MAX_PENDING_PROBE_PACKETS: usize = 64;
+const MAX_PENDING_PROBE_BYTES: usize = 512 * 1024;
 const FRAME_HEADER_LEN: usize = 25;
 const FRAGMENT_HEADER_LEN: usize = 16;
 const MAX_PACKET_FRAGMENTS: usize = 64;
@@ -324,6 +326,7 @@ pub struct PeerChannel {
     send_lock: tokio::sync::Mutex<()>,
     replay_window: Mutex<ReplayWindow>,
     fragments: Mutex<FragmentReassembler>,
+    pending_probe_packets: Mutex<PendingProbePackets>,
     health: Mutex<PeerHealth>,
 }
 
@@ -343,6 +346,33 @@ struct PeerHealth {
     outstanding: HashMap<u64, Instant>,
     probes_succeeded: u64,
     probes_missed: u64,
+}
+
+#[derive(Default)]
+struct PendingProbePackets {
+    packets: VecDeque<Vec<u8>>,
+    bytes: usize,
+}
+
+impl PendingProbePackets {
+    fn push(&mut self, packet: Vec<u8>) -> Result<(), IdentityError> {
+        if self.packets.len() >= MAX_PENDING_PROBE_PACKETS
+            || self.bytes.saturating_add(packet.len()) > MAX_PENDING_PROBE_BYTES
+        {
+            return Err(IdentityError::Transport(
+                "candidate probe packet buffer is full".to_owned(),
+            ));
+        }
+        self.bytes += packet.len();
+        self.packets.push_back(packet);
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Option<Vec<u8>> {
+        let packet = self.packets.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(packet.len());
+        Some(packet)
+    }
 }
 
 #[derive(Default)]
@@ -641,11 +671,17 @@ impl PeerChannel {
             self.send_keepalive().await?;
             let deadline = tokio::time::Instant::now() + per_probe_timeout;
             loop {
-                let _packet = tokio::time::timeout_at(deadline, self.recv_packet())
+                let packet = tokio::time::timeout_at(deadline, self.recv_packet_from_transport())
                     .await
                     .map_err(|_| {
                         IdentityError::Transport("candidate path probe timed out".to_owned())
                     })??;
+                if !packet.is_empty() {
+                    self.pending_probe_packets
+                        .lock()
+                        .map_err(|_| IdentityError::InvalidFrame)?
+                        .push(packet)?;
+                }
                 let health = self.health_snapshot();
                 if health.probes_succeeded > succeeded_before {
                     maximum_rtt = maximum_rtt.max(health.rtt.unwrap_or_default());
@@ -658,6 +694,18 @@ impl PeerChannel {
 
     /// Receive one authenticated packet, reassembling bounded transport fragments as needed.
     pub async fn recv_packet(&self) -> Result<Vec<u8>, IdentityError> {
+        if let Some(packet) = self
+            .pending_probe_packets
+            .lock()
+            .map_err(|_| IdentityError::InvalidFrame)?
+            .pop()
+        {
+            return Ok(packet);
+        }
+        self.recv_packet_from_transport().await
+    }
+
+    async fn recv_packet_from_transport(&self) -> Result<Vec<u8>, IdentityError> {
         loop {
             let frame = match &self.transport {
                 PeerTransport::Quic(connection) => connection
@@ -1368,6 +1416,7 @@ fn new_channel(connection: Connection, network_id: &str) -> PeerChannel {
         send_lock: tokio::sync::Mutex::new(()),
         replay_window: Mutex::new(ReplayWindow::default()),
         fragments: Mutex::new(FragmentReassembler::default()),
+        pending_probe_packets: Mutex::new(PendingProbePackets::default()),
         health: Mutex::new(PeerHealth::default()),
     }
 }
@@ -1393,6 +1442,7 @@ fn new_tcp_channel(
         send_lock: tokio::sync::Mutex::new(()),
         replay_window: Mutex::new(ReplayWindow::default()),
         fragments: Mutex::new(FragmentReassembler::default()),
+        pending_probe_packets: Mutex::new(PendingProbePackets::default()),
         health: Mutex::new(PeerHealth::default()),
     }
 }
@@ -1852,6 +1902,31 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
+    fn pending_probe_packet_buffer_is_ordered_and_bounded() {
+        let mut pending = PendingProbePackets::default();
+        pending.push(vec![1; MAX_TUN_PACKET]).expect("first packet");
+        pending
+            .push(vec![2; MAX_TUN_PACKET])
+            .expect("second packet");
+        assert_eq!(pending.bytes, 2 * MAX_TUN_PACKET);
+        assert_eq!(pending.pop(), Some(vec![1; MAX_TUN_PACKET]));
+        assert_eq!(pending.bytes, MAX_TUN_PACKET);
+        assert_eq!(pending.pop(), Some(vec![2; MAX_TUN_PACKET]));
+
+        for _ in 0..MAX_PENDING_PROBE_PACKETS {
+            pending.push(vec![0]).expect("packet within item limit");
+        }
+        assert!(pending.push(vec![3]).is_err());
+
+        let mut oversized = PendingProbePackets::default();
+        assert!(
+            oversized
+                .push(vec![0; MAX_PENDING_PROBE_BYTES + 1])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn reconnect_backoff_is_bounded() {
         for attempt in 0..100 {
             assert!(reconnect_delay(attempt) <= Duration::from_secs(30));
@@ -2065,6 +2140,73 @@ mod tests {
             channel_a.send_packet(&vec![0; MAX_TUN_PACKET + 1]).await,
             Err(IdentityError::InvalidFrame)
         ));
+        endpoint_a.close(0_u32.into(), b"test complete");
+        endpoint_b.close(0_u32.into(), b"test complete");
+        fs::remove_dir_all(temp).expect("remove test identities");
+    }
+
+    #[tokio::test]
+    async fn candidate_health_probe_preserves_payloads_for_the_tunnel_receiver() {
+        let temp =
+            std::env::temp_dir().join(format!("mini-tunnel-probe-buffer-{}", uuid::Uuid::new_v4()));
+        let a = Identity::load_or_create_at(temp.join("a/device.key")).expect("identity A");
+        let b = Identity::load_or_create_at(temp.join("b/device.key")).expect("identity B");
+        let endpoint_a = peer_endpoint(&a, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .expect("endpoint A");
+        let endpoint_b = peer_endpoint(&b, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .expect("endpoint B");
+        let remote = endpoint_b.local_addr().expect("endpoint B address");
+        let a_id = a.device_id();
+        let a_key = a.public_key();
+        let b_id = b.device_id();
+        let b_key = b.public_key();
+        let server_endpoint = endpoint_b.clone();
+        let accept = tokio::spawn(async move {
+            accept_peer(&server_endpoint, "probe-buffer", &b, &a_id, a_key).await
+        });
+        let channel_a = tokio::time::timeout(
+            Duration::from_secs(3),
+            connect_peer(&endpoint_a, remote, "probe-buffer", &a, &b_id, b_key),
+        )
+        .await
+        .expect("connection handshake timed out")
+        .expect("authenticated QUIC peer");
+        let channel_b = accept.await.expect("accept task").expect("accepted peer");
+
+        let payload = b"packet received while the candidate is being probed";
+        channel_b
+            .send_packet(payload)
+            .await
+            .expect("queue peer payload before health probe");
+        let (release_server_tx, release_server_rx) = tokio::sync::oneshot::channel();
+        let respond_to_probe = tokio::spawn(async move {
+            let response = channel_b.recv_packet().await;
+            let _ = release_server_rx.await;
+            response
+        });
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            channel_a.probe_health(1, Duration::from_secs(2)),
+        )
+        .await
+        .expect("candidate health probe did not finish")
+        .expect("candidate path health probe");
+        release_server_tx
+            .send(())
+            .expect("release probe server after client completes");
+        assert!(
+            respond_to_probe
+                .await
+                .expect("probe response task")
+                .expect("receive probe ping")
+                .is_empty()
+        );
+        assert_eq!(
+            channel_a.recv_packet().await.expect("buffered payload"),
+            payload,
+            "candidate probing must not consume peer data"
+        );
+
         endpoint_a.close(0_u32.into(), b"test complete");
         endpoint_b.close(0_u32.into(), b"test complete");
         fs::remove_dir_all(temp).expect("remove test identities");
