@@ -101,10 +101,10 @@ impl Identity {
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
         }
         if path.exists() {
-            let metadata = fs::metadata(&path)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
+                let metadata = fs::metadata(&path)?;
                 if metadata.permissions().mode() & 0o077 != 0 {
                     return Err(IdentityError::UnsafePermissions);
                 }
@@ -126,10 +126,10 @@ impl Identity {
         let mut file = match options.open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let metadata = fs::metadata(&path)?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
+                    let metadata = fs::metadata(&path)?;
                     if metadata.permissions().mode() & 0o077 != 0 {
                         return Err(IdentityError::UnsafePermissions);
                     }
@@ -1828,6 +1828,12 @@ mod tests {
         fs::create_dir_all(&dir).expect("create temp directory");
         let path = dir.join("device.key");
         fs::write(&path, b"short").expect("write malformed key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("set safe test-key permissions");
+        }
         assert!(matches!(
             Identity::load_or_create_at(path),
             Err(IdentityError::InvalidKey)
