@@ -492,7 +492,6 @@ fn test_candidate_base_addr() -> Result<()> {
         },
         rel_addr: "192.168.0.2".to_owned(),
         rel_port: 5000,
-        ..Default::default()
     }
     .new_candidate_peer_reflexive()?;
     assert_eq!(
@@ -512,7 +511,6 @@ fn test_candidate_base_addr() -> Result<()> {
         },
         rel_addr: "".to_owned(),
         rel_port: 0,
-        ..Default::default()
     }
     .new_candidate_peer_reflexive()?;
     assert_eq!(prflx_no_rel.base_addr(), prflx_no_rel.addr());

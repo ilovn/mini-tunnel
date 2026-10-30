@@ -53,8 +53,6 @@ name = "ping_pong"
 path = "examples/ping_pong.rs"
 bench = false
 
-[workspace]
-resolver = "3"
 
 
 [dependencies.bytes]

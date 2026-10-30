@@ -6,8 +6,8 @@ members = [
     "crates/mini-tunnel-agent",
     "crates/mini-tunnel-relay",
     "crates/mini-tunnel-cli",
+    "vendor/rtc-ice",
 ]
-exclude = ["vendor/rtc-ice"]
 
 [workspace.package]
 version = "0.1.0"

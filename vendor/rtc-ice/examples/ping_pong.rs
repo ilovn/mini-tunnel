@@ -306,18 +306,12 @@ async fn main() -> Result<(), Error> {
         }
         let mut is_failed = false;
         while let Some(event) = ice_agent.poll_event() {
-            match event.event {
-                Event::ConnectionStateChange(cs) => {
-                    println!("ConnectionStateChange with {}", cs);
-                    match cs {
-                        ConnectionState::Failed => {
-                            is_failed = true;
-                            break;
-                        }
-                        _ => {}
-                    }
+            if let Event::ConnectionStateChange(cs) = event.event {
+                println!("ConnectionStateChange with {}", cs);
+                if cs == ConnectionState::Failed {
+                    is_failed = true;
+                    break;
                 }
-                _ => {}
             }
         }
         if is_failed {
@@ -358,7 +352,7 @@ async fn main() -> Result<(), Error> {
                             message:BytesMut::from(&buf[0..n]),
                         })?;
                     } else {
-                        println!("{}", String::from_utf8((&buf[0..n]).to_vec())?);
+                        println!("{}", String::from_utf8(buf[0..n].to_vec())?);
                     }
                 }
             }

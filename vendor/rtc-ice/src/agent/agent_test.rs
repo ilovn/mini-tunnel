@@ -98,7 +98,6 @@ fn test_pair_priority() -> Result<()> {
         },
         rel_addr: "4.3.2.1".to_owned(),
         rel_port: 43211,
-        ..Default::default()
     };
 
     let prflx_remote = prflx_config.new_candidate_peer_reflexive()?;
@@ -158,20 +157,12 @@ fn pipe(
     default_config0: Option<AgentConfig>,
     default_config1: Option<AgentConfig>,
 ) -> Result<(Agent, Agent)> {
-    let mut cfg0 = if let Some(cfg) = default_config0 {
-        cfg
-    } else {
-        AgentConfig::default()
-    };
+    let mut cfg0 = default_config0.unwrap_or_default();
     cfg0.urls = vec![];
 
     let a_agent = Agent::new(Instant::now(), Arc::new(cfg0), test_crypto_provider())?;
 
-    let mut cfg1 = if let Some(cfg) = default_config1 {
-        cfg
-    } else {
-        AgentConfig::default()
-    };
+    let mut cfg1 = default_config1.unwrap_or_default();
     cfg1.urls = vec![];
 
     let b_agent = Agent::new(Instant::now(), Arc::new(cfg1), test_crypto_provider())?;
@@ -312,8 +303,7 @@ fn test_handle_peer_reflexive_udp_pflx_candidate() -> Result<()> {
 
             assert_eq!(c.port(), 999, "Port number mismatch");
         } else {
-            assert!(
-                false,
+            panic!(
                 "expected non-empty remote candidate for network type {}",
                 local_network_type,
             );
@@ -2069,8 +2059,10 @@ fn test_zero_failed_timeout_keeps_checking_agent_recoverable() -> Result<()> {
 #[test]
 fn test_role_conflict_both_controlling_smaller_tiebreaker_switches() -> Result<()> {
     // Create agent with controlling role
-    let mut config = AgentConfig::default();
-    config.is_controlling = true;
+    let config = AgentConfig {
+        is_controlling: true,
+        ..Default::default()
+    };
     let mut agent = Agent::new(Instant::now(), Arc::new(config), test_crypto_provider())?;
 
     // Set a specific tiebreaker value
@@ -2165,7 +2157,7 @@ fn test_role_conflict_both_controlling_smaller_tiebreaker_switches() -> Result<(
         }
 
         // Priorities should change when role changes (unless there were no pairs initially)
-        if initial_pair_count > 0 && initial_priorities.len() > 0 {
+        if initial_pair_count > 0 && !initial_priorities.is_empty() {
             // At least verify the role was updated in pairs
             assert_eq!(
                 agent.candidate_pairs.len(),
@@ -2190,8 +2182,10 @@ fn test_role_conflict_both_controlling_smaller_tiebreaker_switches() -> Result<(
 #[test]
 fn test_role_conflict_both_controlling_larger_tiebreaker_stays() -> Result<()> {
     // Create agent with controlling role
-    let mut config = AgentConfig::default();
-    config.is_controlling = true;
+    let config = AgentConfig {
+        is_controlling: true,
+        ..Default::default()
+    };
     let mut agent = Agent::new(Instant::now(), Arc::new(config), test_crypto_provider())?;
 
     // Set a larger tiebreaker value
@@ -2286,8 +2280,10 @@ fn test_role_conflict_both_controlled_larger_tiebreaker_switches() -> Result<()>
     use crate::attributes::control::AttrControlled;
 
     // Create agent with controlled role
-    let mut config = AgentConfig::default();
-    config.is_controlling = false; // Controlled
+    let config = AgentConfig {
+        is_controlling: false,
+        ..Default::default()
+    }; // Controlled
     let mut agent = Agent::new(Instant::now(), Arc::new(config), test_crypto_provider())?;
 
     // Set a larger tiebreaker value
@@ -2388,8 +2384,10 @@ fn test_role_conflict_both_controlled_smaller_tiebreaker_stays() -> Result<()> {
     use crate::attributes::control::AttrControlled;
 
     // Create agent with controlled role
-    let mut config = AgentConfig::default();
-    config.is_controlling = false; // Controlled
+    let config = AgentConfig {
+        is_controlling: false,
+        ..Default::default()
+    }; // Controlled
     let mut agent = Agent::new(Instant::now(), Arc::new(config), test_crypto_provider())?;
 
     // Set a smaller tiebreaker value
