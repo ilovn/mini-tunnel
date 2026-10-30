@@ -159,13 +159,22 @@ impl TunDevice {
         self.device.name()
     }
 
-    /// Read one local-originated IPv4 or IPv6 packet, rejecting malformed packets and spoofed sources.
+    /// Read one valid local-originated IPv4 or IPv6 packet, dropping malformed and spoofed frames.
     pub async fn read_outbound_packet(&self) -> Result<Vec<u8>, TunError> {
-        let mut packet = vec![0; self.mtu];
-        let length = self.device.recv(&mut packet).await?;
-        packet.truncate(length);
-        validate_outbound_packet(&packet, self.local_ipv4, self.local_ipv6, self.mtu)?;
-        Ok(packet)
+        loop {
+            let mut packet = vec![0; self.mtu];
+            let length = self.device.recv(&mut packet).await?;
+            packet.truncate(length);
+            match validate_outbound_packet(&packet, self.local_ipv4, self.local_ipv6, self.mtu) {
+                Ok(()) => return Ok(packet),
+                Err(error) => {
+                    // The OS can emit interface-local control packets (for example, IPv6 router
+                    // solicitation from a link-local source) that must not terminate the tunnel
+                    // or escape the authenticated overlay source boundary.
+                    tracing::trace!(error = %error, "dropping invalid outbound TUN packet");
+                }
+            }
+        }
     }
 
     /// Write a peer packet into the local stack after checking its peer and destination addresses.
@@ -546,26 +555,18 @@ mod tests {
             .send_to(b"outbound through peer route", (peer_address, 4242))
             .await
             .expect("send UDP datagram to peer overlay address");
-        let mut outbound = vec![0; device.mtu()];
-        let outbound_len = tokio::time::timeout(
+        let outbound = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            device.device.recv(&mut outbound),
+            device.read_outbound_packet(),
         )
         .await
         .expect("kernel-routed datagram reaches the TUN")
-        .expect("read packet from the TUN");
-        outbound.truncate(outbound_len);
+        .expect("read validated local-originated packet from the TUN");
         let (outbound_source, outbound_destination) =
             packet_addresses(&outbound).expect("parse outbound TUN packet addresses");
-        assert_eq!(
-            outbound_source,
-            IpAddr::V4(address_a),
-            "unexpected kernel-generated TUN packet: {outbound:02x?}"
-        );
+        assert_eq!(outbound_source, IpAddr::V4(address_a));
         assert_eq!(outbound_destination, IpAddr::V4(peer_address));
         assert_eq!(outbound[9], 17, "expected an IPv4 UDP packet");
-        validate_outbound_packet(&outbound, address_a, Some(address_a_v6), device.mtu())
-            .expect("validate local-originated TUN packet");
 
         for (family, peer) in [
             ("-4", peer_address.to_string()),
