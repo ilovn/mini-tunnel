@@ -26,6 +26,7 @@ futures-util = "0.3.34"
 if-addrs = "0.15.0"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 getrandom = "0.4.3"
+hyper-util = { version = "0.1.21", default-features = false, features = ["server-auto", "tokio"] }
 hmac = "0.13.0"
 ipnet = "2.12.2"
 libc = "0.2.191"

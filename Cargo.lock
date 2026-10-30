@@ -1723,6 +1723,7 @@ dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
  "getrandom 0.4.3",
+ "hyper-util",
  "ipnet",
  "libc",
  "mini-tunnel-protocol",

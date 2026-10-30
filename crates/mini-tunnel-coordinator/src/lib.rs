@@ -54,6 +54,10 @@ const MAX_STATE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TLS_FILE_BYTES: u64 = 1024 * 1024;
 const COORDINATOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_HTTP2_STREAMS_PER_CONNECTION: u32 = 64;
 const MAX_DEVICE_ID_BYTES: usize = 128;
 const INVITE_TTL: Duration = Duration::from_secs(60 * 60);
 const SIGNATURE_CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
@@ -1903,6 +1907,24 @@ async fn run_plain_http_server<S>(
 where
     S: Future<Output = ()> + Send + 'static,
 {
+    run_plain_http_server_with_header_timeout(
+        address,
+        state,
+        shutdown_signal,
+        HTTP_HEADER_READ_TIMEOUT,
+    )
+    .await
+}
+
+async fn run_plain_http_server_with_header_timeout<S>(
+    address: SocketAddr,
+    state: CoordinatorState,
+    shutdown_signal: S,
+    header_read_timeout: Duration,
+) -> std::io::Result<()>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
     let acceptor = BoundedAcceptor::new(
         DefaultAcceptor::new(),
         state.connection_slots.clone(),
@@ -1914,7 +1936,20 @@ where
         shutdown_signal.await;
         shutdown_handle.graceful_shutdown(Some(COORDINATOR_SHUTDOWN_GRACE));
     });
-    let result = axum_server::bind(address)
+    let mut server = axum_server::bind(address);
+    server
+        .http_builder()
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::default())
+        .header_read_timeout(header_read_timeout);
+    server
+        .http_builder()
+        .http2()
+        .timer(hyper_util::rt::TokioTimer::default())
+        .keep_alive_interval(HTTP2_KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(HTTP2_KEEPALIVE_TIMEOUT)
+        .max_concurrent_streams(MAX_HTTP2_STREAMS_PER_CONNECTION);
+    let result = server
         .acceptor(acceptor)
         .handle(handle)
         .serve(router_with_state(state).into_make_service_with_connect_info::<SocketAddr>())
@@ -1960,7 +1995,20 @@ async fn serve_with_state_and_tls(
     let acceptor = axum_server::tls_rustls::RustlsAcceptor::new(config)
         .handshake_timeout(TLS_HANDSHAKE_TIMEOUT)
         .acceptor(acceptor);
-    let result = axum_server::bind(address)
+    let mut server = axum_server::bind(address);
+    server
+        .http_builder()
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::default())
+        .header_read_timeout(HTTP_HEADER_READ_TIMEOUT);
+    server
+        .http_builder()
+        .http2()
+        .timer(hyper_util::rt::TokioTimer::default())
+        .keep_alive_interval(HTTP2_KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(HTTP2_KEEPALIVE_TIMEOUT)
+        .max_concurrent_streams(MAX_HTTP2_STREAMS_PER_CONNECTION);
+    let result = server
         .acceptor(acceptor)
         .handle(handle)
         .serve(router_with_state(state).into_make_service_with_connect_info::<SocketAddr>())
@@ -2136,6 +2184,7 @@ mod tests {
     use super::*;
     use axum::{body::Body, extract::connect_info::ConnectInfo, http::Request as HttpRequest};
     use ed25519_dalek::{Signer, SigningKey};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::{TcpListener, TcpStream};
     use tower::ServiceExt;
 
@@ -2462,6 +2511,71 @@ mod tests {
                 .unwrap()
                 .contains("mini_tunnel_coordinator_connection_rejected_total 1\n")
         );
+
+        let _ = shutdown_sender.send(());
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server should shut down")
+            .expect("server task")
+            .expect("server result");
+    }
+
+    #[tokio::test]
+    async fn stalled_http_headers_are_timed_out_and_release_connection_slot() {
+        let address = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let state = CoordinatorState {
+            connection_slots: ConnectionSlots(Arc::new(tokio::sync::Semaphore::new(1))),
+            ..CoordinatorState::default()
+        };
+        let observed_state = state.clone();
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(run_plain_http_server_with_header_timeout(
+            address,
+            state,
+            async move {
+                let _ = shutdown_receiver.await;
+            },
+            Duration::from_millis(30),
+        ));
+
+        let mut stalled_client = None;
+        for _ in 0..40 {
+            if let Ok(client) = TcpStream::connect(address).await {
+                stalled_client = Some(client);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut stalled_client = stalled_client.expect("HTTP listener should start");
+        stalled_client
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost:")
+            .await
+            .expect("send incomplete request headers");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while observed_state.connection_slots.0.available_permits() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("stalled connection should acquire its slot");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while observed_state.connection_slots.0.available_permits() != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out connection should release its permit");
+        assert_eq!(observed_state.connection_slots.0.available_permits(), 1);
+
+        let response = reqwest::get(format!("http://{address}/healthz"))
+            .await
+            .expect("a valid request should use the released slot");
+        assert_eq!(response.status(), StatusCode::OK);
 
         let _ = shutdown_sender.send(());
         tokio::time::timeout(Duration::from_secs(2), server)
