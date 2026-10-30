@@ -83,5 +83,6 @@ After each phase, stop both clients cleanly, verify their peer routes are gone, 
 ## Current evidence
 
 - Real Linux, macOS, and Windows TUN runtime and route lifecycle: [CI run 41087037306](https://github.com/ilovn/mini-tunnel/actions/runs/41087037306) and [Windows Wintun run 41085578723](https://github.com/ilovn/mini-tunnel/actions/runs/41085578723).
+- Linux CI applies 100% egress loss to a veth carrying an established authenticated QUIC peer, confirms missed health probes increase, removes the loss qdisc, and confirms probes recover over the same QUIC session ([run 41092221146](https://github.com/ilovn/mini-tunnel/actions/runs/41092221146)). This validates real packet-loss accounting and recovery from a controlled virtual link, not public NAT interoperability.
 - ICE loopback mapping, same-socket checks, pinned QUIC, mesh, restart, consent-loss, and TCP fallback are covered by workspace tests.
 - No case in the public NAT or QoS matrix above has been executed. Public ICE interoperability remains unverified until a sanitized report is attached to this runbook or a linked test artifact.
