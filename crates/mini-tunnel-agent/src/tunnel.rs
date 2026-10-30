@@ -1221,6 +1221,7 @@ mod tests {
             mtu: 1500,
         };
         link.drop_left_egress();
+        let initial_for_diagnostics = Arc::clone(&initial);
         let pump = tokio::spawn(async move {
             pump_mesh_with_quality_interval(
                 &packet_io,
@@ -1238,12 +1239,19 @@ mod tests {
             .await
         });
 
-        let (accepted_id, recovered_remote) =
-            tokio::time::timeout(Duration::from_secs(8), accept_tcp)
-                .await
-                .expect("mesh did not reconnect over TCP after real UDP loss")
+        let accept_result = tokio::time::timeout(Duration::from_secs(8), accept_tcp).await;
+        let (accepted_id, recovered_remote) = match accept_result {
+            Ok(joined) => joined
                 .expect("join TCP accept")
-                .expect("accept authenticated TCP fallback");
+                .expect("accept authenticated TCP fallback"),
+            Err(_) => {
+                let health = initial_for_diagnostics.health_snapshot();
+                panic!(
+                    "mesh did not reconnect over TCP after real UDP loss; health={health:?}, reliable_requested={}",
+                    requested_reliable.load(Ordering::SeqCst)
+                );
+            }
+        };
         assert_eq!(accepted_id, a.device_id());
         assert!(
             requested_reliable.load(Ordering::SeqCst),
