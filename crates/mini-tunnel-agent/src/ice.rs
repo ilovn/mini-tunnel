@@ -823,18 +823,21 @@ impl IceAgentDriver {
         if !is_stun_datagram(message) {
             return Ok(false);
         }
-        self.agent
-            .handle_read(TaggedBytesMut {
-                now,
-                transport: TransportContext {
-                    local_addr: self.local_addr,
-                    peer_addr,
-                    transport_protocol: TransportProtocol::UDP,
-                    ecn,
-                },
-                message: BytesMut::from(message),
-            })
-            .map_err(|error| IceDriverError::Agent(error.to_string()))?;
+        if let Err(error) = self.agent.handle_read(TaggedBytesMut {
+            now,
+            transport: TransportContext {
+                local_addr: self.local_addr,
+                peer_addr,
+                transport_protocol: TransportProtocol::UDP,
+                ecn,
+            },
+            message: BytesMut::from(message),
+        }) {
+            // Incoming STUN is untrusted network input. rtc-ice can update role or checklist
+            // state while still returning a per-message error (for example after rejecting a
+            // conflicting or unauthenticated request); that must not abort the whole ICE session.
+            tracing::trace!(peer = %peer_addr, %error, "discarded ICE datagram");
+        }
         Ok(true)
     }
 
@@ -1136,6 +1139,62 @@ mod tests {
                 assert!(
                     driver_a
                         .handle_datagram(now, address_b, message.transport.ecn, &message.message,)
+                        .expect("deliver B check")
+                );
+            }
+            if driver_a.selected_pair().is_some() && driver_b.selected_pair().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(driver_a.selected_pair(), Some((address_a, address_b)));
+        assert_eq!(driver_b.selected_pair(), Some((address_b, address_a)));
+    }
+
+    #[test]
+    fn simultaneous_controlling_roles_resolve_conflict_and_nominate() {
+        let now = Instant::now();
+        let address_a: SocketAddr = "127.0.0.1:41101".parse().unwrap();
+        let address_b: SocketAddr = "127.0.0.1:41102".parse().unwrap();
+        let credentials_a = generate_ice_credentials(1).expect("A signaling credentials");
+        let credentials_b = generate_ice_credentials(1).expect("B signaling credentials");
+        let mut driver_a = IceAgentDriver::for_peer(
+            &credentials_a,
+            &credentials_b,
+            &[address_a],
+            &[address_b],
+            true,
+            now,
+        )
+        .expect("construct A initially controlling");
+        let mut driver_b = IceAgentDriver::for_peer(
+            &credentials_b,
+            &credentials_a,
+            &[address_b],
+            &[address_a],
+            true,
+            now,
+        )
+        .expect("construct B initially controlling");
+
+        for _ in 0..250 {
+            let now = Instant::now();
+            driver_a.handle_timeout(now).expect("tick A");
+            driver_b.handle_timeout(now).expect("tick B");
+            let from_a = driver_a.poll_transmits();
+            let from_b = driver_b.poll_transmits();
+            for message in from_a {
+                assert!(
+                    driver_b
+                        .handle_datagram(now, address_a, message.transport.ecn, &message.message)
+                        .expect("deliver A check")
+                );
+            }
+            for message in from_b {
+                assert!(
+                    driver_a
+                        .handle_datagram(now, address_b, message.transport.ecn, &message.message)
                         .expect("deliver B check")
                 );
             }
