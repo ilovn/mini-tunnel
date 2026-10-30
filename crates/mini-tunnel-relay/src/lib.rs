@@ -146,7 +146,10 @@ struct SourceConnectionPermit {
 impl SourceConnectionTracker {
     fn try_acquire(self: &Arc<Self>, source: IpAddr) -> Option<SourceConnectionPermit> {
         let source = normalize_source_ip(source);
-        let mut active = self.active.lock().expect("source connection lock poisoned");
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let count = active.entry(source).or_default();
         if *count >= self.limit {
             return None;
@@ -165,7 +168,7 @@ impl Drop for SourceConnectionPermit {
             .tracker
             .active
             .lock()
-            .expect("source connection lock poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(count) = active.get_mut(&self.source) {
             *count -= 1;
             if *count == 0 {
@@ -684,6 +687,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use mini_tunnel_protocol::{RELAY_TICKET_VERSION, RelayTicketClaims, issue_relay_ticket};
+    use std::net::Ipv4Addr;
 
     fn identity(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
@@ -857,6 +861,38 @@ mod tests {
         );
         drop(legitimate_b);
         relay_task.abort();
+    }
+
+    #[test]
+    fn source_connection_permits_recover_a_poisoned_tracker_lock() {
+        let tracker = Arc::new(SourceConnectionTracker {
+            active: StdMutex::new(HashMap::new()),
+            limit: 1,
+        });
+        let poison_tracker = Arc::clone(&tracker);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = poison_tracker.active.lock().expect("initial source lock");
+            panic!("simulate panic while source tracker lock is held");
+        }));
+        assert!(panic.is_err());
+
+        let source = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 40));
+        let permit = tracker
+            .try_acquire(source)
+            .expect("poisoned tracker should recover and admit a connection");
+        assert!(tracker.try_acquire(source).is_none());
+        drop(permit);
+        let replacement = tracker
+            .try_acquire(source)
+            .expect("dropping a permit should release its recovered source slot");
+        drop(replacement);
+        assert!(
+            tracker
+                .active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        );
     }
 
     #[tokio::test]
