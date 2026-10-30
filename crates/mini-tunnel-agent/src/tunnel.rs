@@ -7,12 +7,46 @@ use std::{
     ops::{Deref, DerefMut},
     pin::Pin,
     sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
 use thiserror::Error;
 
 use crate::{IdentityError, PeerChannel, tun_device::TunError};
+
+static MESH_DROPPED_PACKETS: AtomicU64 = AtomicU64::new(0);
+
+/// Total inbound mesh packets dropped because the bounded TUN event queue was full.
+#[must_use]
+pub fn mesh_dropped_packets_total() -> u64 {
+    MESH_DROPPED_PACKETS.load(Ordering::Relaxed)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MeshPacketDelivery {
+    Queued,
+    Dropped,
+    ReceiverClosed,
+}
+
+fn try_deliver_mesh_packet(
+    sender: &tokio::sync::mpsc::Sender<(Ipv4Addr, Result<Vec<u8>, IdentityError>)>,
+    address: Ipv4Addr,
+    packet: Vec<u8>,
+) -> MeshPacketDelivery {
+    match sender.try_send((address, Ok(packet))) {
+        Ok(()) => MeshPacketDelivery::Queued,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            MESH_DROPPED_PACKETS.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(peer_address = %address, "dropping inbound mesh packet because the TUN event queue is full");
+            MeshPacketDelivery::Dropped
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            MeshPacketDelivery::ReceiverClosed
+        }
+    }
+}
 
 pub type PeerConnectFuture =
     Pin<Box<dyn Future<Output = Result<PeerChannel, IdentityError>> + Send>>;
@@ -276,7 +310,10 @@ async fn receive_mesh_peer(
                         Ok(packet) => {
                             last_received = tokio::time::Instant::now();
                             inbound = Box::pin(active.recv_packet());
-                            if !packet.is_empty() && event_tx.send((address, Ok(packet))).await.is_err() {
+                            if !packet.is_empty()
+                                && try_deliver_mesh_packet(&event_tx, address, packet)
+                                    == MeshPacketDelivery::ReceiverClosed
+                            {
                                 return;
                             }
                         }
@@ -673,6 +710,42 @@ mod tests {
         Identity, accept_peer, accept_tcp_peer_any, connect_peer, connect_tcp_peer, peer_endpoint,
         peer_tcp_listener,
     };
+
+    #[tokio::test]
+    async fn mesh_packet_delivery_drops_on_full_queue_and_reports_closed_receiver() {
+        let address = Ipv4Addr::new(10, 77, 0, 2);
+        let (sender, mut receiver) = mpsc::channel(1);
+        let before = mesh_dropped_packets_total();
+
+        assert_eq!(
+            try_deliver_mesh_packet(&sender, address, vec![1]),
+            MeshPacketDelivery::Queued
+        );
+        assert_eq!(
+            try_deliver_mesh_packet(&sender, address, vec![2]),
+            MeshPacketDelivery::Dropped
+        );
+        assert!(mesh_dropped_packets_total() > before);
+        assert_eq!(
+            receiver
+                .recv()
+                .await
+                .expect("queued packet")
+                .1
+                .expect("queued packet payload"),
+            vec![1]
+        );
+
+        assert_eq!(
+            try_deliver_mesh_packet(&sender, address, vec![3]),
+            MeshPacketDelivery::Queued
+        );
+        drop(receiver);
+        assert_eq!(
+            try_deliver_mesh_packet(&sender, address, vec![4]),
+            MeshPacketDelivery::ReceiverClosed
+        );
+    }
 
     #[test]
     fn path_quality_requires_three_bad_windows_and_resets_after_a_healthy_window() {
