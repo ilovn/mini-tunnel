@@ -2365,6 +2365,18 @@ mod tests {
     #[tokio::test]
     async fn coordinator_times_out_stalled_json_body_and_releases_capacity() {
         use std::convert::Infallible;
+        use std::sync::atomic::AtomicBool;
+
+        struct BodyStreamState {
+            cancelled: Arc<AtomicBool>,
+            partial_chunk_sent: bool,
+        }
+
+        impl Drop for BodyStreamState {
+            fn drop(&mut self) {
+                self.cancelled.store(true, Ordering::Relaxed);
+            }
+        }
 
         let state = CoordinatorState {
             request_slots: RequestSlots(Arc::new(tokio::sync::Semaphore::new(1))),
@@ -2377,13 +2389,22 @@ mod tests {
             .layer(from_fn_with_state(state.clone(), limit_requests))
             .with_state(state.clone());
         let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12348);
-        let body_stream = futures_util::stream::unfold(0_u8, |state| async move {
-            if state == 0 {
-                Some((Ok::<_, Infallible>(b"{".to_vec()), 1))
-            } else {
-                std::future::pending::<Option<(Result<Vec<u8>, Infallible>, u8)>>().await
-            }
-        });
+        let body_cancelled = Arc::new(AtomicBool::new(false));
+        let body_stream = futures_util::stream::unfold(
+            BodyStreamState {
+                cancelled: body_cancelled.clone(),
+                partial_chunk_sent: false,
+            },
+            |mut state| async move {
+                if !state.partial_chunk_sent {
+                    state.partial_chunk_sent = true;
+                    Some((Ok::<_, Infallible>(b"{".to_vec()), state))
+                } else {
+                    std::future::pending::<Option<(Result<Vec<u8>, Infallible>, BodyStreamState)>>()
+                        .await
+                }
+            },
+        );
         let mut request = HttpRequest::builder()
             .method("POST")
             .uri("/json")
@@ -2398,6 +2419,7 @@ mod tests {
             .await
             .expect("timeout response");
         assert_eq!(timed_out.status(), StatusCode::REQUEST_TIMEOUT);
+        assert!(body_cancelled.load(Ordering::Relaxed));
         assert_eq!(state.request_timeouts_total.load(Ordering::Relaxed), 1);
 
         let mut fast_request = HttpRequest::builder()
