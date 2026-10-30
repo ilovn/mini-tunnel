@@ -128,9 +128,7 @@ impl RequestRateLimiter {
                 .unwrap_or(IpAddr::V6(address)),
             address => address,
         };
-        let Ok(mut clients) = self.clients.lock() else {
-            return false;
-        };
+        let mut clients = lock_recover(&self.clients);
         if !clients.contains_key(&client) && clients.len() >= MAX_RATE_LIMIT_CLIENTS {
             clients
                 .retain(|_, bucket| now.saturating_duration_since(bucket.started_at) < self.window);
@@ -152,6 +150,12 @@ impl RequestRateLimiter {
         bucket.request_count += 1;
         true
     }
+}
+
+fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[derive(Clone, Default)]
@@ -346,7 +350,7 @@ impl CoordinatorState {
         }
         let expires_at_ms = now.saturating_add(45_000);
         let session_id = {
-            let mut pairs = self.relay_pairs.lock().map_err(|_| ApiError::Internal)?;
+            let mut pairs = lock_recover(&self.relay_pairs);
             pairs.retain(|_, pair| pair.expires_at_ms > now);
             if pairs.len() >= 8192 && !pairs.contains_key(&pair_key) {
                 return Err(ApiError::Conflict("relay pairing capacity reached"));
@@ -2179,6 +2183,22 @@ mod tests {
     }
 
     #[test]
+    fn request_limiter_recovers_after_its_table_mutex_is_poisoned() {
+        let limiter = RequestRateLimiter::new(1, Duration::from_secs(10));
+        let clients = Arc::clone(&limiter.clients);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = clients.lock().unwrap();
+                panic!("simulate a panic while holding the rate-limit table");
+            })
+            .join()
+            .is_err()
+        );
+
+        assert!(limiter.allow(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 19)), Instant::now()));
+    }
+
+    #[test]
     fn request_limiter_unifies_ipv4_mapped_ipv6_source_addresses() {
         let limiter = RequestRateLimiter::new(1, Duration::from_secs(10));
         let now = Instant::now();
@@ -2399,6 +2419,15 @@ mod tests {
             .await
             .networks
             .insert(network_id, network);
+        let relay_pairs = Arc::clone(&state.relay_pairs);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = relay_pairs.lock().unwrap();
+                panic!("simulate a panic while holding the relay-pair table");
+            })
+            .join()
+            .is_err()
+        );
         let now = unix_time_ms().unwrap();
         let make = |signer: &SigningKey, source: &str, target: &str| {
             let sig = signer.sign(&relay_ticket_request_signing_bytes(
