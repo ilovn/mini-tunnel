@@ -982,18 +982,28 @@ mod tests {
         }
 
         fn drop_left_egress(&mut self) {
+            Self::set_egress_loss(&self.left);
+            self.loss_active = true;
+        }
+
+        fn drop_both_egress(&mut self) {
+            Self::set_egress_loss(&self.left);
+            Self::set_egress_loss(&self.right);
+            self.loss_active = true;
+        }
+
+        fn set_egress_loss(device: &str) {
             let output = std::process::Command::new("tc")
                 .args([
-                    "qdisc", "replace", "dev", &self.left, "root", "netem", "loss", "100%",
+                    "qdisc", "replace", "dev", device, "root", "netem", "loss", "100%",
                 ])
                 .output()
                 .expect("run tc to drop QUIC datagrams on veth egress");
             assert!(
                 output.status.success(),
-                "tc netem loss failed: {}",
+                "tc netem loss on {device} failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            self.loss_active = true;
         }
 
         fn restore_left_egress(&mut self) {
@@ -1012,12 +1022,21 @@ mod tests {
             self.loss_active = false;
         }
 
-        fn left_qdisc_stats(&self) -> String {
-            let output = std::process::Command::new("tc")
-                .args(["-s", "qdisc", "show", "dev", &self.left])
-                .output()
-                .expect("read veth qdisc statistics");
-            String::from_utf8_lossy(&output.stdout).into_owned()
+        fn qdisc_stats(&self) -> String {
+            [&self.left, &self.right]
+                .into_iter()
+                .map(|device| {
+                    let output = std::process::Command::new("tc")
+                        .args(["-s", "qdisc", "show", "dev", device])
+                        .output()
+                        .expect("read veth qdisc statistics");
+                    format!(
+                        "{device}: {}",
+                        String::from_utf8_lossy(&output.stdout).trim()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
         }
     }
 
@@ -1228,7 +1247,7 @@ mod tests {
             local_ipv6: None,
             mtu: 1500,
         };
-        link.drop_left_egress();
+        link.drop_both_egress();
         let initial_for_diagnostics = Arc::clone(&initial);
         let pump = tokio::spawn(async move {
             pump_mesh_with_quality_interval(
@@ -1255,9 +1274,9 @@ mod tests {
             Err(_) => {
                 let health = initial_for_diagnostics.health_snapshot();
                 panic!(
-                    "mesh did not reconnect over TCP after real UDP loss; health={health:?}, reliable_requested={}, left_qdisc={}",
+                    "mesh did not reconnect over TCP after real UDP loss; health={health:?}, reliable_requested={}, qdisc={}",
                     requested_reliable.load(Ordering::SeqCst),
-                    link.left_qdisc_stats().trim()
+                    link.qdisc_stats()
                 );
             }
         };
