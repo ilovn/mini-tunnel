@@ -22,7 +22,7 @@ The socket adapter must preserve Quinn's packet metadata and readiness behavior.
 
 ## Signaling and compatibility
 
-ICE credentials (ufrag/password) and candidate generation are ephemeral per endpoint generation. They are authenticated by the enrolled device key and returned only in the same-network peer view. The coordinator keeps them in a bounded in-memory map for at most two minutes; ICE-enabled CLI endpoints refresh at 60-second intervals. Never write passwords to logs. Persist candidate addresses as today, but keep ICE credentials out of the coordinator's durable snapshot; restart requires peers to publish fresh credentials.
+ICE credentials (ufrag/password) and candidate generation are ephemeral per endpoint generation. They are authenticated by the enrolled device key and returned only in the same-network peer view. The coordinator keeps them in a bounded map for at most two minutes; PostgreSQL mode shares this short-lived state across replicas, while JSON snapshots and PostgreSQL JSON exports omit the credentials. ICE-enabled CLI endpoints refresh at 60-second intervals. Never write passwords to logs. After a Coordinator restart, peers must publish fresh credentials before ICE checks can succeed.
 
 The opt-in CLI uses ICE only when both same-network peer snapshots contain current credentials and usable UDP candidates; otherwise it falls back to the current candidate dialer. Keep TCP and ticket-authorized relay selection after ICE failure. Device-ID ordering provides the deterministic ICE role proposal, while RFC 8445 role-conflict handling remains enabled because both processes can restart or observe stale state. Real NAT, IPv6 interface gathering, and Windows TUN configuration remain open.
 
