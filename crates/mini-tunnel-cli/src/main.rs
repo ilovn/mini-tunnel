@@ -2064,11 +2064,15 @@ fn build_mesh_peer_connectors(
                         None
                     };
                     let direct_wait = if force_reliable { 35 } else { 65 };
-                    if let Ok(Some(mut channel)) =
-                        tokio::time::timeout(Duration::from_secs(direct_wait), async {
-                            receiver.lock().await.recv().await
-                        })
-                        .await
+                    if let Some(mut channel) = receive_reconnect_channel(
+                        receiver,
+                        force_reliable,
+                        Duration::from_secs(direct_wait),
+                        |channel: &mini_tunnel_agent::PeerChannel| {
+                            matches!(channel.transport_name(), "TLS/TCP" | "Relay/TLS")
+                        },
+                    )
+                    .await
                     {
                         if let Some(monitor) = monitor.take() {
                             channel.set_ice_consent_monitor(monitor);
@@ -2167,6 +2171,30 @@ fn build_mesh_peer_connectors(
         })
     };
     (connector, probe, accepted_tx)
+}
+
+async fn receive_reconnect_channel<T, IsReliable>(
+    receiver: std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<T>>>,
+    force_reliable: bool,
+    wait: Duration,
+    is_reliable: IsReliable,
+) -> Option<T>
+where
+    IsReliable: Fn(&T) -> bool,
+{
+    tokio::time::timeout(wait, async move {
+        loop {
+            let channel = receiver.lock().await.recv().await?;
+            if !force_reliable || is_reliable(&channel) {
+                return Some(channel);
+            }
+            // Discard stale UDP sessions from the shared accept queue while a reliable
+            // replacement is being established.
+        }
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn spawn_single_peer_acceptors(
@@ -3915,6 +3943,48 @@ mod tests {
             vec!["tcp://203.0.113.1:443"]
         );
         assert_eq!(candidates_for_path(&candidates, false), candidates);
+    }
+
+    #[tokio::test]
+    async fn reliable_reconnect_skips_queued_udp_until_tcp_arrives() {
+        #[derive(Debug, PartialEq, Eq)]
+        enum TestPath {
+            Udp,
+            Tcp,
+        }
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        sender.send(TestPath::Udp).await.unwrap();
+        sender.send(TestPath::Tcp).await.unwrap();
+        let receiver = std::sync::Arc::new(tokio::sync::Mutex::new(receiver));
+
+        let selected = receive_reconnect_channel(receiver, true, Duration::from_secs(1), |path| {
+            matches!(path, TestPath::Tcp)
+        })
+        .await;
+        assert_eq!(selected, Some(TestPath::Tcp));
+    }
+
+    #[tokio::test]
+    async fn normal_reconnect_accepts_udp_and_reliable_reconnect_times_out_on_udp_only() {
+        #[derive(Debug, PartialEq, Eq)]
+        enum TestPath {
+            Udp,
+        }
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender.send(TestPath::Udp).await.unwrap();
+        let receiver = std::sync::Arc::new(tokio::sync::Mutex::new(receiver));
+        let selected =
+            receive_reconnect_channel(receiver, false, Duration::from_secs(1), |_| false).await;
+        assert_eq!(selected, Some(TestPath::Udp));
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender.send(TestPath::Udp).await.unwrap();
+        let receiver = std::sync::Arc::new(tokio::sync::Mutex::new(receiver));
+        let selected =
+            receive_reconnect_channel(receiver, true, Duration::from_millis(10), |_| false).await;
+        assert_eq!(selected, None);
     }
 
     #[test]
