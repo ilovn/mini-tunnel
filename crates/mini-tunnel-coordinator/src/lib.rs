@@ -160,6 +160,7 @@ struct Store {
 #[derive(Clone)]
 struct Network {
     cidr: Ipv4Net,
+    next_address: Ipv4Addr,
     admin_token_hash: [u8; 32],
     invites: HashMap<[u8; 32], Invite>,
     members: HashMap<String, Member>,
@@ -445,6 +446,7 @@ impl CoordinatorState {
             network_id,
             Network {
                 cidr,
+                next_address: first_host(cidr),
                 admin_token_hash,
                 invites: HashMap::new(),
                 members: HashMap::new(),
@@ -524,6 +526,7 @@ impl CoordinatorState {
             .remove(&request.device_id)
             .ok_or(ApiError::NotFound)?;
         network.assigned_addresses.remove(&member.address);
+        network.next_address = member.address;
         self.persist_or_restore(&mut store, previous)?;
         drop(store);
         self.ice_credentials
@@ -611,10 +614,7 @@ impl CoordinatorState {
             return Err(ApiError::Conflict("coordinator member capacity reached"));
         }
 
-        let assigned_ipv4 = network
-            .cidr
-            .hosts()
-            .find(|address| !network.assigned_addresses.contains(address))
+        let (assigned_ipv4, next_address) = find_available_address(network)
             .ok_or(ApiError::Conflict("network has no free IPv4 addresses"))?;
         let cidr = network.cidr.to_string();
         let previous = store.clone();
@@ -622,6 +622,7 @@ impl CoordinatorState {
             .networks
             .get_mut(&network_id)
             .ok_or(ApiError::NotFound)?;
+        network.next_address = next_address;
         network.assigned_addresses.insert(assigned_ipv4);
         network.members.insert(
             request.device_id.clone(),
@@ -1055,6 +1056,10 @@ impl Store {
                 persisted.id,
                 Network {
                     cidr,
+                    next_address: cidr
+                        .hosts()
+                        .find(|address| !assigned_addresses.contains(address))
+                        .unwrap_or_else(|| first_host(cidr)),
                     admin_token_hash: persisted.admin_token_hash,
                     invites,
                     members,
@@ -1070,6 +1075,24 @@ fn valid_network_cidr(cidr: Ipv4Net) -> bool {
     (16..=30).contains(&cidr.prefix_len())
         && cidr.network().is_private()
         && cidr.broadcast().is_private()
+}
+
+fn first_host(cidr: Ipv4Net) -> Ipv4Addr {
+    Ipv4Addr::from(u32::from(cidr.network()) + 1)
+}
+
+fn find_available_address(network: &Network) -> Option<(Ipv4Addr, Ipv4Addr)> {
+    let first = u32::from(network.cidr.network()) + 1;
+    let last = u32::from(network.cidr.broadcast()) - 1;
+    let cursor = u32::from(network.next_address).clamp(first, last);
+    for bits in (cursor..=last).chain(first..cursor) {
+        let address = Ipv4Addr::from(bits);
+        if !network.assigned_addresses.contains(&address) {
+            let next = if bits == last { first } else { bits + 1 };
+            return Some((address, Ipv4Addr::from(next)));
+        }
+    }
+    None
 }
 
 fn invalid_state(message: &str) -> io::Error {
@@ -1677,6 +1700,7 @@ mod tests {
         let unique = Uuid::parse_str("223e4567-e89b-42d3-a456-426614174000").unwrap();
         let network = Network {
             cidr: "10.77.0.0/24".parse().unwrap(),
+            next_address: "10.77.0.1".parse::<Ipv4Addr>().unwrap(),
             admin_token_hash: [0; 32],
             invites: HashMap::new(),
             members: HashMap::new(),
@@ -1687,6 +1711,43 @@ mod tests {
         };
         assert!(!ipv6_prefix_available(&store, collision));
         assert!(ipv6_prefix_available(&store, unique));
+    }
+
+    #[test]
+    fn address_cursor_allocates_sequentially_and_reuses_freed_addresses_after_wrap() {
+        let cidr = "10.77.0.0/29".parse().unwrap();
+        let mut network = Network {
+            cidr,
+            next_address: first_host(cidr),
+            admin_token_hash: [0; 32],
+            invites: HashMap::new(),
+            members: HashMap::new(),
+            assigned_addresses: HashSet::new(),
+        };
+        for expected in ["10.77.0.1", "10.77.0.2", "10.77.0.3"] {
+            let (address, next) = find_available_address(&network).unwrap();
+            assert_eq!(address.to_string(), expected);
+            network.assigned_addresses.insert(address);
+            network.next_address = next;
+        }
+        network
+            .assigned_addresses
+            .remove(&"10.77.0.1".parse::<Ipv4Addr>().unwrap());
+        let (reused, _) = find_available_address(&network).unwrap();
+        assert_eq!(reused, "10.77.0.4".parse::<Ipv4Addr>().unwrap());
+        network.assigned_addresses.insert(reused);
+        network
+            .assigned_addresses
+            .insert("10.77.0.5".parse().unwrap());
+        network
+            .assigned_addresses
+            .insert("10.77.0.6".parse().unwrap());
+        let (reused, _) = find_available_address(&Network {
+            next_address: "10.77.0.6".parse().unwrap(),
+            ..network
+        })
+        .unwrap();
+        assert_eq!(reused, "10.77.0.1".parse::<Ipv4Addr>().unwrap());
     }
 
     #[test]
@@ -2024,6 +2085,7 @@ mod tests {
         let network_id = Uuid::new_v4();
         let mut network = Network {
             cidr: "10.8.0.0/24".parse().unwrap(),
+            next_address: "10.8.0.1".parse().unwrap(),
             admin_token_hash: [0; 32],
             invites: HashMap::new(),
             members: HashMap::new(),
@@ -2264,6 +2326,7 @@ mod tests {
             network_id,
             Network {
                 cidr: "10.90.0.0/16".parse().unwrap(),
+                next_address: "10.90.0.1".parse().unwrap(),
                 admin_token_hash: [0; 32],
                 invites: HashMap::from([(
                     token_hash(&invite_token),
@@ -2675,6 +2738,23 @@ mod tests {
         }
 
         let restored = CoordinatorState::load(&path).expect("restore state");
+        let invite_c = restored
+            .create_invite(
+                network_id,
+                CreateInviteRequest {
+                    admin_token: network.admin_token.clone(),
+                },
+            )
+            .await
+            .expect("invite C after restore");
+        let enrolled_c = restored
+            .join_network(
+                network_id,
+                signed_join(network_id, invite_c.invite_token, 34),
+            )
+            .await
+            .expect("enroll C after restore");
+        assert_eq!(enrolled_c.assigned_ipv4, "10.83.0.3");
         let timestamp_ms = unix_time_ms().expect("clock");
         let signature = SigningKey::from_bytes(&[31; 32]).sign(&peers_signing_bytes(
             &network_id.to_string(),
@@ -2692,10 +2772,15 @@ mod tests {
             )
             .await
             .expect("list restored peers");
-        assert_eq!(peers.peers.len(), 1);
-        assert_eq!(peers.peers[0].candidates, ["198.51.100.22:42000"]);
-        assert!(peers.peers[0].ice_credentials.is_none());
-        assert_eq!(peers.peers[0].assigned_ipv4, enrolled_b.assigned_ipv4);
+        assert_eq!(peers.peers.len(), 2);
+        let peer_b = peers
+            .peers
+            .iter()
+            .find(|peer| peer.device_id == join_b.device_id)
+            .expect("peer B is restored");
+        assert_eq!(peer_b.candidates, ["198.51.100.22:42000"]);
+        assert!(peer_b.ice_credentials.is_none());
+        assert_eq!(peer_b.assigned_ipv4, enrolled_b.assigned_ipv4);
         assert_eq!(enrolled_a.assigned_ipv4, "10.83.0.1");
         assert_eq!(
             restored
