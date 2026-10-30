@@ -652,7 +652,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     manage_route,
                     coordinator_url,
                 } => {
-                    let identity = mini_tunnel_agent::Identity::load_or_create()?;
+                    let identity =
+                        std::sync::Arc::new(mini_tunnel_agent::Identity::load_or_create()?);
                     let (local_ipv4, prefix_len) =
                         resolve_tun_parameters(&network_id, &identity, local_ipv4, prefix_len)?;
                     let endpoint = create_tunnel_endpoint(
@@ -683,16 +684,38 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 &coordinator_url,
                             )
                             .await?;
+                            let (connector, probe, accepted_tx) = build_mesh_peer_connectors(
+                                endpoint.clone(),
+                                std::sync::Arc::clone(&identity),
+                                network_id.clone(),
+                                coordinator_url.clone(),
+                                peer.clone(),
+                                relay_server,
+                            );
+                            let accept_tasks = spawn_single_peer_acceptors(
+                                endpoint.clone(),
+                                std::sync::Arc::clone(&identity),
+                                network_id.clone(),
+                                peer.device_id.clone(),
+                                peer_key,
+                                None,
+                                accepted_tx,
+                            );
                             run_peer_tunnel(
                                 &tun,
-                                &channel,
-                                &peer,
                                 PeerSessionControl {
                                     coordinator_url: &coordinator_url,
                                     network_id: &network_id,
                                     identity: &identity,
                                 },
-                                remote,
+                                PeerSessionRuntime {
+                                    channel: std::sync::Arc::new(channel),
+                                    peer: &peer,
+                                    remote,
+                                    connector,
+                                    probe,
+                                    accept_tasks,
+                                },
                                 manage_route,
                             )
                             .await
@@ -723,11 +746,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     manage_route,
                     coordinator_url,
                 } => {
-                    let identity = mini_tunnel_agent::Identity::load_or_create()?;
+                    let identity =
+                        std::sync::Arc::new(mini_tunnel_agent::Identity::load_or_create()?);
                     let (local_ipv4, prefix_len) =
                         resolve_tun_parameters(&network_id, &identity, local_ipv4, prefix_len)?;
                     let tcp_listener = match tcp_bind {
-                        Some(address) => Some(mini_tunnel_agent::peer_tcp_listener(address).await?),
+                        Some(address) => Some(std::sync::Arc::new(
+                            mini_tunnel_agent::peer_tcp_listener(address).await?,
+                        )),
                         None => None,
                     };
                     let endpoint = create_tunnel_endpoint(
@@ -776,16 +802,38 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 accept_direct.await?
                             };
                             let remote = channel.remote_address();
+                            let (connector, probe, accepted_tx) = build_mesh_peer_connectors(
+                                endpoint.clone(),
+                                std::sync::Arc::clone(&identity),
+                                network_id.clone(),
+                                coordinator_url.clone(),
+                                peer.clone(),
+                                relay_server,
+                            );
+                            let accept_tasks = spawn_single_peer_acceptors(
+                                endpoint.clone(),
+                                std::sync::Arc::clone(&identity),
+                                network_id.clone(),
+                                peer.device_id.clone(),
+                                peer_key,
+                                tcp_listener.clone(),
+                                accepted_tx,
+                            );
                             run_peer_tunnel(
                                 &tun,
-                                &channel,
-                                &peer,
                                 PeerSessionControl {
                                     coordinator_url: &coordinator_url,
                                     network_id: &network_id,
                                     identity: &identity,
                                 },
-                                remote,
+                                PeerSessionRuntime {
+                                    channel: std::sync::Arc::new(channel),
+                                    peer: &peer,
+                                    remote,
+                                    connector,
+                                    probe,
+                                    accept_tasks,
+                                },
                                 manage_route,
                             )
                             .await
@@ -1410,18 +1458,52 @@ struct PeerSessionControl<'a> {
     identity: &'a mini_tunnel_agent::Identity,
 }
 
+struct PeerSessionRuntime<'a> {
+    channel: std::sync::Arc<mini_tunnel_agent::PeerChannel>,
+    peer: &'a PeerInfo,
+    remote: SocketAddr,
+    connector: mini_tunnel_agent::tunnel::PeerConnector,
+    probe: mini_tunnel_agent::tunnel::PeerConnector,
+    accept_tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+type PeerPacketPump<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<(), mini_tunnel_agent::tunnel::PeerTunnelError>>
+            + Send
+            + 'a,
+    >,
+>;
+
+struct AbortTasksOnDrop(Vec<tokio::task::JoinHandle<()>>);
+
+impl Drop for AbortTasksOnDrop {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
 async fn run_peer_tunnel(
     tun: &mini_tunnel_agent::tun_device::TunDevice,
-    channel: &mini_tunnel_agent::PeerChannel,
-    peer: &PeerInfo,
     control: PeerSessionControl<'_>,
-    remote: SocketAddr,
+    session: PeerSessionRuntime<'_>,
     manage_route: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use mini_tunnel_agent::routing::{
         RouteLease, RoutingPlatform, SystemRouteRunner, install_peer_ipv6_route, install_peer_route,
     };
 
+    let PeerSessionRuntime {
+        channel,
+        peer,
+        remote,
+        connector,
+        probe,
+        accept_tasks,
+    } = session;
+    let mut accept_tasks = AbortTasksOnDrop(accept_tasks);
     let peer_ipv4 = peer.assigned_ipv4.parse()?;
     let peer_ipv6 = mini_tunnel_protocol::overlay_ipv6_address(control.network_id, peer_ipv4)
         .ok_or("could not derive peer IPv6 overlay address")?;
@@ -1450,8 +1532,19 @@ async fn run_peer_tunnel(
         channel.transport_name(),
         manage_route,
     );
-    let pump =
-        mini_tunnel_agent::tunnel::pump_peer_packets(tun, channel, peer_ipv4, Some(peer_ipv6));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+    let pump: PeerPacketPump<'_> = Box::pin(mini_tunnel_agent::tunnel::pump_peer_mesh_dynamic(
+        tun,
+        vec![mini_tunnel_agent::tunnel::ReconnectingPeer {
+            address: peer_ipv4,
+            ipv6_address: Some(peer_ipv6),
+            channel: std::sync::Arc::clone(&channel),
+            connector,
+            probe: Some(probe),
+            probe_cooldown: Duration::from_secs(60),
+        }],
+        shutdown_rx,
+    ));
     tokio::pin!(pump);
     let revocation = wait_for_peer_revocation(
         control.coordinator_url.to_owned(),
@@ -1462,10 +1555,19 @@ async fn run_peer_tunnel(
     tokio::pin!(revocation);
     let tunnel_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = tokio::select! {
         result = &mut pump => result.map_err(Into::into),
-        signal = tokio::signal::ctrl_c() => signal.map_err(Into::into),
+        signal = tokio::signal::ctrl_c() => {
+            let result = signal.map_err(Into::into);
+            let _ = shutdown_tx.send(mini_tunnel_agent::tunnel::MeshPeerUpdate::Remove(peer_ipv4)).await;
+            drop(shutdown_tx);
+            let _ = (&mut pump).await;
+            result
+        },
         () = &mut revocation => {
             tracing::warn!(peer_id = %peer.device_id, "peer authorization was revoked; closing tunnel");
-            channel.close_async().await;
+            let shutdown_tx = shutdown_tx;
+            let _ = shutdown_tx.send(mini_tunnel_agent::tunnel::MeshPeerUpdate::Remove(peer_ipv4)).await;
+            drop(shutdown_tx);
+            let _ = (&mut pump).await;
             Ok(())
         },
     };
@@ -1482,6 +1584,10 @@ async fn run_peer_tunnel(
     }
     if let Some(error) = cleanup_error {
         return Err(error.into());
+    }
+    for task in accept_tasks.0.drain(..) {
+        task.abort();
+        let _ = task.await;
     }
     tunnel_result
 }
@@ -1828,6 +1934,75 @@ fn build_mesh_peer_connectors(
         })
     };
     (connector, probe, accepted_tx)
+}
+
+fn spawn_single_peer_acceptors(
+    endpoint: TunnelEndpoint,
+    identity: std::sync::Arc<mini_tunnel_agent::Identity>,
+    network_id: String,
+    expected_peer_id: String,
+    expected_peer_key: [u8; 32],
+    tcp_listener: Option<std::sync::Arc<tokio::net::TcpListener>>,
+    accepted: tokio::sync::mpsc::Sender<mini_tunnel_agent::PeerChannel>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let allowed = vec![(expected_peer_id.clone(), expected_peer_key)];
+    let mut tasks = Vec::with_capacity(1 + usize::from(tcp_listener.is_some()));
+    {
+        let endpoint = endpoint.clone();
+        let identity = std::sync::Arc::clone(&identity);
+        let network_id = network_id.clone();
+        let expected_peer_id = expected_peer_id.clone();
+        let accepted = accepted.clone();
+        let allowed = allowed.clone();
+        tasks.push(tokio::spawn(async move {
+            loop {
+                let result =
+                    mini_tunnel_agent::accept_peer_any(&endpoint, &network_id, &identity, &allowed)
+                        .await;
+                match result {
+                    Ok((device_id, channel)) if device_id == expected_peer_id => {
+                        if let Err(error) = accepted.send(channel).await {
+                            error.0.close_async().await;
+                            break;
+                        }
+                    }
+                    Ok((_, channel)) => channel.close_async().await,
+                    Err(error) => {
+                        tracing::debug!(%error, "single-peer UDP acceptor stopped");
+                        break;
+                    }
+                }
+            }
+        }));
+    }
+    if let Some(listener) = tcp_listener {
+        let identity = std::sync::Arc::clone(&identity);
+        tasks.push(tokio::spawn(async move {
+            loop {
+                let result = mini_tunnel_agent::accept_tcp_peer_any(
+                    &listener,
+                    &network_id,
+                    &identity,
+                    &allowed,
+                )
+                .await;
+                match result {
+                    Ok((device_id, channel)) if device_id == expected_peer_id => {
+                        if let Err(error) = accepted.send(channel).await {
+                            error.0.close_async().await;
+                            break;
+                        }
+                    }
+                    Ok((_, channel)) => channel.close_async().await,
+                    Err(error) => {
+                        tracing::debug!(%error, "single-peer TCP acceptor stopped");
+                        break;
+                    }
+                }
+            }
+        }));
+    }
+    tasks
 }
 
 type AcceptedPeerRegistry = std::sync::Arc<
