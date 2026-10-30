@@ -8,9 +8,12 @@ use std::{
     path::PathBuf,
     pin::Pin,
     process::Output,
+    time::Duration,
 };
 
 use thiserror::Error;
+
+const ROUTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutingPlatform {
@@ -60,6 +63,11 @@ pub enum RouteError {
     InvalidInterface,
     #[error("could not execute route command: {0}")]
     Io(#[from] io::Error),
+    #[error("route command timed out ({operation}) after {timeout:?}")]
+    CommandTimedOut {
+        operation: &'static str,
+        timeout: Duration,
+    },
     #[error("route command failed ({operation}): {detail}")]
     CommandFailed {
         operation: &'static str,
@@ -86,6 +94,7 @@ impl RouteRunner for SystemRouteRunner {
         Box::pin(async move {
             tokio::process::Command::new(&command.program)
                 .args(&command.args)
+                .kill_on_drop(true)
                 .output()
                 .await
         })
@@ -267,7 +276,18 @@ async fn execute(
     command: &RouteCommand,
     operation: &'static str,
 ) -> Result<(), RouteError> {
-    let output = runner.run(command).await?;
+    execute_with_timeout(runner, command, operation, ROUTE_COMMAND_TIMEOUT).await
+}
+
+async fn execute_with_timeout(
+    runner: &dyn RouteRunner,
+    command: &RouteCommand,
+    operation: &'static str,
+    timeout: Duration,
+) -> Result<(), RouteError> {
+    let output = tokio::time::timeout(timeout, runner.run(command))
+        .await
+        .map_err(|_| RouteError::CommandTimedOut { operation, timeout })??;
     if output.status.success() {
         return Ok(());
     }
@@ -340,6 +360,17 @@ mod tests {
                     },
                 })
             })
+        }
+    }
+
+    struct StalledRunner;
+
+    impl RouteRunner for StalledRunner {
+        fn run<'a>(
+            &'a self,
+            _command: &'a RouteCommand,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Output>> + Send + 'a>> {
+            Box::pin(std::future::pending())
         }
     }
 
@@ -546,6 +577,28 @@ mod tests {
             })
         ));
         assert_eq!(runner.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stalled_route_command_returns_timeout_error() {
+        let command = RouteCommand {
+            program: "ip".into(),
+            args: ["-4", "route", "add", "10.77.0.3/32"]
+                .map(OsString::from)
+                .to_vec(),
+        };
+        let error =
+            execute_with_timeout(&StalledRunner, &command, "add", Duration::from_millis(10))
+                .await
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RouteError::CommandTimedOut {
+                operation: "add",
+                timeout
+            } if timeout == Duration::from_millis(10)
+        ));
     }
 
     #[tokio::test]
