@@ -227,6 +227,7 @@ struct MeshPeerReceiver {
     pending_events: Arc<AtomicUsize>,
     outbound_rx: tokio::sync::mpsc::Receiver<QueuedMeshPacket>,
     event_tx: tokio::sync::mpsc::Sender<MeshEvent>,
+    quality_interval: Duration,
 }
 
 fn new_mesh_peer_runtime(
@@ -424,10 +425,11 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         pending_events,
         mut outbound_rx,
         event_tx,
+        quality_interval,
     } = receiver;
     loop {
         let active = Arc::clone(&*channel.read().await);
-        let mut keepalive = tokio::time::interval(Duration::from_secs(10));
+        let mut keepalive = tokio::time::interval(quality_interval);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         keepalive.tick().await;
         let mut last_received = tokio::time::Instant::now();
@@ -690,7 +692,16 @@ pub async fn pump_peer_mesh_dynamic<T: TunnelPacketIo>(
 async fn pump_mesh<T: TunnelPacketIo>(
     packet_io: &T,
     peers: Vec<MeshPeerInput>,
+    updates: Option<tokio::sync::mpsc::Receiver<MeshPeerUpdate>>,
+) -> Result<(), PeerTunnelError> {
+    pump_mesh_with_quality_interval(packet_io, peers, updates, Duration::from_secs(10)).await
+}
+
+async fn pump_mesh_with_quality_interval<T: TunnelPacketIo>(
+    packet_io: &T,
+    peers: Vec<MeshPeerInput>,
     mut updates: Option<tokio::sync::mpsc::Receiver<MeshPeerUpdate>>,
+    quality_interval: Duration,
 ) -> Result<(), PeerTunnelError> {
     if peers.is_empty() && updates.is_none() {
         return Err(PeerTunnelError::NoPeers);
@@ -721,7 +732,13 @@ async fn pump_mesh<T: TunnelPacketIo>(
             .expect("every initial peer has an outbound queue");
         receivers.insert(
             address,
-            spawn_mesh_receiver(address, runtime, outbound_rx, event_tx.clone()),
+            spawn_mesh_receiver(
+                address,
+                runtime,
+                outbound_rx,
+                event_tx.clone(),
+                quality_interval,
+            ),
         );
     }
 
@@ -813,7 +830,13 @@ async fn pump_mesh<T: TunnelPacketIo>(
                         );
                         receivers.insert(
                             address,
-                            spawn_mesh_receiver(address, &runtime, outbound_rx, event_tx.clone()),
+                            spawn_mesh_receiver(
+                                address,
+                                &runtime,
+                                outbound_rx,
+                                event_tx.clone(),
+                                quality_interval,
+                            ),
                         );
                         channels.insert(address, runtime);
                     }
@@ -851,6 +874,7 @@ fn spawn_mesh_receiver(
     runtime: &MeshPeerRuntime,
     outbound_rx: tokio::sync::mpsc::Receiver<QueuedMeshPacket>,
     event_tx: tokio::sync::mpsc::Sender<MeshEvent>,
+    quality_interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(receive_mesh_peer(MeshPeerReceiver {
         address,
@@ -861,6 +885,7 @@ fn spawn_mesh_receiver(
         pending_events: Arc::clone(&runtime.pending_events),
         outbound_rx,
         event_tx,
+        quality_interval,
     }))
 }
 
@@ -1105,6 +1130,133 @@ mod tests {
         snapshot.probes_succeeded += 2;
         snapshot.probes_missed += 1;
         assert!(tracker.observe(snapshot));
+    }
+
+    #[tokio::test]
+    async fn mesh_switches_to_tcp_after_sustained_udp_quality_degradation() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-quality-fallback-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let a = Arc::new(Identity::load_or_create_at(temp.join("a/key")).unwrap());
+        let b = Arc::new(Identity::load_or_create_at(temp.join("b/key")).unwrap());
+        let endpoint_a =
+            peer_endpoint(&a, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+        let endpoint_b =
+            peer_endpoint(&b, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+        let network = "mesh-quality-fallback";
+        let peer_socket = endpoint_b.local_addr().unwrap();
+        let a_id = a.device_id();
+        let a_key = a.public_key();
+        let b_id = b.device_id();
+        let b_key = b.public_key();
+        let server_endpoint = endpoint_b.clone();
+        let server_identity = Arc::clone(&b);
+        let accept_udp = tokio::spawn(async move {
+            accept_peer(&server_endpoint, network, &server_identity, &a_id, a_key).await
+        });
+        let initial = Arc::new(
+            connect_peer(&endpoint_a, peer_socket, network, &a, &b_id, b_key)
+                .await
+                .unwrap(),
+        );
+        let remote_initial = accept_udp.await.unwrap().unwrap();
+        // Seed three poor samples, then keep raising the counters so each shortened test window
+        // observes sustained high RTT without waiting through production's 90-second hysteresis.
+        {
+            let mut health = initial.health.lock().unwrap();
+            health.rtt = Some(Duration::from_millis(500));
+            health.probes_succeeded = 3;
+        }
+
+        let tcp_listener = peer_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .unwrap();
+        let tcp_address = tcp_listener.local_addr().unwrap();
+        let allowed = vec![(a.device_id(), a.public_key())];
+        let accept_identity = Arc::clone(&b);
+        let accept_tcp = tokio::spawn(async move {
+            accept_tcp_peer_any(&tcp_listener, network, &accept_identity, &allowed).await
+        });
+        let requested_reliable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let connector: PeerConnector = {
+            let a = Arc::clone(&a);
+            let b_id = b.device_id();
+            let b_key = b.public_key();
+            let requested_reliable = Arc::clone(&requested_reliable);
+            Arc::new(move |force_reliable| -> PeerConnectFuture {
+                let a = Arc::clone(&a);
+                let b_id = b_id.clone();
+                let requested_reliable = Arc::clone(&requested_reliable);
+                Box::pin(async move {
+                    requested_reliable.store(force_reliable, Ordering::SeqCst);
+                    connect_tcp_peer(tcp_address, network, &a, &b_id, b_key).await
+                })
+            })
+        };
+
+        let local_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let peer_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let (outbound_tx, outbound_rx) = mpsc::channel(2);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(2);
+        let io = MockPacketIo {
+            outbound: Mutex::new(outbound_rx),
+            inbound: inbound_tx,
+            local_ipv4: local_ip,
+            local_ipv6: None,
+            mtu: 1500,
+        };
+        let health_channel = Arc::clone(&initial);
+        let health_driver = tokio::spawn(async move {
+            for _ in 0..32 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let mut health = health_channel.health.lock().unwrap();
+                health.rtt = Some(Duration::from_millis(500));
+                health.probes_succeeded = health.probes_succeeded.saturating_add(1);
+            }
+        });
+        let pump = tokio::spawn(async move {
+            pump_mesh_with_quality_interval(
+                &io,
+                vec![(
+                    peer_ip,
+                    None,
+                    initial,
+                    Some(connector),
+                    None,
+                    Duration::from_secs(3600),
+                )],
+                None,
+                Duration::from_millis(100),
+            )
+            .await
+        });
+
+        let recovered_remote = tokio::time::timeout(Duration::from_secs(4), accept_tcp)
+            .await
+            .expect("quality fallback did not establish TCP")
+            .unwrap()
+            .unwrap()
+            .1;
+        assert!(requested_reliable.load(Ordering::SeqCst));
+        outbound_tx
+            .send(packet(local_ip, peer_ip, 28))
+            .await
+            .unwrap();
+        let forwarded =
+            tokio::time::timeout(Duration::from_secs(3), recovered_remote.recv_packet())
+                .await
+                .expect("recovered TCP path did not forward the packet")
+                .unwrap();
+        assert_eq!(forwarded, packet(local_ip, peer_ip, 28));
+
+        health_driver.abort();
+        pump.abort();
+        endpoint_a.close(0_u32.into(), b"test complete");
+        endpoint_b.close(0_u32.into(), b"test complete");
+        drop(recovered_remote);
+        drop(remote_initial);
+        fs::remove_dir_all(temp).unwrap();
     }
 
     struct MockPacketIo {
