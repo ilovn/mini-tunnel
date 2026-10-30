@@ -3073,10 +3073,47 @@ mod tests {
             .expect("local identity");
         let peer_identity = mini_tunnel_agent::Identity::load_or_create_at(temp.join("peer.key"))
             .expect("peer identity");
+        let local_credentials =
+            mini_tunnel_agent::ice::generate_ice_credentials(1).expect("local ICE credentials");
         let old_credentials =
             mini_tunnel_agent::ice::generate_ice_credentials(1).expect("old peer ICE credentials");
         let fresh_credentials = mini_tunnel_agent::ice::generate_ice_credentials(2)
             .expect("fresh peer ICE credentials");
+        let make_endpoint =
+            |identity: &mini_tunnel_agent::Identity,
+             credentials: mini_tunnel_protocol::IceCredentials| {
+                let iced = mini_tunnel_agent::ice::peer_endpoint_with_ice(
+                    identity,
+                    "127.0.0.1:0".parse().unwrap(),
+                    16,
+                )
+                .expect("create test ICE endpoint");
+                let address = iced.endpoint.local_addr().expect("endpoint address");
+                (
+                    TunnelEndpoint {
+                        endpoint: iced.endpoint,
+                        ice: Some(TunnelIceState {
+                            credentials,
+                            socket: iced.socket,
+                            router: iced.ice_router,
+                            local_socket_addr: address,
+                            local_candidates: vec![
+                                mini_tunnel_agent::candidate::SignaledCandidate {
+                                    address,
+                                    transport:
+                                        mini_tunnel_agent::candidate::CandidateTransport::Udp,
+                                    candidate_type:
+                                        mini_tunnel_agent::candidate::CandidateType::Host,
+                                },
+                            ],
+                        }),
+                    },
+                    address,
+                )
+            };
+        let (local_endpoint, local_address) = make_endpoint(&identity, local_credentials.clone());
+        let (peer_endpoint, peer_address) =
+            make_endpoint(&peer_identity, fresh_credentials.clone());
         let expected_peer = PeerInfo {
             device_id: peer_identity.device_id(),
             assigned_ipv4: "10.77.0.2".to_owned(),
@@ -3086,7 +3123,7 @@ mod tests {
         };
         let current_peer = PeerInfo {
             ice_credentials: Some(fresh_credentials.clone()),
-            candidates: vec!["127.0.0.1:43000".to_owned()],
+            candidates: vec![peer_address.to_string()],
             ..expected_peer.clone()
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -3109,6 +3146,69 @@ mod tests {
         assert_eq!(refreshed.ice_credentials, Some(fresh_credentials));
         assert_eq!(refreshed.candidates, current_peer.candidates);
 
+        let local_peer = PeerInfo {
+            device_id: identity.device_id(),
+            assigned_ipv4: "10.77.0.1".to_owned(),
+            public_key: identity.public_key_encoded(),
+            candidates: vec![local_address.to_string()],
+            ice_credentials: Some(local_credentials),
+        };
+        let (recovered_address, peer_selected_address) = tokio::join!(
+            select_current_ice_peer_address(
+                &local_endpoint,
+                &base_url,
+                "restart-net",
+                &expected_peer,
+                &identity,
+            ),
+            select_ice_peer_address(&peer_endpoint, &local_peer, &peer_identity),
+        );
+        assert_eq!(recovered_address, Some(peer_address));
+        assert_eq!(peer_selected_address, Some(local_address));
+
+        let peer_id = peer_identity.device_id();
+        let peer_key = peer_identity.public_key();
+        let local_id = identity.device_id();
+        let local_key = identity.public_key();
+        let server_endpoint = peer_endpoint.endpoint.clone();
+        let peer_identity_path = temp.join("peer.key");
+        let accept = tokio::spawn(async move {
+            let peer_identity = mini_tunnel_agent::Identity::load_or_create_at(peer_identity_path)
+                .expect("reload peer identity");
+            mini_tunnel_agent::accept_peer(
+                &server_endpoint,
+                "restart-net",
+                &peer_identity,
+                &local_id,
+                local_key,
+            )
+            .await
+        });
+        let channel_local = mini_tunnel_agent::connect_peer(
+            &local_endpoint.endpoint,
+            peer_address,
+            "restart-net",
+            &identity,
+            &peer_id,
+            peer_key,
+        )
+        .await
+        .expect("connect after refreshing ICE credentials");
+        let channel_peer = accept.await.expect("accept task").expect("accept peer");
+        channel_local
+            .send_packet(b"coordinator-refreshed-ice")
+            .await
+            .expect("send over recovered channel");
+        assert_eq!(
+            channel_peer
+                .recv_packet()
+                .await
+                .expect("receive over recovered channel"),
+            b"coordinator-refreshed-ice"
+        );
+        channel_local.close();
+        channel_peer.close();
+
         let mut changed_member = expected_peer.clone();
         changed_member.assigned_ipv4 = "10.77.0.9".to_owned();
         assert!(
@@ -3118,6 +3218,10 @@ mod tests {
         );
 
         server.abort();
+        local_endpoint
+            .endpoint
+            .close(0_u32.into(), b"test complete");
+        peer_endpoint.endpoint.close(0_u32.into(), b"test complete");
         std::fs::remove_dir_all(temp).expect("remove test identities");
     }
 
