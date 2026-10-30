@@ -34,6 +34,8 @@ The opt-in CLI uses ICE only when both same-network peer snapshots contain curre
 - Regression tests proving older peers continue using the existing UDP/TCP/relay path.
 - A real NAT matrix covering endpoint-independent, address-dependent and address-and-port-dependent mappings, plus one-sided and symmetric NAT. Loopback tests cannot establish public NAT traversal success.
 
+See the [public NAT and QoS validation runbook](public-nat-qos-validation.md) for the required two-network setup, matrix profiles, evidence format, cleanup, and pass/fail criteria.
+
 ## References
 
 - [RFC 8445: Interactive Connectivity Establishment](https://www.rfc-editor.org/rfc/rfc8445)

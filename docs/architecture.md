@@ -186,7 +186,7 @@ Coordinator 现可使用 PostgreSQL 作为多实例共享事实源：网络、�
 
 - [RFC 8445: ICE](https://www.rfc-editor.org/rfc/rfc8445.html)：UDP NAT traversal 的候选收集、候选对检查和优先级流程。这里建议采用 ICE 思路而不是宣称自定义探测必然打洞成功。
 
-ICE 实现选型、Quinn 同 socket 分流边界、兼容策略和验收矩阵见 [ICE integration decision](ice-integration.md)。在该实现与实网 NAT 矩阵完成前，当前候选拨号仍是 ICE-inspired best effort。
+ICE 实现选型、Quinn 同 socket 分流边界和兼容策略见 [ICE integration decision](ice-integration.md)；公网 NAT/QoS 测试前置条件、场景和通过标准见 [public NAT/QoS validation runbook](public-nat-qos-validation.md)。ICE 保持实验性 opt-in 状态并保留 TCP/relay fallback，直到两台独立真实 NAT 网络完成矩阵验证。
 - [RFC 8489: STUN](https://www.rfc-editor.org/rfc/rfc8489.html)：STUN 用于发现 NAT 映射/保活/连通性辅助，本身不是 NAT 穿透完整方案。
 - [RFC 8656: TURN](https://www.rfc-editor.org/rfc/rfc8656.html)：无法直接通信时由中间 relay 转发；标准建议结合 ICE，并尽量仅作为最后手段。
 - [RFC 9000: QUIC](https://www.rfc-editor.org/rfc/rfc9000.html)：QUIC 是基于 UDP 的传输，提供流、拥塞控制相关机制和路径迁移；本设计因此把 TCP fallback 视为单独传输。应用层 peer identity 仍需协议绑定。
