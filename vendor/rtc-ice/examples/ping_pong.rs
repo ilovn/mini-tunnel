@@ -1,8 +1,13 @@
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use futures::StreamExt;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Client, Method, Request, Response, Server, StatusCode};
+use http_body_util::{BodyExt, Full};
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode, body::Incoming};
+use hyper_util::{
+    client::legacy::{Client, connect::HttpConnector},
+    rt::{TokioExecutor, TokioIo},
+};
 use rtc_ice::agent::Agent;
 use rtc_ice::agent::agent_config::AgentConfig;
 use rtc_ice::candidate::candidate_host::CandidateHostConfig;
@@ -41,42 +46,38 @@ lazy_static! {
 }
 
 // HTTP Listener to get ICE Credentials/Candidate from remote Peer
-async fn remote_handler(req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
+async fn remote_handler(
+    req: Request<Incoming>,
+) -> Result<Response<Full<Bytes>>, Box<dyn std::error::Error + Send + Sync>> {
     //println!("received {:?}", req);
     match (req.method(), req.uri().path()) {
         (&Method::POST, "/remoteAuth") => {
             let full_body =
-                match std::str::from_utf8(&hyper::body::to_bytes(req.into_body()).await?) {
-                    Ok(s) => s.to_owned(),
-                    Err(err) => panic!("{}", err),
-                };
+                String::from_utf8_lossy(&req.into_body().collect().await?.to_bytes()).into_owned();
             let tx = REMOTE_AUTH_CHANNEL.0.lock().await;
             //println!("body: {:?}", full_body);
             let _ = tx.send(full_body).await;
 
-            let mut response = Response::new(Body::empty());
+            let mut response = Response::new(Full::new(Bytes::new()));
             *response.status_mut() = StatusCode::OK;
             Ok(response)
         }
 
         (&Method::POST, "/remoteCandidate") => {
             let full_body =
-                match std::str::from_utf8(&hyper::body::to_bytes(req.into_body()).await?) {
-                    Ok(s) => s.to_owned(),
-                    Err(err) => panic!("{}", err),
-                };
+                String::from_utf8_lossy(&req.into_body().collect().await?.to_bytes()).into_owned();
             let tx = REMOTE_CAND_CHANNEL.0.lock().await;
             //println!("body: {:?}", full_body);
             let _ = tx.send(full_body).await;
 
-            let mut response = Response::new(Body::empty());
+            let mut response = Response::new(Full::new(Bytes::new()));
             *response.status_mut() = StatusCode::OK;
             Ok(response)
         }
 
         // Return the 404 Not Found for other routes.
         _ => {
-            let mut not_found = Response::default();
+            let mut not_found = Response::new(Full::new(Bytes::new()));
             *not_found.status_mut() = StatusCode::NOT_FOUND;
             Ok(not_found)
         }
@@ -135,16 +136,33 @@ async fn main() -> Result<(), Error> {
     println!("Listening on http://localhost:{local_http_port}");
     let mut done_http_server = done_rx.clone();
     tokio::spawn(async move {
-        let addr = ([0, 0, 0, 0], local_http_port).into();
-        let service =
-            make_service_fn(|_| async { Ok::<_, hyper::Error>(service_fn(remote_handler)) });
-        let server = Server::bind(&addr).serve(service);
+        let addr: std::net::SocketAddr = ([0, 0, 0, 0], local_http_port).into();
+        let listener = match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("could not bind ICE signaling listener: {error}");
+                return;
+            }
+        };
         tokio::select! {
             _ = done_http_server.changed() => {
                 println!("receive cancel http server!");
             }
-            result = server => {
-                // Run this server for... forever!
+            result = async {
+                loop {
+                    let (stream, _) = listener.accept().await?;
+                    tokio::spawn(async move {
+                        if let Err(error) = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service_fn(remote_handler))
+                            .await
+                        {
+                            eprintln!("ICE signaling connection failed: {error}");
+                        }
+                    });
+                }
+                #[allow(unreachable_code)]
+                Ok::<(), std::io::Error>(())
+            } => {
                 if let Err(e) = result {
                     eprintln!("server error: {e}");
                 }
@@ -174,7 +192,9 @@ async fn main() -> Result<(), Error> {
         crypto::default_provider().map_err(|e| Error::Other(e.to_string()))?,
     )?;
 
-    let client = Arc::new(Client::new());
+    type HttpBody = Full<Bytes>;
+    let client: Arc<Client<HttpConnector, HttpBody>> =
+        Arc::new(Client::builder(TokioExecutor::new()).build_http());
 
     // When we have gathered a new ICE Candidate send it to the remote peer
     let client2 = Arc::clone(&client);
@@ -188,7 +208,7 @@ async fn main() -> Result<(), Error> {
                 .uri(format!(
                     "http://localhost:{remote_http_port}/remoteCandidate"
                 ))
-                .body(Body::from(c.marshal()))
+                .body(Full::new(Bytes::from(c.marshal())))
             {
                 Ok(req) => req,
                 Err(err) => {
@@ -217,7 +237,7 @@ async fn main() -> Result<(), Error> {
     let req = match Request::builder()
         .method(Method::POST)
         .uri(format!("http://localhost:{remote_http_port}/remoteAuth"))
-        .body(Body::from(format!("{local_ufrag}:{local_pwd}")))
+        .body(Full::new(Bytes::from(format!("{local_ufrag}:{local_pwd}"))))
     {
         Ok(req) => req,
         Err(err) => return Err(Error::Other(format!("{err}"))),

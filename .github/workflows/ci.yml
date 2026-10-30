@@ -38,6 +38,12 @@ jobs:
         if: runner.os == 'Linux'
         run: python3 deploy/systemd/check_units.py
 
+      - name: Audit Cargo dependencies
+        if: runner.os == 'Linux'
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit
+
       - name: Run workspace tests
         run: cargo +stable test --workspace
 
