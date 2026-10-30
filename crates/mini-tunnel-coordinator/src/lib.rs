@@ -3397,6 +3397,12 @@ mod tests {
         fs::create_dir_all(&dir).expect("create test directory");
         let path = dir.join("coordinator.json");
         fs::write(&path, br#"{"schema_version":1,"networks":[]}"#).expect("write snapshot");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("restrict snapshot permissions");
+        }
 
         let summary = CoordinatorState::verify_persistent_state(&path)
             .await
