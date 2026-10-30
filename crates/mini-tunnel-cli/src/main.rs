@@ -90,6 +90,13 @@ enum CoordinatorCommand {
             value_parser = clap::value_parser!(u64).range(1..)
         )]
         tls_reload_interval_seconds: u64,
+        /// Trusted reverse proxy CIDRs; only these peers may supply X-Forwarded-For.
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_COORDINATOR_TRUSTED_PROXIES",
+            value_delimiter = ','
+        )]
+        trusted_proxies: Vec<ipnet::IpNet>,
     },
     /// Check a running coordinator's health endpoint.
     Health {
@@ -519,6 +526,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 tls_cert,
                 tls_key,
                 tls_reload_interval_seconds,
+                trusted_proxies,
             } => {
                 let relay_key = std::env::var("MINI_TUNNEL_RELAY_TICKET_KEY")
                     .ok()
@@ -538,12 +546,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         "non-loopback coordinator listeners require TLS; configure --tls-cert and --tls-key".into(),
                     );
                 }
-                mini_tunnel_coordinator::serve_with_state_file_and_relay_key_tls_and_reload_interval(
+                mini_tunnel_coordinator::serve_with_state_file_and_relay_key_tls_and_reload_interval_and_trusted_proxies(
                     listen,
                     state_file,
                     relay_key,
                     tls_files,
                     Duration::from_secs(tls_reload_interval_seconds),
+                    trusted_proxies,
                 )
                 .await?;
             }

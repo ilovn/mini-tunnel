@@ -14,7 +14,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State},
-    http::{HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     middleware::{Next, from_fn_with_state},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -22,7 +22,7 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signature, VerifyingKey};
 use getrandom::fill as random_fill;
-use ipnet::Ipv4Net;
+use ipnet::{IpNet, Ipv4Net};
 use mini_tunnel_protocol::{
     ApiErrorResponse, CandidateUpdateRequest, CandidateUpdateResponse, CreateInviteRequest,
     CreateInviteResponse, CreateNetworkRequest, CreateNetworkResponse, IceCredentials,
@@ -69,6 +69,7 @@ pub struct CoordinatorState {
     persistence: Option<Arc<PathBuf>>,
     _state_lock: Option<Arc<fs::File>>,
     request_limiter: RequestRateLimiter,
+    trusted_proxies: Arc<Vec<IpNet>>,
     relay_ticket_key: Option<Arc<[u8; 32]>>,
     relay_pairs: Arc<Mutex<RelayPairStore>>,
     ice_credentials: Arc<RwLock<HashMap<(Uuid, String), EphemeralIceCredentials>>>,
@@ -150,6 +151,59 @@ impl RequestRateLimiter {
         bucket.request_count += 1;
         true
     }
+}
+
+const MAX_FORWARDED_FOR_BYTES: usize = 1024;
+const MAX_FORWARDED_FOR_HOPS: usize = 16;
+
+fn client_ip_for_request(
+    remote: SocketAddr,
+    headers: &HeaderMap,
+    trusted_proxies: &[IpNet],
+) -> IpAddr {
+    if !trusted_proxies
+        .iter()
+        .any(|network| network.contains(&remote.ip()))
+    {
+        return remote.ip();
+    }
+    let mut values = headers.get_all("x-forwarded-for").iter();
+    let Some(value) = values.next() else {
+        return remote.ip();
+    };
+    if values.next().is_some() {
+        return remote.ip();
+    }
+    let Ok(value) = value.to_str() else {
+        return remote.ip();
+    };
+    if value.len() > MAX_FORWARDED_FOR_BYTES {
+        return remote.ip();
+    }
+    let forwarded = value.split(',').map(str::trim).collect::<Vec<_>>();
+    if forwarded.is_empty() || forwarded.len() > MAX_FORWARDED_FOR_HOPS {
+        return remote.ip();
+    }
+    let Ok(addresses) = forwarded
+        .iter()
+        .map(|address| address.parse::<IpAddr>())
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return remote.ip();
+    };
+
+    // X-Forwarded-For is ordered client-to-proxy. Walk back from the trusted socket peer and
+    // return the first address that is not in the trusted proxy set.
+    addresses
+        .iter()
+        .rev()
+        .find(|address| {
+            !trusted_proxies
+                .iter()
+                .any(|network| network.contains(*address))
+        })
+        .copied()
+        .unwrap_or(remote.ip())
 }
 
 fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -270,6 +324,13 @@ impl CoordinatorState {
     #[must_use]
     pub fn with_relay_ticket_key(mut self, key: [u8; 32]) -> Self {
         self.relay_ticket_key = Some(Arc::new(key));
+        self
+    }
+
+    /// Trust forwarded client addresses only from these explicitly configured proxy networks.
+    #[must_use]
+    pub fn with_trusted_proxies(mut self, networks: Vec<IpNet>) -> Self {
+        self.trusted_proxies = Arc::new(networks);
         self
     }
 
@@ -1292,7 +1353,8 @@ async fn limit_requests(
             .into_response();
     };
     let loopback_metrics = request.uri().path() == "/metrics" && remote.ip().is_loopback();
-    if !loopback_metrics && !state.request_limiter.allow(remote.ip(), Instant::now()) {
+    let client_ip = client_ip_for_request(remote, request.headers(), &state.trusted_proxies);
+    if !loopback_metrics && !state.request_limiter.allow(client_ip, Instant::now()) {
         state
             .request_limiter
             .rejected_total
@@ -1516,10 +1578,30 @@ pub async fn serve_with_state_file_and_relay_key_tls_and_reload_interval(
     tls_files: Option<(PathBuf, PathBuf)>,
     tls_reload_interval: Duration,
 ) -> std::io::Result<()> {
+    serve_with_state_file_and_relay_key_tls_and_reload_interval_and_trusted_proxies(
+        address,
+        state_file,
+        relay_ticket_key,
+        tls_files,
+        tls_reload_interval,
+        Vec::new(),
+    )
+    .await
+}
+
+pub async fn serve_with_state_file_and_relay_key_tls_and_reload_interval_and_trusted_proxies(
+    address: SocketAddr,
+    state_file: impl Into<PathBuf>,
+    relay_ticket_key: Option<[u8; 32]>,
+    tls_files: Option<(PathBuf, PathBuf)>,
+    tls_reload_interval: Duration,
+    trusted_proxies: Vec<IpNet>,
+) -> std::io::Result<()> {
     let mut state = CoordinatorState::load(state_file)?;
     if let Some(key) = relay_ticket_key {
         state = state.with_relay_ticket_key(key);
     }
+    state = state.with_trusted_proxies(trusted_proxies);
     serve_with_state_and_tls(address, state, tls_files, tls_reload_interval).await
 }
 
@@ -2222,6 +2304,103 @@ mod tests {
         assert_eq!(limiter.clients.lock().unwrap().len(), 1);
     }
 
+    #[test]
+    fn forwarded_client_ip_requires_a_trusted_socket_peer() {
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 443);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.25".parse().expect("forwarded header"),
+        );
+        let trusted = ["203.0.113.0/24".parse::<IpNet>().unwrap()];
+        assert_eq!(
+            client_ip_for_request(remote, &headers, &trusted),
+            remote.ip()
+        );
+    }
+
+    #[test]
+    fn forwarded_client_ip_walks_back_through_trusted_proxies() {
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.25, 10.20.0.8"
+                .parse()
+                .expect("forwarded header"),
+        );
+        let trusted = [
+            "127.0.0.0/8".parse::<IpNet>().unwrap(),
+            "10.20.0.0/16".parse::<IpNet>().unwrap(),
+        ];
+        assert_eq!(
+            client_ip_for_request(remote, &headers, &trusted),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 25))
+        );
+
+        headers.insert(
+            "x-forwarded-for",
+            "192.0.2.10, 203.0.113.11"
+                .parse()
+                .expect("forwarded header"),
+        );
+        assert_eq!(
+            client_ip_for_request(remote, &headers, &trusted),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11)),
+            "stop at the first untrusted proxy so a client cannot spoof earlier hops"
+        );
+    }
+
+    #[test]
+    fn malformed_oversized_and_excessive_forwarded_chains_fall_back_to_socket_peer() {
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443);
+        let trusted = ["127.0.0.0/8".parse::<IpNet>().unwrap()];
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "not-an-ip".parse().expect("forwarded header"),
+        );
+        assert_eq!(
+            client_ip_for_request(remote, &headers, &trusted),
+            remote.ip()
+        );
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.25".parse().expect("forwarded header"),
+        );
+        headers.append(
+            "x-forwarded-for",
+            "203.0.113.10".parse().expect("second forwarded header"),
+        );
+        assert_eq!(
+            client_ip_for_request(remote, &headers, &trusted),
+            remote.ip()
+        );
+        headers.insert(
+            "x-forwarded-for",
+            "1".repeat(MAX_FORWARDED_FOR_BYTES + 1)
+                .parse()
+                .expect("forwarded header"),
+        );
+        assert_eq!(
+            client_ip_for_request(remote, &headers, &trusted),
+            remote.ip()
+        );
+        headers.insert(
+            "x-forwarded-for",
+            (0..=MAX_FORWARDED_FOR_HOPS)
+                .map(|_| "198.51.100.25")
+                .collect::<Vec<_>>()
+                .join(",")
+                .parse()
+                .expect("forwarded header"),
+        );
+        assert_eq!(
+            client_ip_for_request(remote, &headers, &trusted),
+            remote.ip()
+        );
+    }
+
     #[tokio::test]
     async fn router_returns_429_with_retry_after_for_over_limit_source() {
         let state = CoordinatorState {
@@ -2268,6 +2447,72 @@ mod tests {
             app.oneshot(other_request)
                 .await
                 .expect("independent source response")
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn router_uses_forwarded_addresses_only_for_trusted_proxies() {
+        let state = CoordinatorState {
+            request_limiter: RequestRateLimiter::new(1, Duration::from_secs(60)),
+            ..CoordinatorState::default()
+        }
+        .with_trusted_proxies(vec!["127.0.0.0/8".parse().unwrap()]);
+        let app = router_with_state(state);
+        let make_request = |source: SocketAddr, forwarded: &str| {
+            let mut request = HttpRequest::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .expect("valid request");
+            request.extensions_mut().insert(ConnectInfo(source));
+            request.headers_mut().insert(
+                "x-forwarded-for",
+                forwarded.parse().expect("forwarded header"),
+            );
+            request
+        };
+        let untrusted_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 12345);
+        let untrusted_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)), 12346);
+        assert_eq!(
+            app.clone()
+                .oneshot(make_request(untrusted_a, "198.51.100.9"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(make_request(untrusted_b, "198.51.100.9"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK,
+            "untrusted peers must not be able to choose the limiter identity"
+        );
+
+        let trusted_proxy = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8443);
+        assert_eq!(
+            app.clone()
+                .oneshot(make_request(trusted_proxy, "198.51.100.9"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(make_request(trusted_proxy, "198.51.100.9"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            app.oneshot(make_request(trusted_proxy, "198.51.100.10"))
+                .await
+                .unwrap()
                 .status(),
             StatusCode::OK
         );

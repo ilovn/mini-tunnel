@@ -26,3 +26,4 @@ tracing-subscriber.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 if-addrs.workspace = true
+ipnet.workspace = true

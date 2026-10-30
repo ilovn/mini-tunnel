@@ -1732,6 +1732,7 @@ dependencies = [
  "clap",
  "directories",
  "if-addrs",
+ "ipnet",
  "mini-tunnel-agent",
  "mini-tunnel-coordinator",
  "mini-tunnel-protocol",

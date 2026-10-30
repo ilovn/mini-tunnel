@@ -30,6 +30,8 @@ On Unix, the private-key file must not be world-accessible; use mode `0600` or a
 
 On clients, set `MINI_TUNNEL_COORDINATOR_URL='https://tunnel.example:8443'`. Clients validate the certificate chain and hostname; the CLI has no insecure TLS bypass. A reverse proxy that terminates TLS is also supported while the coordinator remains bound to loopback.
 
+When the coordinator is behind a reverse proxy, set `--trusted-proxy` to the proxy's source CIDR (repeat the option for multiple proxies), or provide comma-separated CIDRs through `MINI_TUNNEL_COORDINATOR_TRUSTED_PROXIES`. Only requests whose direct TCP peer matches a configured CIDR use `X-Forwarded-For` for per-client rate limiting. The proxy must append the immediate downstream address; malformed chains are ignored. Keep `/metrics` off public proxy routes.
+
 Coordinator exposes basic Prometheus metrics at `/metrics` for loopback scrapes only. The endpoint reports configured networks, enrolled members, and rate-limited requests; when using a reverse proxy, keep `/metrics` off its public routes.
 
 CLI commands emit structured logs to stderr. Peer path degradation, reconnect attempts, relay/TCP fallback, and healthy UDP promotion include the peer overlay address, path, and reason. Set `RUST_LOG` to adjust verbosity, for example `RUST_LOG=mini_tunnel_agent=debug`.
