@@ -36,6 +36,25 @@ sudo systemctl enable --now mini-tunnel-coordinator-postgres.service
 
 Check the selected Coordinator unit and relay with `systemctl status` and `journalctl`.
 
+## Monitoring and alerts
+
+`deploy/prometheus/mini-tunnel.yml` is a complete Prometheus configuration for a local scraper. Install it as `/etc/prometheus/prometheus.yml` (or merge its `rule_files` and `scrape_configs` into the existing file), install `deploy/prometheus/mini-tunnel-alerts.yml` at `/etc/prometheus/mini-tunnel-alerts.yml`, and set the Coordinator certificate authority file and DNS SAN to match the host certificate. Keep Prometheus in the host network namespace: Coordinator `/metrics` accepts loopback connections only, and both configured targets use `127.0.0.1`. For a remote monitoring server, forward these metrics through Prometheus `remote_write`; do not expose the Coordinator metrics route publicly.
+
+Before reload, run `promtool check config /etc/prometheus/prometheus.yml` and `promtool check rules /etc/prometheus/mini-tunnel-alerts.yml`. Verify health and metrics locally with certificate validation:
+
+```sh
+curl --fail --cacert /etc/mini-tunnel/tls/coordinator-ca.pem \
+  --resolve coordinator.internal:8443:127.0.0.1 \
+  https://coordinator.internal:8443/healthz
+curl --fail http://127.0.0.1:42002/healthz
+curl --fail --cacert /etc/mini-tunnel/tls/coordinator-ca.pem \
+  --resolve coordinator.internal:8443:127.0.0.1 \
+  https://coordinator.internal:8443/metrics
+curl --fail http://127.0.0.1:42002/metrics
+```
+
+The alerts cover loss of either scrape endpoint, Coordinator request timeouts or concurrency rejection, and Relay connection-capacity rejection. For a scrape alert, check `systemctl status`, the service journal, certificate expiry/trust, and whether the local Prometheus process can reach loopback. For a Coordinator saturation alert, inspect database health/latency and API load before raising limits. For Relay capacity rejection, compare active connections with `mini_tunnel_relay_max_connections` and the per-source limit; investigate connection churn before increasing caps. The Coordinator's `/healthz` returns `503` while the configured PostgreSQL store is unavailable.
+
 The coordinator template binds HTTPS to loopback for a local reverse proxy. Configure the proxy to validate the coordinator certificate and expose only the API routes required by clients; keep `/metrics` private. The relay serves TCP on port `42001`; permit that port in the host/network firewall. Its health and Prometheus endpoints stay bound to loopback at `127.0.0.1:42002`.
 
 Enable either `mini-tunnel-coordinator.service` for a single-node JSON snapshot or `mini-tunnel-coordinator-postgres.service` for shared PostgreSQL state, not both. For JSON mode, continue protecting `/var/lib/mini-tunnel/coordinator-state.json`. For PostgreSQL mode, back up the database with `pg_dump`/PITR and periodically export a verified JSON recovery snapshot with `mini-tunnel coordinator export-state-from-postgres --output <path>`.

@@ -1,0 +1,54 @@
+groups:
+  - name: mini-tunnel-availability
+    rules:
+      - alert: MiniTunnelCoordinatorMetricsUnavailable
+        expr: up{job="mini-tunnel-coordinator"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: mini-tunnel Coordinator metrics endpoint is unavailable
+          description: Prometheus cannot scrape the local HTTPS Coordinator metrics endpoint for two minutes.
+          runbook: deploy/systemd/README.md#monitoring-and-alerts
+
+      - alert: MiniTunnelRelayMetricsUnavailable
+        expr: up{job="mini-tunnel-relay"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: mini-tunnel Relay metrics endpoint is unavailable
+          description: Prometheus cannot scrape the local Relay metrics endpoint for two minutes.
+          runbook: deploy/systemd/README.md#monitoring-and-alerts
+
+  - name: mini-tunnel-capacity
+    rules:
+      - alert: MiniTunnelCoordinatorRequestTimeouts
+        expr: increase(mini_tunnel_coordinator_request_timeouts_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: mini-tunnel Coordinator requests are timing out
+          description: At least one Coordinator request exceeded its processing deadline in each recent evaluation window.
+          runbook: deploy/systemd/README.md#monitoring-and-alerts
+
+      - alert: MiniTunnelCoordinatorConcurrencyRejected
+        expr: increase(mini_tunnel_coordinator_concurrency_rejected_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: mini-tunnel Coordinator is rejecting concurrent API work
+          description: The global in-flight request limit is being reached; inspect request volume and host capacity.
+          runbook: deploy/systemd/README.md#monitoring-and-alerts
+
+      - alert: MiniTunnelRelayCapacityRejected
+        expr: increase(mini_tunnel_relay_capacity_rejections_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: mini-tunnel Relay connection capacity was exhausted
+          description: The relay rejected connections at its global or per-source-IP limit.
+          runbook: deploy/systemd/README.md#monitoring-and-alerts
