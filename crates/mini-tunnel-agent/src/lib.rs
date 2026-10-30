@@ -1277,8 +1277,9 @@ pub async fn connect_peer_candidates(
                     checklist.finish(index, true);
                     return Ok((channel, address));
                 }
-                Ok(Err(IdentityError::UnauthorizedPeer)) => {
-                    return Err(CandidateConnectError::UnauthorizedPeer);
+                Ok(Err(error @ IdentityError::UnauthorizedPeer)) => {
+                    checklist.finish(index, false);
+                    last_error = Some(error.to_string());
                 }
                 Ok(Err(error)) => {
                     checklist.finish(index, false);
@@ -1322,8 +1323,9 @@ pub async fn connect_peer_candidates(
                 checklist.finish(index, true);
                 return Ok((channel, address));
             }
-            Ok(Err(IdentityError::UnauthorizedPeer)) => {
-                return Err(CandidateConnectError::UnauthorizedPeer);
+            Ok(Err(error @ IdentityError::UnauthorizedPeer)) => {
+                checklist.finish(index, false);
+                last_error = Some(error.to_string());
             }
             Ok(Err(error)) => {
                 checklist.finish(index, false);
@@ -2300,6 +2302,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_candidate_authentication_failure_does_not_block_later_candidate() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-udp-candidate-retry-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let a = Identity::load_or_create_at(temp.join("a/device.key")).expect("identity A");
+        let b = std::sync::Arc::new(
+            Identity::load_or_create_at(temp.join("b/device.key")).expect("identity B"),
+        );
+        let endpoint_a = peer_endpoint(&a, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .expect("UDP endpoint A");
+        let wrong_endpoint = peer_endpoint(&b, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .expect("wrong-network endpoint");
+        let correct_endpoint =
+            peer_endpoint(&b, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .expect("correct-network endpoint");
+        let expected_a = a.device_id();
+        let expected_a_key = a.public_key();
+        let wrong_server = wrong_endpoint.clone();
+        let wrong_identity = std::sync::Arc::clone(&b);
+        let wrong_accept = tokio::spawn(async move {
+            accept_peer(
+                &wrong_server,
+                "another-network",
+                &wrong_identity,
+                &expected_a,
+                expected_a_key,
+            )
+            .await
+        });
+        let expected_a = a.device_id();
+        let expected_a_key = a.public_key();
+        let correct_server = correct_endpoint.clone();
+        let correct_identity = std::sync::Arc::clone(&b);
+        let correct_accept = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            accept_peer(
+                &correct_server,
+                "office",
+                &correct_identity,
+                &expected_a,
+                expected_a_key,
+            )
+            .await
+        });
+
+        let wrong_address = wrong_endpoint.local_addr().expect("wrong endpoint address");
+        let correct_address = correct_endpoint
+            .local_addr()
+            .expect("correct endpoint address");
+        let (channel, connected_address) = connect_peer_candidates(
+            &endpoint_a,
+            &[wrong_address.to_string(), correct_address.to_string()],
+            "office",
+            &a,
+            &b.device_id(),
+            b.public_key(),
+        )
+        .await
+        .expect("the later authorized candidate should connect");
+        assert_eq!(connected_address, correct_address);
+        let accepted = correct_accept
+            .await
+            .expect("correct accept task")
+            .expect("correct peer accepted");
+        assert!(matches!(
+            wrong_accept.await.expect("wrong accept task"),
+            Err(IdentityError::UnauthorizedPeer)
+        ));
+
+        channel.close_async().await;
+        accepted.close_async().await;
+        endpoint_a.close(0_u32.into(), b"test complete");
+        wrong_endpoint.close(0_u32.into(), b"test complete");
+        correct_endpoint.close(0_u32.into(), b"test complete");
+        fs::remove_dir_all(temp).expect("remove test identities");
+    }
+
+    #[tokio::test]
     async fn tcp_peer_channel_authenticates_and_transfers_bounded_frames() {
         let temp = std::env::temp_dir().join(format!("mini-tunnel-tcp-{}", uuid::Uuid::new_v4()));
         let a = Identity::load_or_create_at(temp.join("a/device.key")).expect("identity A");
@@ -2397,6 +2478,78 @@ mod tests {
         ));
         fs::remove_dir_all(temp).expect("remove test identities");
         udp_endpoint.close(0_u32.into(), b"test complete");
+    }
+
+    #[tokio::test]
+    async fn tcp_candidate_authentication_failure_does_not_block_later_candidate() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-tcp-candidate-retry-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let a = Identity::load_or_create_at(temp.join("a/device.key")).expect("identity A");
+        let b = std::sync::Arc::new(
+            Identity::load_or_create_at(temp.join("b/device.key")).expect("identity B"),
+        );
+        let endpoint_a = peer_endpoint(&a, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .expect("UDP endpoint A");
+        let wrong_listener = peer_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("wrong-network TCP listener");
+        let wrong_address = wrong_listener.local_addr().expect("wrong listener address");
+        let expected_a = (a.device_id(), a.public_key());
+        let wrong_identity = std::sync::Arc::clone(&b);
+        let wrong_accept = tokio::spawn(async move {
+            accept_tcp_peer_any(
+                &wrong_listener,
+                "another-network",
+                &wrong_identity,
+                &[expected_a],
+            )
+            .await
+        });
+
+        let correct_listener =
+            peer_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await
+                .expect("correct-network TCP listener");
+        let correct_address = correct_listener
+            .local_addr()
+            .expect("correct listener address");
+        let expected_a = (a.device_id(), a.public_key());
+        let correct_identity = std::sync::Arc::clone(&b);
+        let b_accept = tokio::spawn(async move {
+            accept_tcp_peer_any(
+                &correct_listener,
+                "office",
+                &correct_identity,
+                &[expected_a],
+            )
+            .await
+        });
+
+        let (channel, connected_address) = connect_peer_candidates(
+            &endpoint_a,
+            &[
+                format!("tcp://{wrong_address}"),
+                format!("tcp://{correct_address}"),
+            ],
+            "office",
+            &a,
+            &b.device_id(),
+            b.public_key(),
+        )
+        .await
+        .expect("the later authorized candidate should connect");
+        assert_eq!(connected_address, correct_address);
+        assert_eq!(channel.transport_name(), "TLS/TCP");
+        let (_, accepted) = b_accept.await.expect("accept task").expect("accept peer");
+
+        channel.close_async().await;
+        accepted.close_async().await;
+        wrong_accept.abort();
+        let _ = wrong_accept.await;
+        endpoint_a.close(0_u32.into(), b"test complete");
+        fs::remove_dir_all(temp).expect("remove test identities");
     }
 
     #[tokio::test]
