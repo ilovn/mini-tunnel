@@ -328,6 +328,7 @@ pub struct PeerChannel {
     fragments: Mutex<FragmentReassembler>,
     pending_probe_packets: Mutex<PendingProbePackets>,
     health: Mutex<PeerHealth>,
+    ice_consent: Option<ice::IceConsentMonitor>,
 }
 
 const HEALTH_PING: u8 = 0xf0;
@@ -477,6 +478,35 @@ impl FragmentReassembler {
 }
 
 impl PeerChannel {
+    /// Attach the nominated ICE session whose consent lifetime follows this channel.
+    pub fn set_ice_consent_monitor(&mut self, monitor: ice::IceConsentMonitor) {
+        self.ice_consent = Some(monitor);
+    }
+
+    /// Resolve when ICE consent expires; channels without ICE consent remain pending.
+    pub async fn wait_ice_consent_failure(&self) {
+        let Some(monitor) = &self.ice_consent else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        let mut failed = monitor.failure_receiver();
+        loop {
+            if *failed.borrow() {
+                return;
+            }
+            if failed.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Stop this channel's ICE driver and wait for its router registration to be released.
+    pub async fn stop_ice_consent_monitor(&self) {
+        if let Some(monitor) = &self.ice_consent {
+            monitor.stop().await;
+        }
+    }
+
     #[must_use]
     pub fn remote_address(&self) -> SocketAddr {
         match &self.transport {
@@ -1418,6 +1448,7 @@ fn new_channel(connection: Connection, network_id: &str) -> PeerChannel {
         fragments: Mutex::new(FragmentReassembler::default()),
         pending_probe_packets: Mutex::new(PendingProbePackets::default()),
         health: Mutex::new(PeerHealth::default()),
+        ice_consent: None,
     }
 }
 
@@ -1444,6 +1475,7 @@ fn new_tcp_channel(
         fragments: Mutex::new(FragmentReassembler::default()),
         pending_probe_packets: Mutex::new(PendingProbePackets::default()),
         health: Mutex::new(PeerHealth::default()),
+        ice_consent: None,
     }
 }
 

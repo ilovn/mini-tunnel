@@ -16,7 +16,11 @@ use rtc_ice::Agent;
 use rtc_shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use sansio::Protocol;
 use thiserror::Error;
-use tokio::{io::Interest, net::UdpSocket, sync::mpsc};
+use tokio::{
+    io::Interest,
+    net::UdpSocket,
+    sync::{mpsc, watch},
+};
 
 use mini_tunnel_protocol::IceCredentials;
 
@@ -690,6 +694,51 @@ pub struct IceAgentDriver {
     local_addr: SocketAddr,
 }
 
+/// Channel-owned cancellation and failure signal for a nominated ICE consent session.
+pub struct IceConsentMonitor {
+    cancel: watch::Sender<bool>,
+    failed: watch::Receiver<bool>,
+    task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl IceConsentMonitor {
+    /// Create a monitor handle and the receivers/sender consumed by its driver task.
+    pub fn new() -> (Self, watch::Receiver<bool>, watch::Sender<bool>) {
+        let (cancel, cancel_receiver) = watch::channel(false);
+        let (failure_sender, failed) = watch::channel(false);
+        (
+            Self {
+                cancel,
+                failed,
+                task: tokio::sync::Mutex::new(None),
+            },
+            cancel_receiver,
+            failure_sender,
+        )
+    }
+
+    pub(crate) fn failure_receiver(&self) -> watch::Receiver<bool> {
+        self.failed.clone()
+    }
+
+    pub async fn set_task(&self, task: tokio::task::JoinHandle<()>) {
+        *self.task.lock().await = Some(task);
+    }
+
+    pub async fn stop(&self) {
+        self.cancel.send_replace(true);
+        if let Some(task) = self.task.lock().await.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for IceConsentMonitor {
+    fn drop(&mut self) {
+        self.cancel.send_replace(true);
+    }
+}
+
 impl IceAgentDriver {
     #[must_use]
     pub fn new(agent: Agent, local_addr: SocketAddr) -> Self {
@@ -931,6 +980,64 @@ impl IceAgentDriver {
                         return Err(IceDriverError::Timeout);
                     }
                 }
+            }
+        }
+    }
+
+    /// Keep a nominated pair's RFC 7675 consent fresh until cancellation or consent loss.
+    pub async fn monitor_consent(
+        &mut self,
+        socket: &IceSocketHandle,
+        router: &IceDatagramRouterHandle,
+        local_ufrag: &str,
+        remote_ufrag: &str,
+        datagrams: &mut mpsc::Receiver<IceDatagram>,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<(), IceDriverError> {
+        loop {
+            if *cancel.borrow() {
+                return Ok(());
+            }
+            let now = Instant::now();
+            self.handle_timeout(now)?;
+            for transmit in self.poll_transmits() {
+                socket
+                    .send_to(&transmit.message, transmit.transport.peer_addr)
+                    .await
+                    .map_err(|error| IceDriverError::Socket(error.to_string()))?;
+            }
+            let mut disconnected = false;
+            for event in self.poll_events() {
+                if let rtc_ice::Event::ConnectionStateChange(state) = event
+                    && matches!(
+                        state,
+                        rtc_ice::state::ConnectionState::Disconnected
+                            | rtc_ice::state::ConnectionState::Failed
+                            | rtc_ice::state::ConnectionState::Closed
+                    )
+                {
+                    disconnected = true;
+                }
+            }
+            if disconnected || self.selected_pair().is_none() {
+                return Err(IceDriverError::Timeout);
+            }
+            let next_deadline = self
+                .next_timeout()
+                .unwrap_or_else(|| now + Duration::from_secs(1));
+            tokio::select! {
+                changed = cancel.changed() => {
+                    if changed.is_err() || *cancel.borrow() {
+                        return Ok(());
+                    }
+                }
+                datagram = datagrams.recv() => {
+                    let datagram = datagram.ok_or_else(|| IceDriverError::Router("peer datagram queue closed".to_owned()))?;
+                    router
+                        .handle_datagram(local_ufrag, remote_ufrag, self, datagram, Instant::now())
+                        .map_err(|error| IceDriverError::Router(error.to_string()))?;
+                }
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(next_deadline)) => {}
             }
         }
     }
@@ -1457,6 +1564,47 @@ mod tests {
         );
         assert_eq!(pair_a.expect("A nominates pair"), (address_a, address_b));
         assert_eq!(pair_b.expect("B nominates pair"), (address_b, address_a));
+
+        let (monitor, mut cancel, failure_sender) = IceConsentMonitor::new();
+        let router = endpoint_a.ice_router.clone();
+        let socket = endpoint_a.socket.clone();
+        let local_ufrag = credentials_a.ufrag.clone();
+        let remote_ufrag = credentials_b.ufrag.clone();
+        let task = tokio::spawn(async move {
+            if driver_a
+                .monitor_consent(
+                    &socket,
+                    &router,
+                    &local_ufrag,
+                    &remote_ufrag,
+                    &mut ice_messages_a,
+                    &mut cancel,
+                )
+                .await
+                .is_err()
+            {
+                failure_sender.send_replace(true);
+            }
+            let _ = router.unregister(&local_ufrag, &remote_ufrag);
+        });
+        monitor.set_task(task).await;
+        drop(driver_b);
+        drop(ice_messages);
+        let mut failed = monitor.failure_receiver();
+        tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                if *failed.borrow() {
+                    break;
+                }
+                failed.changed().await.expect("consent failure sender");
+            }
+        })
+        .await
+        .expect("ICE consent loss is detected after the selected peer stops responding");
+        monitor.stop().await;
+        let _ = endpoint_b
+            .ice_router
+            .unregister(&credentials_b.ufrag, &credentials_a.ufrag);
 
         let identity_a_id = identity_a.device_id();
         let identity_a_key = identity_a.public_key();

@@ -202,24 +202,45 @@ pub async fn pump_peer_packets<T: TunnelPacketIo>(
     keepalive.tick().await;
     let mut last_received = tokio::time::Instant::now();
     let mut inbound = Box::pin(peer.recv_packet());
-    loop {
+    let outcome = loop {
         tokio::select! {
+            _ = peer.wait_ice_consent_failure() => {
+                break Err(IdentityError::Transport("ICE consent expired".to_owned()).into());
+            }
             outbound = packet_io.read_outbound_packet() => {
-                peer.send_packet(&outbound?).await?;
+                let packet = match outbound {
+                    Ok(packet) => packet,
+                    Err(error) => break Err(error.into()),
+                };
+                if let Err(error) = peer.send_packet(&packet).await {
+                    break Err(error.into());
+                }
             }
             result = tokio::time::timeout_at(last_received + Duration::from_secs(30), &mut inbound) => {
-                let packet = result.map_err(|_| IdentityError::Transport("peer keepalive timed out".to_owned()))??;
+                let packet = match result {
+                    Ok(Ok(packet)) => packet,
+                    Ok(Err(error)) => break Err(error.into()),
+                    Err(_) => break Err(IdentityError::Transport("peer keepalive timed out".to_owned()).into()),
+                };
                 last_received = tokio::time::Instant::now();
-                if !packet.is_empty() {
-                    packet_io
+                if !packet.is_empty()
+                    && let Err(error) = packet_io
                         .write_inbound_ip_packet(&packet, peer_ipv4, peer_ipv6)
-                        .await?;
+                        .await
+                {
+                    break Err(error.into());
                 }
                 inbound = Box::pin(peer.recv_packet());
             }
-            _ = keepalive.tick() => peer.send_keepalive().await?,
+            _ = keepalive.tick() => {
+                if let Err(error) = peer.send_keepalive().await {
+                    break Err(error.into());
+                }
+            },
         }
-    }
+    };
+    peer.stop_ice_consent_monitor().await;
+    outcome
 }
 
 async fn receive_mesh_peer(
@@ -261,6 +282,9 @@ async fn receive_mesh_peer(
                         }
                         Err(error) => break Err(error),
                     }
+                }
+                _ = active.wait_ice_consent_failure() => {
+                    break Err(IdentityError::Transport("ICE consent expired".to_owned()));
                 }
                 _ = keepalive.tick() => {
                     let health = active.health_snapshot();
@@ -313,9 +337,13 @@ async fn receive_mesh_peer(
             task.abort();
         }
         let failure = match outcome {
-            Ok(()) => continue,
+            Ok(()) => {
+                active.stop_ice_consent_monitor().await;
+                continue;
+            }
             Err(failure) => failure,
         };
+        active.stop_ice_consent_monitor().await;
         if active.transport_name() == "QUIC/UDP" && matches!(&failure, IdentityError::Transport(_))
         {
             force_reliable = true;
@@ -872,7 +900,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mesh_uses_reliable_fallback_after_unexpected_quic_disconnect() {
+    async fn mesh_uses_reliable_fallback_after_ice_consent_expiry() {
         async fn tcp_pair(a: Arc<Identity>, b: Arc<Identity>) -> (PeerChannel, PeerChannel) {
             let listener = peer_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
                 .await
@@ -912,7 +940,7 @@ mod tests {
             )
             .await
         });
-        let initial = connect_peer(
+        let mut initial = connect_peer(
             &endpoint_a,
             endpoint_b.local_addr().unwrap(),
             "mesh-udp-fallback",
@@ -922,7 +950,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let remote_initial = accept.await.unwrap().unwrap();
+        let _remote_initial = accept.await.unwrap().unwrap();
+        let (monitor, mut cancel, consent_failed) = crate::ice::IceConsentMonitor::new();
+        monitor
+            .set_task(tokio::spawn(async move {
+                let _ = cancel.changed().await;
+            }))
+            .await;
+        initial.set_ice_consent_monitor(monitor);
 
         let reliable_requested = Arc::new(Mutex::new(None));
         let reliable_notify = Arc::new(tokio::sync::Notify::new());
@@ -974,7 +1009,7 @@ mod tests {
             )
             .await
         });
-        remote_initial.close();
+        consent_failed.send_replace(true);
         tokio::time::timeout(Duration::from_secs(3), reliable_notify.notified())
             .await
             .expect("reconnect requested");

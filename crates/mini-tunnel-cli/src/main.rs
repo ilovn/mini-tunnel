@@ -777,7 +777,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let result = async {
                             let peer = discover_peer(&coordinator_url, &network_id, &peer_id, &identity).await?;
                             let peer_key = decode_peer_key(&peer.public_key)?;
-                            let _ = select_ice_peer_address(&endpoint, &peer, &identity).await;
+                            let nominated = select_ice_peer_address(&endpoint, &peer, &identity).await;
                             let accept_direct = async {
                                 let channel = mini_tunnel_agent::accept_peer(
                                     &endpoint, &network_id, &identity, &peer.device_id, peer_key,
@@ -792,7 +792,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     channel.await
                                 }
                             };
-                            let channel = if let Some(relay) = relay_server {
+                            let mut channel = if let Some(relay) = relay_server {
                                 match tokio::time::timeout(Duration::from_secs(35), accept_direct).await {
                                     Ok(result) => result?,
                                     Err(_) => connect_peer_via_relay(
@@ -803,6 +803,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 accept_direct.await?
                             };
                             let remote = channel.remote_address();
+                            if let Some((nominated_remote, monitor)) = nominated {
+                                if remote == nominated_remote
+                                    && channel.transport_name() == "QUIC/UDP"
+                                {
+                                    channel.set_ice_consent_monitor(monitor);
+                                } else {
+                                    monitor.stop().await;
+                                }
+                            }
                             let (connector, probe, accepted_tx) = build_mesh_peer_connectors(
                                 endpoint.clone(),
                                 std::sync::Arc::clone(&identity),
@@ -1634,7 +1643,7 @@ async fn connect_tunnel_peer(
     relay_server: Option<SocketAddr>,
     coordinator_url: &str,
 ) -> Result<(mini_tunnel_agent::PeerChannel, SocketAddr), mini_tunnel_agent::IdentityError> {
-    if let Some(remote) = select_ice_peer_address(endpoint, peer, identity).await {
+    if let Some((remote, monitor)) = select_ice_peer_address(endpoint, peer, identity).await {
         match mini_tunnel_agent::connect_peer(
             &endpoint.endpoint,
             remote,
@@ -1645,11 +1654,16 @@ async fn connect_tunnel_peer(
         )
         .await
         {
-            Ok(channel) => return Ok((channel, remote)),
+            Ok(mut channel) => {
+                channel.set_ice_consent_monitor(monitor);
+                return Ok((channel, remote));
+            }
             Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer) => {
+                monitor.stop().await;
                 return Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer);
             }
             Err(error) => {
+                monitor.stop().await;
                 eprintln!("ICE selected {remote}, retrying advertised candidates: {error}")
             }
         }
@@ -1684,7 +1698,7 @@ async fn select_ice_peer_address(
     endpoint: &TunnelEndpoint,
     peer: &PeerInfo,
     identity: &mini_tunnel_agent::Identity,
-) -> Option<SocketAddr> {
+) -> Option<(SocketAddr, mini_tunnel_agent::ice::IceConsentMonitor)> {
     let local = endpoint.ice.as_ref()?;
     let remote = peer.ice_credentials.as_ref()?;
     let remote_candidates = udp_ice_candidates(&peer.candidates);
@@ -1704,39 +1718,65 @@ async fn select_ice_peer_address(
     };
     let local_ufrag = local.credentials.ufrag.clone();
     let controlling = identity.device_id() < peer.device_id;
-    let result = async {
-        let mut driver =
-            mini_tunnel_agent::ice::IceAgentDriver::for_peer_with_candidates_on_socket(
-                local.local_socket_addr,
-                &local.credentials,
-                remote,
-                &local.local_candidates,
-                &remote_candidates,
-                controlling,
-                std::time::Instant::now(),
-            )
-            .map_err(|error| error.to_string())?;
-        driver
-            .run_checks(
-                &local.socket,
-                &local.router,
-                &local_ufrag,
-                &remote.ufrag,
-                &mut datagrams,
-                Duration::from_secs(5),
-            )
-            .await
-            .map(|(_, remote)| remote)
-            .map_err(|error| error.to_string())
-    }
-    .await;
-    let _ = local.router.unregister(&local_ufrag, &remote.ufrag);
-    match result {
-        Ok(remote) => {
-            tracing::info!(peer_id = %peer.device_id, %remote, "ICE nominated a direct peer path");
-            Some(remote)
+    let mut driver =
+        match mini_tunnel_agent::ice::IceAgentDriver::for_peer_with_candidates_on_socket(
+            local.local_socket_addr,
+            &local.credentials,
+            remote,
+            &local.local_candidates,
+            &remote_candidates,
+            controlling,
+            std::time::Instant::now(),
+        ) {
+            Ok(driver) => driver,
+            Err(error) => {
+                let _ = local.router.unregister(&local_ufrag, &remote.ufrag);
+                tracing::debug!(peer_id = %peer.device_id, %error, "could not initialize ICE checks");
+                return None;
+            }
+        };
+    let nominated = driver
+        .run_checks(
+            &local.socket,
+            &local.router,
+            &local_ufrag,
+            &remote.ufrag,
+            &mut datagrams,
+            Duration::from_secs(5),
+        )
+        .await
+        .map(|(_, remote)| remote);
+    match nominated {
+        Ok(remote_address) => {
+            tracing::info!(peer_id = %peer.device_id, remote = %remote_address, "ICE nominated a direct peer path");
+            let socket = local.socket.clone();
+            let router = local.router.clone();
+            let local_ufrag = local_ufrag.clone();
+            let remote_ufrag = remote.ufrag.clone();
+            let (monitor, mut cancel, failure_sender) =
+                mini_tunnel_agent::ice::IceConsentMonitor::new();
+            let task = tokio::spawn(async move {
+                if let Err(error) = driver
+                    .monitor_consent(
+                        &socket,
+                        &router,
+                        &local_ufrag,
+                        &remote_ufrag,
+                        &mut datagrams,
+                        &mut cancel,
+                    )
+                    .await
+                {
+                    tracing::warn!(%error, "nominated ICE consent expired");
+                    failure_sender.send_replace(true);
+                }
+                let _ = router.unregister(&local_ufrag, &remote_ufrag);
+            });
+            monitor.set_task(task).await;
+            Some((remote_address, monitor))
         }
         Err(error) => {
+            let _ = local.router.unregister(&local_ufrag, &remote.ufrag);
             tracing::debug!(peer_id = %peer.device_id, %error, "ICE checks failed; using transport fallback");
             None
         }
@@ -1770,7 +1810,7 @@ async fn select_current_ice_peer_address(
     network_id: &str,
     expected_peer: &PeerInfo,
     identity: &mini_tunnel_agent::Identity,
-) -> Option<SocketAddr> {
+) -> Option<(SocketAddr, mini_tunnel_agent::ice::IceConsentMonitor)> {
     match refresh_peer_snapshot_for_ice(coordinator_url, network_id, expected_peer, identity).await
     {
         Ok(current) => select_ice_peer_address(endpoint, &current, identity).await,
@@ -1809,7 +1849,8 @@ async fn connect_mesh_peer(
     }
     let peer_key = decode_peer_key(&peer.public_key)
         .map_err(|_| mini_tunnel_agent::IdentityError::UnauthorizedPeer)?;
-    if !reliable_only && let Some(remote) = select_ice_peer_address(endpoint, &peer, identity).await
+    if !reliable_only
+        && let Some((remote, monitor)) = select_ice_peer_address(endpoint, &peer, identity).await
     {
         match mini_tunnel_agent::connect_peer(
             &endpoint.endpoint,
@@ -1821,11 +1862,16 @@ async fn connect_mesh_peer(
         )
         .await
         {
-            Ok(channel) => return Ok((channel, remote)),
+            Ok(mut channel) => {
+                channel.set_ice_consent_monitor(monitor);
+                return Ok((channel, remote));
+            }
             Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer) => {
+                monitor.stop().await;
                 return Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer);
             }
             Err(error) => {
+                monitor.stop().await;
                 tracing::debug!(peer_id = %peer.device_id, %error, "ICE nominated path failed QUIC setup; trying candidates")
             }
         }
@@ -1873,7 +1919,8 @@ fn build_mesh_peer_connectors(
     tokio::sync::mpsc::Sender<mini_tunnel_agent::PeerChannel>,
 ) {
     let keep_outbound = identity.device_id() < peer.device_id;
-    let (accepted_tx, accepted_rx) = tokio::sync::mpsc::channel(2);
+    let (accepted_tx, accepted_rx) =
+        tokio::sync::mpsc::channel::<mini_tunnel_agent::PeerChannel>(2);
     let receiver = std::sync::Arc::new(tokio::sync::Mutex::new(accepted_rx));
     let connector: mini_tunnel_agent::tunnel::PeerConnector = if keep_outbound {
         let endpoint = endpoint.clone();
@@ -1919,24 +1966,33 @@ fn build_mesh_peer_connectors(
                 let network_id = network_id.clone();
                 let peer = peer.clone();
                 Box::pin(async move {
-                    if !force_reliable {
-                        let _ = select_current_ice_peer_address(
+                    let mut monitor = if !force_reliable {
+                        select_current_ice_peer_address(
                             &endpoint,
                             &coordinator_url,
                             &network_id,
                             &peer,
                             &identity,
                         )
-                        .await;
-                    }
+                        .await
+                        .map(|(_, monitor)| monitor)
+                    } else {
+                        None
+                    };
                     let direct_wait = if force_reliable { 35 } else { 65 };
-                    if let Ok(Some(channel)) =
+                    if let Ok(Some(mut channel)) =
                         tokio::time::timeout(Duration::from_secs(direct_wait), async {
                             receiver.lock().await.recv().await
                         })
                         .await
                     {
+                        if let Some(monitor) = monitor.take() {
+                            channel.set_ice_consent_monitor(monitor);
+                        }
                         return Ok(channel);
+                    }
+                    if let Some(monitor) = monitor {
+                        monitor.stop().await;
                     }
                     let relay = relay_server.ok_or_else(|| {
                         mini_tunnel_agent::IdentityError::Transport(
@@ -1991,14 +2047,15 @@ fn build_mesh_peer_connectors(
             let network_id = network_id.clone();
             let peer = peer.clone();
             Box::pin(async move {
-                let _ = select_current_ice_peer_address(
+                let monitor = select_current_ice_peer_address(
                     &endpoint,
                     &coordinator_url,
                     &network_id,
                     &peer,
                     &identity,
                 )
-                .await;
+                .await
+                .map(|(_, monitor)| monitor);
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
                 loop {
                     let channel = tokio::time::timeout_at(deadline, async {
@@ -2015,7 +2072,10 @@ fn build_mesh_peer_connectors(
                             "peer accept dispatcher stopped".to_owned(),
                         )
                     })?;
-                    if let Ok(channel) = validate_udp_probe(channel).await {
+                    if let Ok(mut channel) = validate_udp_probe(channel).await {
+                        if let Some(monitor) = monitor {
+                            channel.set_ice_consent_monitor(monitor);
+                        }
                         return Ok(channel);
                     }
                 }
@@ -3163,8 +3223,20 @@ mod tests {
             ),
             select_ice_peer_address(&peer_endpoint, &local_peer, &peer_identity),
         );
-        assert_eq!(recovered_address, Some(peer_address));
-        assert_eq!(peer_selected_address, Some(local_address));
+        assert_eq!(
+            recovered_address.map(|(address, monitor)| {
+                drop(monitor);
+                address
+            }),
+            Some(peer_address)
+        );
+        assert_eq!(
+            peer_selected_address.map(|(address, monitor)| {
+                drop(monitor);
+                address
+            }),
+            Some(local_address)
+        );
 
         let peer_id = peer_identity.device_id();
         let peer_key = peer_identity.public_key();
@@ -3482,7 +3554,13 @@ mod tests {
             accept,
         );
         let (channel_a, remote) = connected.expect("connect via ICE-nominated path");
-        assert_eq!(Some(endpoint_a.endpoint.local_addr().unwrap()), selected_b);
+        assert_eq!(
+            selected_b.map(|(address, monitor)| {
+                drop(monitor);
+                address
+            }),
+            Some(endpoint_a.endpoint.local_addr().unwrap())
+        );
         assert_eq!(remote, endpoint_b.endpoint.local_addr().unwrap());
         let channel_b = accepted.expect("accept peer");
         channel_a
@@ -3569,10 +3647,24 @@ mod tests {
             select_ice_peer_address(&endpoint_b, &peer_a, &identity_b),
             select_ice_peer_address(&endpoint_c, &peer_a, &identity_c),
         );
-        assert_eq!(a_to_b, Some(address_b));
-        assert_eq!(a_to_c, Some(address_c));
-        assert_eq!(b_to_a, Some(address_a));
-        assert_eq!(c_to_a, Some(address_a));
+        let (a_to_b_address, a_to_b_monitor) = a_to_b.expect("ICE peer B");
+        let (a_to_c_address, a_to_c_monitor) = a_to_c.expect("ICE peer C");
+        assert_eq!(a_to_b_address, address_b);
+        assert_eq!(a_to_c_address, address_c);
+        assert_eq!(
+            b_to_a.map(|(address, monitor)| {
+                drop(monitor);
+                address
+            }),
+            Some(address_a)
+        );
+        assert_eq!(
+            c_to_a.map(|(address, monitor)| {
+                drop(monitor);
+                address
+            }),
+            Some(address_a)
+        );
 
         let accept_b = mini_tunnel_agent::accept_peer(
             &endpoint_b.endpoint,
@@ -3591,7 +3683,7 @@ mod tests {
         let (connect_b, connect_c, channel_b, channel_c) = tokio::join!(
             mini_tunnel_agent::connect_peer(
                 &endpoint_a.endpoint,
-                a_to_b.unwrap(),
+                a_to_b_address,
                 "mesh-ice-test",
                 &identity_a,
                 &peer_b.device_id,
@@ -3599,7 +3691,7 @@ mod tests {
             ),
             mini_tunnel_agent::connect_peer(
                 &endpoint_a.endpoint,
-                a_to_c.unwrap(),
+                a_to_c_address,
                 "mesh-ice-test",
                 &identity_a,
                 &peer_c.device_id,
@@ -3608,8 +3700,10 @@ mod tests {
             accept_b,
             accept_c,
         );
-        let channel_a_b = connect_b.expect("QUIC peer B");
-        let channel_a_c = connect_c.expect("QUIC peer C");
+        let mut channel_a_b = connect_b.expect("QUIC peer B");
+        channel_a_b.set_ice_consent_monitor(a_to_b_monitor);
+        let mut channel_a_c = connect_c.expect("QUIC peer C");
+        channel_a_c.set_ice_consent_monitor(a_to_c_monitor);
         let channel_b = channel_b.expect("accept peer B");
         let channel_c = channel_c.expect("accept peer C");
         channel_a_b.send_packet(b"mesh-peer-b").await.unwrap();
