@@ -29,6 +29,8 @@ pub enum MembershipError {
     InvalidAssignedAddress,
     #[error("membership belongs to a different local device identity")]
     WrongDevice,
+    #[error("membership path must be a regular file without symlinks or reparse points")]
+    UnsafePath,
     #[error("membership file has unsafe permissions; restrict it to the current user")]
     UnsafePermissions,
     #[error("membership file has an unsupported schema version")]
@@ -181,9 +183,11 @@ impl MembershipStore {
             .map(|id| id.hyphenated().to_string())
             .map_err(|_| MembershipError::InvalidNetworkId)?;
         let path = self.root.join(format!("{canonical_id}.json"));
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() {
-            return Err(MembershipError::UnsafePermissions);
+        let file = open_membership_file(&path)?;
+        let metadata = file.metadata()?;
+        reject_membership_reparse_point(&metadata)?;
+        if !metadata.is_file() {
+            return Err(MembershipError::UnsafePath);
         }
         #[cfg(unix)]
         {
@@ -195,7 +199,6 @@ impl MembershipStore {
         if metadata.len() > MAX_MEMBERSHIP_FILE_SIZE {
             return Err(MembershipError::TooLarge);
         }
-        let file = fs::File::open(path)?;
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
         file.take(MAX_MEMBERSHIP_FILE_SIZE + 1)
             .read_to_end(&mut bytes)?;
@@ -212,6 +215,58 @@ impl MembershipStore {
         }
         Ok(membership)
     }
+}
+
+fn open_membership_file(path: &std::path::Path) -> Result<fs::File, MembershipError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    configure_membership_no_follow(&mut options);
+    options.open(path).map_err(normalize_membership_open_error)
+}
+
+#[cfg(unix)]
+fn configure_membership_no_follow(options: &mut fs::OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+}
+
+#[cfg(windows)]
+fn configure_membership_no_follow(options: &mut fs::OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_membership_no_follow(_options: &mut fs::OpenOptions) {}
+
+#[cfg(windows)]
+fn reject_membership_reparse_point(metadata: &fs::Metadata) -> Result<(), MembershipError> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(MembershipError::UnsafePath);
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn reject_membership_reparse_point(_metadata: &fs::Metadata) -> Result<(), MembershipError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn normalize_membership_open_error(error: io::Error) -> MembershipError {
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        MembershipError::UnsafePath
+    } else {
+        MembershipError::Io(error)
+    }
+}
+
+#[cfg(not(unix))]
+fn normalize_membership_open_error(error: io::Error) -> MembershipError {
+    MembershipError::Io(error)
 }
 
 #[cfg(test)]
@@ -320,6 +375,44 @@ mod tests {
                 Err(MembershipError::UnsafePermissions)
             ));
         }
+        fs::remove_dir_all(root).expect("remove membership directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn membership_load_rejects_symlink_without_reading_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("mini-tunnel-membership-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create membership directory");
+        let membership = sample_membership();
+        let path = root.join(format!("{}.json", membership.network_id));
+        let target = root.join("external.json");
+        fs::write(
+            &target,
+            serde_json::to_vec(&membership).expect("serialize membership"),
+        )
+        .expect("write target");
+        symlink(&target, &path).expect("create symlink");
+
+        let result =
+            MembershipStore::new(root.clone()).load(&membership.network_id, &membership.device_id);
+
+        assert!(matches!(result, Err(MembershipError::UnsafePath)));
+        fs::remove_dir_all(root).expect("remove membership directory");
+    }
+
+    #[test]
+    fn membership_load_rejects_non_regular_files_from_opened_handle_metadata() {
+        let root = std::env::temp_dir().join(format!("mini-tunnel-membership-{}", Uuid::new_v4()));
+        let membership = sample_membership();
+        let path = root.join(format!("{}.json", membership.network_id));
+        fs::create_dir_all(&path).expect("create directory at membership path");
+
+        let result =
+            MembershipStore::new(root.clone()).load(&membership.network_id, &membership.device_id);
+
+        assert!(matches!(result, Err(MembershipError::UnsafePath)));
         fs::remove_dir_all(root).expect("remove membership directory");
     }
 
