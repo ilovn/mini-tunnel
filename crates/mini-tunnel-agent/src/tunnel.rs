@@ -1182,6 +1182,22 @@ mod tests {
         let b = Arc::new(Identity::load_or_create_at(temp.join("b/device.key")).unwrap());
         let endpoint_a = peer_endpoint(&a, local_address).expect("endpoint A");
         let endpoint_b = peer_endpoint(&b, remote_address).expect("endpoint B");
+        assert_eq!(
+            endpoint_a
+                .local_addr()
+                .expect("endpoint A local address")
+                .ip(),
+            local_address.ip(),
+            "endpoint A must bind to the left veth address"
+        );
+        assert_eq!(
+            endpoint_b
+                .local_addr()
+                .expect("endpoint B local address")
+                .ip(),
+            remote_address.ip(),
+            "endpoint B must bind to the right veth address"
+        );
         let network = "veth-loss-fallback";
         let a_id = a.device_id();
         let a_key = a.public_key();
@@ -1273,9 +1289,24 @@ mod tests {
                 .expect("accept authenticated TCP fallback"),
             Err(_) => {
                 let health = initial_for_diagnostics.health_snapshot();
+                let route = std::process::Command::new("ip")
+                    .args([
+                        "route",
+                        "get",
+                        &remote_address.ip().to_string(),
+                        "from",
+                        &local_address.ip().to_string(),
+                    ])
+                    .output()
+                    .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+                    .unwrap_or_else(|error| error.to_string());
                 panic!(
-                    "mesh did not reconnect over TCP after real UDP loss; health={health:?}, reliable_requested={}, qdisc={}",
+                    "mesh did not reconnect over TCP after real UDP loss; health={health:?}, reliable_requested={}, local={}, remote={}, channel_remote={}, route={}, qdisc={}",
                     requested_reliable.load(Ordering::SeqCst),
+                    endpoint_a.local_addr().expect("endpoint A address"),
+                    endpoint_b.local_addr().expect("endpoint B address"),
+                    initial_for_diagnostics.remote_address(),
+                    route.trim(),
                     link.qdisc_stats()
                 );
             }
