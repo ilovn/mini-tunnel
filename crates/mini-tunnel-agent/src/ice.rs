@@ -1209,6 +1209,56 @@ mod tests {
     }
 
     #[test]
+    fn learns_peer_reflexive_remote_candidate_from_a_mapped_source() {
+        let now = Instant::now();
+        let address_a: SocketAddr = "127.0.0.1:41301".parse().unwrap();
+        let address_b: SocketAddr = "127.0.0.1:41302".parse().unwrap();
+        let mapped_a: SocketAddr = "127.0.0.1:52301".parse().unwrap();
+        let credentials_a = generate_ice_credentials(1).expect("A signaling credentials");
+        let credentials_b = generate_ice_credentials(1).expect("B signaling credentials");
+        let mut driver_a = IceAgentDriver::for_peer(
+            &credentials_a,
+            &credentials_b,
+            &[address_a],
+            &[address_b],
+            true,
+            now,
+        )
+        .expect("construct A session");
+        let mut driver_b = IceAgentDriver::for_peer(
+            &credentials_b,
+            &credentials_a,
+            &[address_b],
+            &[address_a],
+            false,
+            now,
+        )
+        .expect("construct B session");
+
+        driver_a.handle_timeout(now).expect("tick A");
+        let checks = driver_a.poll_transmits();
+        assert!(!checks.is_empty(), "A should start a connectivity check");
+        for check in checks {
+            assert!(
+                driver_b
+                    .handle_datagram(now, mapped_a, check.transport.ecn, &check.message)
+                    .expect("deliver authenticated check through simulated NAT")
+            );
+        }
+
+        let learned = driver_b
+            .agent
+            .get_remote_candidates()
+            .iter()
+            .find(|candidate| candidate.addr() == mapped_a)
+            .expect("NAT-mapped address should be learned as a peer-reflexive candidate");
+        assert_eq!(
+            learned.candidate_type(),
+            rtc_ice::candidate::CandidateType::PeerReflexive
+        );
+    }
+
+    #[test]
     fn peer_session_allows_independent_generations_and_rejects_empty_candidates() {
         let local = generate_ice_credentials(1).expect("local credentials");
         let mut remote = generate_ice_credentials(1).expect("remote credentials");

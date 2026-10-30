@@ -26,7 +26,7 @@ The opt-in CLI uses ICE only when both same-network peer snapshots contain curre
 
 ## Required verification before enabling by default
 
-- Deterministic Sans-I/O tests cover authenticated checks, controlling/controlled roles, simultaneous-controlling role-conflict recovery, and nomination. Peer-reflexive candidates, restart, and longer consent/timeout behavior still need dedicated tests.
+- Deterministic Sans-I/O tests cover authenticated checks, controlling/controlled roles, simultaneous-controlling role-conflict recovery, peer-reflexive learning from a simulated mapped source, and nomination. ICE restart and longer consent/timeout behavior still need dedicated tests.
 - Same-socket UDP demultiplexer tests for valid STUN, QUIC-shaped datagrams, malformed packets, multi-datagram batches and a full bounded ICE queue.
 - End-to-end CLI loopback coverage publishes signed credentials, runs checks over the shared socket, nominates a pair, then transfers a packet over the pinned QUIC connection.
 - Regression tests proving older peers continue using the existing UDP/TCP/relay path.
