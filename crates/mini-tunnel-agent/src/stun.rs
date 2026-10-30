@@ -342,16 +342,21 @@ mod tests {
             Self(fd)
         }
 
-        fn drain(&self) -> Vec<(u8, std::net::Ipv4Addr, u16, std::net::Ipv4Addr, u16)> {
+        fn drain(&self) -> Vec<(u8, u8, std::net::Ipv4Addr, u16, std::net::Ipv4Addr, u16)> {
             let mut packets = Vec::new();
             loop {
                 let mut packet = [0_u8; 2048];
+                let mut link_address: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+                let mut link_address_length =
+                    std::mem::size_of_val(&link_address) as libc::socklen_t;
                 let length = unsafe {
-                    libc::recv(
+                    libc::recvfrom(
                         std::os::fd::AsRawFd::as_raw_fd(&self.0),
                         packet.as_mut_ptr().cast(),
                         packet.len(),
                         libc::MSG_DONTWAIT,
+                        (&mut link_address as *mut libc::sockaddr_ll).cast(),
+                        &mut link_address_length,
                     )
                 };
                 if length < 0 {
@@ -390,6 +395,7 @@ mod tests {
                     (0, 0)
                 };
                 packets.push((
+                    link_address.sll_pkttype,
                     packet[9],
                     source,
                     source_port,
@@ -551,9 +557,11 @@ mod tests {
         client_a: String,
         client_a_if: String,
         router_a: String,
+        router_a_wan: String,
         client_b: String,
         client_b_if: String,
         router_b: String,
+        router_b_wan: String,
         bridge: String,
     }
 
@@ -604,9 +612,11 @@ mod tests {
                 client_a: client_a.clone(),
                 client_a_if: client_a_if.clone(),
                 router_a: router_a.clone(),
+                router_a_wan: router_a_wan.clone(),
                 client_b: client_b.clone(),
                 client_b_if: client_b_if.clone(),
                 router_b: router_b.clone(),
+                router_b_wan: router_b_wan.clone(),
                 bridge: bridge.clone(),
             };
 
@@ -1057,6 +1067,10 @@ mod tests {
         let _topology = DualSnatTopology::create();
         let capture_a = Ipv4UdpCapture::in_namespace(&_topology.client_a, &_topology.client_a_if);
         let capture_b = Ipv4UdpCapture::in_namespace(&_topology.client_b, &_topology.client_b_if);
+        let capture_wan_a =
+            Ipv4UdpCapture::in_namespace(&_topology.router_a, &_topology.router_a_wan);
+        let capture_wan_b =
+            Ipv4UdpCapture::in_namespace(&_topology.router_b, &_topology.router_b_wan);
         let stun_server = UdpSocket::bind("198.18.0.254:3478")
             .await
             .expect("bind transit STUN server");
@@ -1239,9 +1253,11 @@ mod tests {
         );
         eprintln!("dual-SNAT raw probes received: A={raw_received_a:?} B={raw_received_b:?}");
         eprintln!(
-            "dual-SNAT packet capture: A={:?} B={:?}",
+            "dual-SNAT packet capture: client A={:?} client B={:?} WAN A={:?} WAN B={:?}",
             capture_a.drain(),
-            capture_b.drain()
+            capture_b.drain(),
+            capture_wan_a.drain(),
+            capture_wan_b.drain()
         );
         eprintln!(
             "dual-SNAT ICE: mapped A={mapped_a} B={mapped_b}, host A={host_a} B={host_b}, sent A={sent_a} targets={targets_a:?} B={sent_b} targets={targets_b:?}, failed A={failed_candidates_a:?} B={failed_candidates_b:?}, received A={received_a:?} B={received_b:?}, selected A={selected_a:?} B={selected_b:?}"
