@@ -38,10 +38,11 @@ use mini_tunnel_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use subtle::ConstantTimeEq;
 use tokio::{
     io::AsyncReadExt,
-    sync::{OwnedSemaphorePermit, RwLock},
+    sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, RwLock},
 };
 use tower_service::Service;
 use uuid::Uuid;
@@ -90,6 +91,8 @@ pub struct StateSnapshotSummary {
 pub struct CoordinatorState {
     inner: Arc<RwLock<Store>>,
     persistence: Option<Arc<PathBuf>>,
+    postgres: Option<Arc<PgPool>>,
+    postgres_request_lock: Arc<AsyncMutex<()>>,
     _state_lock: Option<Arc<fs::File>>,
     request_limiter: RequestRateLimiter,
     request_slots: RequestSlots,
@@ -218,7 +221,7 @@ impl Default for RequestSlots {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct EphemeralIceCredentials {
     credentials: IceCredentials,
     updated_at_ms: u64,
@@ -227,7 +230,7 @@ struct EphemeralIceCredentials {
 
 type RelayPairStore = HashMap<(Uuid, String, String), RelayPair>;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct RelayPair {
     session_id: [u8; 16],
     expires_at_ms: u64,
@@ -355,12 +358,12 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 struct Store {
     networks: HashMap<Uuid, Network>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct Network {
     cidr: Ipv4Net,
     next_address: Ipv4Addr,
@@ -370,7 +373,7 @@ struct Network {
     assigned_addresses: HashSet<Ipv4Addr>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct Member {
     address: Ipv4Addr,
     public_key: [u8; 32],
@@ -378,7 +381,7 @@ struct Member {
     last_candidate_timestamp_ms: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct Invite {
     consumed_by: Option<String>,
     expires_at_ms: u64,
@@ -463,6 +466,59 @@ impl IntoResponse for ApiError {
 }
 
 impl CoordinatorState {
+    /// Apply additive PostgreSQL schema migrations using a database-owner role.
+    pub async fn migrate_postgres_database(database_url: &str) -> io::Result<()> {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect(database_url)
+            .await
+            .map_err(|_| database_connection_error())?;
+        let result = migrate_postgres(&pool).await;
+        pool.close().await;
+        result
+    }
+
+    /// Connect to the authoritative PostgreSQL store and apply compatible schema migrations.
+    pub async fn connect_postgres(database_url: &str) -> io::Result<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(32)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect(database_url)
+            .await
+            .map_err(|_| database_connection_error())?;
+        let version = sqlx::query("SELECT version FROM mini_tunnel_schema WHERE singleton = TRUE")
+            .fetch_one(&pool)
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "coordinator PostgreSQL schema is missing or unavailable",
+                )
+            })?
+            .try_get::<i32, _>("version")
+            .map_err(|_| invalid_state("invalid coordinator PostgreSQL schema version"))?;
+        if version != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported coordinator PostgreSQL schema version",
+            ));
+        }
+        sqlx::query("SELECT singleton FROM mini_tunnel_transaction_lock WHERE singleton = TRUE")
+            .fetch_one(&pool)
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "coordinator PostgreSQL schema is incomplete",
+                )
+            })?;
+        Ok(Self {
+            postgres: Some(Arc::new(pool)),
+            ..Self::default()
+        })
+    }
+
     /// Validate and atomically copy a snapshot while holding source and destination locks.
     ///
     /// This operation supports both creating backups and restoring them into a stopped state path.
@@ -538,6 +594,66 @@ impl CoordinatorState {
                 .map(|network| network.invites.len())
                 .sum(),
         })
+    }
+
+    /// Import a validated JSON snapshot into an empty PostgreSQL store while stopped.
+    pub async fn import_snapshot_to_postgres(
+        snapshot_path: impl Into<PathBuf>,
+        database_url: &str,
+    ) -> io::Result<StateSnapshotSummary> {
+        let source = Self::load(snapshot_path)?;
+        let destination = Self::connect_postgres(database_url).await?;
+        let pool = destination.postgres.as_ref().expect("PostgreSQL state");
+        let mut transaction = pool.begin().await.map_err(database_sql_error)?;
+        sqlx::query(
+            "SELECT singleton FROM mini_tunnel_transaction_lock WHERE singleton = TRUE FOR UPDATE",
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_sql_error)?;
+        let existing = load_postgres_store(&mut transaction).await?;
+        if !existing.networks.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "PostgreSQL coordinator store is not empty",
+            ));
+        }
+        sqlx::query("DELETE FROM mini_tunnel_ice_credentials")
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_sql_error)?;
+        sqlx::query("DELETE FROM mini_tunnel_relay_pairs")
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_sql_error)?;
+        let store = source.inner.read().await;
+        let summary = state_summary(&store);
+        persist_postgres_store(&mut transaction, &existing, &store).await?;
+        transaction.commit().await.map_err(database_sql_error)?;
+        Ok(summary)
+    }
+
+    /// Export a consistent PostgreSQL snapshot to the existing protected JSON format.
+    pub async fn export_postgres_to_snapshot(
+        database_url: &str,
+        destination: impl Into<PathBuf>,
+    ) -> io::Result<StateSnapshotSummary> {
+        let destination = destination.into();
+        let state = Self::connect_postgres(database_url).await?;
+        let pool = state.postgres.as_ref().expect("PostgreSQL state");
+        let mut transaction = pool.begin().await.map_err(database_sql_error)?;
+        sqlx::query(
+            "SELECT singleton FROM mini_tunnel_transaction_lock WHERE singleton = TRUE FOR UPDATE",
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_sql_error)?;
+        let store = load_postgres_store(&mut transaction).await?;
+        let _destination_lock = acquire_state_file_lock(&destination)?;
+        let summary = state_summary(&store);
+        persist_store(&destination, &store)?;
+        transaction.commit().await.map_err(database_sql_error)?;
+        Ok(summary)
     }
 
     /// Enable ticket issuance with the secret shared only with trusted relay nodes.
@@ -814,6 +930,9 @@ impl CoordinatorState {
             .ok_or(ApiError::NotFound)?;
         network.assigned_addresses.remove(&member.address);
         network.next_address = member.address;
+        network
+            .invites
+            .retain(|_, invite| invite.consumed_by.as_deref() != Some(request.device_id.as_str()));
         self.persist_or_restore(&mut store, previous)?;
         drop(store);
         self.ice_credentials
@@ -1406,6 +1525,444 @@ impl Store {
     }
 }
 
+async fn migrate_postgres(pool: &PgPool) -> io::Result<()> {
+    const MIGRATIONS: &[&str] = &[
+        "CREATE TABLE IF NOT EXISTS mini_tunnel_schema (singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton), version INTEGER NOT NULL)",
+        "INSERT INTO mini_tunnel_schema (singleton, version) VALUES (TRUE, 1) ON CONFLICT (singleton) DO NOTHING",
+        "CREATE TABLE IF NOT EXISTS mini_tunnel_transaction_lock (singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton))",
+        "INSERT INTO mini_tunnel_transaction_lock (singleton) VALUES (TRUE) ON CONFLICT (singleton) DO NOTHING",
+        "CREATE TABLE IF NOT EXISTS mini_tunnel_networks (network_id UUID PRIMARY KEY, cidr TEXT NOT NULL UNIQUE, admin_token_hash BYTEA NOT NULL CHECK (octet_length(admin_token_hash) = 32))",
+        "CREATE TABLE IF NOT EXISTS mini_tunnel_members (network_id UUID NOT NULL REFERENCES mini_tunnel_networks(network_id) ON DELETE CASCADE, device_id TEXT NOT NULL, address TEXT NOT NULL, public_key BYTEA NOT NULL CHECK (octet_length(public_key) = 32), candidates TEXT[] NOT NULL DEFAULT '{}', last_candidate_timestamp_ms BIGINT NOT NULL CHECK (last_candidate_timestamp_ms >= 0), PRIMARY KEY (network_id, device_id), UNIQUE (network_id, address))",
+        "CREATE TABLE IF NOT EXISTS mini_tunnel_invites (network_id UUID NOT NULL REFERENCES mini_tunnel_networks(network_id) ON DELETE CASCADE, token_hash BYTEA NOT NULL CHECK (octet_length(token_hash) = 32), consumed_by TEXT, expires_at_ms BIGINT NOT NULL CHECK (expires_at_ms >= 0), PRIMARY KEY (network_id, token_hash))",
+        "CREATE TABLE IF NOT EXISTS mini_tunnel_ice_credentials (network_id UUID NOT NULL, device_id TEXT NOT NULL, ufrag TEXT NOT NULL, password TEXT NOT NULL, generation BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL, request_timestamp_ms BIGINT NOT NULL, PRIMARY KEY (network_id, device_id))",
+        "CREATE TABLE IF NOT EXISTS mini_tunnel_relay_pairs (network_id UUID NOT NULL, device_a TEXT NOT NULL, device_b TEXT NOT NULL, session_id BYTEA NOT NULL CHECK (octet_length(session_id) = 16), expires_at_ms BIGINT NOT NULL, first_device TEXT NOT NULL, PRIMARY KEY (network_id, device_a, device_b))",
+    ];
+    let mut transaction = pool.begin().await.map_err(database_sql_error)?;
+    for statement in MIGRATIONS {
+        sqlx::query(statement)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unable to initialize coordinator PostgreSQL schema",
+                )
+            })?;
+    }
+    let version = sqlx::query("SELECT version FROM mini_tunnel_schema WHERE singleton = TRUE")
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unable to read coordinator PostgreSQL schema version",
+            )
+        })?
+        .try_get::<i32, _>("version")
+        .map_err(|_| invalid_state("invalid coordinator PostgreSQL schema version"))?;
+    if version != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported coordinator PostgreSQL schema version",
+        ));
+    }
+    transaction.commit().await.map_err(database_sql_error)?;
+    Ok(())
+}
+
+async fn load_postgres_store(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> io::Result<Store> {
+    let network_rows = sqlx::query(
+        "SELECT network_id, cidr, admin_token_hash FROM mini_tunnel_networks ORDER BY network_id",
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(database_sql_error)?;
+    let mut networks = HashMap::<Uuid, PersistedNetwork>::new();
+    for row in network_rows {
+        let id: Uuid = row.try_get("network_id").map_err(database_sql_error)?;
+        let hash = row
+            .try_get::<Vec<u8>, _>("admin_token_hash")
+            .map_err(database_sql_error)?;
+        let admin_token_hash = <[u8; 32]>::try_from(hash)
+            .map_err(|_| invalid_state("invalid coordinator PostgreSQL token hash"))?;
+        networks.insert(
+            id,
+            PersistedNetwork {
+                id,
+                cidr: row.try_get("cidr").map_err(database_sql_error)?,
+                admin_token_hash,
+                invites: Vec::new(),
+                members: Vec::new(),
+            },
+        );
+    }
+
+    let invite_rows = sqlx::query(
+        "SELECT network_id, token_hash, consumed_by, expires_at_ms FROM mini_tunnel_invites ORDER BY network_id",
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(database_sql_error)?;
+    for row in invite_rows {
+        let network_id: Uuid = row.try_get("network_id").map_err(database_sql_error)?;
+        let hash = row
+            .try_get::<Vec<u8>, _>("token_hash")
+            .map_err(database_sql_error)?;
+        let token_hash = <[u8; 32]>::try_from(hash)
+            .map_err(|_| invalid_state("invalid coordinator PostgreSQL invitation hash"))?;
+        let consumed_by = row.try_get("consumed_by").map_err(database_sql_error)?;
+        let expires_at_ms = u64::try_from(
+            row.try_get::<i64, _>("expires_at_ms")
+                .map_err(database_sql_error)?,
+        )
+        .map_err(|_| invalid_state("invalid coordinator PostgreSQL invitation expiry"))?;
+        networks
+            .get_mut(&network_id)
+            .ok_or_else(|| invalid_state("orphan coordinator PostgreSQL invitation"))?
+            .invites
+            .push(PersistedInvite {
+                token_hash,
+                consumed_by,
+                expires_at_ms,
+            });
+    }
+
+    let member_rows = sqlx::query(
+        "SELECT network_id, device_id, address, public_key, candidates, last_candidate_timestamp_ms FROM mini_tunnel_members ORDER BY network_id, device_id",
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(database_sql_error)?;
+    for row in member_rows {
+        let network_id: Uuid = row.try_get("network_id").map_err(database_sql_error)?;
+        let public_key = row
+            .try_get::<Vec<u8>, _>("public_key")
+            .map_err(database_sql_error)?;
+        let public_key = <[u8; 32]>::try_from(public_key)
+            .map_err(|_| invalid_state("invalid coordinator PostgreSQL public key"))?;
+        let last_candidate_timestamp_ms = u64::try_from(
+            row.try_get::<i64, _>("last_candidate_timestamp_ms")
+                .map_err(database_sql_error)?,
+        )
+        .map_err(|_| invalid_state("invalid coordinator PostgreSQL candidate timestamp"))?;
+        networks
+            .get_mut(&network_id)
+            .ok_or_else(|| invalid_state("orphan coordinator PostgreSQL member"))?
+            .members
+            .push(PersistedMember {
+                device_id: row.try_get("device_id").map_err(database_sql_error)?,
+                address: row
+                    .try_get::<String, _>("address")
+                    .map_err(database_sql_error)?
+                    .parse()
+                    .map_err(|_| invalid_state("invalid coordinator PostgreSQL IPv4 address"))?,
+                public_key,
+                candidates: row.try_get("candidates").map_err(database_sql_error)?,
+                last_candidate_timestamp_ms,
+            });
+    }
+
+    Store::from_snapshot(StateSnapshot {
+        schema_version: 1,
+        networks: networks.into_values().collect(),
+    })
+}
+
+async fn persist_postgres_store(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    previous: &Store,
+    store: &Store,
+) -> io::Result<()> {
+    for network_id in previous.networks.keys() {
+        if !store.networks.contains_key(network_id) {
+            sqlx::query("DELETE FROM mini_tunnel_networks WHERE network_id = $1")
+                .bind(network_id)
+                .execute(&mut **transaction)
+                .await
+                .map_err(database_sql_error)?;
+        }
+    }
+    for (network_id, network) in &store.networks {
+        match previous.networks.get(network_id) {
+            None => {
+                sqlx::query("INSERT INTO mini_tunnel_networks (network_id, cidr, admin_token_hash) VALUES ($1, $2, $3)")
+                    .bind(network_id)
+                    .bind(network.cidr.to_string())
+                    .bind(network.admin_token_hash.as_slice())
+                    .execute(&mut **transaction)
+                    .await
+                    .map_err(database_sql_error)?;
+            }
+            Some(previous_network)
+                if previous_network.cidr != network.cidr
+                    || previous_network.admin_token_hash != network.admin_token_hash =>
+            {
+                sqlx::query("UPDATE mini_tunnel_networks SET cidr = $2, admin_token_hash = $3 WHERE network_id = $1")
+                    .bind(network_id)
+                    .bind(network.cidr.to_string())
+                    .bind(network.admin_token_hash.as_slice())
+                    .execute(&mut **transaction)
+                    .await
+                    .map_err(database_sql_error)?;
+            }
+            Some(_) => {}
+        }
+
+        if let Some(previous_network) = previous.networks.get(network_id) {
+            for device_id in previous_network.members.keys() {
+                if !network.members.contains_key(device_id) {
+                    sqlx::query(
+                        "DELETE FROM mini_tunnel_members WHERE network_id = $1 AND device_id = $2",
+                    )
+                    .bind(network_id)
+                    .bind(device_id)
+                    .execute(&mut **transaction)
+                    .await
+                    .map_err(database_sql_error)?;
+                }
+            }
+            for token_hash in previous_network.invites.keys() {
+                if !network.invites.contains_key(token_hash) {
+                    sqlx::query(
+                        "DELETE FROM mini_tunnel_invites WHERE network_id = $1 AND token_hash = $2",
+                    )
+                    .bind(network_id)
+                    .bind(token_hash.as_slice())
+                    .execute(&mut **transaction)
+                    .await
+                    .map_err(database_sql_error)?;
+                }
+            }
+        }
+
+        for (device_id, member) in &network.members {
+            if previous
+                .networks
+                .get(network_id)
+                .and_then(|previous_network| previous_network.members.get(device_id))
+                == Some(member)
+            {
+                continue;
+            }
+            sqlx::query("INSERT INTO mini_tunnel_members (network_id, device_id, address, public_key, candidates, last_candidate_timestamp_ms) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (network_id, device_id) DO UPDATE SET address = EXCLUDED.address, public_key = EXCLUDED.public_key, candidates = EXCLUDED.candidates, last_candidate_timestamp_ms = EXCLUDED.last_candidate_timestamp_ms")
+                .bind(network_id)
+                .bind(device_id)
+                .bind(member.address.to_string())
+                .bind(member.public_key.as_slice())
+                .bind(&member.candidates)
+                .bind(i64::try_from(member.last_candidate_timestamp_ms).map_err(|_| invalid_state("candidate timestamp exceeds PostgreSQL range"))?)
+                .execute(&mut **transaction)
+                .await
+                .map_err(database_sql_error)?;
+        }
+        for (token_hash, invite) in &network.invites {
+            if previous
+                .networks
+                .get(network_id)
+                .and_then(|previous_network| previous_network.invites.get(token_hash))
+                == Some(invite)
+            {
+                continue;
+            }
+            sqlx::query("INSERT INTO mini_tunnel_invites (network_id, token_hash, consumed_by, expires_at_ms) VALUES ($1, $2, $3, $4) ON CONFLICT (network_id, token_hash) DO UPDATE SET consumed_by = EXCLUDED.consumed_by, expires_at_ms = EXCLUDED.expires_at_ms")
+                .bind(network_id)
+                .bind(token_hash.as_slice())
+                .bind(&invite.consumed_by)
+                .bind(i64::try_from(invite.expires_at_ms).map_err(|_| invalid_state("invitation expiry exceeds PostgreSQL range"))?)
+                .execute(&mut **transaction)
+                .await
+                .map_err(database_sql_error)?;
+        }
+    }
+    Ok(())
+}
+
+async fn load_postgres_runtime_state(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    state: &CoordinatorState,
+) -> io::Result<()> {
+    let credential_rows = sqlx::query(
+        "SELECT network_id, device_id, ufrag, password, generation, updated_at_ms, request_timestamp_ms FROM mini_tunnel_ice_credentials",
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(database_sql_error)?;
+    let mut credentials = HashMap::with_capacity(credential_rows.len());
+    for row in credential_rows {
+        let network_id = row.try_get("network_id").map_err(database_sql_error)?;
+        let device_id = row.try_get("device_id").map_err(database_sql_error)?;
+        let generation = u64::try_from(
+            row.try_get::<i64, _>("generation")
+                .map_err(database_sql_error)?,
+        )
+        .map_err(|_| invalid_state("invalid PostgreSQL ICE generation"))?;
+        let updated_at_ms = u64::try_from(
+            row.try_get::<i64, _>("updated_at_ms")
+                .map_err(database_sql_error)?,
+        )
+        .map_err(|_| invalid_state("invalid PostgreSQL ICE credential timestamp"))?;
+        let request_timestamp_ms = u64::try_from(
+            row.try_get::<i64, _>("request_timestamp_ms")
+                .map_err(database_sql_error)?,
+        )
+        .map_err(|_| invalid_state("invalid PostgreSQL ICE request timestamp"))?;
+        credentials.insert(
+            (network_id, device_id),
+            EphemeralIceCredentials {
+                credentials: IceCredentials {
+                    ufrag: row.try_get("ufrag").map_err(database_sql_error)?,
+                    password: row.try_get("password").map_err(database_sql_error)?,
+                    generation,
+                },
+                updated_at_ms,
+                request_timestamp_ms,
+            },
+        );
+    }
+    *state.ice_credentials.write().await = credentials;
+
+    let pair_rows = sqlx::query(
+        "SELECT network_id, device_a, device_b, session_id, expires_at_ms, first_device FROM mini_tunnel_relay_pairs",
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(database_sql_error)?;
+    let mut pairs = HashMap::with_capacity(pair_rows.len());
+    for row in pair_rows {
+        let session_id = row
+            .try_get::<Vec<u8>, _>("session_id")
+            .map_err(database_sql_error)?;
+        let session_id = <[u8; 16]>::try_from(session_id)
+            .map_err(|_| invalid_state("invalid PostgreSQL relay session ID"))?;
+        let expires_at_ms = u64::try_from(
+            row.try_get::<i64, _>("expires_at_ms")
+                .map_err(database_sql_error)?,
+        )
+        .map_err(|_| invalid_state("invalid PostgreSQL relay pair expiry"))?;
+        let network_id = row.try_get("network_id").map_err(database_sql_error)?;
+        let device_a: String = row.try_get("device_a").map_err(database_sql_error)?;
+        let device_b: String = row.try_get("device_b").map_err(database_sql_error)?;
+        pairs.insert(
+            (network_id, device_a, device_b),
+            RelayPair {
+                session_id,
+                expires_at_ms,
+                first_device: row.try_get("first_device").map_err(database_sql_error)?,
+            },
+        );
+    }
+    *lock_recover(&state.relay_pairs) = pairs;
+    Ok(())
+}
+
+async fn persist_postgres_runtime_state(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    previous_credentials: &HashMap<(Uuid, String), EphemeralIceCredentials>,
+    credentials: &HashMap<(Uuid, String), EphemeralIceCredentials>,
+    previous_pairs: &RelayPairStore,
+    pairs: &RelayPairStore,
+) -> io::Result<()> {
+    for (network_id, device_id) in previous_credentials.keys() {
+        if !credentials.contains_key(&(network_id.to_owned(), device_id.to_owned())) {
+            sqlx::query(
+                "DELETE FROM mini_tunnel_ice_credentials WHERE network_id = $1 AND device_id = $2",
+            )
+            .bind(network_id)
+            .bind(device_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(database_sql_error)?;
+        }
+    }
+    for ((network_id, device_id), value) in credentials {
+        if previous_credentials.get(&(network_id.to_owned(), device_id.to_owned())) == Some(value) {
+            continue;
+        }
+        sqlx::query("INSERT INTO mini_tunnel_ice_credentials (network_id, device_id, ufrag, password, generation, updated_at_ms, request_timestamp_ms) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (network_id, device_id) DO UPDATE SET ufrag = EXCLUDED.ufrag, password = EXCLUDED.password, generation = EXCLUDED.generation, updated_at_ms = EXCLUDED.updated_at_ms, request_timestamp_ms = EXCLUDED.request_timestamp_ms")
+            .bind(network_id)
+            .bind(device_id)
+            .bind(&value.credentials.ufrag)
+            .bind(&value.credentials.password)
+            .bind(i64::try_from(value.credentials.generation).map_err(|_| invalid_state("ICE generation exceeds PostgreSQL range"))?)
+            .bind(i64::try_from(value.updated_at_ms).map_err(|_| invalid_state("ICE timestamp exceeds PostgreSQL range"))?)
+            .bind(i64::try_from(value.request_timestamp_ms).map_err(|_| invalid_state("ICE request timestamp exceeds PostgreSQL range"))?)
+            .execute(&mut **transaction)
+            .await
+            .map_err(database_sql_error)?;
+    }
+
+    for (network_id, device_a, device_b) in previous_pairs.keys() {
+        if !pairs.contains_key(&(
+            network_id.to_owned(),
+            device_a.to_owned(),
+            device_b.to_owned(),
+        )) {
+            sqlx::query("DELETE FROM mini_tunnel_relay_pairs WHERE network_id = $1 AND device_a = $2 AND device_b = $3")
+                .bind(network_id)
+                .bind(device_a)
+                .bind(device_b)
+                .execute(&mut **transaction)
+                .await
+                .map_err(database_sql_error)?;
+        }
+    }
+    for ((network_id, device_a, device_b), value) in pairs {
+        if previous_pairs.get(&(
+            network_id.to_owned(),
+            device_a.to_owned(),
+            device_b.to_owned(),
+        )) == Some(value)
+        {
+            continue;
+        }
+        sqlx::query("INSERT INTO mini_tunnel_relay_pairs (network_id, device_a, device_b, session_id, expires_at_ms, first_device) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (network_id, device_a, device_b) DO UPDATE SET session_id = EXCLUDED.session_id, expires_at_ms = EXCLUDED.expires_at_ms, first_device = EXCLUDED.first_device")
+            .bind(network_id)
+            .bind(device_a)
+            .bind(device_b)
+            .bind(value.session_id.as_slice())
+            .bind(i64::try_from(value.expires_at_ms).map_err(|_| invalid_state("relay expiry exceeds PostgreSQL range"))?)
+            .bind(&value.first_device)
+            .execute(&mut **transaction)
+            .await
+            .map_err(database_sql_error)?;
+    }
+    Ok(())
+}
+
+fn database_operation_error() -> io::Error {
+    io::Error::other("coordinator PostgreSQL operation failed")
+}
+
+fn database_sql_error(error: sqlx::Error) -> io::Error {
+    tracing::error!(error = %error, "coordinator PostgreSQL query failed");
+    database_operation_error()
+}
+
+fn database_connection_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionRefused,
+        "unable to connect to coordinator PostgreSQL database",
+    )
+}
+
+fn state_summary(store: &Store) -> StateSnapshotSummary {
+    StateSnapshotSummary {
+        networks: store.networks.len(),
+        members: store
+            .networks
+            .values()
+            .map(|network| network.members.len())
+            .sum(),
+        invites: store
+            .networks
+            .values()
+            .map(|network| network.invites.len())
+            .sum(),
+    }
+}
+
 fn valid_network_cidr(cidr: Ipv4Net) -> bool {
     (16..=30).contains(&cidr.prefix_len())
         && cidr.network().is_private()
@@ -1634,10 +2191,126 @@ async fn limit_requests(
             }
         }
     };
-    run_with_timeout(state.request_timeout.0, next.run(request), || {
-        state.request_timeouts_total.fetch_add(1, Ordering::Relaxed);
-    })
+    let state_for_request = state.clone();
+    run_with_timeout(
+        state.request_timeout.0,
+        async move {
+            if state_for_request.postgres.is_some() && request.uri().path() != "/metrics" {
+                run_postgres_request(state_for_request, request, next).await
+            } else {
+                next.run(request).await
+            }
+        },
+        || {
+            state.request_timeouts_total.fetch_add(1, Ordering::Relaxed);
+        },
+    )
     .await
+}
+
+async fn run_postgres_request(state: CoordinatorState, request: Request, next: Next) -> Response {
+    let Some(pool) = state.postgres.as_ref() else {
+        return next.run(request).await;
+    };
+    let is_write = !request.method().is_safe();
+    let _local_request_guard = state.postgres_request_lock.lock().await;
+    let mut transaction = match pool.begin().await {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            tracing::error!(error = %error, "coordinator PostgreSQL transaction could not start");
+            return database_unavailable_response();
+        }
+    };
+    if is_write {
+        if sqlx::query(
+            "SELECT singleton FROM mini_tunnel_transaction_lock WHERE singleton = TRUE FOR UPDATE",
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .is_err()
+        {
+            tracing::error!("coordinator PostgreSQL transaction lock could not be acquired");
+            return database_unavailable_response();
+        }
+    } else if sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *transaction)
+        .await
+        .is_err()
+    {
+        tracing::error!("coordinator PostgreSQL read transaction could not be configured");
+        return database_unavailable_response();
+    }
+    let store = match load_postgres_store(&mut transaction).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(error = %error, "coordinator PostgreSQL state could not be loaded");
+            return database_unavailable_response();
+        }
+    };
+    if load_postgres_runtime_state(&mut transaction, &state)
+        .await
+        .is_err()
+    {
+        tracing::error!("coordinator PostgreSQL runtime state could not be loaded");
+        return database_unavailable_response();
+    }
+    let latest_store = store.clone();
+    let latest_ice_credentials = state.ice_credentials.read().await.clone();
+    let latest_relay_pairs = lock_recover(&state.relay_pairs).clone();
+    *state.inner.write().await = store;
+    let response = next.run(request).await;
+    if response.status().is_success() && is_write {
+        let current = state.inner.read().await;
+        let current_ice_credentials = state.ice_credentials.read().await.clone();
+        let current_relay_pairs = lock_recover(&state.relay_pairs).clone();
+        let store_result = persist_postgres_store(&mut transaction, &latest_store, &current).await;
+        let runtime_result = if store_result.is_ok() {
+            persist_postgres_runtime_state(
+                &mut transaction,
+                &latest_ice_credentials,
+                &current_ice_credentials,
+                &latest_relay_pairs,
+                &current_relay_pairs,
+            )
+            .await
+        } else {
+            Ok(())
+        };
+        if store_result.is_err() || runtime_result.is_err() {
+            drop(current);
+            *state.inner.write().await = latest_store;
+            *state.ice_credentials.write().await = latest_ice_credentials;
+            *lock_recover(&state.relay_pairs) = latest_relay_pairs;
+            let _ = transaction.rollback().await;
+            return database_unavailable_response();
+        }
+        drop(current);
+        if transaction.commit().await.is_err() {
+            *state.inner.write().await = latest_store;
+            *state.ice_credentials.write().await = latest_ice_credentials;
+            *lock_recover(&state.relay_pairs) = latest_relay_pairs;
+            return database_unavailable_response();
+        }
+    } else {
+        *state.inner.write().await = latest_store;
+        let _ = transaction.rollback().await;
+    }
+    response
+}
+
+fn database_unavailable_response() -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiErrorResponse {
+            error: "coordinator_store_unavailable".to_owned(),
+            message: "coordinator state store is temporarily unavailable".to_owned(),
+        }),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert("retry-after", HeaderValue::from_static("1"));
+    response
 }
 
 async fn run_with_timeout<F, C>(timeout: Duration, request: F, on_timeout: C) -> Response
@@ -1897,6 +2570,23 @@ pub async fn serve_with_state_file_and_relay_key_tls_and_reload_interval_and_tru
 async fn serve_with_state(address: SocketAddr, state: CoordinatorState) -> std::io::Result<()> {
     validate_listener_security(address, false)?;
     run_plain_http_server(address, state, shutdown_signal()).await
+}
+
+pub async fn serve_with_postgres_url_and_relay_key_tls_and_reload_interval_and_trusted_proxies(
+    address: SocketAddr,
+    database_url: &str,
+    relay_ticket_key: Option<[u8; 32]>,
+    tls_files: Option<(PathBuf, PathBuf)>,
+    tls_reload_interval: Duration,
+    trusted_proxies: Vec<IpNet>,
+) -> std::io::Result<()> {
+    validate_listener_security(address, tls_files.is_some())?;
+    let mut state = CoordinatorState::connect_postgres(database_url).await?;
+    if let Some(key) = relay_ticket_key {
+        state = state.with_relay_ticket_key(key);
+    }
+    state = state.with_trusted_proxies(trusted_proxies);
+    serve_with_state_and_tls(address, state, tls_files, tls_reload_interval).await
 }
 
 async fn run_plain_http_server<S>(
@@ -3501,6 +4191,434 @@ mod tests {
         }
     }
 
+    fn signed_relay_request(
+        network_id: Uuid,
+        signer: &SigningKey,
+        source: &str,
+        target: &str,
+    ) -> RelayTicketRequest {
+        let timestamp_ms = unix_time_ms().expect("clock");
+        let signature = signer.sign(&relay_ticket_request_signing_bytes(
+            &network_id.to_string(),
+            source,
+            target,
+            timestamp_ms,
+        ));
+        RelayTicketRequest {
+            device_id: source.to_owned(),
+            peer_id: target.to_owned(),
+            timestamp_ms,
+            signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+        }
+    }
+
+    async fn post_json<T: Serialize>(app: Router, uri: &str, payload: &T) -> Response {
+        let mut request = HttpRequest::builder()
+            .method("POST")
+            .uri(uri)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(payload).expect("serialize test request"),
+            ))
+            .expect("valid HTTP request");
+        request.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            12345,
+        )));
+        app.oneshot(request).await.expect("Coordinator response")
+    }
+
+    async fn response_json<T: for<'de> Deserialize<'de>>(response: Response) -> T {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read Coordinator response body");
+        serde_json::from_slice(&bytes).expect("valid Coordinator JSON response")
+    }
+
+    async fn get_from_router(app: Router, uri: &str) -> Response {
+        let mut request = HttpRequest::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .expect("valid HTTP request");
+        request.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            12345,
+        )));
+        app.oneshot(request).await.expect("Coordinator response")
+    }
+
+    async fn cleanup_postgres_network(pool: &PgPool, network_id: Uuid) {
+        let mut cleanup = pool.begin().await.expect("begin test cleanup");
+        sqlx::query(
+            "SELECT singleton FROM mini_tunnel_transaction_lock WHERE singleton = TRUE FOR UPDATE",
+        )
+        .fetch_one(&mut *cleanup)
+        .await
+        .expect("lock shared state for cleanup");
+        sqlx::query("DELETE FROM mini_tunnel_ice_credentials WHERE network_id = $1")
+            .bind(network_id)
+            .execute(&mut *cleanup)
+            .await
+            .expect("delete test ICE state");
+        sqlx::query("DELETE FROM mini_tunnel_relay_pairs WHERE network_id = $1")
+            .bind(network_id)
+            .execute(&mut *cleanup)
+            .await
+            .expect("delete test relay state");
+        sqlx::query("DELETE FROM mini_tunnel_networks WHERE network_id = $1")
+            .bind(network_id)
+            .execute(&mut *cleanup)
+            .await
+            .expect("delete test network");
+        cleanup.commit().await.expect("commit test cleanup");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MINI_TUNNEL_TEST_DATABASE_URL and a real PostgreSQL service"]
+    async fn postgres_coordinator_instances_serialize_join_and_restore_state() {
+        let database_url = std::env::var("MINI_TUNNEL_TEST_DATABASE_URL")
+            .expect("set MINI_TUNNEL_TEST_DATABASE_URL for PostgreSQL integration tests");
+        let app_database_url = std::env::var("MINI_TUNNEL_TEST_APP_DATABASE_URL")
+            .expect("set MINI_TUNNEL_TEST_APP_DATABASE_URL to a least-privilege test role");
+        CoordinatorState::migrate_postgres_database(&database_url)
+            .await
+            .expect("apply PostgreSQL test schema");
+        // MINI_TUNNEL_TEST_DATABASE_URL must point to a disposable test database.
+        let test_pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect disposable PostgreSQL test database");
+        sqlx::query("GRANT USAGE ON SCHEMA public TO mini_tunnel_runtime")
+            .execute(&test_pool)
+            .await
+            .expect("grant runtime role schema access");
+        sqlx::query("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO mini_tunnel_runtime")
+            .execute(&test_pool)
+            .await
+            .expect("grant runtime role DML access");
+        let mut reset = test_pool.begin().await.expect("begin database reset");
+        sqlx::query(
+            "SELECT singleton FROM mini_tunnel_transaction_lock WHERE singleton = TRUE FOR UPDATE",
+        )
+        .fetch_one(&mut *reset)
+        .await
+        .expect("lock disposable database for reset");
+        for table in [
+            "mini_tunnel_ice_credentials",
+            "mini_tunnel_relay_pairs",
+            "mini_tunnel_invites",
+            "mini_tunnel_members",
+            "mini_tunnel_networks",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table}"))
+                .execute(&mut *reset)
+                .await
+                .expect("reset disposable database table");
+        }
+        reset.commit().await.expect("commit database reset");
+        test_pool.close().await;
+        let relay_key = [203; 32];
+        let state_a = CoordinatorState::connect_postgres(&app_database_url)
+            .await
+            .expect("connect first Coordinator instance")
+            .with_relay_ticket_key(relay_key);
+        let state_b = CoordinatorState::connect_postgres(&app_database_url)
+            .await
+            .expect("connect second Coordinator instance")
+            .with_relay_ticket_key(relay_key);
+        let app_pool = state_a.postgres.as_ref().expect("runtime PostgreSQL pool");
+        let can_create_schema_objects: bool =
+            sqlx::query_scalar("SELECT has_schema_privilege(current_user, 'public', 'CREATE')")
+                .fetch_one(app_pool.as_ref())
+                .await
+                .expect("inspect runtime role permissions");
+        assert!(
+            !can_create_schema_objects,
+            "Coordinator runtime role must not have schema DDL privileges"
+        );
+        let app_a = router_with_state(state_a.clone());
+        let app_b = router_with_state(state_b.clone());
+        let pool = state_a.postgres.as_ref().expect("test PostgreSQL pool");
+        let existing_networks = sqlx::query("SELECT cidr FROM mini_tunnel_networks")
+            .fetch_all(pool.as_ref())
+            .await
+            .expect("read existing test database networks")
+            .into_iter()
+            .map(|row| {
+                row.try_get::<String, _>("cidr")
+                    .expect("CIDR column")
+                    .parse::<Ipv4Net>()
+                    .expect("valid stored CIDR")
+            })
+            .collect::<Vec<_>>();
+        let random = Uuid::new_v4();
+        let prefix: [u8; 2] = random.as_bytes()[..2].try_into().expect("two prefix bytes");
+        let start = usize::from(u16::from_be_bytes(prefix));
+        let cidr = (0..=u16::MAX)
+            .map(|step| {
+                let offset = (start + usize::from(step)) % (usize::from(u16::MAX) + 1);
+                format!("10.{}.{}.{}/24", offset / 256, offset % 256, 0)
+            })
+            .find(|candidate| {
+                let candidate = candidate.parse::<Ipv4Net>().expect("generated CIDR");
+                existing_networks
+                    .iter()
+                    .all(|existing| !cidrs_overlap(candidate, *existing))
+            })
+            .expect("find an unused private test CIDR");
+
+        let create_request_a = create_request("postgres integration A", &cidr);
+        let create_request_b = create_request("postgres integration B", &cidr);
+        let (create_a, create_b) = tokio::join!(
+            post_json(app_a.clone(), "/v1/networks", &create_request_a),
+            post_json(app_b.clone(), "/v1/networks", &create_request_b),
+        );
+        let a_created = create_a.status() == StatusCode::OK;
+        let (create, overlap) = if a_created {
+            (create_a, create_b)
+        } else {
+            (create_b, create_a)
+        };
+        let create_status = create.status();
+        let create_body = axum::body::to_bytes(create.into_body(), 16 * 1024)
+            .await
+            .expect("read create network result");
+        assert_eq!(
+            create_status,
+            StatusCode::OK,
+            "create network failure: {}",
+            String::from_utf8_lossy(&create_body)
+        );
+        assert_eq!(
+            overlap.status(),
+            StatusCode::CONFLICT,
+            "concurrent instances must serialize overlapping CIDR reservations"
+        );
+        let created: CreateNetworkResponse =
+            serde_json::from_slice(&create_body).expect("create network JSON response");
+        let network_id = Uuid::parse_str(&created.network_id).expect("network UUID");
+
+        let invite = post_json(
+            app_b.clone(),
+            &format!("/v1/networks/{network_id}/invites"),
+            &CreateInviteRequest {
+                admin_token: created.admin_token.clone(),
+            },
+        )
+        .await;
+        assert_eq!(invite.status(), StatusCode::OK);
+        let invite: CreateInviteResponse = response_json(invite).await;
+        let join_a = signed_join(network_id, invite.invite_token.clone(), 201);
+        let join_b = signed_join(network_id, invite.invite_token, 202);
+        let join_path = format!("/v1/networks/{network_id}/join");
+        let (response_a, response_b) = tokio::join!(
+            post_json(app_a.clone(), &join_path, &join_a),
+            post_json(app_b.clone(), &join_path, &join_b),
+        );
+        let a_won = response_a.status() == StatusCode::OK;
+        let winner_request = if a_won { join_a } else { join_b };
+        let (winner_response, loser_response) = if a_won {
+            (response_a, response_b)
+        } else {
+            (response_b, response_a)
+        };
+        assert_eq!(winner_response.status(), StatusCode::OK);
+        let winner: JoinNetworkResponse = response_json(winner_response).await;
+        assert_eq!(
+            loser_response.status(),
+            StatusCode::UNAUTHORIZED,
+            "one invitation cannot allocate two addresses across instances"
+        );
+
+        let second_invite = post_json(
+            app_a.clone(),
+            &format!("/v1/networks/{network_id}/invites"),
+            &CreateInviteRequest {
+                admin_token: created.admin_token.clone(),
+            },
+        )
+        .await;
+        assert_eq!(second_invite.status(), StatusCode::OK);
+        let second_invite: CreateInviteResponse = response_json(second_invite).await;
+        let second_join = signed_join(network_id, second_invite.invite_token, 203);
+        let second_join_response = post_json(app_a.clone(), &join_path, &second_join).await;
+        assert_eq!(second_join_response.status(), StatusCode::OK);
+        let second_joined: JoinNetworkResponse = response_json(second_join_response).await;
+        assert_ne!(
+            winner.assigned_ipv4, second_joined.assigned_ipv4,
+            "concurrent replicas must preserve unique IPv4 leases"
+        );
+
+        let winner_seed = if a_won { 201 } else { 202 };
+        let winner_key = SigningKey::from_bytes(&[winner_seed; 32]);
+        let second_key = SigningKey::from_bytes(&[203; 32]);
+        let candidates = vec!["192.0.2.7:42000".to_owned()];
+        let ice_credentials = IceCredentials {
+            ufrag: "postgresUfrag12".to_owned(),
+            password: "postgresIcePassword0123456789".to_owned(),
+            generation: 1,
+        };
+        let candidate_timestamp = unix_time_ms().expect("clock");
+        let candidate_signature = winner_key.sign(&candidate_signing_bytes_with_ice(
+            &network_id.to_string(),
+            &winner_request.device_id,
+            candidate_timestamp,
+            &candidates,
+            &ice_credentials,
+        ));
+        let candidate_path = format!("/v1/networks/{network_id}/candidates");
+        let candidate_update = post_json(
+            app_a.clone(),
+            &candidate_path,
+            &CandidateUpdateRequest {
+                device_id: winner_request.device_id.clone(),
+                timestamp_ms: candidate_timestamp,
+                candidates: candidates.clone(),
+                ice_credentials: Some(ice_credentials.clone()),
+                signature: URL_SAFE_NO_PAD.encode(candidate_signature.to_bytes()),
+            },
+        )
+        .await;
+        assert_eq!(candidate_update.status(), StatusCode::OK);
+
+        let peers_timestamp = unix_time_ms().expect("clock");
+        let peers_signature = second_key.sign(&peers_signing_bytes(
+            &network_id.to_string(),
+            &second_join.device_id,
+            peers_timestamp,
+        ));
+        let peer_list = post_json(
+            app_b.clone(),
+            &format!("/v1/networks/{network_id}/peers"),
+            &PeerListRequest {
+                device_id: second_join.device_id.clone(),
+                timestamp_ms: peers_timestamp,
+                signature: URL_SAFE_NO_PAD.encode(peers_signature.to_bytes()),
+            },
+        )
+        .await;
+        assert_eq!(peer_list.status(), StatusCode::OK);
+        let peer_list: PeerListResponse = response_json(peer_list).await;
+        let peer = peer_list
+            .peers
+            .iter()
+            .find(|peer| peer.device_id == winner_request.device_id)
+            .expect("peer enrolled on another Coordinator instance");
+        assert_eq!(peer.candidates, candidates);
+        assert_eq!(peer.ice_credentials, Some(ice_credentials));
+
+        let ticket_a = post_json(
+            app_a.clone(),
+            &format!("/v1/networks/{network_id}/relay-ticket"),
+            &signed_relay_request(
+                network_id,
+                &winner_key,
+                &winner_request.device_id,
+                &second_join.device_id,
+            ),
+        )
+        .await;
+        assert_eq!(ticket_a.status(), StatusCode::OK);
+        let ticket_a: RelayTicketResponse = response_json(ticket_a).await;
+        let ticket_b = post_json(
+            app_b.clone(),
+            &format!("/v1/networks/{network_id}/relay-ticket"),
+            &signed_relay_request(
+                network_id,
+                &second_key,
+                &second_join.device_id,
+                &winner_request.device_id,
+            ),
+        )
+        .await;
+        assert_eq!(ticket_b.status(), StatusCode::OK);
+        let ticket_b: RelayTicketResponse = response_json(ticket_b).await;
+        let now = unix_time_ms().expect("clock");
+        let claims_a = mini_tunnel_protocol::verify_relay_ticket(&relay_key, &ticket_a.ticket, now)
+            .expect("ticket issued by first instance");
+        let claims_b = mini_tunnel_protocol::verify_relay_ticket(&relay_key, &ticket_b.ticket, now)
+            .expect("ticket issued by second instance");
+        assert_eq!(
+            claims_a.session_id, claims_b.session_id,
+            "relay pairing state must be shared across instances"
+        );
+
+        let restored = CoordinatorState::connect_postgres(&app_database_url)
+            .await
+            .expect("restart a Coordinator instance against PostgreSQL");
+        let restored_response = post_json(
+            router_with_state(restored),
+            &format!("/v1/networks/{network_id}/join"),
+            &winner_request,
+        )
+        .await;
+        assert_eq!(restored_response.status(), StatusCode::OK);
+        let restored: JoinNetworkResponse = response_json(restored_response).await;
+        assert_eq!(restored.assigned_ipv4, winner.assigned_ipv4);
+
+        let snapshot_path =
+            std::env::temp_dir().join(format!("mini-tunnel-postgres-{}.json", Uuid::new_v4()));
+        let exported =
+            CoordinatorState::export_postgres_to_snapshot(&app_database_url, &snapshot_path)
+                .await
+                .expect("export PostgreSQL state to JSON snapshot");
+        assert_eq!(exported.networks, 1);
+        assert_eq!(exported.members, 2);
+        let validated = CoordinatorState::verify_persistent_state(&snapshot_path)
+            .await
+            .expect("validate exported JSON snapshot");
+        assert_eq!(validated, exported);
+        cleanup_postgres_network(pool, network_id).await;
+        let imported =
+            CoordinatorState::import_snapshot_to_postgres(&snapshot_path, &app_database_url)
+                .await
+                .expect("import validated JSON into an empty PostgreSQL store");
+        assert_eq!(imported, exported);
+        let reimported = post_json(app_b.clone(), &join_path, &winner_request).await;
+        assert_eq!(reimported.status(), StatusCode::OK);
+        let reimported: JoinNetworkResponse = response_json(reimported).await;
+        assert_eq!(reimported.assigned_ipv4, winner.assigned_ipv4);
+
+        let revoke_path = format!("/v1/networks/{network_id}/members/revoke");
+        let revoked = post_json(
+            app_b.clone(),
+            &revoke_path,
+            &RevokeMemberRequest {
+                admin_token: created.admin_token.clone(),
+                device_id: winner_request.device_id.clone(),
+            },
+        )
+        .await;
+        assert_eq!(revoked.status(), StatusCode::OK);
+        let revoked: RevokeMemberResponse = response_json(revoked).await;
+        assert_eq!(revoked.released_ipv4, winner.assigned_ipv4);
+        let revoked_join = post_json(app_a.clone(), &join_path, &winner_request).await;
+        assert_eq!(
+            revoked_join.status(),
+            StatusCode::UNAUTHORIZED,
+            "revocation must be visible on other Coordinator instances"
+        );
+        cleanup_postgres_network(pool, network_id).await;
+        let _ = fs::remove_file(&snapshot_path);
+        let _ = fs::remove_file(state_lock_path(&snapshot_path).expect("snapshot lock path"));
+
+        let unavailable = CoordinatorState::connect_postgres(&app_database_url)
+            .await
+            .expect("connect readiness test instance");
+        unavailable
+            .postgres
+            .as_ref()
+            .expect("readiness test pool")
+            .close()
+            .await;
+        let health = get_from_router(router_with_state(unavailable), "/healthz").await;
+        assert_eq!(
+            health.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "readiness must fail closed when the authoritative store is unavailable"
+        );
+    }
+
     #[tokio::test]
     async fn relay_tickets_require_network_members_and_pair_opposite_requests() {
         let key_a = SigningKey::from_bytes(&[31; 32]);
@@ -3675,6 +4793,8 @@ mod tests {
             .unwrap();
         assert!(revoked.revoked);
         assert_eq!(revoked.released_ipv4, "10.79.0.1");
+        Store::from_snapshot(state.inner.read().await.snapshot())
+            .expect("revoked member must leave a valid restart snapshot");
 
         let next_invite = state
             .create_invite(

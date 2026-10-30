@@ -14,6 +14,49 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  postgres-integration:
+    name: PostgreSQL integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: mini_tunnel_owner
+          POSTGRES_PASSWORD: mini_tunnel_owner
+          POSTGRES_DB: mini_tunnel_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mini_tunnel_test -d mini_tunnel_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CARGO_INCREMENTAL: 0
+      MINI_TUNNEL_TEST_DATABASE_URL: postgres://mini_tunnel_owner:mini_tunnel_owner@localhost:5432/mini_tunnel_test
+      MINI_TUNNEL_TEST_APP_DATABASE_URL: postgres://mini_tunnel_runtime:mini_tunnel_runtime@localhost:5432/mini_tunnel_test
+      PGPASSWORD: mini_tunnel_owner
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Prepare least-privilege runtime database role
+        run: |
+          psql --host localhost --username mini_tunnel_owner --dbname mini_tunnel_test <<'SQL'
+          CREATE ROLE mini_tunnel_runtime LOGIN PASSWORD 'mini_tunnel_runtime';
+          GRANT CONNECT ON DATABASE mini_tunnel_test TO mini_tunnel_runtime;
+          GRANT USAGE ON SCHEMA public TO mini_tunnel_runtime;
+          ALTER DEFAULT PRIVILEGES FOR ROLE mini_tunnel_owner IN SCHEMA public
+            GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO mini_tunnel_runtime;
+          SQL
+
+      - name: Run real PostgreSQL multi-instance integration
+        run: cargo +stable test -p mini-tunnel-coordinator postgres_coordinator_instances_serialize_join_and_restore_state -- --ignored --nocapture
+
   verify:
     name: Verify (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

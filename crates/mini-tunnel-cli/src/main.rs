@@ -70,12 +70,8 @@ enum CoordinatorCommand {
         )]
         listen: SocketAddr,
         /// Coordinator state snapshot path.
-        #[arg(
-            long,
-            env = "MINI_TUNNEL_COORDINATOR_STATE",
-            default_value_os_t = default_coordinator_state_path()
-        )]
-        state_file: PathBuf,
+        #[arg(long, env = "MINI_TUNNEL_COORDINATOR_STATE")]
+        state_file: Option<PathBuf>,
         /// PEM certificate chain used to serve HTTPS. Required with --tls-key.
         #[arg(long, env = "MINI_TUNNEL_COORDINATOR_TLS_CERT")]
         tls_cert: Option<PathBuf>,
@@ -134,6 +130,24 @@ enum CoordinatorCommand {
         #[arg(long)]
         backup: PathBuf,
     },
+    /// Import a validated JSON snapshot into an empty PostgreSQL store.
+    ImportStateToPostgres {
+        /// Source coordinator state snapshot path.
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_COORDINATOR_STATE",
+            default_value_os_t = default_coordinator_state_path()
+        )]
+        state_file: PathBuf,
+    },
+    /// Export a consistent PostgreSQL state snapshot to the protected JSON format.
+    ExportStateFromPostgres {
+        /// Destination JSON snapshot path.
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Apply additive PostgreSQL schema migrations using a database-owner role.
+    MigratePostgres,
     /// Check a running coordinator's health endpoint.
     Health {
         /// Coordinator base URL.
@@ -582,15 +596,34 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         "non-loopback coordinator listeners require TLS; configure --tls-cert and --tls-key".into(),
                     );
                 }
-                mini_tunnel_coordinator::serve_with_state_file_and_relay_key_tls_and_reload_interval_and_trusted_proxies(
-                    listen,
-                    state_file,
-                    relay_key,
-                    tls_files,
-                    Duration::from_secs(tls_reload_interval_seconds),
-                    trusted_proxies,
-                )
-                .await?;
+                let database_url = std::env::var("MINI_TUNNEL_COORDINATOR_DATABASE_URL").ok();
+                if database_url.is_some() && state_file.is_some() {
+                    return Err(
+                        "choose either MINI_TUNNEL_COORDINATOR_DATABASE_URL or --state-file, not both".into(),
+                    );
+                }
+                let reload_interval = Duration::from_secs(tls_reload_interval_seconds);
+                if let Some(database_url) = database_url {
+                    mini_tunnel_coordinator::serve_with_postgres_url_and_relay_key_tls_and_reload_interval_and_trusted_proxies(
+                        listen,
+                        &database_url,
+                        relay_key,
+                        tls_files,
+                        reload_interval,
+                        trusted_proxies,
+                    )
+                    .await?;
+                } else {
+                    mini_tunnel_coordinator::serve_with_state_file_and_relay_key_tls_and_reload_interval_and_trusted_proxies(
+                        listen,
+                        state_file.unwrap_or_else(default_coordinator_state_path),
+                        relay_key,
+                        tls_files,
+                        reload_interval,
+                        trusted_proxies,
+                    )
+                    .await?;
+                }
             }
             CoordinatorCommand::VerifyState { state_file } => {
                 let summary =
@@ -630,6 +663,44 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     summary.invites,
                     backup.display()
                 );
+            }
+            CoordinatorCommand::ImportStateToPostgres { state_file } => {
+                let database_url = std::env::var("MINI_TUNNEL_COORDINATOR_DATABASE_URL")
+                    .map_err(|_| "MINI_TUNNEL_COORDINATOR_DATABASE_URL is required")?;
+                let summary =
+                    mini_tunnel_coordinator::CoordinatorState::import_snapshot_to_postgres(
+                        &state_file,
+                        &database_url,
+                    )
+                    .await?;
+                println!(
+                    "imported {} networks, {} members, {} invites into PostgreSQL",
+                    summary.networks, summary.members, summary.invites
+                );
+            }
+            CoordinatorCommand::ExportStateFromPostgres { output } => {
+                let database_url = std::env::var("MINI_TUNNEL_COORDINATOR_DATABASE_URL")
+                    .map_err(|_| "MINI_TUNNEL_COORDINATOR_DATABASE_URL is required")?;
+                let summary =
+                    mini_tunnel_coordinator::CoordinatorState::export_postgres_to_snapshot(
+                        &database_url,
+                        &output,
+                    )
+                    .await?;
+                println!(
+                    "exported {} networks, {} members, {} invites to {}",
+                    summary.networks,
+                    summary.members,
+                    summary.invites,
+                    output.display()
+                );
+            }
+            CoordinatorCommand::MigratePostgres => {
+                let database_url = std::env::var("MINI_TUNNEL_COORDINATOR_DATABASE_URL")
+                    .map_err(|_| "MINI_TUNNEL_COORDINATOR_DATABASE_URL is required")?;
+                mini_tunnel_coordinator::CoordinatorState::migrate_postgres_database(&database_url)
+                    .await?;
+                println!("Coordinator PostgreSQL schema is up to date");
             }
             CoordinatorCommand::Health { url } => {
                 let endpoint = format!("{}/healthz", url.trim_end_matches('/'));

@@ -136,6 +136,8 @@ TCP fallback 的帧格式：`u32_be frame_length | encrypted_packet`，最大 fr
 
 服务端不可用影响：已建立 P2P 正常继续至租约到期；新 peer 发现和认证失败；既有 relay 会话按 ticket 租期继续或到期断开。Coordinator 做多副本和数据库备份；relay 故障需客户端切换备用区域。发布采用兼容的协议版本协商、先服务端后客户端的滚动升级；保留一个旧版本窗口。
 
+Coordinator 现可使用 PostgreSQL 作为多实例共享事实源：网络、邀请、成员/IPv4 租约、候选、短期 ICE 凭证和 relay ticket 配对均在数据库事务中读取或更新；JSON 快照继续用于单进程部署与显式迁移/回滚。应用启动只校验 schema，不自动执行 DDL；由独立 owner 凭据运行迁移，服务进程使用受限 DML 角色。当前实现用单一数据库事务锁保护既有内存领域逻辑，跨实例写入正确但会串行化，适合 MVP 高可用部署，不承诺随副本线性扩展写吞吐。数据库故障时 API/health readiness fail closed，不回退到空状态。
+
 ## 10. 技术模块建议
 
 - 语言：Rust workspace；`protocol`（schema/校验）、`agent`、`coordinator`、`relay`、`cli`。
@@ -150,7 +152,7 @@ TCP fallback 的帧格式：`u32_be frame_length | encrypted_packet`，最大 fr
 
 **阶段 1：MVP（原始路线）**：Linux/macOS agent、Coordinator、邀请加入、设备密钥、IPv4 地址分配、UDP 直连、UDP relay、status/诊断、撤销、断线重连。此阶段是项目启动时的计划记录；当前实现进度以本节的“当前实现边界”为准。
 
-**阶段 2：网络兼容（原始路线）**：TCP 直连和 TLS/TCP relay、自动降级/恢复迟滞、Windows TUN、IPv6、服务端多副本、升级/密钥轮换。TCP/TLS fallback、IPv6 overlay、peer mesh 和路径降级/恢复现已实现；Windows TUN runtime、多副本 Coordinator 和实网互通仍未完成验收或实现。
+**阶段 2：网络兼容（原始路线）**：TCP 直连和 TLS/TCP relay、自动降级/恢复迟滞、Windows TUN、IPv6、服务端多副本、升级/密钥轮换。TCP/TLS fallback、IPv6 overlay、peer mesh 和路径降级/恢复现已实现；Coordinator 已有事务化 PostgreSQL 多实例模式与 JSON 文件模式，写吞吐仍受全局写锁限制；Windows TUN runtime 和公网实网互通仍未完成验收。
 
 **当前实现边界（2026-10）**：已有 IPv4/IPv6 ULA overlay 地址、受当前封装 MTU 限制的双栈包验证与 mesh 路由；当前默认 TUN MTU 为 1280 bytes，peer frame 单片上限为 1175 bytes；较大包会拆分为有界认证片段并按 peer 限额重组，丢片后 5 秒过期。发送时逐包读取 Quinn 当前 `max_datagram_size()` 并据此切片，该值会随 QUIC 的路径 MTU 估算变化；真实网络的 MTU 变化和丢片场景仍待验证；IPv6 地址由 network UUID 与唯一 IPv4 lease 稳定推导，Coordinator 检查本地 ULA prefix 冲突。IPv4/IPv6 TUN 地址及 Linux/macOS peer host routes 已接入，但当前环境未执行特权真实 TUN 验收，Windows route 命令已接入；Windows 特权 TUN 和 route 实机验收仍待执行。NAT 路径已有 STUN 映射发现、host candidate gathering、UDP 优先/TCP 次选的有界拨号、多 peer mesh、链路探测和 ticket 中继兜底。单 peer Connect/Listen 和 mesh 都提供实验性 `--ice` 路径，在同一 socket 上用 RFC 8445 Agent 执行认证 connectivity checks 和 nomination；consent 以 5 秒为基准独立随机化到 4–6 秒，15 秒无响应触发断开、30 秒 consent 失效时进入路径恢复，peer channel 清理时注销 session。mesh 用双方 ufrag 分流并维持每 peer session。未启用或检查失败时回退现有候选拨号。仍缺实网 NAT/QoS 矩阵、重启和拥塞场景验证；不能据此保证对称 NAT 下的直连，中继仍是兜底。
 

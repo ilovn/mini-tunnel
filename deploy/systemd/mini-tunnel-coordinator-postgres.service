@@ -1,0 +1,38 @@
+[Unit]
+Description=mini-tunnel coordinator (PostgreSQL)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mini-tunnel
+Group=mini-tunnel
+EnvironmentFile=/etc/mini-tunnel/coordinator.env
+ExecStart=/usr/local/bin/mini-tunnel coordinator serve --listen 127.0.0.1:8443 --tls-cert /etc/mini-tunnel/tls/fullchain.pem --tls-key /etc/mini-tunnel/tls/privkey.pem
+Restart=on-failure
+RestartSec=3s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+StateDirectory=mini-tunnel
+StateDirectoryMode=0700
+ReadOnlyPaths=/etc/mini-tunnel/tls
+ReadWritePaths=/var/lib/mini-tunnel
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectHostname=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

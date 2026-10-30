@@ -15,17 +15,32 @@ sudo install -d -o mini-tunnel -g mini-tunnel -m 0700 /var/lib/mini-tunnel
 
 Install TLS files readable by the service account and not writable by it. Put environment files in `/etc/mini-tunnel`, owned by `root:mini-tunnel` with mode `0640`. `coordinator.env` should contain `MINI_TUNNEL_RELAY_TICKET_KEY` with a URL-safe base64 encoded random 32-byte value. `relay.env` must contain the same key. Do not put secrets in unit files, command-line arguments, source control, or logs. During key rotation, set the relay's `MINI_TUNNEL_RELAY_PREVIOUS_TICKET_KEY` as described in the main README.
 
+For PostgreSQL mode, add `MINI_TUNNEL_COORDINATOR_DATABASE_URL` to the protected `coordinator.env` file and use `mini-tunnel-coordinator-postgres.service` instead of the JSON-file unit. The URL should use `sslmode=verify-full`; do not set `MINI_TUNNEL_COORDINATOR_STATE` or pass `--state-file` in this mode. First run `mini-tunnel coordinator migrate-postgres` with a separate schema-owner environment file. Then change `coordinator.env` to the restricted runtime database role that has only schema usage and table DML rights (including `UPDATE` on the transaction-lock row). Keep migration credentials out of the running service environment.
+
 Copy the unit files to `/etc/systemd/system/`, then:
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl enable --now mini-tunnel-coordinator.service
 sudo systemctl enable --now mini-tunnel-relay.service
-systemctl status mini-tunnel-coordinator mini-tunnel-relay
-journalctl -u mini-tunnel-coordinator -u mini-tunnel-relay
 ```
 
+Enable exactly one Coordinator unit, matching the selected state backend:
+
+```sh
+# Single-node JSON snapshot mode
+sudo systemctl enable --now mini-tunnel-coordinator.service
+
+# Or shared PostgreSQL mode
+sudo systemctl enable --now mini-tunnel-coordinator-postgres.service
+```
+
+Check the selected Coordinator unit and relay with `systemctl status` and `journalctl`.
+
 The coordinator template binds HTTPS to loopback for a local reverse proxy. Configure the proxy to validate the coordinator certificate and expose only the API routes required by clients; keep `/metrics` private. The relay serves TCP on port `42001`; permit that port in the host/network firewall. Its health and Prometheus endpoints stay bound to loopback at `127.0.0.1:42002`.
+
+Enable either `mini-tunnel-coordinator.service` for a single-node JSON snapshot or `mini-tunnel-coordinator-postgres.service` for shared PostgreSQL state, not both. For JSON mode, continue protecting `/var/lib/mini-tunnel/coordinator-state.json`. For PostgreSQL mode, back up the database with `pg_dump`/PITR and periodically export a verified JSON recovery snapshot with `mini-tunnel coordinator export-state-from-postgres --output <path>`.
+
+PostgreSQL stores short-lived ICE credentials and relay pairing metadata alongside durable network state. Restrict database access and protect database disks and backups accordingly; ICE passwords are ephemeral credentials, not long-term secrets.
 
 On Unix, both services treat systemd's default `SIGTERM` and `Ctrl+C` as graceful shutdown signals. The relay waits up to its configured shutdown grace period for paired sessions to finish; the coordinator stops accepting new requests and completes in-flight requests.
 
