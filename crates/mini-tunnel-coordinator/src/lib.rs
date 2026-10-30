@@ -1161,7 +1161,7 @@ fn persist_store(path: &FsPath, store: &Store) -> io::Result<()> {
         let mut file = options.open(&temporary)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        fs::rename(&temporary, path)?;
+        replace_state_file(&temporary, path)?;
         // The rename is the commit point. A directory sync failure must not report a failed
         // mutation after the new snapshot became visible and cause memory/disk divergence.
         let _ = fs::File::open(parent).and_then(|directory| directory.sync_all());
@@ -1171,6 +1171,43 @@ fn persist_store(path: &FsPath, store: &Store) -> io::Result<()> {
         let _ = fs::remove_file(&temporary);
     }
     write_result
+}
+
+#[cfg(not(windows))]
+fn replace_state_file(temporary: &FsPath, path: &FsPath) -> io::Result<()> {
+    fs::rename(temporary, path)
+}
+
+#[cfg(windows)]
+fn replace_state_file(temporary: &FsPath, path: &FsPath) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let temporary = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // Both paths are in the same directory, so replacement is atomic on the same volume.
+    let replaced = unsafe {
+        MoveFileExW(
+            temporary.as_ptr(),
+            path.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 pub fn router() -> Router {
@@ -2941,6 +2978,43 @@ mod tests {
             };
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         }
+        fs::remove_dir_all(dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn persisted_snapshot_atomically_replaces_an_existing_file() {
+        let dir =
+            std::env::temp_dir().join(format!("mini-tunnel-state-replace-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create test directory");
+        let path = dir.join("coordinator.json");
+        let empty = Store {
+            networks: HashMap::new(),
+        };
+        persist_store(&path, &empty).expect("write initial snapshot");
+        let initial = fs::read(&path).expect("read initial snapshot");
+        let cidr = "10.91.0.0/24".parse().unwrap();
+        let populated = Store {
+            networks: HashMap::from([(
+                Uuid::new_v4(),
+                Network {
+                    cidr,
+                    next_address: first_host(cidr),
+                    admin_token_hash: [7; 32],
+                    invites: HashMap::new(),
+                    members: HashMap::new(),
+                    assigned_addresses: HashSet::new(),
+                },
+            )]),
+        };
+        persist_store(&path, &populated).expect("replace existing snapshot");
+        let replaced = fs::read(&path).expect("read replaced snapshot");
+        assert_ne!(initial, replaced);
+        assert!(replace_state_file(&dir.join("missing.tmp"), &path).is_err());
+        assert_eq!(fs::read(&path).expect("old snapshot remains"), replaced);
+        let snapshot: StateSnapshot =
+            serde_json::from_slice(&replaced).expect("decode replaced snapshot");
+        assert_eq!(snapshot.networks.len(), 1);
+        assert_eq!(Store::from_snapshot(snapshot).unwrap().networks.len(), 1);
         fs::remove_dir_all(dir).expect("remove test directory");
     }
 

@@ -23,6 +23,9 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 rcgen.workspace = true
 reqwest.workspace = true
