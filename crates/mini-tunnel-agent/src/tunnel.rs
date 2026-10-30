@@ -1027,9 +1027,25 @@ mod tests {
             self.loss_active = true;
         }
 
-        fn drop_both_egress(&mut self) {
-            Self::set_egress_loss(&self.left_namespace, &self.left);
-            Self::set_egress_loss(&self.right_namespace, &self.right);
+        fn degrade_both_egress(&mut self) {
+            for (namespace, device) in [
+                (&self.left_namespace, &self.left),
+                (&self.right_namespace, &self.right),
+            ] {
+                let output = Self::run_in_namespace(
+                    namespace,
+                    "tc",
+                    &[
+                        "qdisc", "replace", "dev", device, "root", "netem", "delay", "200ms",
+                        "20ms", "loss", "10%",
+                    ],
+                );
+                assert!(
+                    output.status.success(),
+                    "tc QoS profile on {device} failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
             self.loss_active = true;
         }
 
@@ -1286,7 +1302,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires root privileges, iproute2, and tc netem"]
-    async fn privileged_linux_veth_udp_loss_triggers_mesh_tcp_fallback() {
+    async fn privileged_linux_veth_degraded_udp_triggers_mesh_tcp_fallback() {
         let (mut link, local_address, remote_address) = TestVethPair::create();
         let temp = std::env::temp_dir().join(format!(
             "mini-tunnel-veth-fallback-{}",
@@ -1314,7 +1330,7 @@ mod tests {
             remote_address.ip(),
             "endpoint B must bind to the right veth address"
         );
-        let network = "veth-loss-fallback";
+        let network = "veth-qos-fallback";
         let a_id = a.device_id();
         let a_key = a.public_key();
         let b_id = b.device_id();
@@ -1379,7 +1395,7 @@ mod tests {
             local_ipv6: None,
             mtu: 1500,
         };
-        link.drop_both_egress();
+        link.degrade_both_egress();
         let initial_for_diagnostics = Arc::clone(&initial);
         let pump = tokio::spawn(async move {
             pump_mesh_with_quality_interval(
@@ -1398,7 +1414,7 @@ mod tests {
             .await
         });
 
-        let accept_result = tokio::time::timeout(Duration::from_secs(8), accept_tcp).await;
+        let accept_result = tokio::time::timeout(Duration::from_secs(12), accept_tcp).await;
         let (accepted_id, recovered_remote) = match accept_result {
             Ok(joined) => joined
                 .expect("join TCP accept")
@@ -1419,7 +1435,7 @@ mod tests {
                     .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
                     .unwrap_or_else(|error| error.to_string());
                 panic!(
-                    "mesh did not reconnect over TCP after real UDP loss; health={health:?}, reliable_requested={}, local={}, remote={}, channel_remote={}, route={}, qdisc={}",
+                    "mesh did not reconnect over TCP after degraded UDP QoS; health={health:?}, reliable_requested={}, local={}, remote={}, channel_remote={}, route={}, qdisc={}",
                     requested_reliable.load(Ordering::SeqCst),
                     endpoint_a.local_addr().expect("endpoint A address"),
                     endpoint_b.local_addr().expect("endpoint B address"),
