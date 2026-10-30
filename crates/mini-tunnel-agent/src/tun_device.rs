@@ -624,6 +624,117 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    #[ignore = "requires Administrator privileges and the official wintun.dll runtime"]
+    async fn privileged_windows_wintun_routes_packets_and_cleans_up() {
+        let pid = std::process::id();
+        let subnet = (pid % 250 + 1) as u8;
+        let local_ipv4 = Ipv4Addr::new(10, 252, subnet, 1);
+        let peer_ipv4 = Ipv4Addr::new(10, 252, subnet, 2);
+        let local_ipv6 = Ipv6Addr::new(0xfd17, 0x252, u16::from(subnet), 0, 0, 0, 0, 1);
+        let peer_ipv6 = Ipv6Addr::new(0xfd17, 0x252, u16::from(subnet), 0, 0, 0, 0, 2);
+        let interface_name = format!("mtun{}", pid % 100_000);
+        let mut config = TunConfig::ipv4(local_ipv4, 32).with_ipv6(local_ipv6, 128);
+        config.name = Some(interface_name.clone());
+        let device = TunDevice::create(config).expect("create privileged Windows Wintun device");
+        assert_eq!(device.local_ipv4(), local_ipv4);
+        assert_eq!(device.local_ipv6(), Some(local_ipv6));
+        assert_eq!(device.mtu(), usize::from(DEFAULT_TUN_MTU));
+        assert_eq!(
+            device.name().expect("read Wintun adapter name"),
+            interface_name
+        );
+
+        let powershell = |script: &str| {
+            std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", script])
+                .output()
+                .expect("inspect Wintun state with PowerShell")
+        };
+        let inspect = powershell(&format!(
+            "$ErrorActionPreference='Stop'; \
+             Get-NetIPAddress -InterfaceAlias '{interface_name}' -IPAddress '{local_ipv4}' | Out-Null; \
+             Get-NetIPAddress -InterfaceAlias '{interface_name}' -IPAddress '{local_ipv6}' | Out-Null; \
+             $mtu=(Get-NetIPInterface -InterfaceAlias '{interface_name}' -AddressFamily IPv4).NlMtu; \
+             if ($mtu -ne 1280) {{ exit 23 }}"
+        ));
+        assert!(
+            inspect.status.success(),
+            "Wintun address/MTU inspection failed: {}",
+            String::from_utf8_lossy(&inspect.stderr)
+        );
+
+        let runner = crate::routing::SystemRouteRunner;
+        let ipv4_route = crate::routing::install_peer_route(
+            &runner,
+            crate::routing::RoutingPlatform::Windows,
+            &interface_name,
+            peer_ipv4,
+        )
+        .await
+        .expect("install Windows IPv4 peer route");
+        let ipv6_route = crate::routing::install_peer_ipv6_route(
+            &runner,
+            crate::routing::RoutingPlatform::Windows,
+            &interface_name,
+            peer_ipv6,
+        )
+        .await
+        .expect("install Windows IPv6 peer route");
+
+        let overlay_socket = tokio::net::UdpSocket::bind((local_ipv4, 0))
+            .await
+            .expect("bind UDP socket to assigned overlay address");
+        overlay_socket
+            .send_to(b"outbound through Wintun peer route", (peer_ipv4, 4242))
+            .await
+            .expect("send UDP datagram to peer overlay address");
+        let outbound = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            device.read_outbound_packet(),
+        )
+        .await
+        .expect("kernel-routed datagram reaches Wintun")
+        .expect("read validated local-originated packet from Wintun");
+        let (source, destination) =
+            packet_addresses(&outbound).expect("parse outbound Wintun packet");
+        assert_eq!(source, IpAddr::V4(local_ipv4));
+        assert_eq!(destination, IpAddr::V4(peer_ipv4));
+        assert_eq!(outbound[9], 17, "expected an IPv4 UDP packet");
+
+        device
+            .write_inbound_packet(&packet(peer_ipv4, local_ipv4, 28), peer_ipv4)
+            .await
+            .expect("inject validated peer packet into the Windows IP stack");
+        ipv6_route
+            .remove(&runner)
+            .await
+            .expect("remove Windows IPv6 peer route");
+        ipv4_route
+            .remove(&runner)
+            .await
+            .expect("remove Windows IPv4 peer route");
+
+        drop(overlay_socket);
+        drop(device);
+        let mut removed = false;
+        for _ in 0..20 {
+            let result = powershell(&format!(
+                "if (Get-NetAdapter -Name '{interface_name}' -ErrorAction SilentlyContinue) {{ exit 1 }}"
+            ));
+            if result.status.success() {
+                removed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            removed,
+            "dropping TunDevice should remove the Wintun adapter"
+        );
+    }
+
     #[test]
     fn ipv6_packet_boundary_checks_length_mtu_and_peer_addresses() {
         let local: Ipv6Addr = "fd12:3456::2".parse().unwrap();

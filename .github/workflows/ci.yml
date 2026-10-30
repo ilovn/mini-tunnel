@@ -116,3 +116,36 @@ jobs:
           )"
           sudo modprobe tun || true
           sudo "$test_binary" --exact tun_device::tests::privileged_linux_tun_assigns_addresses_mtu_and_cleans_up --ignored --nocapture
+
+      - name: Run privileged Windows Wintun packet round trip
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'wintun-0.14.1.zip'
+          $extract = Join-Path $env:RUNNER_TEMP 'wintun-0.14.1'
+          Invoke-WebRequest 'https://www.wintun.net/builds/wintun-0.14.1.zip' -OutFile $archive
+          $actualHash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          $expectedHash = '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51'
+          if ($actualHash -ne $expectedHash) {
+            throw "Wintun archive SHA-256 mismatch: $actualHash"
+          }
+          Expand-Archive -Path $archive -DestinationPath $extract -Force
+          $dll = Join-Path $extract 'wintun\bin\amd64\wintun.dll'
+          if (-not (Test-Path $dll)) { throw "Official x64 Wintun DLL missing: $dll" }
+
+          $buildMessages = Join-Path $env:RUNNER_TEMP 'mini-tunnel-agent-test-build.jsonl'
+          cargo +stable test -p mini-tunnel-agent --lib --no-run --message-format=json | Out-File -FilePath $buildMessages -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to build mini-tunnel-agent tests' }
+          $testExecutable = $null
+          foreach ($line in Get-Content $buildMessages) {
+            $message = $line | ConvertFrom-Json
+            if ($message.reason -eq 'compiler-artifact' -and $message.profile.test -and $message.target.name -eq 'mini_tunnel_agent') {
+              $testExecutable = $message.executable
+              break
+            }
+          }
+          if (-not $testExecutable) { throw 'mini-tunnel-agent test binary was not built' }
+          Copy-Item -Path $dll -Destination (Join-Path (Split-Path $testExecutable) 'wintun.dll') -Force
+          & $testExecutable --exact tun_device::tests::privileged_windows_wintun_routes_packets_and_cleans_up --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Privileged Windows Wintun runtime test failed' }
