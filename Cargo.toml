@@ -7,6 +7,7 @@ members = [
     "crates/mini-tunnel-relay",
     "crates/mini-tunnel-cli",
 ]
+exclude = ["vendor/rtc-ice"]
 
 [workspace.package]
 version = "0.1.0"
@@ -32,7 +33,7 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "r
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rcgen = { version = "0.14.5", default-features = false, features = ["pem", "ring"] }
 rustls = { version = "0.23.35", default-features = false, features = ["ring", "std"] }
-rtc-ice = { version = "0.21.1", default-features = false, features = ["crypto-ring"] }
+rtc-ice = { path = "vendor/rtc-ice", default-features = false, features = ["crypto-ring"] }
 rtc-shared = { version = "0.21.1", default-features = false }
 sansio = "1.0.1"
 serde = { version = "1.0.229", features = ["derive"] }
