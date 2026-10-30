@@ -1751,6 +1751,12 @@ mod tests {
         let file = fs::File::create(&path).expect("create sparse state file");
         file.set_len(MAX_STATE_FILE_BYTES + 1)
             .expect("set oversized sparse file length");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("set secure sparse-state permissions");
+        }
         let error = match CoordinatorState::load(&path) {
             Ok(_) => panic!("oversized state must be rejected"),
             Err(error) => error,
@@ -2972,6 +2978,12 @@ mod tests {
         fs::create_dir_all(&dir).expect("create test directory");
         let path = dir.join("coordinator.json");
         fs::write(&path, b"not json").expect("write corrupt state");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("set secure corrupt-state permissions");
+        }
         let error = match CoordinatorState::load(&path) {
             Ok(_) => panic!("corrupt state must not silently reset"),
             Err(error) => error,
