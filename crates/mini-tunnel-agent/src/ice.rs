@@ -29,6 +29,9 @@ const MAX_SOCKET_QUEUE_CAPACITY: usize = 128;
 const MAX_UDP_DATAGRAM_SIZE: usize = u16::MAX as usize;
 const MAX_ICE_SESSIONS: usize = 1024;
 const MAX_SESSION_PEER_ADDRESSES: usize = 16;
+const ICE_CONSENT_INTERVAL: Duration = Duration::from_secs(2);
+const ICE_DISCONNECTED_TIMEOUT: Duration = Duration::from_secs(8);
+const ICE_FAILED_TIMEOUT: Duration = Duration::from_secs(24);
 
 /// Generate an ephemeral ICE credential pair suitable for both rtc-ice and coordinator signaling.
 /// The coordinator accepts the RFC 8445 alphanumeric, `+`, and `/` alphabet; credentials are
@@ -57,6 +60,9 @@ pub fn agent_config(credentials: &IceCredentials) -> rtc_ice::AgentConfig {
     rtc_ice::AgentConfig {
         local_ufrag: credentials.ufrag.clone(),
         local_pwd: credentials.password.clone(),
+        keepalive_interval: Some(ICE_CONSENT_INTERVAL),
+        disconnected_timeout: Some(ICE_DISCONNECTED_TIMEOUT),
+        failed_timeout: Some(ICE_FAILED_TIMEOUT),
         ..Default::default()
     }
 }
@@ -994,6 +1000,11 @@ mod tests {
         let config = agent_config(&credentials);
         assert_eq!(config.local_ufrag, credentials.ufrag);
         assert_eq!(config.local_pwd, credentials.password);
+        assert_eq!(config.keepalive_interval, Some(ICE_CONSENT_INTERVAL));
+        assert_eq!(config.disconnected_timeout, Some(ICE_DISCONNECTED_TIMEOUT));
+        assert_eq!(config.failed_timeout, Some(ICE_FAILED_TIMEOUT));
+        assert!(ICE_CONSENT_INTERVAL < ICE_DISCONNECTED_TIMEOUT);
+        assert!(ICE_DISCONNECTED_TIMEOUT < ICE_FAILED_TIMEOUT);
     }
 
     #[test]
