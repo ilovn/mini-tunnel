@@ -45,6 +45,7 @@ const MAX_INVITES_PER_NETWORK: usize = 1024;
 const MAX_TOTAL_MEMBERS: usize = 16_384;
 const MAX_STATE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TLS_FILE_BYTES: u64 = 1024 * 1024;
+const COORDINATOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
 const MAX_DEVICE_ID_BYTES: usize = 128;
 const INVITE_TTL: Duration = Duration::from_secs(60 * 60);
 const SIGNATURE_CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
@@ -1522,12 +1523,49 @@ async fn serve_with_state(address: SocketAddr, state: CoordinatorState) -> std::
     validate_listener_security(address, false)?;
     let listener = TcpListener::bind(address).await?;
     tracing::info!(address = %listener.local_addr()?, "coordinator listening");
-    axum::serve(
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+    let server = axum::serve(
         listener,
         router_with_state(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(async move {
+        let _ = shutdown_receiver.await;
+    })
+    .into_future();
+    run_http_until_shutdown(
+        server,
+        shutdown_sender,
+        shutdown_signal(),
+        COORDINATOR_SHUTDOWN_GRACE,
+    )
     .await
+}
+
+async fn run_http_until_shutdown<F, S>(
+    server: F,
+    shutdown_sender: tokio::sync::oneshot::Sender<()>,
+    shutdown_signal: S,
+    grace: Duration,
+) -> io::Result<()>
+where
+    F: std::future::Future<Output = io::Result<()>>,
+    S: std::future::Future<Output = ()>,
+{
+    tokio::pin!(server);
+    tokio::pin!(shutdown_signal);
+    tokio::select! {
+        result = &mut server => result,
+        _ = &mut shutdown_signal => {
+            let _ = shutdown_sender.send(());
+            match tokio::time::timeout(grace, &mut server).await {
+                Ok(result) => result,
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "coordinator HTTP server exceeded graceful shutdown deadline",
+                )),
+            }
+        }
+    }
 }
 
 async fn serve_with_state_and_tls(
@@ -1557,7 +1595,7 @@ async fn serve_with_state_and_tls(
     let shutdown_handle = handle.clone();
     let shutdown = tokio::spawn(async move {
         shutdown_signal().await;
-        shutdown_handle.graceful_shutdown(Some(Duration::from_secs(15)));
+        shutdown_handle.graceful_shutdown(Some(COORDINATOR_SHUTDOWN_GRACE));
     });
     let result = axum_server::bind_rustls(address, config)
         .handle(handle)
@@ -1751,6 +1789,41 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn plain_http_shutdown_drains_server_until_completion() {
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let server = async move {
+            shutdown_receiver
+                .await
+                .map_err(|_| io::Error::other("shutdown signal was dropped"))?;
+            Ok(())
+        };
+
+        let result = run_http_until_shutdown(
+            server,
+            shutdown_sender,
+            std::future::ready(()),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn plain_http_shutdown_ends_after_grace_deadline() {
+        let (shutdown_sender, _shutdown_receiver) = tokio::sync::oneshot::channel();
+        let result = run_http_until_shutdown(
+            std::future::pending::<io::Result<()>>(),
+            shutdown_sender,
+            std::future::ready(()),
+            Duration::from_millis(10),
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 
     fn persisted_network(id: Uuid, cidr: &str, member_count: usize) -> PersistedNetwork {
