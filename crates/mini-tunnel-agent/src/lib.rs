@@ -283,6 +283,7 @@ const MAX_INCOMPLETE_PACKETS: usize = 4;
 const FRAGMENT_TTL: Duration = Duration::from_secs(5);
 const PEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const TCP_PEER_FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const TCP_PEER_FRAME_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PENDING_QUIC_HANDSHAKES: usize = 32;
 const MAX_PENDING_TCP_HANDSHAKES: usize = 32;
 const UDP_CANDIDATE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -739,23 +740,7 @@ impl PeerChannel {
                     .map_err(|error| IdentityError::Transport(error.to_string()))?
                     .to_vec(),
                 PeerTransport::Tcp(transport) => {
-                    let mut receiver = transport.receiver.lock().await;
-                    let frame_len = receiver
-                        .read_u32()
-                        .await
-                        .map_err(|error| IdentityError::Transport(error.to_string()))?
-                        as usize;
-                    if !(FRAME_HEADER_LEN..=FRAME_HEADER_LEN + MAX_PACKET_PAYLOAD)
-                        .contains(&frame_len)
-                    {
-                        return Err(IdentityError::InvalidFrame);
-                    }
-                    let mut frame = vec![0; frame_len];
-                    receiver
-                        .read_exact(&mut frame)
-                        .await
-                        .map_err(|error| IdentityError::Transport(error.to_string()))?;
-                    frame
+                    read_tcp_peer_frame(transport, TCP_PEER_FRAME_READ_TIMEOUT).await?
                 }
             };
             let decoded =
@@ -821,6 +806,43 @@ async fn write_tcp_peer_frame(
             let mut sender = transport.sender.lock().await;
             let _ = sender.shutdown().await;
             Err(IdentityError::Transport(error.to_string()))
+        }
+        Err(error) => {
+            let mut sender = transport.sender.lock().await;
+            let _ = sender.shutdown().await;
+            Err(IdentityError::Transport(error.to_string()))
+        }
+    }
+}
+
+async fn read_tcp_peer_frame(
+    transport: &TcpPeerTransport,
+    timeout: Duration,
+) -> Result<Vec<u8>, IdentityError> {
+    let read_result = tokio::time::timeout(timeout, async {
+        let mut receiver = transport.receiver.lock().await;
+        let frame_len = receiver.read_u32().await? as usize;
+        if !(FRAME_HEADER_LEN..=FRAME_HEADER_LEN + MAX_PACKET_PAYLOAD).contains(&frame_len) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid peer frame length",
+            ));
+        }
+        let mut frame = vec![0; frame_len];
+        receiver.read_exact(&mut frame).await?;
+        Ok(frame)
+    })
+    .await;
+    match read_result {
+        Ok(Ok(frame)) => Ok(frame),
+        Ok(Err(error)) => {
+            let mut sender = transport.sender.lock().await;
+            let _ = sender.shutdown().await;
+            if error.kind() == io::ErrorKind::InvalidData {
+                Err(IdentityError::InvalidFrame)
+            } else {
+                Err(IdentityError::Transport(error.to_string()))
+            }
         }
         Err(error) => {
             let mut sender = transport.sender.lock().await;
@@ -2655,6 +2677,24 @@ mod tests {
         let mut partial_frame = Vec::new();
         remote.read_to_end(&mut partial_frame).await.unwrap();
         assert!(partial_frame.len() <= 4);
+    }
+
+    #[tokio::test]
+    async fn partial_tcp_frame_read_times_out_and_closes_the_stream() {
+        let (local, mut remote) = tokio::io::duplex(64);
+        let local: BoxedPeerIo = Box::new(local);
+        let (receiver, sender) = tokio::io::split(local);
+        let transport = TcpPeerTransport {
+            sender: tokio::sync::Mutex::new(sender),
+            receiver: tokio::sync::Mutex::new(receiver),
+            remote_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+        };
+        remote.write_all(&[0, 0]).await.unwrap();
+        let result = read_tcp_peer_frame(&transport, Duration::from_millis(25)).await;
+        assert!(matches!(result, Err(IdentityError::Transport(_))));
+        let mut received = Vec::new();
+        remote.read_to_end(&mut received).await.unwrap();
+        assert!(received.is_empty());
     }
 
     #[tokio::test]
