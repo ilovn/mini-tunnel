@@ -404,6 +404,202 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    struct DualSnatTopology {
+        client_a: String,
+        router_a: String,
+        client_b: String,
+        router_b: String,
+        bridge: String,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl DualSnatTopology {
+        fn create() -> Self {
+            fn run(args: &[&str]) {
+                let output = std::process::Command::new("ip")
+                    .args(args)
+                    .output()
+                    .expect("run iproute2");
+                assert!(
+                    output.status.success(),
+                    "ip {args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+
+            fn router(namespace: &str, command: &str, args: &[&str]) {
+                let output = std::process::Command::new("ip")
+                    .args(["netns", "exec", namespace, command])
+                    .args(args)
+                    .output()
+                    .expect("run NAT router command");
+                assert!(
+                    output.status.success(),
+                    "{command} {args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+
+            let suffix = uuid::Uuid::new_v4().simple().to_string();
+            let suffix = &suffix[..8];
+            let client_a = format!("mda{suffix}");
+            let router_a = format!("mdra{suffix}");
+            let client_b = format!("mdb{suffix}");
+            let router_b = format!("mdrb{suffix}");
+            let bridge = format!("mbr{suffix}");
+            let client_a_if = format!("ca{suffix}");
+            let router_a_lan = format!("al{suffix}");
+            let router_a_wan = format!("aw{suffix}");
+            let bridge_a_if = format!("ba{suffix}");
+            let client_b_if = format!("cb{suffix}");
+            let router_b_lan = format!("bl{suffix}");
+            let router_b_wan = format!("bw{suffix}");
+            let bridge_b_if = format!("bb{suffix}");
+            let topology = Self {
+                client_a: client_a.clone(),
+                router_a: router_a.clone(),
+                client_b: client_b.clone(),
+                router_b: router_b.clone(),
+                bridge: bridge.clone(),
+            };
+
+            run(&["netns", "add", &client_a]);
+            run(&["netns", "add", &router_a]);
+            run(&["netns", "add", &client_b]);
+            run(&["netns", "add", &router_b]);
+            run(&["link", "add", &bridge, "type", "bridge"]);
+            run(&["address", "add", "198.18.0.254/24", "dev", &bridge]);
+            run(&["link", "set", &bridge, "up"]);
+
+            for (client_if, router_lan) in
+                [(&client_a_if, &router_a_lan), (&client_b_if, &router_b_lan)]
+            {
+                run(&[
+                    "link", "add", client_if, "type", "veth", "peer", "name", router_lan,
+                ]);
+            }
+            for (bridge_if, router_wan) in
+                [(&bridge_a_if, &router_a_wan), (&bridge_b_if, &router_b_wan)]
+            {
+                run(&[
+                    "link", "add", bridge_if, "type", "veth", "peer", "name", router_wan,
+                ]);
+            }
+            for (device, namespace) in [
+                (&client_a_if, &client_a),
+                (&router_a_lan, &router_a),
+                (&router_a_wan, &router_a),
+                (&client_b_if, &client_b),
+                (&router_b_lan, &router_b),
+                (&router_b_wan, &router_b),
+            ] {
+                run(&["link", "set", device, "netns", namespace]);
+            }
+            for bridge_if in [&bridge_a_if, &bridge_b_if] {
+                run(&["link", "set", bridge_if, "master", &bridge]);
+                run(&["link", "set", bridge_if, "up"]);
+            }
+
+            for namespace in [&client_a, &router_a, &client_b, &router_b] {
+                run(&["-n", namespace, "link", "set", "lo", "up"]);
+            }
+            for (namespace, device, address) in [
+                (&client_a, &client_a_if, "10.77.1.2/24"),
+                (&router_a, &router_a_lan, "10.77.1.1/24"),
+                (&router_a, &router_a_wan, "198.18.0.1/24"),
+                (&client_b, &client_b_if, "10.78.1.2/24"),
+                (&router_b, &router_b_lan, "10.78.1.1/24"),
+                (&router_b, &router_b_wan, "198.18.0.2/24"),
+            ] {
+                run(&["-n", namespace, "address", "add", address, "dev", device]);
+                run(&["-n", namespace, "link", "set", "dev", device, "up"]);
+            }
+            run(&[
+                "-n",
+                &client_a,
+                "route",
+                "add",
+                "default",
+                "via",
+                "10.77.1.1",
+            ]);
+            run(&[
+                "-n",
+                &client_b,
+                "route",
+                "add",
+                "default",
+                "via",
+                "10.78.1.1",
+            ]);
+
+            for (namespace, inside, outside) in [
+                (&router_a, &router_a_lan, &router_a_wan),
+                (&router_b, &router_b_lan, &router_b_wan),
+            ] {
+                router(namespace, "sysctl", &["-w", "net.ipv4.ip_forward=1"]);
+                router(
+                    namespace,
+                    "iptables",
+                    &[
+                        "-t",
+                        "nat",
+                        "-A",
+                        "POSTROUTING",
+                        "-o",
+                        outside,
+                        "-j",
+                        "MASQUERADE",
+                    ],
+                );
+                router(
+                    namespace,
+                    "iptables",
+                    &["-A", "FORWARD", "-i", inside, "-o", outside, "-j", "ACCEPT"],
+                );
+                router(
+                    namespace,
+                    "iptables",
+                    &[
+                        "-A",
+                        "FORWARD",
+                        "-i",
+                        outside,
+                        "-o",
+                        inside,
+                        "-m",
+                        "conntrack",
+                        "--ctstate",
+                        "RELATED,ESTABLISHED",
+                        "-j",
+                        "ACCEPT",
+                    ],
+                );
+            }
+            topology
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for DualSnatTopology {
+        fn drop(&mut self) {
+            for namespace in [
+                &self.client_a,
+                &self.router_a,
+                &self.client_b,
+                &self.router_b,
+            ] {
+                let _ = std::process::Command::new("ip")
+                    .args(["netns", "del", namespace])
+                    .status();
+            }
+            let _ = std::process::Command::new("ip")
+                .args(["link", "del", &self.bridge])
+                .status();
+        }
+    }
+
     fn mapped_response(address: SocketAddr, transaction_id: [u8; 12]) -> Vec<u8> {
         let mut value = vec![0, if address.is_ipv4() { 1 } else { 2 }];
         let port = address.port() ^ (MAGIC_COOKIE >> 16) as u16;
@@ -691,6 +887,175 @@ mod tests {
                 .expect("read overlay payload");
         assert_eq!(&payload[..length], b"overlay-through-snat");
         assert_eq!(source, mapped);
+        run_dual_snat_ice_scenario().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn run_dual_snat_ice_scenario() {
+        let _topology = DualSnatTopology::create();
+        let stun_server = UdpSocket::bind("198.18.0.254:3478")
+            .await
+            .expect("bind transit STUN server");
+        let stun_address = stun_server.local_addr().expect("STUN server address");
+        let responder = tokio::spawn(async move {
+            for _ in 0..2 {
+                let mut request = [0; HEADER_LEN];
+                let (length, source) = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    stun_server.recv_from(&mut request),
+                )
+                .await
+                .expect("both NAT clients reach the STUN server")
+                .expect("receive STUN request");
+                assert_eq!(length, HEADER_LEN);
+                let transaction = request[8..20].try_into().expect("transaction ID");
+                stun_server
+                    .send_to(&mapped_response(source, transaction), source)
+                    .await
+                    .expect("send mapped address response");
+            }
+        });
+
+        let socket_a = bind_udp_in_namespace(
+            &_topology.client_a,
+            "0.0.0.0:0".parse().expect("client A wildcard address"),
+        );
+        let socket_b = bind_udp_in_namespace(
+            &_topology.client_b,
+            "0.0.0.0:0".parse().expect("client B wildcard address"),
+        );
+        let local_a = socket_a.local_addr().expect("client A socket address");
+        let local_b = socket_b.local_addr().expect("client B socket address");
+        let (mapped_a, mapped_b) = tokio::try_join!(
+            discover_mapped_address(&socket_a, stun_address),
+            discover_mapped_address(&socket_b, stun_address),
+        )
+        .expect("both clients discover NAT mappings on their tunnel sockets");
+        responder.await.expect("join STUN responder");
+        assert_eq!(
+            mapped_a.ip(),
+            "198.18.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(
+            mapped_b.ip(),
+            "198.18.0.2".parse::<std::net::IpAddr>().unwrap()
+        );
+
+        let host_a: SocketAddr = format!("10.77.1.2:{}", local_a.port())
+            .parse()
+            .expect("client A host candidate");
+        let host_b: SocketAddr = format!("10.78.1.2:{}", local_b.port())
+            .parse()
+            .expect("client B host candidate");
+        let candidates_a = [
+            crate::candidate::SignaledCandidate {
+                address: host_a,
+                transport: crate::candidate::CandidateTransport::Udp,
+                candidate_type: crate::candidate::CandidateType::Host,
+            },
+            crate::candidate::SignaledCandidate {
+                address: mapped_a,
+                transport: crate::candidate::CandidateTransport::Udp,
+                candidate_type: crate::candidate::CandidateType::ServerReflexive {
+                    related_address: host_a,
+                },
+            },
+        ];
+        let candidates_b = [
+            crate::candidate::SignaledCandidate {
+                address: host_b,
+                transport: crate::candidate::CandidateTransport::Udp,
+                candidate_type: crate::candidate::CandidateType::Host,
+            },
+            crate::candidate::SignaledCandidate {
+                address: mapped_b,
+                transport: crate::candidate::CandidateTransport::Udp,
+                candidate_type: crate::candidate::CandidateType::ServerReflexive {
+                    related_address: host_b,
+                },
+            },
+        ];
+        let credentials_a = crate::ice::generate_ice_credentials(1).unwrap();
+        let credentials_b = crate::ice::generate_ice_credentials(1).unwrap();
+        let mut driver_a = crate::ice::IceAgentDriver::for_peer_with_candidates_on_socket(
+            host_a,
+            &credentials_a,
+            &credentials_b,
+            &candidates_a,
+            &candidates_b,
+            true,
+            std::time::Instant::now(),
+        )
+        .expect("construct client A ICE agent");
+        let mut driver_b = crate::ice::IceAgentDriver::for_peer_with_candidates_on_socket(
+            host_b,
+            &credentials_b,
+            &credentials_a,
+            &candidates_b,
+            &candidates_a,
+            false,
+            std::time::Instant::now(),
+        )
+        .expect("construct client B ICE agent");
+
+        for _ in 0..900 {
+            let now = std::time::Instant::now();
+            driver_a.handle_timeout(now).expect("tick client A ICE");
+            driver_b.handle_timeout(now).expect("tick client B ICE");
+            for transmit in driver_a.poll_transmits() {
+                socket_a
+                    .send_to(&transmit.message, transmit.transport.peer_addr)
+                    .await
+                    .expect("send client A ICE check");
+            }
+            for transmit in driver_b.poll_transmits() {
+                socket_b
+                    .send_to(&transmit.message, transmit.transport.peer_addr)
+                    .await
+                    .expect("send client B ICE check");
+            }
+
+            let mut packet = [0; MAX_STUN_MESSAGE];
+            while let Ok((length, source)) = socket_a.try_recv_from(&mut packet) {
+                assert!(
+                    driver_a
+                        .handle_datagram(now, source, None, &packet[..length])
+                        .expect("handle client A ICE check")
+                );
+            }
+            while let Ok((length, source)) = socket_b.try_recv_from(&mut packet) {
+                assert!(
+                    driver_b
+                        .handle_datagram(now, source, None, &packet[..length])
+                        .expect("handle client B ICE check")
+                );
+            }
+            if driver_a.selected_pair().is_some() && driver_b.selected_pair().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let pair_a = driver_a
+            .selected_pair()
+            .expect("client A nominates direct pair through both NATs");
+        let pair_b = driver_b
+            .selected_pair()
+            .expect("client B nominates direct pair through both NATs");
+        assert_eq!(pair_a.1, mapped_b);
+        assert_eq!(pair_b.1, mapped_a);
+        socket_a
+            .send_to(b"overlay-through-dual-snat", pair_a.1)
+            .await
+            .expect("send overlay payload through both NATs");
+        let mut payload = [0; 64];
+        let (length, source) =
+            tokio::time::timeout(Duration::from_secs(1), socket_b.recv_from(&mut payload))
+                .await
+                .expect("client B receives overlay payload")
+                .expect("read client B overlay payload");
+        assert_eq!(&payload[..length], b"overlay-through-dual-snat");
+        assert_eq!(source, mapped_a);
     }
 
     #[tokio::test]
