@@ -3652,6 +3652,44 @@ mod tests {
         assert!(reassembler.packets.is_empty());
     }
 
+    #[test]
+    fn late_fragment_after_packet_loss_cannot_complete_an_expired_packet() {
+        let payload = (0..1280).map(|byte| (byte % 251) as u8).collect::<Vec<_>>();
+        let chunks = payload.chunks(700).collect::<Vec<_>>();
+        let first = DecodedFragment {
+            packet_id: 103,
+            index: 0,
+            count: 2,
+            total_len: payload.len(),
+            chunk_size: 700,
+            payload: chunks[0],
+        };
+        let late = DecodedFragment {
+            packet_id: 103,
+            index: 1,
+            count: 2,
+            total_len: payload.len(),
+            chunk_size: 700,
+            payload: chunks[1],
+        };
+        let mut reassembler = FragmentReassembler::default();
+        assert!(reassembler.accept(first).unwrap().is_none());
+        reassembler
+            .packets
+            .get_mut(&103)
+            .expect("incomplete packet assembly")
+            .created = Instant::now() - FRAGMENT_TTL - Duration::from_millis(1);
+
+        assert!(
+            reassembler.accept(late).unwrap().is_none(),
+            "a late fragment must start a new incomplete assembly after the first fragment expired"
+        );
+        let incomplete = reassembler.packets.get(&103).expect("fresh assembly");
+        assert_eq!(incomplete.received, chunks[1].len());
+        assert!(incomplete.chunks[0].is_none());
+        assert_eq!(incomplete.chunks[1].as_deref(), Some(chunks[1]));
+    }
+
     #[tokio::test]
     async fn rejects_cross_network_quic_authentication() {
         let temp =
