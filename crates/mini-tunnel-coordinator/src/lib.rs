@@ -1925,6 +1925,28 @@ async fn run_plain_http_server_with_header_timeout<S>(
 where
     S: Future<Output = ()> + Send + 'static,
 {
+    run_plain_http_server_with_router_and_limits(
+        address,
+        state.clone(),
+        router_with_state(state),
+        shutdown_signal,
+        header_read_timeout,
+        COORDINATOR_SHUTDOWN_GRACE,
+    )
+    .await
+}
+
+async fn run_plain_http_server_with_router_and_limits<S>(
+    address: SocketAddr,
+    state: CoordinatorState,
+    router: Router,
+    shutdown_signal: S,
+    header_read_timeout: Duration,
+    shutdown_grace: Duration,
+) -> std::io::Result<()>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
     let acceptor = BoundedAcceptor::new(
         DefaultAcceptor::new(),
         state.connection_slots.clone(),
@@ -1934,7 +1956,7 @@ where
     let shutdown_handle = handle.clone();
     let shutdown = tokio::spawn(async move {
         shutdown_signal.await;
-        shutdown_handle.graceful_shutdown(Some(COORDINATOR_SHUTDOWN_GRACE));
+        shutdown_handle.graceful_shutdown(Some(shutdown_grace));
     });
     let mut server = axum_server::bind(address);
     server
@@ -1952,7 +1974,7 @@ where
     let result = server
         .acceptor(acceptor)
         .handle(handle)
-        .serve(router_with_state(state).into_make_service_with_connect_info::<SocketAddr>())
+        .serve(router.into_make_service_with_connect_info::<SocketAddr>())
         .await;
     shutdown.abort();
     result
@@ -2592,6 +2614,114 @@ mod tests {
             .expect("server should shut down")
             .expect("server task")
             .expect("server result");
+    }
+
+    #[tokio::test]
+    async fn plain_http_shutdown_drains_active_request_within_grace_period() {
+        let address = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let router = Router::new()
+            .route("/blocked", get(block_until_released))
+            .with_state((entered.clone(), release.clone()));
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(run_plain_http_server_with_router_and_limits(
+            address,
+            CoordinatorState::default(),
+            router,
+            async move {
+                let _ = shutdown_receiver.await;
+            },
+            HTTP_HEADER_READ_TIMEOUT,
+            Duration::from_millis(500),
+        ));
+
+        let client = reqwest::Client::new();
+        let request =
+            tokio::spawn(
+                async move { client.get(format!("http://{address}/blocked")).send().await },
+            );
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("request should become active before shutdown");
+        let _ = shutdown_sender.send(());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        release.notify_one();
+
+        let response = tokio::time::timeout(Duration::from_secs(1), request)
+            .await
+            .expect("active request should finish during graceful shutdown")
+            .expect("request task")
+            .expect("HTTP response");
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server should exit after draining active request")
+            .expect("server task")
+            .expect("server result");
+    }
+
+    #[tokio::test]
+    async fn plain_http_shutdown_terminates_request_after_grace_period() {
+        let address = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let router = Router::new()
+            .route("/blocked", get(block_until_released))
+            .with_state((entered.clone(), release));
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let grace = Duration::from_millis(100);
+        let server = tokio::spawn(run_plain_http_server_with_router_and_limits(
+            address,
+            CoordinatorState::default(),
+            router,
+            async move {
+                let _ = shutdown_receiver.await;
+            },
+            HTTP_HEADER_READ_TIMEOUT,
+            grace,
+        ));
+
+        let client = reqwest::Client::new();
+        let request =
+            tokio::spawn(
+                async move { client.get(format!("http://{address}/blocked")).send().await },
+            );
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("request should become active before shutdown");
+        let _ = shutdown_sender.send(());
+        let shutdown_started = tokio::time::Instant::now();
+
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server must force shutdown after grace expires")
+            .expect("server task")
+            .expect("server result");
+        assert!(
+            shutdown_started.elapsed() >= grace,
+            "active request should be allowed to drain for the configured grace"
+        );
+        assert!(
+            shutdown_started.elapsed() < Duration::from_secs(1),
+            "shutdown must remain bounded"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), request)
+                .await
+                .expect("aborted request should be observed")
+                .expect("request task")
+                .is_err(),
+            "the active request should be terminated when grace expires"
+        );
     }
 
     #[tokio::test]
