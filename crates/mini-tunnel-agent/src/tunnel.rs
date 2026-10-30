@@ -253,6 +253,7 @@ pub async fn pump_peer_packets<T: TunnelPacketIo>(
             outbound = packet_io.read_outbound_packet() => {
                 let packet = match outbound {
                     Ok(packet) => packet,
+                    Err(TunError::InvalidPacket(_)) => continue,
                     Err(error) => break Err(error.into()),
                 };
                 if let Err(error) = peer.send_packet(&packet).await {
@@ -580,7 +581,11 @@ async fn pump_mesh<T: TunnelPacketIo>(
     while !channels.is_empty() || updates.is_some() {
         tokio::select! {
             outbound = packet_io.read_outbound_packet() => {
-                let packet = outbound?;
+                let packet = match outbound {
+                    Ok(packet) => packet,
+                    Err(TunError::InvalidPacket(_)) => continue,
+                    Err(error) => return Err(error.into()),
+                };
                 let Ok((_, destination)) = crate::tun_device::packet_addresses(&packet) else {
                     continue;
                 };
@@ -1368,6 +1373,10 @@ mod tests {
         let pump_b =
             tokio::spawn(async move { pump_peer_packets(&io_b, &channel_b, a_ip, None).await });
 
+        a_out_tx
+            .send(packet(b_ip, b_ip, 28))
+            .await
+            .expect("inject invalid source packet");
         let packet_a = packet(a_ip, b_ip, 28);
         a_out_tx
             .send(packet_a.clone())
@@ -1496,6 +1505,10 @@ mod tests {
             .await
         });
 
+        outbound_tx
+            .send(packet(b_ip, b_ip, 28))
+            .await
+            .expect("inject invalid source packet");
         let to_b = packet(a_ip, b_ip, 28);
         outbound_tx
             .send(to_b.clone())
