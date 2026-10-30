@@ -402,6 +402,7 @@ mod tests {
         fs::remove_dir_all(root).expect("remove membership directory");
     }
 
+    #[cfg(unix)]
     #[test]
     fn membership_load_rejects_non_regular_files_from_opened_handle_metadata() {
         let root = std::env::temp_dir().join(format!("mini-tunnel-membership-{}", Uuid::new_v4()));
