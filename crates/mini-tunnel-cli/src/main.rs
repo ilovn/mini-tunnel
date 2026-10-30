@@ -98,6 +98,16 @@ enum CoordinatorCommand {
         )]
         trusted_proxies: Vec<ipnet::IpNet>,
     },
+    /// Validate an existing coordinator snapshot without starting the service.
+    VerifyState {
+        /// Coordinator state snapshot path.
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_COORDINATOR_STATE",
+            default_value_os_t = default_coordinator_state_path()
+        )]
+        state_file: PathBuf,
+    },
     /// Check a running coordinator's health endpoint.
     Health {
         /// Coordinator base URL.
@@ -555,6 +565,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     trusted_proxies,
                 )
                 .await?;
+            }
+            CoordinatorCommand::VerifyState { state_file } => {
+                let summary =
+                    mini_tunnel_coordinator::CoordinatorState::verify_persistent_state(&state_file)
+                        .await?;
+                println!(
+                    "valid coordinator snapshot: {} networks, {} members, {} invites",
+                    summary.networks, summary.members, summary.invites
+                );
             }
             CoordinatorCommand::Health { url } => {
                 let endpoint = format!("{}/healthz", url.trim_end_matches('/'));

@@ -63,6 +63,14 @@ pub struct HealthResponse {
     pub version: &'static str,
 }
 
+/// Aggregate counts from a validated coordinator snapshot. Contains no credentials or tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StateSnapshotSummary {
+    pub networks: usize,
+    pub members: usize,
+    pub invites: usize,
+}
+
 #[derive(Clone, Default)]
 pub struct CoordinatorState {
     inner: Arc<RwLock<Store>>,
@@ -320,6 +328,29 @@ impl IntoResponse for ApiError {
 }
 
 impl CoordinatorState {
+    /// Validate an existing snapshot while holding its process lock, then return aggregate counts.
+    pub async fn verify_persistent_state(
+        path: impl Into<PathBuf>,
+    ) -> io::Result<StateSnapshotSummary> {
+        let path = path.into();
+        fs::symlink_metadata(&path)?;
+        let state = Self::load(path)?;
+        let store = state.inner.read().await;
+        Ok(StateSnapshotSummary {
+            networks: store.networks.len(),
+            members: store
+                .networks
+                .values()
+                .map(|network| network.members.len())
+                .sum(),
+            invites: store
+                .networks
+                .values()
+                .map(|network| network.invites.len())
+                .sum(),
+        })
+    }
+
     /// Enable ticket issuance with the secret shared only with trusted relay nodes.
     #[must_use]
     pub fn with_relay_ticket_key(mut self, key: [u8; 32]) -> Self {
@@ -3357,6 +3388,50 @@ mod tests {
             Err(ApiError::Unauthorized)
         ));
         drop(restored);
+        fs::remove_dir_all(dir).expect("remove test directory");
+    }
+
+    #[tokio::test]
+    async fn snapshot_verification_validates_existing_state_and_requires_exclusive_lock() {
+        let dir = std::env::temp_dir().join(format!("mini-tunnel-state-verify-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create test directory");
+        let path = dir.join("coordinator.json");
+        fs::write(&path, br#"{"schema_version":1,"networks":[]}"#).expect("write snapshot");
+
+        let summary = CoordinatorState::verify_persistent_state(&path)
+            .await
+            .expect("verify snapshot");
+        assert_eq!(
+            summary,
+            StateSnapshotSummary {
+                networks: 0,
+                members: 0,
+                invites: 0
+            }
+        );
+
+        let state = CoordinatorState::load(&path).expect("acquire state lock");
+        let error = CoordinatorState::verify_persistent_state(&path)
+            .await
+            .expect_err("verification must reject a live state file");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        drop(state);
+
+        fs::write(&path, b"not json").expect("corrupt snapshot");
+        assert_eq!(
+            CoordinatorState::verify_persistent_state(&path)
+                .await
+                .expect_err("reject corrupt state")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            CoordinatorState::verify_persistent_state(dir.join("missing.json"))
+                .await
+                .expect_err("missing state is not a valid backup")
+                .kind(),
+            io::ErrorKind::NotFound
+        );
         fs::remove_dir_all(dir).expect("remove test directory");
     }
 
