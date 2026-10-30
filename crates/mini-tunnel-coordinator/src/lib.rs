@@ -848,12 +848,13 @@ fn acquire_state_file_lock(path: &FsPath) -> io::Result<Arc<fs::File>> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
+    configure_no_follow(&mut options);
     let lock = options
         .open(&lock_path)
         .map_err(|error| normalize_no_follow_error(error, "coordinator state lock path"))?;
     let metadata = lock.metadata()?;
+    reject_reparse_point(&metadata, "coordinator state lock path")?;
     if !metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -893,15 +894,12 @@ fn open_regular_state_file(path: &FsPath) -> io::Result<fs::File> {
     }
     let mut options = fs::OpenOptions::new();
     options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
+    configure_no_follow(&mut options);
     let file = options
         .open(path)
         .map_err(|error| normalize_no_follow_error(error, "coordinator state path"))?;
     let metadata = file.metadata()?;
+    reject_reparse_point(&metadata, "coordinator state path")?;
     if !metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -919,6 +917,38 @@ fn open_regular_state_file(path: &FsPath) -> io::Result<fs::File> {
         }
     }
     Ok(file)
+}
+
+#[cfg(unix)]
+fn configure_no_follow(options: &mut fs::OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+}
+
+#[cfg(windows)]
+fn configure_no_follow(options: &mut fs::OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_no_follow(_options: &mut fs::OpenOptions) {}
+
+fn reject_reparse_point(metadata: &fs::Metadata, description: &'static str) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{description} must not be a reparse point"),
+            ));
+        }
+    }
+    let _ = (metadata, description);
+    Ok(())
 }
 
 fn normalize_no_follow_error(error: io::Error, description: &'static str) -> io::Error {
