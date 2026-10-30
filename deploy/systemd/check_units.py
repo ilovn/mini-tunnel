@@ -27,9 +27,14 @@ REQUIRED = {
     "ProtectControlGroups": "true",
     "ProtectKernelLogs": "true",
     "ProtectHostname": "true",
+    "ProtectClock": "true",
+    "ProtectProc": "invisible",
+    "ProcSubset": "pid",
     "LockPersonality": "true",
     "RestrictSUIDSGID": "true",
     "RestrictRealtime": "true",
+    "RestrictNamespaces": "true",
+    "MemoryDenyWriteExecute": "true",
     "RestrictAddressFamilies": "AF_UNIX AF_INET AF_INET6",
 }
 

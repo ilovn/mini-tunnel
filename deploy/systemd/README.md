@@ -1,6 +1,6 @@
 # Linux systemd deployment templates
 
-These templates install the coordinator and opaque TCP relay as separate, unprivileged services. They do not configure a firewall, TLS proxy, certificate renewal, or secret distribution. Review those choices for your host before enabling the units.
+These templates install the coordinator and opaque TCP relay as separate, unprivileged services. They require systemd 247 or newer for the complete sandbox profile. They do not configure a firewall, TLS proxy, certificate renewal, or secret distribution. Review those choices for your host before enabling the units.
 
 ## Install
 
@@ -44,7 +44,7 @@ PostgreSQL stores short-lived ICE credentials and relay pairing metadata alongsi
 
 On Unix, both services treat systemd's default `SIGTERM` and `Ctrl+C` as graceful shutdown signals. The relay waits up to its configured shutdown grace period for paired sessions to finish; the coordinator stops accepting new requests and completes in-flight requests.
 
-`ProtectSystem=strict`, `NoNewPrivileges`, and the dedicated account limit service access. Both units drop all Linux capabilities, hide device nodes, and protect kernel control interfaces. The relay does not need TUN or network-administration capabilities. These services do not run the peer TUN client; client-side interface and route setup requires a separate, explicit privilege model.
+`ProtectSystem=strict`, `NoNewPrivileges`, and the dedicated account limit service access. Both units drop all Linux capabilities, hide device nodes, and protect kernel control interfaces, the system clock, and other processes in procfs. Namespace creation and writable-executable memory are disabled. The relay does not need TUN or network-administration capabilities. These services do not run the peer TUN client; client-side interface and route setup requires a separate, explicit privilege model.
 
 ## Upgrade and rollback
 
