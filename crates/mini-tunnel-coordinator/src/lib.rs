@@ -1611,8 +1611,8 @@ async fn read_tls_pair(
     certificate: &FsPath,
     private_key: &FsPath,
 ) -> io::Result<([u8; 32], Vec<u8>, Vec<u8>)> {
-    let certificate_pem = read_bounded_tls_file(certificate).await?;
-    let private_key_pem = read_bounded_tls_file(private_key).await?;
+    let certificate_pem = read_bounded_tls_file(certificate, false).await?;
+    let private_key_pem = read_bounded_tls_file(private_key, true).await?;
     let mut hasher = Sha256::new();
     hasher.update((certificate_pem.len() as u64).to_be_bytes());
     hasher.update(&certificate_pem);
@@ -1620,14 +1620,27 @@ async fn read_tls_pair(
     Ok((hasher.finalize().into(), certificate_pem, private_key_pem))
 }
 
-async fn read_bounded_tls_file(path: &FsPath) -> io::Result<Vec<u8>> {
+async fn read_bounded_tls_file(path: &FsPath, private_key: bool) -> io::Result<Vec<u8>> {
     let file = tokio::fs::File::open(path).await?;
-    if !file.metadata().await?.is_file() {
+    let metadata = file.metadata().await?;
+    if !metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "coordinator TLS input must be a regular file",
         ));
     }
+    #[cfg(unix)]
+    if private_key {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o007 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "coordinator TLS private key must not be world-accessible",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = private_key;
     let mut bytes = Vec::new();
     file.take(MAX_TLS_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -1928,18 +1941,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            read_bounded_tls_file(&path).await.unwrap().len() as u64,
+            read_bounded_tls_file(&path, false).await.unwrap().len() as u64,
             MAX_TLS_FILE_BYTES
         );
 
         tokio::fs::write(&path, vec![b'x'; MAX_TLS_FILE_BYTES as usize + 1])
             .await
             .unwrap();
-        let error = read_bounded_tls_file(&path)
+        let error = read_bounded_tls_file(&path, false)
             .await
             .expect_err("oversized TLS file must be rejected");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(read_bounded_tls_file(&temporary).await.is_err());
+        assert!(read_bounded_tls_file(&temporary, false).await.is_err());
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tls_private_key_must_not_be_world_accessible() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = std::env::temp_dir().join(format!(
+            "mini-tunnel-coordinator-tls-key-mode-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temporary).unwrap();
+        let path = temporary.join("private-key.pem");
+        tokio::fs::write(&path, b"key").await.unwrap();
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_bounded_tls_file(&path, true).await.is_ok());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(read_bounded_tls_file(&path, true).await.is_ok());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let error = read_bounded_tls_file(&path, true)
+            .await
+            .expect_err("world-readable private keys must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         fs::remove_dir_all(temporary).unwrap();
     }
 
@@ -1955,6 +1993,11 @@ mod tests {
         let key_path = temporary.join("private-key.pem");
         fs::write(&certificate_path, &certificate_pem).unwrap();
         fs::write(&key_path, &private_key_pem).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let state_path = temporary.join("state.json");
         let address = TcpListener::bind("127.0.0.1:0")
             .await
