@@ -1093,7 +1093,15 @@ fn ice_candidate(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, sync::Arc, thread, time::Duration};
+    use std::{
+        fs,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
 
     use super::*;
 
@@ -1674,14 +1682,19 @@ mod tests {
         // B from A's mapping, and vice versa, so the endpoints see translated source addresses.
         let mapping_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("mapping A"));
         let mapping_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("mapping B"));
+        let drop_first_mapped_datagram = Arc::new(AtomicBool::new(true));
         let mapped_a = mapping_a.local_addr().expect("mapped A address");
         let mapped_b = mapping_b.local_addr().expect("mapped B address");
         let proxy_a = {
             let mapping_a = Arc::clone(&mapping_a);
             let mapping_b = Arc::clone(&mapping_b);
+            let drop_first_mapped_datagram = Arc::clone(&drop_first_mapped_datagram);
             tokio::spawn(async move {
                 let mut packet = vec![0; 65_535];
                 while let Ok((length, _source)) = mapping_a.recv_from(&mut packet).await {
+                    if drop_first_mapped_datagram.swap(false, Ordering::Relaxed) {
+                        continue;
+                    }
                     if mapping_b
                         .send_to(&packet[..length], address_a)
                         .await
@@ -1757,6 +1770,10 @@ mod tests {
         );
         assert_eq!(pair_a.expect("A nominates mapped pair").1, mapped_b);
         assert_eq!(pair_b.expect("B nominates mapped pair").1, mapped_a);
+        assert!(
+            !drop_first_mapped_datagram.load(Ordering::Relaxed),
+            "the simulated NAT must discard one datagram before nomination succeeds"
+        );
         assert_eq!(mapping_a.local_addr().unwrap(), mapped_a);
         assert_eq!(mapping_b.local_addr().unwrap(), mapped_b);
 
