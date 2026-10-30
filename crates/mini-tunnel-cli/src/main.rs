@@ -1409,7 +1409,11 @@ async fn shutdown_signal() -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c().await
+        select_shutdown_signal(
+            tokio::signal::ctrl_c(),
+            std::future::pending::<std::io::Result<()>>(),
+        )
+        .await
     }
 }
 
