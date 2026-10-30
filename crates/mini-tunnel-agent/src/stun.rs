@@ -1022,6 +1022,8 @@ mod tests {
         let mut targets_b = Vec::new();
         let mut received_a = Vec::new();
         let mut received_b = Vec::new();
+        let mut receive_errors_a = Vec::new();
+        let mut receive_errors_b = Vec::new();
         for _ in 0..900 {
             let now = std::time::Instant::now();
             driver_a.handle_timeout(now).expect("tick client A ICE");
@@ -1052,21 +1054,39 @@ mod tests {
             }
 
             let mut packet = [0; MAX_STUN_MESSAGE];
-            while let Ok((length, source)) = socket_a.try_recv_from(&mut packet) {
-                received_a.push(source);
-                assert!(
-                    driver_a
-                        .handle_datagram(now, source, None, &packet[..length])
-                        .expect("handle client A ICE check")
-                );
+            for _ in 0..128 {
+                match socket_a.try_recv_from(&mut packet) {
+                    Ok((length, source)) => {
+                        received_a.push(source);
+                        assert!(
+                            driver_a
+                                .handle_datagram(now, source, None, &packet[..length])
+                                .expect("handle client A ICE check")
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) if receive_errors_a.len() < 32 => {
+                        receive_errors_a.push(error.kind());
+                    }
+                    Err(_) => {}
+                }
             }
-            while let Ok((length, source)) = socket_b.try_recv_from(&mut packet) {
-                received_b.push(source);
-                assert!(
-                    driver_b
-                        .handle_datagram(now, source, None, &packet[..length])
-                        .expect("handle client B ICE check")
-                );
+            for _ in 0..128 {
+                match socket_b.try_recv_from(&mut packet) {
+                    Ok((length, source)) => {
+                        received_b.push(source);
+                        assert!(
+                            driver_b
+                                .handle_datagram(now, source, None, &packet[..length])
+                                .expect("handle client B ICE check")
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) if receive_errors_b.len() < 32 => {
+                        receive_errors_b.push(error.kind());
+                    }
+                    Err(_) => {}
+                }
             }
             if driver_a.selected_pair().is_some() && driver_b.selected_pair().is_some() {
                 break;
@@ -1077,7 +1097,7 @@ mod tests {
         let selected_a = driver_a.selected_pair();
         let selected_b = driver_b.selected_pair();
         eprintln!(
-            "dual-SNAT ICE: mapped A={mapped_a} B={mapped_b}, host A={host_a} B={host_b}, sent A={sent_a} targets={targets_a:?} B={sent_b} targets={targets_b:?}, failed A={failed_candidates_a:?} B={failed_candidates_b:?}, received A={received_a:?} B={received_b:?}, selected A={selected_a:?} B={selected_b:?}"
+            "dual-SNAT ICE: mapped A={mapped_a} B={mapped_b}, host A={host_a} B={host_b}, sent A={sent_a} targets={targets_a:?} B={sent_b} targets={targets_b:?}, failed A={failed_candidates_a:?} B={failed_candidates_b:?}, received A={received_a:?} B={received_b:?}, receive errors A={receive_errors_a:?} B={receive_errors_b:?}, selected A={selected_a:?} B={selected_b:?}"
         );
         if selected_a.is_none() || selected_b.is_none() {
             for namespace in [&_topology.router_a, &_topology.router_b] {
