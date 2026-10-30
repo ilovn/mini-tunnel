@@ -107,6 +107,8 @@ UDP “不稳定”的判定需区分丢包、拥塞和运营商 QoS：用户数
 
 核心控制消息：`RegisterDevice, Heartbeat, ListPeers, CandidateUpdate, ConnectivityCheck, SessionReady, RelayTicket, NetworkConfig, Revoke, Error`。核心数据消息只运 overlay IP packet；传输层必须提供 peer 身份、会话 epoch 和防重放属性。消息采用 protobuf 或 postcard/CBOR 的带版本 schema，首版选 protobuf 以方便跨版本诊断；不要把任意 serde 内部表示当长期 wire contract。
 
+**当前实现与原建议的差异**：Coordinator 当前是版本化路径的 HTTPS REST API，消息体为 JSON，没有 WebSocket、protobuf/CBOR schema 或通用协议版本协商。直连优先使用 QUIC；RFC 8445 ICE 是显式 `--ice` 的实验性能力，未启用时使用候选拨号器。Relay 目前只实现 ticket 授权的 TCP 不透明转发，没有 UDP relay。CLI 有 identity、health、网络加入/发现和隧道命令，但没有可查询运行中 peer 路径/RTT/loss 的 status 命令。相关设计项仍是目标，不应视为已交付能力。
+
 TCP fallback 的帧格式：`u32_be frame_length | encrypted_packet`，最大 frame 长度受 MTU/实现上限约束；接收端先验证长度再分配内存。TCP 本身有序可靠，拥塞和丢包会阻塞该连接后续所有 packet；因此按 peer 建连接、限制队列、丢弃过期的非必要包，不做无界缓存。
 
 ## 7. 网络保障与恢复
@@ -132,7 +134,7 @@ TCP fallback 的帧格式：`u32_be frame_length | encrypted_packet`，最大 fr
 
 ## 9. 部署和可用性
 
-首版可单机部署 coordinator + STUN + relay，监听 443/TCP（控制面及 TCP relay）和可配置 UDP relay 端口；生产拆分 relay 节点和控制服务，部署多个区域 relay。控制面状态存在 PostgreSQL（网络、设备、租约、凭证哈希、审计元数据）；Redis 可选用于 presence/短期协调，不作地址分配的唯一事实源。Relay 尽量无状态，按 ticket 验证并从 coordinator 获取短期授权密钥/策略。
+当前部署支持 Coordinator 与 TCP Relay 分开运行：Coordinator 使用 HTTPS REST，单机 JSON 快照或共享 PostgreSQL；Relay 使用独立 TCP 监听端口，不提供 STUN 服务，也没有 UDP relay。Redis、区域 relay 调度和容器编排均未实现。运维模板与暴露边界见 `deploy/systemd/README.md`。
 
 服务端不可用影响：已建立 P2P 正常继续至租约到期；新 peer 发现和认证失败；既有 relay 会话按 ticket 租期继续或到期断开。Coordinator 做多副本和数据库备份；relay 故障需客户端切换备用区域。发布采用兼容的协议版本协商、先服务端后客户端的滚动升级；保留一个旧版本窗口。
 
@@ -150,13 +152,15 @@ Coordinator 现可使用 PostgreSQL 作为多实例共享事实源：网络、�
 
 **阶段 0：原型验证**：单平台 TUN + 两端 QUIC 直连；随后加 STUN/候选交换和 TLS/TCP relay；确认数据路径与权限模型。
 
-**阶段 1：MVP（原始路线）**：Linux/macOS agent、Coordinator、邀请加入、设备密钥、IPv4 地址分配、UDP 直连、UDP relay、status/诊断、撤销、断线重连。此阶段是项目启动时的计划记录；当前实现进度以本节的“当前实现边界”为准。
+**阶段 1：MVP（原始路线）**：Linux/macOS agent、Coordinator、邀请加入、设备密钥、IPv4 地址分配、UDP 直连、UDP relay、status/诊断、撤销、断线重连。当前已有前三类核心组网能力、直接 UDP/TCP peer path、TCP relay fallback、撤销和重连；UDP relay 与运行中 status/诊断尚未实现。此阶段是项目启动时的计划记录，以上状态优先于原始路线清单。
 
 **阶段 2：网络兼容（原始路线）**：TCP 直连和 TLS/TCP relay、自动降级/恢复迟滞、Windows TUN、IPv6、服务端多副本、升级/密钥轮换。TCP/TLS fallback、IPv6 overlay、peer mesh 和路径降级/恢复现已实现；Coordinator 已有事务化 PostgreSQL 多实例模式与 JSON 文件模式，写吞吐仍受全局写锁限制；Linux、macOS 和 Windows 的 TUN runtime 与 host-route 生命周期已在特权 CI 验收，公网实网互通仍未完成验收。
 
 **当前实现边界（2026-10）**：已有 IPv4/IPv6 ULA overlay 地址、受当前封装 MTU 限制的双栈包验证与 mesh 路由；当前默认 TUN MTU 为 1280 bytes，peer frame 单片上限为 1175 bytes；较大包会拆分为有界认证片段并按 peer 限额重组，丢片后 5 秒过期。发送时逐包读取 Quinn 当前 `max_datagram_size()` 并据此切片，该值会随 QUIC 的路径 MTU 估算变化；特权 Linux CI 在既有 QUIC 会话上将 veth MTU 降至 1280 后验证 9000-byte 包收发与重组（run `41098094503`），公网 PMTU 发现和丢片场景仍待验证；IPv6 地址由 network UUID 与唯一 IPv4 lease 稳定推导，Coordinator 检查本地 ULA prefix 冲突。Linux、macOS 和 Windows TUN 地址/MTU 与双栈 peer host route 生命周期均已有特权 CI 覆盖：Linux 验证 TUN packet 注入、IPv4 `/32` 和 IPv6 `/128` 路由安装/删除与接口清理；macOS 验证 utun 上路由的 UDP 包、IPv4/IPv6 地址、MTU 和清理（run `41087037306`）；Windows 验证 Wintun、路由的 UDP 包和清理（run `41085578723`）。NAT 路径已有 STUN 映射发现、host candidate gathering、UDP 优先/TCP 次选的有界拨号、多 peer mesh、链路探测和 ticket 中继兜底。单 peer Connect/Listen 和 mesh 都提供实验性 `--ice` 路径，在同一 socket 上用 RFC 8445 Agent 执行认证 connectivity checks 和 nomination；consent 以 5 秒为基准独立随机化到 4–6 秒，15 秒无响应触发断开、30 秒 consent 失效时进入路径恢复，peer channel 清理时注销 session。mesh 用双方 ufrag 分流并维持每 peer session。未启用或检查失败时回退现有候选拨号。仍缺实网 NAT/QoS 矩阵、重启和拥塞场景验证；不能据此保证对称 NAT 下的直连，中继仍是兜底。
 
 **阶段 3：规模和策略**：子网路由、多网络、管理员策略、区域 relay 调度、可选 DNS、容量和抗滥用加强。广播、多播、L2 VLAN 桥接需单独评审，不属于首版。
+
+**仍需工程完成或实网验收**：运行中路径/质量 status 命令、UDP relay（如果产品仍需要它）、ICE 默认启用前的独立公网 NAT/防火墙/QoS 矩阵，以及拥塞/重启/网络切换场景验证。子网路由、L2、DNS 和区域 relay 属于阶段 3 范围，需另行定义需求，不计入当前 MVP 完成度。
 
 建议验收目标（压测与实网数据验证后调整，不构成现有能力承诺）：
 
