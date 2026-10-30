@@ -27,6 +27,8 @@ journalctl -u mini-tunnel-coordinator -u mini-tunnel-relay
 
 The coordinator template binds HTTPS to loopback for a local reverse proxy. Configure the proxy to validate the coordinator certificate and expose only the API routes required by clients; keep `/metrics` private. The relay serves TCP on port `42001`; permit that port in the host/network firewall. Its health and Prometheus endpoints stay bound to loopback at `127.0.0.1:42002`.
 
+On Unix, both services treat systemd's default `SIGTERM` and `Ctrl+C` as graceful shutdown signals. The relay waits up to its configured shutdown grace period for paired sessions to finish; the coordinator stops accepting new requests and completes in-flight requests.
+
 `ProtectSystem=strict`, `NoNewPrivileges`, and the dedicated account limit service access. The relay does not need TUN or network-administration capabilities. These services do not run the peer TUN client; client-side interface and route setup requires a separate, explicit privilege model.
 
 ## Upgrade and rollback

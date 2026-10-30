@@ -1661,8 +1661,32 @@ fn ipv6_prefix_available(store: &Store, candidate: Uuid) -> bool {
 }
 
 async fn shutdown_signal() {
-    if let Err(error) = tokio::signal::ctrl_c().await {
+    #[cfg(unix)]
+    let result = {
+        let terminate = async {
+            let mut signal =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            signal.recv().await;
+            Ok::<(), io::Error>(())
+        };
+        select_shutdown_signal(tokio::signal::ctrl_c(), terminate).await
+    };
+    #[cfg(not(unix))]
+    let result = tokio::signal::ctrl_c().await;
+
+    if let Err(error) = result {
         tracing::error!(%error, "failed to listen for shutdown signal");
+    }
+}
+
+async fn select_shutdown_signal<C, T>(ctrl_c: C, terminate: T) -> io::Result<()>
+where
+    C: std::future::Future<Output = io::Result<()>>,
+    T: std::future::Future<Output = io::Result<()>>,
+{
+    tokio::select! {
+        result = ctrl_c => result,
+        result = terminate => result,
     }
 }
 
@@ -1672,6 +1696,23 @@ mod tests {
     use axum::{body::Body, extract::connect_info::ConnectInfo, http::Request as HttpRequest};
     use ed25519_dalek::{Signer, SigningKey};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn coordinator_shutdown_accepts_either_signal_source() {
+        let result = select_shutdown_signal(
+            std::future::pending(),
+            std::future::ready(Ok::<(), io::Error>(())),
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let result = select_shutdown_signal(
+            std::future::ready(Ok::<(), io::Error>(())),
+            std::future::pending(),
+        )
+        .await;
+        assert!(result.is_ok());
+    }
 
     fn persisted_network(id: Uuid, cidr: &str, member_count: usize) -> PersistedNetwork {
         PersistedNetwork {

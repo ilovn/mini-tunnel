@@ -21,7 +21,6 @@ RestrictSUIDSGID=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LimitNOFILE=65536
 TimeoutStopSec=25s
-KillSignal=SIGINT
 
 [Install]
 WantedBy=multi-user.target
