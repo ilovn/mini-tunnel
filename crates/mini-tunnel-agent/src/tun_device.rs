@@ -520,6 +520,70 @@ mod tests {
             .await
             .expect("write authenticated peer packet to the OS TUN interface");
 
+        let peer_address_v6 = Ipv6Addr::new(0xfd18, 0x253, u16::from(subnet), 0, 0, 0, 0, 2);
+        let runner = crate::routing::SystemRouteRunner;
+        let ipv4_lease = crate::routing::install_peer_route(
+            &runner,
+            crate::routing::RoutingPlatform::Linux,
+            &interface_name,
+            peer_address,
+        )
+        .await
+        .expect("install IPv4 peer host route");
+        let ipv6_lease = crate::routing::install_peer_ipv6_route(
+            &runner,
+            crate::routing::RoutingPlatform::Linux,
+            &interface_name,
+            peer_address_v6,
+        )
+        .await
+        .expect("install IPv6 peer host route");
+
+        for (family, peer) in [
+            ("-4", peer_address.to_string()),
+            ("-6", peer_address_v6.to_string()),
+        ] {
+            let route = std::process::Command::new("ip")
+                .args([
+                    family,
+                    "route",
+                    "show",
+                    &format!("{peer}/{}", if family == "-4" { 32 } else { 128 }),
+                ])
+                .output()
+                .expect("inspect installed peer route");
+            assert!(route.status.success());
+            let route = String::from_utf8_lossy(&route.stdout);
+            assert!(
+                route.contains(&format!("dev {interface_name}")),
+                "unexpected route: {route}"
+            );
+        }
+
+        ipv4_lease
+            .remove(&runner)
+            .await
+            .expect("remove IPv4 peer route");
+        ipv6_lease
+            .remove(&runner)
+            .await
+            .expect("remove IPv6 peer route");
+        for (family, prefix) in [
+            ("-4", format!("{peer_address}/32")),
+            ("-6", format!("{peer_address_v6}/128")),
+        ] {
+            let route = std::process::Command::new("ip")
+                .args([family, "route", "show", &prefix])
+                .output()
+                .expect("verify peer route cleanup");
+            assert!(route.status.success());
+            assert!(
+                route.stdout.is_empty(),
+                "route still exists after lease removal: {}",
+                String::from_utf8_lossy(&route.stdout)
+            );
+        }
+
         drop(device);
         let removed = std::process::Command::new("ip")
             .args(["link", "show", "dev", &interface_name])
