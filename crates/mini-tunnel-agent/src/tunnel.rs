@@ -1200,9 +1200,11 @@ mod tests {
             Arc::new(move |force_reliable| -> PeerConnectFuture {
                 let identity = Arc::clone(&identity);
                 let requested_reliable = Arc::clone(&requested_reliable);
+                let expected_peer_id = b_id.clone();
                 Box::pin(async move {
                     requested_reliable.store(force_reliable, Ordering::SeqCst);
-                    connect_tcp_peer(tcp_address, network, &identity, &b_id, b_key).await
+                    connect_tcp_peer(tcp_address, network, &identity, &expected_peer_id, b_key)
+                        .await
                 })
             })
         };
