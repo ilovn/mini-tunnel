@@ -53,6 +53,7 @@ const MAX_CANDIDATES: usize = 8;
 const MAX_REQUESTS_PER_MINUTE_PER_IP: usize = 600;
 const MAX_RATE_LIMIT_CLIENTS: usize = 8192;
 const MAX_CONCURRENT_API_REQUESTS: usize = 256;
+const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const ICE_CREDENTIAL_TTL_MS: u64 = 120_000;
 const MAX_EPHEMERAL_ICE_CREDENTIALS: usize = 8192;
@@ -79,7 +80,9 @@ pub struct CoordinatorState {
     _state_lock: Option<Arc<fs::File>>,
     request_limiter: RequestRateLimiter,
     request_slots: RequestSlots,
+    request_timeout: RequestTimeout,
     concurrency_rejections_total: Arc<AtomicU64>,
+    request_timeouts_total: Arc<AtomicU64>,
     trusted_proxies: Arc<Vec<IpNet>>,
     relay_ticket_key: Option<Arc<[u8; 32]>>,
     relay_pairs: Arc<Mutex<RelayPairStore>>,
@@ -88,6 +91,15 @@ pub struct CoordinatorState {
 
 #[derive(Clone)]
 struct RequestSlots(Arc<tokio::sync::Semaphore>);
+
+#[derive(Clone)]
+struct RequestTimeout(Duration);
+
+impl Default for RequestTimeout {
+    fn default() -> Self {
+        Self(API_REQUEST_TIMEOUT)
+    }
+}
 
 impl Default for RequestSlots {
     fn default() -> Self {
@@ -1513,7 +1525,31 @@ async fn limit_requests(
             }
         }
     };
-    next.run(request).await
+    run_with_timeout(state.request_timeout.0, next.run(request), || {
+        state.request_timeouts_total.fetch_add(1, Ordering::Relaxed);
+    })
+    .await
+}
+
+async fn run_with_timeout<F, C>(timeout: Duration, request: F, on_timeout: C) -> Response
+where
+    F: std::future::Future<Output = Response>,
+    C: FnOnce(),
+{
+    match tokio::time::timeout(timeout, request).await {
+        Ok(response) => response,
+        Err(_) => {
+            on_timeout();
+            (
+                StatusCode::REQUEST_TIMEOUT,
+                Json(ApiErrorResponse {
+                    error: "request_timeout".to_owned(),
+                    message: "coordinator request exceeded the processing time limit".to_owned(),
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -1540,9 +1576,10 @@ async fn metrics(State(state): State<CoordinatorState>, request: Request) -> Res
         .map(|network| network.members.len())
         .sum();
     let body = format!(
-        "# HELP mini_tunnel_coordinator_networks Configured overlay networks.\n# TYPE mini_tunnel_coordinator_networks gauge\nmini_tunnel_coordinator_networks {networks}\n# HELP mini_tunnel_coordinator_members Enrolled devices across all networks.\n# TYPE mini_tunnel_coordinator_members gauge\nmini_tunnel_coordinator_members {members}\n# HELP mini_tunnel_coordinator_rate_limited_total Requests rejected by the source IP rate limiter.\n# TYPE mini_tunnel_coordinator_rate_limited_total counter\nmini_tunnel_coordinator_rate_limited_total {}\n# HELP mini_tunnel_coordinator_concurrency_rejected_total API requests rejected because the global in-flight limit was reached.\n# TYPE mini_tunnel_coordinator_concurrency_rejected_total counter\nmini_tunnel_coordinator_concurrency_rejected_total {}\n",
+        "# HELP mini_tunnel_coordinator_networks Configured overlay networks.\n# TYPE mini_tunnel_coordinator_networks gauge\nmini_tunnel_coordinator_networks {networks}\n# HELP mini_tunnel_coordinator_members Enrolled devices across all networks.\n# TYPE mini_tunnel_coordinator_members gauge\nmini_tunnel_coordinator_members {members}\n# HELP mini_tunnel_coordinator_rate_limited_total Requests rejected by the source IP rate limiter.\n# TYPE mini_tunnel_coordinator_rate_limited_total counter\nmini_tunnel_coordinator_rate_limited_total {}\n# HELP mini_tunnel_coordinator_concurrency_rejected_total API requests rejected because the global in-flight limit was reached.\n# TYPE mini_tunnel_coordinator_concurrency_rejected_total counter\nmini_tunnel_coordinator_concurrency_rejected_total {}\n# HELP mini_tunnel_coordinator_request_timeouts_total API requests that exceeded the processing time limit.\n# TYPE mini_tunnel_coordinator_request_timeouts_total counter\nmini_tunnel_coordinator_request_timeouts_total {}\n",
         state.request_limiter.rejected_total.load(Ordering::Relaxed),
         state.concurrency_rejections_total.load(Ordering::Relaxed),
+        state.request_timeouts_total.load(Ordering::Relaxed),
     );
     (
         [(
@@ -2010,6 +2047,33 @@ mod tests {
         StatusCode::OK
     }
 
+    async fn hold_until_cancelled(
+        State((_, entered, cancelled)): State<(
+            CoordinatorState,
+            Arc<tokio::sync::Notify>,
+            Arc<AtomicU64>,
+        )>,
+    ) -> StatusCode {
+        struct CancellationSignal(Arc<AtomicU64>);
+        impl Drop for CancellationSignal {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let _signal = CancellationSignal(cancelled);
+        entered.notify_one();
+        std::future::pending::<()>().await;
+        StatusCode::OK
+    }
+
+    async fn metrics_for_timeout_test(
+        State((state, _, _)): State<(CoordinatorState, Arc<tokio::sync::Notify>, Arc<AtomicU64>)>,
+        request: Request,
+    ) -> Response {
+        metrics(State(state), request).await
+    }
+
     #[tokio::test]
     async fn coordinator_bounds_in_flight_api_work_and_keeps_health_available() {
         let state = CoordinatorState {
@@ -2084,6 +2148,64 @@ mod tests {
                 .expect("response")
                 .status(),
             StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_times_out_slow_requests_and_releases_capacity() {
+        let state = CoordinatorState {
+            request_slots: RequestSlots(Arc::new(tokio::sync::Semaphore::new(1))),
+            request_timeout: RequestTimeout(Duration::from_millis(10)),
+            ..CoordinatorState::default()
+        };
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(AtomicU64::new(0));
+        let app_state = (state.clone(), entered.clone(), cancelled.clone());
+        let app = Router::new()
+            .route("/slow", get(hold_until_cancelled))
+            .route("/fast", get(|| async { StatusCode::OK }))
+            .route("/metrics", get(metrics_for_timeout_test))
+            .layer(from_fn_with_state(state.clone(), limit_requests))
+            .with_state(app_state);
+        let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12347);
+        let make_request = |path: &str| {
+            let mut request = HttpRequest::builder()
+                .uri(path)
+                .body(Body::empty())
+                .expect("valid request");
+            request.extensions_mut().insert(ConnectInfo(source));
+            request
+        };
+
+        let slow_app = app.clone();
+        let slow_request = make_request("/slow");
+        let slow = tokio::spawn(async move { slow_app.oneshot(slow_request).await });
+        entered.notified().await;
+        let timed_out = slow
+            .await
+            .expect("slow request task")
+            .expect("timeout response");
+        assert_eq!(timed_out.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(cancelled.load(Ordering::Relaxed), 1);
+
+        let fast = app
+            .clone()
+            .oneshot(make_request("/fast"))
+            .await
+            .expect("fast request after timeout");
+        assert_eq!(fast.status(), StatusCode::OK);
+        assert_eq!(state.request_timeouts_total.load(Ordering::Relaxed), 1);
+
+        let metrics = app
+            .oneshot(make_request("/metrics"))
+            .await
+            .expect("metrics response");
+        let body = axum::body::to_bytes(metrics.into_body(), 16 * 1024)
+            .await
+            .expect("metrics body");
+        assert!(
+            String::from_utf8_lossy(&body)
+                .contains("mini_tunnel_coordinator_request_timeouts_total 1\n")
         );
     }
 
