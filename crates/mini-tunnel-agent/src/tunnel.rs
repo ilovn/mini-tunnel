@@ -1045,7 +1045,6 @@ mod tests {
     #[ignore = "requires root privileges, iproute2, and tc netem"]
     async fn privileged_linux_veth_quic_probe_loss_and_recovery() {
         let (mut link, local_address, remote_address) = TestVethPair::create();
-        link.set_mtu("1280");
         let temp =
             std::env::temp_dir().join(format!("mini-tunnel-veth-loss-{}", uuid::Uuid::new_v4()));
         let identity_a = Identity::load_or_create_at(temp.join("a/device.key")).unwrap();
@@ -1110,13 +1109,14 @@ mod tests {
         assert!(recovered.probes_succeeded >= succeeded_before + 3);
         assert_eq!(channel_a.transport_name(), "QUIC/UDP");
 
+        link.set_mtu("1280");
         let large_packet = (0..crate::MAX_TUN_PACKET)
             .map(|byte| (byte % 251) as u8)
             .collect::<Vec<_>>();
         channel_a
             .send_packet(&large_packet)
             .await
-            .expect("fragment maximum-sized overlay packet over 1280-byte veth");
+            .expect("fragment maximum-sized overlay packet after reducing veth MTU");
         let received = tokio::time::timeout(Duration::from_secs(3), channel_b.recv_packet())
             .await
             .expect("receive reassembled packet over constrained veth")
