@@ -909,6 +909,8 @@ mod tests {
     struct TestVethPair {
         left: String,
         right: String,
+        left_namespace: String,
+        right_namespace: String,
         loss_active: bool,
     }
 
@@ -928,11 +930,16 @@ mod tests {
             }
 
             let pid = std::process::id();
-            let left = format!("mtl{}", pid % 10_000_000);
-            let right = format!("mtr{}", pid % 10_000_000);
+            let suffix = format!("{}", pid % 10_000_000);
+            let left = format!("mtl{suffix}");
+            let right = format!("mtr{suffix}");
+            let left_namespace = format!("mtna{suffix}");
+            let right_namespace = format!("mtnb{suffix}");
             let subnet = (pid % 250 + 1) as u8;
             let local: SocketAddr = format!("198.18.{subnet}.1:0").parse().unwrap();
             let remote: SocketAddr = format!("198.18.{subnet}.2:0").parse().unwrap();
+            run("ip", &["netns", "add", &left_namespace]);
+            run("ip", &["netns", "add", &right_namespace]);
             run(
                 "ip",
                 &["link", "add", &left, "type", "veth", "peer", "name", &right],
@@ -940,11 +947,23 @@ mod tests {
             let pair = Self {
                 left: left.clone(),
                 right: right.clone(),
+                left_namespace: left_namespace.clone(),
+                right_namespace: right_namespace.clone(),
                 loss_active: false,
             };
             run(
                 "ip",
+                &["link", "set", "dev", &left, "netns", &left_namespace],
+            );
+            run(
+                "ip",
+                &["link", "set", "dev", &right, "netns", &right_namespace],
+            );
+            run(
+                "ip",
                 &[
+                    "-n",
+                    &left_namespace,
                     "address",
                     "add",
                     &format!("198.18.{subnet}.1/30"),
@@ -955,6 +974,8 @@ mod tests {
             run(
                 "ip",
                 &[
+                    "-n",
+                    &right_namespace,
                     "address",
                     "add",
                     &format!("198.18.{subnet}.2/30"),
@@ -962,17 +983,37 @@ mod tests {
                     &right,
                 ],
             );
-            run("ip", &["link", "set", "dev", &left, "up"]);
-            run("ip", &["link", "set", "dev", &right, "up"]);
+            run("ip", &["-n", &left_namespace, "link", "set", "lo", "up"]);
+            run("ip", &["-n", &right_namespace, "link", "set", "lo", "up"]);
+            run(
+                "ip",
+                &["-n", &left_namespace, "link", "set", "dev", &left, "up"],
+            );
+            run(
+                "ip",
+                &["-n", &right_namespace, "link", "set", "dev", &right, "up"],
+            );
             (pair, local, remote)
         }
 
+        fn run_in_namespace(namespace: &str, command: &str, args: &[&str]) -> std::process::Output {
+            std::process::Command::new("ip")
+                .args(["netns", "exec", namespace, command])
+                .args(args)
+                .output()
+                .unwrap_or_else(|error| panic!("run {command} in {namespace}: {error}"))
+        }
+
         fn set_mtu(&self, mtu: &str) {
-            for device in [&self.left, &self.right] {
-                let output = std::process::Command::new("ip")
-                    .args(["link", "set", "dev", device, "mtu", mtu])
-                    .output()
-                    .expect("set veth MTU");
+            for (namespace, device) in [
+                (&self.left_namespace, &self.left),
+                (&self.right_namespace, &self.right),
+            ] {
+                let output = Self::run_in_namespace(
+                    namespace,
+                    "ip",
+                    &["link", "set", "dev", device, "mtu", mtu],
+                );
                 assert!(
                     output.status.success(),
                     "could not set veth MTU: {}",
@@ -982,23 +1023,24 @@ mod tests {
         }
 
         fn drop_left_egress(&mut self) {
-            Self::set_egress_loss(&self.left);
+            Self::set_egress_loss(&self.left_namespace, &self.left);
             self.loss_active = true;
         }
 
         fn drop_both_egress(&mut self) {
-            Self::set_egress_loss(&self.left);
-            Self::set_egress_loss(&self.right);
+            Self::set_egress_loss(&self.left_namespace, &self.left);
+            Self::set_egress_loss(&self.right_namespace, &self.right);
             self.loss_active = true;
         }
 
-        fn set_egress_loss(device: &str) {
-            let output = std::process::Command::new("tc")
-                .args([
+        fn set_egress_loss(namespace: &str, device: &str) {
+            let output = Self::run_in_namespace(
+                namespace,
+                "tc",
+                &[
                     "qdisc", "replace", "dev", device, "root", "netem", "loss", "100%",
-                ])
-                .output()
-                .expect("run tc to drop QUIC datagrams on veth egress");
+                ],
+            );
             assert!(
                 output.status.success(),
                 "tc netem loss on {device} failed: {}",
@@ -1010,10 +1052,11 @@ mod tests {
             if !self.loss_active {
                 return;
             }
-            let output = std::process::Command::new("tc")
-                .args(["qdisc", "del", "dev", &self.left, "root"])
-                .output()
-                .expect("remove tc loss qdisc from veth egress");
+            let output = Self::run_in_namespace(
+                &self.left_namespace,
+                "tc",
+                &["qdisc", "del", "dev", &self.left, "root"],
+            );
             assert!(
                 output.status.success(),
                 "could not remove tc loss qdisc: {}",
@@ -1023,33 +1066,100 @@ mod tests {
         }
 
         fn qdisc_stats(&self) -> String {
-            [&self.left, &self.right]
-                .into_iter()
-                .map(|device| {
-                    let output = std::process::Command::new("tc")
-                        .args(["-s", "qdisc", "show", "dev", device])
-                        .output()
-                        .expect("read veth qdisc statistics");
-                    format!(
-                        "{device}: {}",
-                        String::from_utf8_lossy(&output.stdout).trim()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("; ")
+            [
+                (&self.left_namespace, &self.left),
+                (&self.right_namespace, &self.right),
+            ]
+            .into_iter()
+            .map(|(namespace, device)| {
+                let output = Self::run_in_namespace(
+                    namespace,
+                    "tc",
+                    &["-s", "qdisc", "show", "dev", device],
+                );
+                format!(
+                    "{namespace}/{device}: {}",
+                    String::from_utf8_lossy(&output.stdout).trim()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
         }
     }
 
     #[cfg(target_os = "linux")]
     impl Drop for TestVethPair {
         fn drop(&mut self) {
-            let _ = std::process::Command::new("tc")
-                .args(["qdisc", "del", "dev", &self.left, "root"])
+            let _ = std::process::Command::new("ip")
+                .args(["netns", "del", &self.left_namespace])
                 .output();
             let _ = std::process::Command::new("ip")
-                .args(["link", "del", "dev", &self.left])
+                .args(["netns", "del", &self.right_namespace])
                 .output();
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct NetworkNamespaceGuard {
+        original: std::fs::File,
+        active: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl NetworkNamespaceGuard {
+        fn enter(namespace: &str) -> Self {
+            use std::os::fd::AsRawFd;
+
+            let original = std::fs::File::open("/proc/self/ns/net").expect("open current netns");
+            let target = std::fs::File::open(format!("/var/run/netns/{namespace}"))
+                .expect("open target netns");
+            let result = unsafe { libc::setns(target.as_raw_fd(), libc::CLONE_NEWNET) };
+            assert_eq!(
+                result,
+                0,
+                "enter network namespace: {}",
+                std::io::Error::last_os_error()
+            );
+            Self {
+                original,
+                active: true,
+            }
+        }
+
+        fn restore(mut self) {
+            use std::os::fd::AsRawFd;
+
+            let result = unsafe { libc::setns(self.original.as_raw_fd(), libc::CLONE_NEWNET) };
+            assert_eq!(
+                result,
+                0,
+                "restore network namespace: {}",
+                std::io::Error::last_os_error()
+            );
+            self.active = false;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for NetworkNamespaceGuard {
+        fn drop(&mut self) {
+            if self.active {
+                use std::os::fd::AsRawFd;
+                let _ = unsafe { libc::setns(self.original.as_raw_fd(), libc::CLONE_NEWNET) };
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn peer_endpoint_in_namespace(
+        identity: &Identity,
+        bind_address: SocketAddr,
+        namespace: &str,
+    ) -> Result<quinn::Endpoint, crate::IdentityError> {
+        let guard = NetworkNamespaceGuard::enter(namespace);
+        let endpoint = peer_endpoint(identity, bind_address);
+        guard.restore();
+        endpoint
     }
 
     #[test]
@@ -1076,8 +1186,12 @@ mod tests {
             std::env::temp_dir().join(format!("mini-tunnel-veth-loss-{}", uuid::Uuid::new_v4()));
         let identity_a = Identity::load_or_create_at(temp.join("a/device.key")).unwrap();
         let identity_b = Identity::load_or_create_at(temp.join("b/device.key")).unwrap();
-        let endpoint_a = peer_endpoint(&identity_a, local_address).expect("endpoint A");
-        let endpoint_b = peer_endpoint(&identity_b, remote_address).expect("endpoint B");
+        let endpoint_a =
+            peer_endpoint_in_namespace(&identity_a, local_address, &link.left_namespace)
+                .expect("endpoint A");
+        let endpoint_b =
+            peer_endpoint_in_namespace(&identity_b, remote_address, &link.right_namespace)
+                .expect("endpoint B");
         let peer_id = identity_a.device_id();
         let peer_key = identity_a.public_key();
         let accept_endpoint = endpoint_b.clone();
@@ -1180,8 +1294,10 @@ mod tests {
         ));
         let a = Arc::new(Identity::load_or_create_at(temp.join("a/device.key")).unwrap());
         let b = Arc::new(Identity::load_or_create_at(temp.join("b/device.key")).unwrap());
-        let endpoint_a = peer_endpoint(&a, local_address).expect("endpoint A");
-        let endpoint_b = peer_endpoint(&b, remote_address).expect("endpoint B");
+        let endpoint_a = peer_endpoint_in_namespace(&a, local_address, &link.left_namespace)
+            .expect("endpoint A");
+        let endpoint_b = peer_endpoint_in_namespace(&b, remote_address, &link.right_namespace)
+            .expect("endpoint B");
         assert_eq!(
             endpoint_a
                 .local_addr()
@@ -1291,6 +1407,8 @@ mod tests {
                 let health = initial_for_diagnostics.health_snapshot();
                 let route = std::process::Command::new("ip")
                     .args([
+                        "-n",
+                        &link.left_namespace,
                         "route",
                         "get",
                         &remote_address.ip().to_string(),
