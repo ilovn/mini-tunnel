@@ -16,6 +16,15 @@ use thiserror::Error;
 use crate::{IdentityError, PeerChannel, tun_device::TunError};
 
 static MESH_DROPPED_PACKETS: AtomicU64 = AtomicU64::new(0);
+const MESH_EVENT_QUEUE_PER_PEER: usize = 8;
+// At the maximum 9000-byte packet size, this caps queued payloads at about 8.8 MiB.
+const MAX_MESH_EVENT_QUEUE_CAPACITY: usize = 1024;
+
+fn mesh_event_queue_capacity(peer_count: usize) -> usize {
+    peer_count
+        .saturating_mul(MESH_EVENT_QUEUE_PER_PEER)
+        .clamp(MESH_EVENT_QUEUE_PER_PEER, MAX_MESH_EVENT_QUEUE_CAPACITY)
+}
 
 /// Total inbound mesh packets dropped because the bounded TUN event queue was full.
 #[must_use]
@@ -559,7 +568,7 @@ async fn pump_mesh<T: TunnelPacketIo>(
     }
 
     let (event_tx, mut event_rx) =
-        tokio::sync::mpsc::channel(channels.len().saturating_mul(8).max(8));
+        tokio::sync::mpsc::channel(mesh_event_queue_capacity(channels.len()));
     let mut receivers = MeshReceiverTasks(HashMap::with_capacity(channels.len()));
     for (&address, runtime) in &channels {
         receivers.insert(
@@ -710,6 +719,21 @@ mod tests {
         Identity, accept_peer, accept_tcp_peer_any, connect_peer, connect_tcp_peer, peer_endpoint,
         peer_tcp_listener,
     };
+
+    #[test]
+    fn mesh_event_queue_capacity_is_bounded_at_maximum_network_size() {
+        assert_eq!(mesh_event_queue_capacity(0), MESH_EVENT_QUEUE_PER_PEER);
+        assert_eq!(mesh_event_queue_capacity(1), MESH_EVENT_QUEUE_PER_PEER);
+        assert_eq!(mesh_event_queue_capacity(4), 32);
+        assert_eq!(
+            mesh_event_queue_capacity(4096),
+            MAX_MESH_EVENT_QUEUE_CAPACITY
+        );
+        assert_eq!(
+            MAX_MESH_EVENT_QUEUE_CAPACITY * crate::MAX_TUN_PACKET,
+            9_216_000
+        );
+    }
 
     #[tokio::test]
     async fn mesh_packet_delivery_drops_on_full_queue_and_reports_closed_receiver() {
