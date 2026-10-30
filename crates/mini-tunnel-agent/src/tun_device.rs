@@ -624,6 +624,143 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "requires root privileges to create utun and host routes"]
+    async fn privileged_macos_utun_routes_packets_and_cleans_up() {
+        let pid = std::process::id();
+        let subnet = (pid % 250 + 1) as u8;
+        let local_ipv4 = Ipv4Addr::new(10, 254, subnet, 1);
+        let peer_ipv4 = Ipv4Addr::new(10, 254, subnet, 2);
+        let local_ipv6 = Ipv6Addr::new(0xfd19, 0x254, u16::from(subnet), 0, 0, 0, 0, 1);
+        let peer_ipv6 = Ipv6Addr::new(0xfd19, 0x254, u16::from(subnet), 0, 0, 0, 0, 2);
+        let interface_name = format!("utun{}", pid % 1000 + 1);
+        let mut config = TunConfig::ipv4(local_ipv4, 32).with_ipv6(local_ipv6, 128);
+        config.name = Some(interface_name.clone());
+        let device = TunDevice::create(config).expect("create privileged macOS utun device");
+        assert_eq!(device.local_ipv4(), local_ipv4);
+        assert_eq!(device.local_ipv6(), Some(local_ipv6));
+        assert_eq!(device.mtu(), usize::from(DEFAULT_TUN_MTU));
+        assert_eq!(
+            device.name().expect("read utun interface name"),
+            interface_name
+        );
+
+        let inspect = std::process::Command::new("/sbin/ifconfig")
+            .arg(&interface_name)
+            .output()
+            .expect("inspect utun interface with ifconfig");
+        assert!(
+            inspect.status.success(),
+            "ifconfig could not inspect utun: {}",
+            String::from_utf8_lossy(&inspect.stderr)
+        );
+        let details = String::from_utf8_lossy(&inspect.stdout);
+        assert!(details.contains(&format!("inet {local_ipv4}")), "{details}");
+        assert!(
+            details.contains(&format!("inet6 {local_ipv6}")),
+            "{details}"
+        );
+        assert!(details.contains("mtu 1280"), "{details}");
+
+        let runner = crate::routing::SystemRouteRunner;
+        let ipv4_route = crate::routing::install_peer_route(
+            &runner,
+            crate::routing::RoutingPlatform::MacOs,
+            &interface_name,
+            peer_ipv4,
+        )
+        .await
+        .expect("install macOS IPv4 peer host route");
+        let ipv6_route = crate::routing::install_peer_ipv6_route(
+            &runner,
+            crate::routing::RoutingPlatform::MacOs,
+            &interface_name,
+            peer_ipv6,
+        )
+        .await
+        .expect("install macOS IPv6 peer host route");
+
+        let overlay_socket = tokio::net::UdpSocket::bind((local_ipv4, 0))
+            .await
+            .expect("bind UDP socket to assigned overlay address");
+        overlay_socket
+            .send_to(b"outbound through utun peer route", (peer_ipv4, 4242))
+            .await
+            .expect("send UDP datagram to peer overlay address");
+        let outbound = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let candidate = device
+                    .read_outbound_packet()
+                    .await
+                    .expect("read validated local-originated packet from utun");
+                if packet_addresses(&candidate).ok()
+                    == Some((IpAddr::V4(local_ipv4), IpAddr::V4(peer_ipv4)))
+                {
+                    break candidate;
+                }
+            }
+        })
+        .await
+        .expect("kernel-routed datagram reaches utun");
+        let (source, destination) =
+            packet_addresses(&outbound).expect("parse outbound utun packet");
+        assert_eq!(source, IpAddr::V4(local_ipv4));
+        assert_eq!(destination, IpAddr::V4(peer_ipv4));
+        assert_eq!(outbound[9], 17, "expected an IPv4 UDP packet");
+
+        for (family, peer) in [
+            ("-inet", peer_ipv4.to_string()),
+            ("-inet6", peer_ipv6.to_string()),
+        ] {
+            let route = std::process::Command::new("/sbin/route")
+                .args(["-n", "get", family, &peer])
+                .output()
+                .expect("inspect installed macOS peer route");
+            assert!(route.status.success());
+            let route = String::from_utf8_lossy(&route.stdout);
+            assert!(
+                route.contains(&format!("interface: {interface_name}")),
+                "unexpected route: {route}"
+            );
+        }
+
+        ipv6_route
+            .remove(&runner)
+            .await
+            .expect("remove macOS IPv6 peer route");
+        ipv4_route
+            .remove(&runner)
+            .await
+            .expect("remove macOS IPv4 peer route");
+        for (family, peer) in [
+            ("-inet", peer_ipv4.to_string()),
+            ("-inet6", peer_ipv6.to_string()),
+        ] {
+            let route = std::process::Command::new("/sbin/route")
+                .args(["-n", "get", family, &peer])
+                .output()
+                .expect("verify macOS peer route cleanup");
+            assert!(route.status.success());
+            let route = String::from_utf8_lossy(&route.stdout);
+            assert!(
+                !route.contains(&format!("interface: {interface_name}")),
+                "peer route still points to utun after lease removal: {route}"
+            );
+        }
+
+        drop(overlay_socket);
+        drop(device);
+        let removed = std::process::Command::new("/sbin/ifconfig")
+            .arg(&interface_name)
+            .output()
+            .expect("verify utun interface cleanup");
+        assert!(
+            !removed.status.success(),
+            "dropping TunDevice should remove its utun interface"
+        );
+    }
+
     #[cfg(target_os = "windows")]
     #[tokio::test]
     #[ignore = "requires Administrator privileges and the official wintun.dll runtime"]

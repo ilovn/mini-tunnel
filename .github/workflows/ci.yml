@@ -149,3 +149,25 @@ jobs:
           Copy-Item -Path $dll -Destination (Join-Path (Split-Path $testExecutable) 'wintun.dll') -Force
           & $testExecutable --exact tun_device::tests::privileged_windows_wintun_routes_packets_and_cleans_up --ignored --nocapture
           if ($LASTEXITCODE -ne 0) { throw 'Privileged Windows Wintun runtime test failed' }
+
+      - name: Run privileged macOS utun packet round trip
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          build_messages="$RUNNER_TEMP/mini-tunnel-agent-test-build.jsonl"
+          cargo +stable test -p mini-tunnel-agent --lib --no-run --message-format=json > "$build_messages"
+          test_binary="$(python3 - "$build_messages" <<'PY'
+          import json
+          import sys
+
+          for line in open(sys.argv[1], encoding="utf-8"):
+              message = json.loads(line)
+              target = message.get("target", {})
+              if message.get("profile", {}).get("test") and target.get("name") == "mini_tunnel_agent":
+                  print(message["executable"])
+                  break
+          else:
+              raise SystemExit("mini-tunnel-agent test binary was not built")
+          PY
+          )"
+          sudo "$test_binary" --exact tun_device::tests::privileged_macos_utun_routes_packets_and_cleans_up --ignored --nocapture
