@@ -4,10 +4,12 @@ use std::{
     io::{self, Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path as FsPath, PathBuf},
+    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -19,6 +21,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use axum_server::accept::{Accept, DefaultAcceptor};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signature, VerifyingKey};
 use getrandom::fill as random_fill;
@@ -36,7 +39,11 @@ use mini_tunnel_protocol::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use tokio::{io::AsyncReadExt, net::TcpListener, sync::RwLock};
+use tokio::{
+    io::AsyncReadExt,
+    sync::{OwnedSemaphorePermit, RwLock},
+};
+use tower_service::Service;
 use uuid::Uuid;
 
 pub const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -46,6 +53,7 @@ const MAX_TOTAL_MEMBERS: usize = 16_384;
 const MAX_STATE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TLS_FILE_BYTES: u64 = 1024 * 1024;
 const COORDINATOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DEVICE_ID_BYTES: usize = 128;
 const INVITE_TTL: Duration = Duration::from_secs(60 * 60);
 const SIGNATURE_CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
@@ -53,6 +61,7 @@ const MAX_CANDIDATES: usize = 8;
 const MAX_REQUESTS_PER_MINUTE_PER_IP: usize = 600;
 const MAX_RATE_LIMIT_CLIENTS: usize = 8192;
 const MAX_CONCURRENT_API_REQUESTS: usize = 256;
+const MAX_CONCURRENT_HTTP_CONNECTIONS: usize = 512;
 const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const ICE_CREDENTIAL_TTL_MS: u64 = 120_000;
@@ -80,8 +89,10 @@ pub struct CoordinatorState {
     _state_lock: Option<Arc<fs::File>>,
     request_limiter: RequestRateLimiter,
     request_slots: RequestSlots,
+    connection_slots: ConnectionSlots,
     request_timeout: RequestTimeout,
     concurrency_rejections_total: Arc<AtomicU64>,
+    connection_rejections_total: Arc<AtomicU64>,
     request_timeouts_total: Arc<AtomicU64>,
     trusted_proxies: Arc<Vec<IpNet>>,
     relay_ticket_key: Option<Arc<[u8; 32]>>,
@@ -91,6 +102,100 @@ pub struct CoordinatorState {
 
 #[derive(Clone)]
 struct RequestSlots(Arc<tokio::sync::Semaphore>);
+
+#[derive(Clone)]
+struct ConnectionSlots(Arc<tokio::sync::Semaphore>);
+
+impl Default for ConnectionSlots {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(
+            MAX_CONCURRENT_HTTP_CONNECTIONS,
+        )))
+    }
+}
+
+#[derive(Clone)]
+struct BoundedAcceptor<A> {
+    inner: A,
+    slots: ConnectionSlots,
+    rejected_total: Arc<AtomicU64>,
+}
+
+impl<A> BoundedAcceptor<A> {
+    fn new(inner: A, slots: ConnectionSlots, rejected_total: Arc<AtomicU64>) -> Self {
+        Self {
+            inner,
+            slots,
+            rejected_total,
+        }
+    }
+}
+
+struct ConnectionLimitedService<S> {
+    inner: S,
+    _permit: Arc<OwnedSemaphorePermit>,
+}
+
+impl<S: Clone> Clone for ConnectionLimitedService<S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            _permit: Arc::clone(&self._permit),
+        }
+    }
+}
+
+impl<S, Request> Service<Request> for ConnectionLimitedService<S>
+where
+    S: Service<Request>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(context)
+    }
+
+    fn call(&mut self, request: Request) -> Self::Future {
+        self.inner.call(request)
+    }
+}
+
+impl<A, I, S> Accept<I, S> for BoundedAcceptor<A>
+where
+    A: Accept<I, S>,
+    A::Future: Future<Output = io::Result<(A::Stream, A::Service)>> + Send + 'static,
+    A::Stream: Send + 'static,
+    A::Service: Send + 'static,
+    I: Send + 'static,
+    S: Send + 'static,
+{
+    type Stream = A::Stream;
+    type Service = ConnectionLimitedService<A::Service>;
+    type Future = Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
+
+    fn accept(&self, stream: I, service: S) -> Self::Future {
+        let Ok(permit) = Arc::clone(&self.slots.0).try_acquire_owned() else {
+            self.rejected_total.fetch_add(1, Ordering::Relaxed);
+            return Box::pin(std::future::ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "coordinator connection capacity is full",
+            ))));
+        };
+        let accepted = self.inner.accept(stream, service);
+        Box::pin(async move {
+            let (stream, inner) = accepted.await?;
+            Ok((
+                stream,
+                ConnectionLimitedService {
+                    inner,
+                    _permit: Arc::new(permit),
+                },
+            ))
+        })
+    }
+}
 
 #[derive(Clone)]
 struct RequestTimeout(Duration);
@@ -1576,9 +1681,10 @@ async fn metrics(State(state): State<CoordinatorState>, request: Request) -> Res
         .map(|network| network.members.len())
         .sum();
     let body = format!(
-        "# HELP mini_tunnel_coordinator_networks Configured overlay networks.\n# TYPE mini_tunnel_coordinator_networks gauge\nmini_tunnel_coordinator_networks {networks}\n# HELP mini_tunnel_coordinator_members Enrolled devices across all networks.\n# TYPE mini_tunnel_coordinator_members gauge\nmini_tunnel_coordinator_members {members}\n# HELP mini_tunnel_coordinator_rate_limited_total Requests rejected by the source IP rate limiter.\n# TYPE mini_tunnel_coordinator_rate_limited_total counter\nmini_tunnel_coordinator_rate_limited_total {}\n# HELP mini_tunnel_coordinator_concurrency_rejected_total API requests rejected because the global in-flight limit was reached.\n# TYPE mini_tunnel_coordinator_concurrency_rejected_total counter\nmini_tunnel_coordinator_concurrency_rejected_total {}\n# HELP mini_tunnel_coordinator_request_timeouts_total API requests that exceeded the processing time limit.\n# TYPE mini_tunnel_coordinator_request_timeouts_total counter\nmini_tunnel_coordinator_request_timeouts_total {}\n",
+        "# HELP mini_tunnel_coordinator_networks Configured overlay networks.\n# TYPE mini_tunnel_coordinator_networks gauge\nmini_tunnel_coordinator_networks {networks}\n# HELP mini_tunnel_coordinator_members Enrolled devices across all networks.\n# TYPE mini_tunnel_coordinator_members gauge\nmini_tunnel_coordinator_members {members}\n# HELP mini_tunnel_coordinator_rate_limited_total Requests rejected by the source IP rate limiter.\n# TYPE mini_tunnel_coordinator_rate_limited_total counter\nmini_tunnel_coordinator_rate_limited_total {}\n# HELP mini_tunnel_coordinator_concurrency_rejected_total API requests rejected because the global in-flight limit was reached.\n# TYPE mini_tunnel_coordinator_concurrency_rejected_total counter\nmini_tunnel_coordinator_concurrency_rejected_total {}\n# HELP mini_tunnel_coordinator_connection_rejected_total HTTP connections rejected because the active connection limit was reached.\n# TYPE mini_tunnel_coordinator_connection_rejected_total counter\nmini_tunnel_coordinator_connection_rejected_total {}\n# HELP mini_tunnel_coordinator_request_timeouts_total API requests that exceeded the processing time limit.\n# TYPE mini_tunnel_coordinator_request_timeouts_total counter\nmini_tunnel_coordinator_request_timeouts_total {}\n",
         state.request_limiter.rejected_total.load(Ordering::Relaxed),
         state.concurrency_rejections_total.load(Ordering::Relaxed),
+        state.connection_rejections_total.load(Ordering::Relaxed),
         state.request_timeouts_total.load(Ordering::Relaxed),
     );
     (
@@ -1786,51 +1892,35 @@ pub async fn serve_with_state_file_and_relay_key_tls_and_reload_interval_and_tru
 
 async fn serve_with_state(address: SocketAddr, state: CoordinatorState) -> std::io::Result<()> {
     validate_listener_security(address, false)?;
-    let listener = TcpListener::bind(address).await?;
-    tracing::info!(address = %listener.local_addr()?, "coordinator listening");
-    let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
-    let server = axum::serve(
-        listener,
-        router_with_state(state).into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        let _ = shutdown_receiver.await;
-    })
-    .into_future();
-    run_http_until_shutdown(
-        server,
-        shutdown_sender,
-        shutdown_signal(),
-        COORDINATOR_SHUTDOWN_GRACE,
-    )
-    .await
+    run_plain_http_server(address, state, shutdown_signal()).await
 }
 
-async fn run_http_until_shutdown<F, S>(
-    server: F,
-    shutdown_sender: tokio::sync::oneshot::Sender<()>,
+async fn run_plain_http_server<S>(
+    address: SocketAddr,
+    state: CoordinatorState,
     shutdown_signal: S,
-    grace: Duration,
-) -> io::Result<()>
+) -> std::io::Result<()>
 where
-    F: std::future::Future<Output = io::Result<()>>,
-    S: std::future::Future<Output = ()>,
+    S: Future<Output = ()> + Send + 'static,
 {
-    tokio::pin!(server);
-    tokio::pin!(shutdown_signal);
-    tokio::select! {
-        result = &mut server => result,
-        _ = &mut shutdown_signal => {
-            let _ = shutdown_sender.send(());
-            match tokio::time::timeout(grace, &mut server).await {
-                Ok(result) => result,
-                Err(_) => Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "coordinator HTTP server exceeded graceful shutdown deadline",
-                )),
-            }
-        }
-    }
+    let acceptor = BoundedAcceptor::new(
+        DefaultAcceptor::new(),
+        state.connection_slots.clone(),
+        state.connection_rejections_total.clone(),
+    );
+    let handle = axum_server::Handle::new();
+    let shutdown_handle = handle.clone();
+    let shutdown = tokio::spawn(async move {
+        shutdown_signal.await;
+        shutdown_handle.graceful_shutdown(Some(COORDINATOR_SHUTDOWN_GRACE));
+    });
+    let result = axum_server::bind(address)
+        .acceptor(acceptor)
+        .handle(handle)
+        .serve(router_with_state(state).into_make_service_with_connect_info::<SocketAddr>())
+        .await;
+    shutdown.abort();
+    result
 }
 
 async fn serve_with_state_and_tls(
@@ -1862,7 +1952,16 @@ async fn serve_with_state_and_tls(
         shutdown_signal().await;
         shutdown_handle.graceful_shutdown(Some(COORDINATOR_SHUTDOWN_GRACE));
     });
-    let result = axum_server::bind_rustls(address, config)
+    let acceptor = BoundedAcceptor::new(
+        DefaultAcceptor::new(),
+        state.connection_slots.clone(),
+        state.connection_rejections_total.clone(),
+    );
+    let acceptor = axum_server::tls_rustls::RustlsAcceptor::new(config)
+        .handshake_timeout(TLS_HANDSHAKE_TIMEOUT)
+        .acceptor(acceptor);
+    let result = axum_server::bind(address)
+        .acceptor(acceptor)
         .handle(handle)
         .serve(router_with_state(state).into_make_service_with_connect_info::<SocketAddr>())
         .await;
@@ -2037,6 +2136,7 @@ mod tests {
     use super::*;
     use axum::{body::Body, extract::connect_info::ConnectInfo, http::Request as HttpRequest};
     use ed25519_dalek::{Signer, SigningKey};
+    use tokio::net::{TcpListener, TcpStream};
     use tower::ServiceExt;
 
     async fn block_until_released(
@@ -2210,6 +2310,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordinator_connection_acceptor_rejects_at_capacity_and_reuses_permits() {
+        let rejected_total = Arc::new(AtomicU64::new(0));
+        let acceptor = BoundedAcceptor::new(
+            DefaultAcceptor::new(),
+            ConnectionSlots(Arc::new(tokio::sync::Semaphore::new(1))),
+            rejected_total.clone(),
+        );
+
+        let (_stream, active_connection) = acceptor
+            .accept((), ())
+            .await
+            .expect("first connection should acquire the slot");
+        let rejected = acceptor.accept((), ()).await;
+        assert!(matches!(
+            rejected,
+            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused
+        ));
+        assert_eq!(rejected_total.load(Ordering::Relaxed), 1);
+
+        drop(active_connection);
+        assert!(acceptor.accept((), ()).await.is_ok());
+        assert_eq!(rejected_total.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn coordinator_tls_handshake_holds_and_releases_connection_capacity() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let config = axum_server::tls_rustls::RustlsConfig::from_pem(
+            certified.cert.pem().into_bytes(),
+            certified.signing_key.serialize_pem().into_bytes(),
+        )
+        .await
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let slots = ConnectionSlots(Arc::new(tokio::sync::Semaphore::new(1)));
+        let rejected_total = Arc::new(AtomicU64::new(0));
+        let acceptor = axum_server::tls_rustls::RustlsAcceptor::new(config)
+            .handshake_timeout(Duration::from_millis(100))
+            .acceptor(BoundedAcceptor::new(
+                DefaultAcceptor::new(),
+                slots,
+                rejected_total.clone(),
+            ));
+
+        let _first_client = TcpStream::connect(address).await.unwrap();
+        let (first_server, _) = listener.accept().await.unwrap();
+        let first_handshake = {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move { acceptor.accept(first_server, ()).await })
+        };
+        tokio::task::yield_now().await;
+
+        let second_client = TcpStream::connect(address).await.unwrap();
+        let (second_server, _) = listener.accept().await.unwrap();
+        let rejected = acceptor.accept(second_server, ()).await;
+        assert!(matches!(
+            rejected,
+            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused
+        ));
+        assert_eq!(rejected_total.load(Ordering::Relaxed), 1);
+        drop(second_client);
+
+        let handshake_result = tokio::time::timeout(Duration::from_secs(1), first_handshake)
+            .await
+            .expect("TLS handshake should be bounded")
+            .expect("handshake task");
+        assert!(matches!(
+            handshake_result,
+            Err(error) if error.kind() == io::ErrorKind::TimedOut
+        ));
+
+        let third_client = TcpStream::connect(address).await.unwrap();
+        let (third_server, _) = listener.accept().await.unwrap();
+        let third_handshake = acceptor.accept(third_server, ());
+        drop(third_handshake);
+        drop(third_client);
+    }
+
+    #[tokio::test]
     async fn coordinator_shutdown_accepts_either_signal_source() {
         let result = select_shutdown_signal(
             std::future::pending(),
@@ -2227,38 +2408,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plain_http_shutdown_drains_server_until_completion() {
-        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
-        let server = async move {
-            shutdown_receiver
-                .await
-                .map_err(|_| io::Error::other("shutdown signal was dropped"))?;
-            Ok(())
+    async fn plain_http_listener_limits_connections_and_reports_rejections() {
+        let address = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let state = CoordinatorState {
+            connection_slots: ConnectionSlots(Arc::new(tokio::sync::Semaphore::new(1))),
+            ..CoordinatorState::default()
         };
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(run_plain_http_server(address, state, async move {
+            let _ = shutdown_receiver.await;
+        }));
 
-        let result = run_http_until_shutdown(
-            server,
-            shutdown_sender,
-            std::future::ready(()),
-            Duration::from_secs(1),
-        )
-        .await;
+        let first_client = reqwest::Client::new();
+        let mut response = None;
+        for _ in 0..40 {
+            if let Ok(connected) = first_client
+                .get(format!("http://{address}/healthz"))
+                .send()
+                .await
+            {
+                response = Some(connected);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let response = response.expect("first connection should reach health route");
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
 
-        assert!(result.is_ok());
-    }
+        let second_client = reqwest::Client::new();
+        assert!(
+            second_client
+                .get(format!("http://{address}/healthz"))
+                .send()
+                .await
+                .is_err(),
+            "connection beyond the configured limit should be closed"
+        );
 
-    #[tokio::test]
-    async fn plain_http_shutdown_ends_after_grace_deadline() {
-        let (shutdown_sender, _shutdown_receiver) = tokio::sync::oneshot::channel();
-        let result = run_http_until_shutdown(
-            std::future::pending::<io::Result<()>>(),
-            shutdown_sender,
-            std::future::ready(()),
-            Duration::from_millis(10),
-        )
-        .await;
+        let metrics = first_client
+            .get(format!("http://{address}/metrics"))
+            .send()
+            .await
+            .expect("existing connection remains usable");
+        assert!(
+            metrics
+                .text()
+                .await
+                .unwrap()
+                .contains("mini_tunnel_coordinator_connection_rejected_total 1\n")
+        );
 
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        let _ = shutdown_sender.send(());
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server should shut down")
+            .expect("server task")
+            .expect("server result");
     }
 
     fn persisted_network(id: Uuid, cidr: &str, member_count: usize) -> PersistedNetwork {
