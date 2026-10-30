@@ -1672,7 +1672,11 @@ async fn shutdown_signal() {
         select_shutdown_signal(tokio::signal::ctrl_c(), terminate).await
     };
     #[cfg(not(unix))]
-    let result = tokio::signal::ctrl_c().await;
+    let result = select_shutdown_signal(
+        tokio::signal::ctrl_c(),
+        std::future::pending::<io::Result<()>>(),
+    )
+    .await;
 
     if let Err(error) = result {
         tracing::error!(%error, "failed to listen for shutdown signal");
