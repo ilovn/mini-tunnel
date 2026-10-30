@@ -694,6 +694,21 @@ pub struct IceAgentDriver {
     local_addr: SocketAddr,
 }
 
+/// Return whether a failed datagram send is specific to this candidate and should not stop the
+/// rest of the ICE checklist from trying other addresses.
+pub(crate) fn is_candidate_send_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::AddrNotAvailable
+            | io::ErrorKind::PermissionDenied
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::Unsupported
+    )
+}
+
 /// Channel-owned cancellation and failure signal for a nominated ICE consent session.
 pub struct IceConsentMonitor {
     cancel: watch::Sender<bool>,
@@ -960,6 +975,9 @@ impl IceAgentDriver {
                     .send_to(&transmit.message, transmit.transport.peer_addr)
                     .await
                 {
+                    if !is_candidate_send_error(&error) {
+                        return Err(IceDriverError::Socket(error.to_string()));
+                    }
                     // A candidate-specific routing error must not abort the checklist: another
                     // address family or server-reflexive candidate may still be reachable.
                     tracing::debug!(

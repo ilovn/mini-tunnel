@@ -626,6 +626,7 @@ mod tests {
         )
         .expect("construct public ICE peer");
 
+        let mut failed_candidates = Vec::new();
         for _ in 0..600 {
             let now = std::time::Instant::now();
             driver_client.handle_timeout(now).expect("tick client ICE");
@@ -639,9 +640,13 @@ mod tests {
                     .expect("send client ICE check");
             }
             for transmit in driver_peer.poll_transmits() {
-                peer.send_to(&transmit.message, transmit.transport.peer_addr)
+                if let Err(error) = peer
+                    .send_to(&transmit.message, transmit.transport.peer_addr)
                     .await
-                    .expect("send public peer ICE check");
+                {
+                    assert!(crate::ice::is_candidate_send_error(&error));
+                    failed_candidates.push(transmit.transport.peer_addr);
+                }
             }
 
             let mut packet = [0; MAX_STUN_MESSAGE];
@@ -673,6 +678,7 @@ mod tests {
             .expect("public peer nominates the SNAT mapping");
         assert_eq!(client_pair.1, peer_address);
         assert_eq!(peer_pair.1, mapped);
+        assert!(failed_candidates.contains(&private_candidate));
         client
             .send_to(b"overlay-through-snat", client_pair.1)
             .await
