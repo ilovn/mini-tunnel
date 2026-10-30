@@ -116,11 +116,15 @@ jobs:
           PY
           )"
           sudo modprobe tun || true
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y iptables
           sudo "$test_binary" --exact tun_device::tests::privileged_linux_tun_assigns_addresses_mtu_and_cleans_up --ignored --nocapture
           command -v tc
           sudo "$test_binary" --exact tunnel::tests::privileged_linux_veth_quic_probe_loss_and_recovery --ignored --nocapture
           sudo "$test_binary" --exact tunnel::tests::privileged_linux_veth_degraded_udp_triggers_mesh_tcp_fallback --ignored --nocapture
           sudo "$test_binary" --exact tunnel::tests::privileged_linux_veth_mesh_promotes_reliable_session_to_direct_udp --ignored --nocapture
+          command -v iptables
+          sudo "$test_binary" --exact stun::tests::privileged_linux_snat_discovers_server_reflexive_address_on_same_socket --ignored --nocapture
 
       - name: Run privileged Windows Wintun packet round trip
         if: runner.os == 'Windows'

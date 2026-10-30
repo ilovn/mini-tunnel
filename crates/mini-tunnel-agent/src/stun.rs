@@ -226,6 +226,193 @@ fn parse_address(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    fn bind_udp_in_namespace(namespace: &str, address: SocketAddr) -> UdpSocket {
+        use std::os::fd::AsRawFd;
+
+        let namespace = namespace.to_owned();
+        std::thread::spawn(move || {
+            let original = std::fs::File::open("/proc/self/ns/net").expect("open original netns");
+            let target = std::fs::File::open(format!("/var/run/netns/{namespace}"))
+                .expect("open target netns");
+            // Keep setns off Tokio worker threads; only this short-lived setup thread changes ns.
+            let result = unsafe { libc::setns(target.as_raw_fd(), libc::CLONE_NEWNET) };
+            assert_eq!(
+                result,
+                0,
+                "enter {namespace}: {}",
+                std::io::Error::last_os_error()
+            );
+            let socket = std::net::UdpSocket::bind(address).expect("bind namespaced UDP socket");
+            socket.set_nonblocking(true).expect("set nonblocking");
+            let result = unsafe { libc::setns(original.as_raw_fd(), libc::CLONE_NEWNET) };
+            assert_eq!(
+                result,
+                0,
+                "restore netns: {}",
+                std::io::Error::last_os_error()
+            );
+            socket
+        })
+        .join()
+        .expect("namespace socket setup thread");
+        UdpSocket::from_std(socket).expect("adopt namespaced UDP socket")
+    }
+
+    #[cfg(target_os = "linux")]
+    struct SnatTopology {
+        client: String,
+        router: String,
+        server: String,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl SnatTopology {
+        fn create() -> Self {
+            fn run(args: &[&str]) {
+                let output = std::process::Command::new("ip")
+                    .args(args)
+                    .output()
+                    .expect("run iproute2");
+                assert!(
+                    output.status.success(),
+                    "ip {args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+
+            fn router(namespace: &str, command: &str, args: &[&str]) {
+                let output = std::process::Command::new("ip")
+                    .args(["netns", "exec", namespace, command])
+                    .args(args)
+                    .output()
+                    .expect("run NAT router command");
+                assert!(
+                    output.status.success(),
+                    "{command} {args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+
+            let suffix = format!("{}", std::process::id() % 10_000_000);
+            let client = format!("mtc{suffix}");
+            let router_ns = format!("mtr{suffix}");
+            let server = format!("mts{suffix}");
+            let client_if = format!("mc{}", suffix.get(..5).unwrap_or(&suffix));
+            let router_in = format!("ri{}", suffix.get(..5).unwrap_or(&suffix));
+            let router_out = format!("ro{}", suffix.get(..5).unwrap_or(&suffix));
+            let server_if = format!("ms{}", suffix.get(..5).unwrap_or(&suffix));
+            let topology = Self {
+                client: client.clone(),
+                router: router_ns.clone(),
+                server: server.clone(),
+            };
+            run(&["netns", "add", &client]);
+            run(&["netns", "add", &router_ns]);
+            run(&["netns", "add", &server]);
+            run(&[
+                "link", "add", &client_if, "type", "veth", "peer", "name", &router_in,
+            ]);
+            run(&[
+                "link",
+                "add",
+                &router_out,
+                "type",
+                "veth",
+                "peer",
+                "name",
+                &server_if,
+            ]);
+            run(&["link", "set", &client_if, "netns", &client]);
+            run(&["link", "set", &router_in, "netns", &router_ns]);
+            run(&["link", "set", &router_out, "netns", &router_ns]);
+            run(&["link", "set", &server_if, "netns", &server]);
+
+            for namespace in [&client, &router_ns, &server] {
+                run(&["-n", namespace, "link", "set", "lo", "up"]);
+            }
+            let addresses = [
+                (&client, &client_if, "10.77.0.2/24"),
+                (&router_ns, &router_in, "10.77.0.1/24"),
+                (&router_ns, &router_out, "198.18.0.1/24"),
+                (&server, &server_if, "198.18.0.2/24"),
+            ];
+            for (namespace, device, address) in addresses {
+                run(&["-n", namespace, "address", "add", address, "dev", device]);
+                run(&["-n", namespace, "link", "set", "dev", device, "up"]);
+            }
+            run(&["-n", &client, "route", "add", "default", "via", "10.77.0.1"]);
+            run(&[
+                "-n",
+                &server,
+                "route",
+                "add",
+                "10.77.0.0/24",
+                "via",
+                "198.18.0.1",
+            ]);
+            router(&router_ns, "sysctl", &["-w", "net.ipv4.ip_forward=1"]);
+            router(
+                &router_ns,
+                "iptables",
+                &[
+                    "-t",
+                    "nat",
+                    "-A",
+                    "POSTROUTING",
+                    "-o",
+                    &router_out,
+                    "-j",
+                    "MASQUERADE",
+                ],
+            );
+            router(
+                &router_ns,
+                "iptables",
+                &[
+                    "-A",
+                    "FORWARD",
+                    "-i",
+                    &router_in,
+                    "-o",
+                    &router_out,
+                    "-j",
+                    "ACCEPT",
+                ],
+            );
+            router(
+                &router_ns,
+                "iptables",
+                &[
+                    "-A",
+                    "FORWARD",
+                    "-i",
+                    &router_out,
+                    "-o",
+                    &router_in,
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "RELATED,ESTABLISHED",
+                    "-j",
+                    "ACCEPT",
+                ],
+            );
+            topology
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for SnatTopology {
+        fn drop(&mut self) {
+            for namespace in [&self.client, &self.router, &self.server] {
+                let _ = std::process::Command::new("ip")
+                    .args(["netns", "del", namespace])
+                    .status();
+            }
+        }
+    }
+
     fn mapped_response(address: SocketAddr, transaction_id: [u8; 12]) -> Vec<u8> {
         let mut value = vec![0, if address.is_ipv4() { 1 } else { 2 }];
         let port = address.port() ^ (MAGIC_COOKIE >> 16) as u16;
@@ -346,6 +533,51 @@ mod tests {
             socket.local_addr().expect("socket remains bound").port(),
             local_port
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires root privileges, iproute2, iptables, and network namespaces"]
+    async fn privileged_linux_snat_discovers_server_reflexive_address_on_same_socket() {
+        let _topology = SnatTopology::create();
+        let server = bind_udp_in_namespace(
+            &_topology.server,
+            "198.18.0.2:3478".parse().expect("server address"),
+        );
+        let client = bind_udp_in_namespace(
+            &_topology.client,
+            "0.0.0.0:0".parse().expect("client bind address"),
+        );
+        let server_address = server.local_addr().expect("server socket address");
+        let responder = tokio::spawn(async move {
+            let mut request = [0; HEADER_LEN];
+            let (length, peer) =
+                tokio::time::timeout(Duration::from_secs(5), server.recv_from(&mut request))
+                    .await
+                    .expect("NAT forwarded STUN request")
+                    .expect("receive STUN request");
+            assert_eq!(length, HEADER_LEN);
+            assert_eq!(peer.ip(), "198.18.0.1".parse::<std::net::IpAddr>().unwrap());
+            let transaction = request[8..20].try_into().expect("transaction ID");
+            server
+                .send_to(&mapped_response(peer, transaction), peer)
+                .await
+                .expect("send mapped response through NAT");
+            peer
+        });
+
+        let local = client.local_addr().expect("client local address");
+        let mapped = discover_mapped_address(&client, server_address)
+            .await
+            .expect("discover translated mapping");
+        let server_observed = responder.await.expect("STUN server response");
+        assert_eq!(mapped, server_observed);
+        assert_eq!(
+            mapped.ip(),
+            "198.18.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_ne!(mapped.port(), 0);
+        assert_eq!(client.local_addr().expect("socket remains bound"), local);
     }
 
     #[tokio::test]
