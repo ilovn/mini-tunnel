@@ -539,6 +539,26 @@ mod tests {
         .await
         .expect("install IPv6 peer host route");
 
+        let overlay_socket = tokio::net::UdpSocket::bind((address_a, 0))
+            .await
+            .expect("bind UDP socket to assigned TUN address");
+        overlay_socket
+            .send_to(b"outbound through peer route", (peer_address, 4242))
+            .await
+            .expect("send UDP datagram to peer overlay address");
+        let outbound = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            device.read_outbound_packet(),
+        )
+        .await
+        .expect("kernel-routed datagram reaches the TUN")
+        .expect("read validated local-originated packet from the TUN");
+        let (outbound_source, outbound_destination) =
+            packet_addresses(&outbound).expect("parse outbound TUN packet addresses");
+        assert_eq!(outbound_source, IpAddr::V4(address_a));
+        assert_eq!(outbound_destination, IpAddr::V4(peer_address));
+        assert_eq!(outbound[9], 17, "expected an IPv4 UDP packet");
+
         for (family, peer) in [
             ("-4", peer_address.to_string()),
             ("-6", peer_address_v6.to_string()),
