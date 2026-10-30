@@ -2,6 +2,22 @@
 
 These templates install the coordinator and opaque TCP relay as separate, unprivileged services. They require systemd 247 or newer for the complete sandbox profile. They do not configure a firewall, TLS proxy, certificate renewal, or secret distribution. Review those choices for your host before enabling the units.
 
+## Network exposure
+
+Apply host and cloud firewall rules with this exposure model; do not expose service health or metrics endpoints:
+
+| Listener | Transport | Public ingress | Purpose |
+| --- | --- | --- | --- |
+| Reverse proxy (example: 443) | TCP | Yes | Coordinator HTTPS API; allow the chosen proxy port only. |
+| Relay `42001` | TCP | Yes, when relay fallback is offered | Opaque relayed peer stream. |
+| Coordinator `127.0.0.1:8443` | TCP | No | TLS backend reachable only by the local proxy. |
+| Relay metrics `127.0.0.1:42002` | TCP | No | Local health and Prometheus scrape. |
+| Peer tunnel `--bind` | UDP, and optional TCP | As configured per device | Direct peer path. Open/forward the selected ports on the peer host/router; there is no single server-side peer port because each device chooses its bind address. |
+
+If serving Coordinator HTTPS directly, expose its configured TLS listener instead of the reverse proxy, and bind it to the public interface with a valid certificate. Do not expose the JSON state file or PostgreSQL. Restrict database ingress to Coordinator hosts. Prometheus can scrape loopback endpoints locally; for remote monitoring, use authenticated `remote_write` rather than opening the metrics ports.
+
+Clients initiating connections need outbound HTTPS to the Coordinator, UDP to STUN (if configured), UDP to peer candidates, and TCP to peer candidates or the Relay as used. UDP NAT traversal usually requires no inbound firewall pinhole on the client, but symmetric/firewall-restricted NATs can prevent direct paths; configure relay fallback for those networks. If a peer accepts direct connections behind a router, forward the selected UDP/TCP bind port to that device and advertise the matching public candidate.
+
 ## Install
 
 Build a release binary and install it at `/usr/local/bin/mini-tunnel`. Create a dedicated account and configuration directories:
@@ -56,6 +72,19 @@ curl --fail http://127.0.0.1:42002/metrics
 The alerts cover loss of either scrape endpoint, Coordinator request timeouts or concurrency rejection, and Relay connection-capacity rejection. For a scrape alert, check `systemctl status`, the service journal, certificate expiry/trust, and whether the local Prometheus process can reach loopback. For a Coordinator saturation alert, inspect database health/latency and API load before raising limits. For Relay capacity rejection, compare active connections with `mini_tunnel_relay_max_connections` and the per-source limit; investigate connection churn before increasing caps. The Coordinator's `/healthz` returns `503` while the configured PostgreSQL store is unavailable.
 
 The coordinator template binds HTTPS to loopback for a local reverse proxy and trusts only `127.0.0.1/32` to supply `X-Forwarded-For` for per-client rate limiting. The example [`deploy/nginx/mini-tunnel-coordinator.conf.example`](../nginx/mini-tunnel-coordinator.conf.example) forwards only `/v1/`, appends the actual client address, verifies the backend certificate, and rejects public `/healthz` and `/metrics`. Configure the backend certificate with the `coordinator.internal` SAN and install its CA at the configured path. If the proxy connects from a different address, update `--trusted-proxies` and the systemd regression check to match that exact proxy CIDR; never trust an untrusted client network. The relay serves TCP on port `42001`; permit that port in the host/network firewall. Its health and Prometheus endpoints stay bound to loopback at `127.0.0.1:42002`.
+
+## Certificate renewal
+
+The Coordinator checks its configured certificate and key every 30 seconds and reloads a valid matching pair without restarting. Renew the backend certificate and key at the configured paths, preserve the `coordinator.internal` DNS SAN used by Nginx, and ensure the service account can read the files but cannot modify them. Write renewed files to temporary paths, set ownership/mode, then atomically rename them into place so the watcher never sees a half-written pair. A mismatched or invalid pair leaves the current certificate active; inspect the Coordinator journal for reload errors and correct the files before the next poll. For a custom interval, set `MINI_TUNNEL_COORDINATOR_TLS_RELOAD_INTERVAL_SECONDS` in `coordinator.env` and restart the service once to apply it.
+
+For a publicly terminated certificate in Nginx, validate and reload Nginx after renewal (the example path uses Certbot):
+
+```sh
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Then verify the public endpoint against the expected hostname and trust chain, and verify the backend locally using its CA and SAN as shown in the Monitoring section. Check `systemctl status` and `journalctl -u mini-tunnel-coordinator.service` (or the PostgreSQL unit) if the proxy reports TLS errors. Schedule renewal hooks to reload Nginx only after `nginx -t` succeeds.
 
 Enable either `mini-tunnel-coordinator.service` for a single-node JSON snapshot or `mini-tunnel-coordinator-postgres.service` for shared PostgreSQL state, not both. For JSON mode, continue protecting `/var/lib/mini-tunnel/coordinator-state.json`. For PostgreSQL mode, back up the database with `pg_dump`/PITR and periodically export a verified JSON recovery snapshot with `mini-tunnel coordinator export-state-from-postgres --output <path>`.
 
