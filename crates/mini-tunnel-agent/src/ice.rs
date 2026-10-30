@@ -1492,6 +1492,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ice_credentials_can_restart_on_the_same_udp_socket() {
+        let temp =
+            std::env::temp_dir().join(format!("mini-tunnel-ice-restart-{}", uuid::Uuid::new_v4()));
+        let identity_a =
+            crate::Identity::load_or_create_at(temp.join("a/device.key")).expect("identity A");
+        let identity_b =
+            crate::Identity::load_or_create_at(temp.join("b/device.key")).expect("identity B");
+        let endpoint_a =
+            super::peer_endpoint_with_ice(&identity_a, "127.0.0.1:0".parse().unwrap(), 8)
+                .expect("ICE endpoint A");
+        let endpoint_b =
+            super::peer_endpoint_with_ice(&identity_b, "127.0.0.1:0".parse().unwrap(), 8)
+                .expect("ICE endpoint B");
+        let address_a = endpoint_a.endpoint.local_addr().expect("A address");
+        let address_b = endpoint_b.endpoint.local_addr().expect("B address");
+        type CredentialPair = (String, String);
+        let (mut previous_a, mut previous_b): (Option<CredentialPair>, Option<CredentialPair>) =
+            (None, None);
+
+        for generation in 1..=2 {
+            let credentials_a = generate_ice_credentials(generation).expect("credentials A");
+            let credentials_b = generate_ice_credentials(generation).expect("credentials B");
+            if let Some((ufrag_a, ufrag_b)) = previous_a.take() {
+                assert!(
+                    endpoint_a
+                        .ice_router
+                        .unregister(&ufrag_a, &ufrag_b)
+                        .unwrap()
+                );
+            }
+            if let Some((ufrag_b, ufrag_a)) = previous_b.take() {
+                assert!(
+                    endpoint_b
+                        .ice_router
+                        .unregister(&ufrag_b, &ufrag_a)
+                        .unwrap()
+                );
+            }
+            let mut messages_a = endpoint_a
+                .ice_router
+                .register(credentials_a.ufrag.clone(), credentials_b.ufrag.clone(), 8)
+                .expect("register A session");
+            let mut messages_b = endpoint_b
+                .ice_router
+                .register(credentials_b.ufrag.clone(), credentials_a.ufrag.clone(), 8)
+                .expect("register B session");
+            let mut driver_a = IceAgentDriver::for_peer(
+                &credentials_a,
+                &credentials_b,
+                &[address_a],
+                &[address_b],
+                true,
+                Instant::now(),
+            )
+            .expect("construct A ICE session");
+            let mut driver_b = IceAgentDriver::for_peer(
+                &credentials_b,
+                &credentials_a,
+                &[address_b],
+                &[address_a],
+                false,
+                Instant::now(),
+            )
+            .expect("construct B ICE session");
+            let (pair_a, pair_b) = tokio::join!(
+                driver_a.run_checks(
+                    &endpoint_a.socket,
+                    &endpoint_a.ice_router,
+                    &credentials_a.ufrag,
+                    &credentials_b.ufrag,
+                    &mut messages_a,
+                    Duration::from_secs(3),
+                ),
+                driver_b.run_checks(
+                    &endpoint_b.socket,
+                    &endpoint_b.ice_router,
+                    &credentials_b.ufrag,
+                    &credentials_a.ufrag,
+                    &mut messages_b,
+                    Duration::from_secs(3),
+                ),
+            );
+            assert_eq!(pair_a.expect("A nominates pair"), (address_a, address_b));
+            assert_eq!(pair_b.expect("B nominates pair"), (address_b, address_a));
+            assert_eq!(endpoint_a.endpoint.local_addr().unwrap(), address_a);
+            assert_eq!(endpoint_b.endpoint.local_addr().unwrap(), address_b);
+
+            let peer_a_id = identity_a.device_id();
+            let peer_a_key = identity_a.public_key();
+            let peer_b_id = identity_b.device_id();
+            let peer_b_key = identity_b.public_key();
+            let server = endpoint_b.endpoint.clone();
+            let identity_b_path = temp.join("b/device.key");
+            let accept = tokio::spawn(async move {
+                let accept_identity =
+                    crate::Identity::load_or_create_at(identity_b_path).expect("reload identity B");
+                crate::accept_peer(
+                    &server,
+                    "ice-restart-test",
+                    &accept_identity,
+                    &peer_a_id,
+                    peer_a_key,
+                )
+                .await
+            });
+            let channel_a = crate::connect_peer(
+                &endpoint_a.endpoint,
+                address_b,
+                "ice-restart-test",
+                &identity_a,
+                &peer_b_id,
+                peer_b_key,
+            )
+            .await
+            .expect("connect with current ICE generation");
+            let channel_b = accept.await.expect("accept task").expect("accept QUIC");
+            let payload = format!("ice-generation-{generation}");
+            channel_a
+                .send_packet(payload.as_bytes())
+                .await
+                .expect("send through restarted tunnel");
+            assert_eq!(
+                channel_b
+                    .recv_packet()
+                    .await
+                    .expect("receive tunnel packet"),
+                payload.as_bytes()
+            );
+            channel_a.close();
+            channel_b.close();
+            previous_a = Some((credentials_a.ufrag.clone(), credentials_b.ufrag.clone()));
+            previous_b = Some((credentials_b.ufrag, credentials_a.ufrag));
+        }
+
+        endpoint_a.endpoint.close(0_u32.into(), b"test complete");
+        endpoint_b.endpoint.close(0_u32.into(), b"test complete");
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test]
     async fn iced_socket_drops_stun_when_the_bounded_ice_queue_is_full() {
         let temp =
             std::env::temp_dir().join(format!("mini-tunnel-ice-queue-{}", uuid::Uuid::new_v4()));
