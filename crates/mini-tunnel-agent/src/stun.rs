@@ -231,7 +231,7 @@ mod tests {
         use std::os::fd::AsRawFd;
 
         let namespace = namespace.to_owned();
-        std::thread::spawn(move || {
+        let socket = std::thread::spawn(move || {
             let original = std::fs::File::open("/proc/self/ns/net").expect("open original netns");
             let target = std::fs::File::open(format!("/var/run/netns/{namespace}"))
                 .expect("open target netns");
