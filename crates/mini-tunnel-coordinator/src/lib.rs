@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path as FsPath, PathBuf},
     sync::{
@@ -26,9 +26,9 @@ use ipnet::Ipv4Net;
 use mini_tunnel_protocol::{
     ApiErrorResponse, CandidateUpdateRequest, CandidateUpdateResponse, CreateInviteRequest,
     CreateInviteResponse, CreateNetworkRequest, CreateNetworkResponse, IceCredentials,
-    JoinNetworkRequest, JoinNetworkResponse, PeerInfo, PeerListRequest, PeerListResponse,
-    RELAY_TICKET_VERSION, RelayTicketClaims, RelayTicketRequest, RelayTicketResponse,
-    RevokeMemberRequest, RevokeMemberResponse, candidate_signing_bytes,
+    JoinNetworkRequest, JoinNetworkResponse, MAX_NETWORK_MEMBERS, PeerInfo, PeerListRequest,
+    PeerListResponse, RELAY_TICKET_VERSION, RelayTicketClaims, RelayTicketRequest,
+    RelayTicketResponse, RevokeMemberRequest, RevokeMemberResponse, candidate_signing_bytes,
     candidate_signing_bytes_with_ice, device_id_from_public_key, issue_relay_ticket,
     join_signing_bytes, overlay_ipv6_prefix, peers_signing_bytes,
     relay_ticket_request_signing_bytes,
@@ -42,6 +42,8 @@ use uuid::Uuid;
 pub const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_NETWORKS: usize = 128;
 const MAX_INVITES_PER_NETWORK: usize = 1024;
+const MAX_TOTAL_MEMBERS: usize = 16_384;
+const MAX_STATE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DEVICE_ID_BYTES: usize = 128;
 const INVITE_TTL: Duration = Duration::from_secs(60 * 60);
 const SIGNATURE_CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
@@ -286,7 +288,15 @@ impl CoordinatorState {
                         ));
                     }
                 }
-                let bytes = fs::read(&path)?;
+                let state_file = fs::File::open(&path)?;
+                validate_state_file_size(state_file.metadata()?.len())?;
+                let mut bytes = Vec::new();
+                state_file
+                    .take(MAX_STATE_FILE_BYTES + 1)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() as u64 > MAX_STATE_FILE_BYTES {
+                    return Err(invalid_state("coordinator state file exceeds size limit"));
+                }
                 let snapshot: StateSnapshot = serde_json::from_slice(&bytes).map_err(|error| {
                     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
                 })?;
@@ -573,11 +583,12 @@ impl CoordinatorState {
 
         let requested_hash = token_hash(&request.invite_token);
         let mut store = self.inner.write().await;
-        let previous = store.clone();
-        let network = store
+        let total_members = store
             .networks
-            .get_mut(&network_id)
-            .ok_or(ApiError::NotFound)?;
+            .values()
+            .map(|network| network.members.len())
+            .sum::<usize>();
+        let network = store.networks.get(&network_id).ok_or(ApiError::NotFound)?;
         let invite_hash = network
             .invites
             .keys()
@@ -586,7 +597,7 @@ impl CoordinatorState {
             .ok_or(ApiError::Unauthorized)?;
         let invite = network
             .invites
-            .get_mut(&invite_hash)
+            .get(&invite_hash)
             .ok_or(ApiError::Unauthorized)?;
         if invite.expires_at_ms <= unix_time_ms().ok_or(ApiError::Internal)? {
             return Err(ApiError::Unauthorized);
@@ -612,12 +623,21 @@ impl CoordinatorState {
         if network.members.contains_key(&request.device_id) {
             return Err(ApiError::Conflict("device_id is already enrolled"));
         }
+        if member_capacity_reached(network.members.len(), total_members) {
+            return Err(ApiError::Conflict("coordinator member capacity reached"));
+        }
 
         let assigned_ipv4 = network
             .cidr
             .hosts()
             .find(|address| !network.assigned_addresses.contains(address))
             .ok_or(ApiError::Conflict("network has no free IPv4 addresses"))?;
+        let cidr = network.cidr.to_string();
+        let previous = store.clone();
+        let network = store
+            .networks
+            .get_mut(&network_id)
+            .ok_or(ApiError::NotFound)?;
         network.assigned_addresses.insert(assigned_ipv4);
         network.members.insert(
             request.device_id.clone(),
@@ -628,8 +648,11 @@ impl CoordinatorState {
                 last_candidate_timestamp_ms: 0,
             },
         );
-        invite.consumed_by = Some(request.device_id.clone());
-        let cidr = network.cidr.to_string();
+        network
+            .invites
+            .get_mut(&invite_hash)
+            .ok_or(ApiError::Unauthorized)?
+            .consumed_by = Some(request.device_id.clone());
         self.persist_or_restore(&mut store, previous)?;
 
         Ok(JoinNetworkResponse {
@@ -895,7 +918,11 @@ impl Store {
             ));
         }
         let mut store = Store::default();
+        let mut total_members = 0_usize;
         for persisted in snapshot.networks {
+            total_members = total_members
+                .checked_add(persisted.members.len())
+                .ok_or_else(|| invalid_state("persisted member count overflow"))?;
             let cidr = persisted
                 .cidr
                 .parse::<Ipv4Net>()
@@ -905,6 +932,8 @@ impl Store {
                     .networks
                     .values()
                     .any(|network| cidrs_overlap(cidr, network.cidr))
+                || persisted.members.len() > MAX_NETWORK_MEMBERS
+                || total_members > MAX_TOTAL_MEMBERS
                 || persisted.invites.len() > MAX_INVITES_PER_NETWORK
             {
                 return Err(invalid_state("invalid or overlapping persisted network"));
@@ -990,9 +1019,26 @@ fn invalid_state(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_owned())
 }
 
+fn member_capacity_reached(network_members: usize, total_members: usize) -> bool {
+    network_members >= MAX_NETWORK_MEMBERS || total_members >= MAX_TOTAL_MEMBERS
+}
+
+fn validate_state_file_size(length: u64) -> io::Result<()> {
+    if length > MAX_STATE_FILE_BYTES {
+        return Err(invalid_state("coordinator state file exceeds size limit"));
+    }
+    Ok(())
+}
+
 fn persist_store(path: &FsPath, store: &Store) -> io::Result<()> {
     let bytes = serde_json::to_vec(&store.snapshot())
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    validate_state_file_size(bytes.len() as u64).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "coordinator state snapshot exceeds size limit",
+        )
+    })?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1479,6 +1525,93 @@ mod tests {
     use axum::{body::Body, extract::connect_info::ConnectInfo, http::Request as HttpRequest};
     use ed25519_dalek::{Signer, SigningKey};
     use tower::ServiceExt;
+
+    fn persisted_network(id: Uuid, cidr: &str, member_count: usize) -> PersistedNetwork {
+        PersistedNetwork {
+            id,
+            cidr: cidr.to_owned(),
+            admin_token_hash: [0; 32],
+            invites: Vec::new(),
+            members: (0..member_count)
+                .map(|_| PersistedMember {
+                    device_id: String::new(),
+                    address: Ipv4Addr::UNSPECIFIED,
+                    public_key: [0; 32],
+                    candidates: Vec::new(),
+                    last_candidate_timestamp_ms: 0,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn coordinator_network_and_global_member_caps_have_exact_boundaries() {
+        assert!(!member_capacity_reached(
+            MAX_NETWORK_MEMBERS - 1,
+            MAX_TOTAL_MEMBERS - 1
+        ));
+        assert!(member_capacity_reached(MAX_NETWORK_MEMBERS, 0));
+        assert!(member_capacity_reached(0, MAX_TOTAL_MEMBERS));
+        assert!(validate_state_file_size(MAX_STATE_FILE_BYTES).is_ok());
+        assert_eq!(
+            validate_state_file_size(MAX_STATE_FILE_BYTES + 1)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn persisted_snapshot_rejects_per_network_and_global_member_overflow() {
+        let over_network_limit = StateSnapshot {
+            schema_version: 1,
+            networks: vec![persisted_network(
+                Uuid::from_u128(1),
+                "10.1.0.0/16",
+                MAX_NETWORK_MEMBERS + 1,
+            )],
+        };
+        assert!(Store::from_snapshot(over_network_limit).is_err());
+
+        let networks = (0..4)
+            .map(|index| {
+                persisted_network(
+                    Uuid::from_u128(index + 1),
+                    &format!("10.{}.0.0/16", index + 1),
+                    MAX_NETWORK_MEMBERS,
+                )
+            })
+            .chain(std::iter::once(persisted_network(
+                Uuid::from_u128(5),
+                "10.5.0.0/16",
+                1,
+            )))
+            .collect();
+        assert!(
+            Store::from_snapshot(StateSnapshot {
+                schema_version: 1,
+                networks,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn coordinator_load_rejects_oversized_state_file_before_deserialization() {
+        let dir = std::env::temp_dir().join(format!("mini-tunnel-state-large-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create state directory");
+        let path = dir.join("coordinator.json");
+        let file = fs::File::create(&path).expect("create sparse state file");
+        file.set_len(MAX_STATE_FILE_BYTES + 1)
+            .expect("set oversized sparse file length");
+        let error = match CoordinatorState::load(&path) {
+            Ok(_) => panic!("oversized state must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        drop(file);
+        fs::remove_dir_all(dir).expect("remove state directory");
+    }
 
     #[test]
     fn network_ids_with_colliding_ula_prefixes_are_rejected() {
@@ -2049,6 +2182,68 @@ mod tests {
             .await
             .expect_err("an invite must not enroll a second device");
         assert!(matches!(replay, ApiError::Unauthorized));
+    }
+
+    #[tokio::test]
+    async fn join_rejects_enrollment_when_network_member_capacity_is_reached() {
+        let state = CoordinatorState::default();
+        let network_id = Uuid::new_v4();
+        let invite_token = "capacity-invite-token".to_owned();
+        let now = unix_time_ms().expect("system clock");
+        let members = (0..MAX_NETWORK_MEMBERS)
+            .map(|index| {
+                (
+                    format!("existing-{index}"),
+                    Member {
+                        address: Ipv4Addr::UNSPECIFIED,
+                        public_key: [0; 32],
+                        candidates: Vec::new(),
+                        last_candidate_timestamp_ms: 0,
+                    },
+                )
+            })
+            .collect();
+        state.inner.write().await.networks.insert(
+            network_id,
+            Network {
+                cidr: "10.90.0.0/16".parse().unwrap(),
+                admin_token_hash: [0; 32],
+                invites: HashMap::from([(
+                    token_hash(&invite_token),
+                    Invite {
+                        consumed_by: None,
+                        expires_at_ms: now + 60_000,
+                    },
+                )]),
+                members,
+                assigned_addresses: HashSet::new(),
+            },
+        );
+        let key = SigningKey::from_bytes(&[99; 32]);
+        let public_key = key.verifying_key().to_bytes();
+        let device_id = device_id_from_public_key(&public_key);
+        let signature = key.sign(&join_signing_bytes(
+            &network_id.to_string(),
+            &device_id,
+            &public_key,
+            &invite_token,
+        ));
+        let error = state
+            .join_network(
+                network_id,
+                JoinNetworkRequest {
+                    invite_token,
+                    device_id,
+                    public_key: URL_SAFE_NO_PAD.encode(public_key),
+                    signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+                },
+            )
+            .await
+            .expect_err("network member cap must reject new enrollment");
+        assert!(matches!(
+            error,
+            ApiError::Conflict("coordinator member capacity reached")
+        ));
     }
 
     #[tokio::test]

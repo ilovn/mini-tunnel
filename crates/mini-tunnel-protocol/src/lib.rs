@@ -13,6 +13,9 @@ use uuid::Uuid;
 /// Current version of the control message envelope.
 pub const PROTOCOL_VERSION: u16 = 1;
 
+/// Maximum member count supported by a coordinator network and the full-mesh client.
+pub const MAX_NETWORK_MEMBERS: usize = 4096;
+
 /// Stable, non-secret identifier derived from the Ed25519 public key.
 #[must_use]
 pub fn device_id_from_public_key(public_key: &[u8; 32]) -> String {

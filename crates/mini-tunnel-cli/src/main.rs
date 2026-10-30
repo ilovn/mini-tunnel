@@ -2097,7 +2097,7 @@ fn spawn_mesh_membership_refresh(config: MeshMembershipRefresh) -> tokio::task::
                     continue;
                 }
             };
-            if peers.len() > 4096 {
+            if peers.len() > mini_tunnel_protocol::MAX_NETWORK_MEMBERS {
                 eprintln!("mesh membership snapshot exceeds the local peer limit; ignoring it");
                 continue;
             }
