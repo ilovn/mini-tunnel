@@ -52,6 +52,7 @@ const SIGNATURE_CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
 const MAX_CANDIDATES: usize = 8;
 const MAX_REQUESTS_PER_MINUTE_PER_IP: usize = 600;
 const MAX_RATE_LIMIT_CLIENTS: usize = 8192;
+const MAX_CONCURRENT_API_REQUESTS: usize = 256;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const ICE_CREDENTIAL_TTL_MS: u64 = 120_000;
 const MAX_EPHEMERAL_ICE_CREDENTIALS: usize = 8192;
@@ -77,10 +78,23 @@ pub struct CoordinatorState {
     persistence: Option<Arc<PathBuf>>,
     _state_lock: Option<Arc<fs::File>>,
     request_limiter: RequestRateLimiter,
+    request_slots: RequestSlots,
+    concurrency_rejections_total: Arc<AtomicU64>,
     trusted_proxies: Arc<Vec<IpNet>>,
     relay_ticket_key: Option<Arc<[u8; 32]>>,
     relay_pairs: Arc<Mutex<RelayPairStore>>,
     ice_credentials: Arc<RwLock<HashMap<(Uuid, String), EphemeralIceCredentials>>>,
+}
+
+#[derive(Clone)]
+struct RequestSlots(Arc<tokio::sync::Semaphore>);
+
+impl Default for RequestSlots {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(
+            MAX_CONCURRENT_API_REQUESTS,
+        )))
+    }
 }
 
 #[derive(Clone)]
@@ -1403,6 +1417,30 @@ async fn limit_requests(
             .insert("retry-after", HeaderValue::from_static("60"));
         return response;
     }
+    let _permit = if matches!(request.uri().path(), "/healthz" | "/metrics") {
+        None
+    } else {
+        match state.request_slots.0.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                state
+                    .concurrency_rejections_total
+                    .fetch_add(1, Ordering::Relaxed);
+                let mut response = (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ApiErrorResponse {
+                        error: "server_busy".to_owned(),
+                        message: "coordinator request capacity is temporarily full".to_owned(),
+                    }),
+                )
+                    .into_response();
+                response
+                    .headers_mut()
+                    .insert("retry-after", HeaderValue::from_static("1"));
+                return response;
+            }
+        }
+    };
     next.run(request).await
 }
 
@@ -1430,8 +1468,9 @@ async fn metrics(State(state): State<CoordinatorState>, request: Request) -> Res
         .map(|network| network.members.len())
         .sum();
     let body = format!(
-        "# HELP mini_tunnel_coordinator_networks Configured overlay networks.\n# TYPE mini_tunnel_coordinator_networks gauge\nmini_tunnel_coordinator_networks {networks}\n# HELP mini_tunnel_coordinator_members Enrolled devices across all networks.\n# TYPE mini_tunnel_coordinator_members gauge\nmini_tunnel_coordinator_members {members}\n# HELP mini_tunnel_coordinator_rate_limited_total Requests rejected by the source IP rate limiter.\n# TYPE mini_tunnel_coordinator_rate_limited_total counter\nmini_tunnel_coordinator_rate_limited_total {}\n",
+        "# HELP mini_tunnel_coordinator_networks Configured overlay networks.\n# TYPE mini_tunnel_coordinator_networks gauge\nmini_tunnel_coordinator_networks {networks}\n# HELP mini_tunnel_coordinator_members Enrolled devices across all networks.\n# TYPE mini_tunnel_coordinator_members gauge\nmini_tunnel_coordinator_members {members}\n# HELP mini_tunnel_coordinator_rate_limited_total Requests rejected by the source IP rate limiter.\n# TYPE mini_tunnel_coordinator_rate_limited_total counter\nmini_tunnel_coordinator_rate_limited_total {}\n# HELP mini_tunnel_coordinator_concurrency_rejected_total API requests rejected because the global in-flight limit was reached.\n# TYPE mini_tunnel_coordinator_concurrency_rejected_total counter\nmini_tunnel_coordinator_concurrency_rejected_total {}\n",
         state.request_limiter.rejected_total.load(Ordering::Relaxed),
+        state.concurrency_rejections_total.load(Ordering::Relaxed),
     );
     (
         [(
@@ -1890,6 +1929,91 @@ mod tests {
     use axum::{body::Body, extract::connect_info::ConnectInfo, http::Request as HttpRequest};
     use ed25519_dalek::{Signer, SigningKey};
     use tower::ServiceExt;
+
+    async fn block_until_released(
+        State((entered, release)): State<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    ) -> StatusCode {
+        entered.notify_one();
+        release.notified().await;
+        StatusCode::OK
+    }
+
+    #[tokio::test]
+    async fn coordinator_bounds_in_flight_api_work_and_keeps_health_available() {
+        let state = CoordinatorState {
+            request_slots: RequestSlots(Arc::new(tokio::sync::Semaphore::new(1))),
+            ..CoordinatorState::default()
+        };
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let hold_route = Router::new()
+            .route("/blocked", get(block_until_released))
+            .with_state((entered.clone(), release.clone()));
+        let app = Router::new()
+            .merge(hold_route)
+            .route("/healthz", get(health))
+            .route("/metrics", get(metrics))
+            .layer(from_fn_with_state(state.clone(), limit_requests))
+            .with_state(state.clone());
+        let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 88)), 12345);
+        let make_request = |path: &str, source: SocketAddr| {
+            let mut request = HttpRequest::builder()
+                .uri(path)
+                .body(Body::empty())
+                .expect("valid request");
+            request.extensions_mut().insert(ConnectInfo(source));
+            request
+        };
+
+        let active_app = app.clone();
+        let active_request = make_request("/blocked", source);
+        let active = tokio::spawn(async move { active_app.oneshot(active_request).await });
+        entered.notified().await;
+
+        let rejected = app
+            .clone()
+            .oneshot(make_request("/blocked", source))
+            .await
+            .expect("over-capacity response");
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(rejected.headers()["retry-after"], "1");
+
+        let healthy = app
+            .clone()
+            .oneshot(make_request("/healthz", source))
+            .await
+            .expect("health response while saturated");
+        assert_eq!(healthy.status(), StatusCode::OK);
+        let metrics = app
+            .oneshot(make_request(
+                "/metrics",
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12346),
+            ))
+            .await
+            .expect("metrics response while saturated");
+        assert_eq!(metrics.status(), StatusCode::OK);
+        let metrics_body = axum::body::to_bytes(metrics.into_body(), 16 * 1024)
+            .await
+            .expect("metrics body");
+        assert!(
+            String::from_utf8_lossy(&metrics_body)
+                .contains("mini_tunnel_coordinator_concurrency_rejected_total 1\n")
+        );
+        assert_eq!(
+            state.concurrency_rejections_total.load(Ordering::Relaxed),
+            1
+        );
+
+        release.notify_one();
+        assert_eq!(
+            active
+                .await
+                .expect("active request task")
+                .expect("response")
+                .status(),
+            StatusCode::OK
+        );
+    }
 
     #[tokio::test]
     async fn coordinator_shutdown_accepts_either_signal_source() {
