@@ -1403,23 +1403,36 @@ pub async fn accept_peer(
     if expected_peer_id != mini_tunnel_protocol::device_id_from_public_key(&expected_peer_key) {
         return Err(IdentityError::UnauthorizedPeer);
     }
-    let incoming = tokio::time::timeout(PEER_HANDSHAKE_TIMEOUT, endpoint.accept())
-        .await
-        .map_err(|error| IdentityError::Transport(error.to_string()))?
-        .ok_or_else(|| IdentityError::Transport("endpoint closed".to_owned()))?;
-    let connection = tokio::time::timeout(PEER_HANDSHAKE_TIMEOUT, incoming)
-        .await
-        .map_err(|error| IdentityError::Transport(error.to_string()))?
-        .map_err(|error| IdentityError::Transport(error.to_string()))?;
-    server_authenticate(
-        &connection,
+    accept_peer_with_timeout(
+        endpoint,
         network_id,
         identity,
         Some((expected_peer_id, expected_peer_key)),
-        None,
+        PEER_HANDSHAKE_TIMEOUT,
     )
-    .await?;
-    Ok(new_channel(connection, network_id))
+    .await
+}
+
+async fn accept_peer_with_timeout(
+    endpoint: &Endpoint,
+    network_id: &str,
+    identity: &Identity,
+    expected_peer: Option<(&str, [u8; 32])>,
+    timeout: Duration,
+) -> Result<PeerChannel, IdentityError> {
+    tokio::time::timeout(timeout, async {
+        let incoming = endpoint
+            .accept()
+            .await
+            .ok_or_else(|| IdentityError::Transport("endpoint closed".to_owned()))?;
+        let connection = incoming
+            .await
+            .map_err(|error| IdentityError::Transport(error.to_string()))?;
+        server_authenticate(&connection, network_id, identity, expected_peer, None).await?;
+        Ok(new_channel(connection, network_id))
+    })
+    .await
+    .map_err(|error| IdentityError::Transport(error.to_string()))?
 }
 
 /// Accept the next authenticated member from an allowlist, returning its identity for demux.
@@ -3020,6 +3033,60 @@ mod tests {
         accepted.close_async().await;
         stalled_connection.close(0_u32.into(), b"test complete");
         endpoint_a.close(0_u32.into(), b"test complete");
+        endpoint_b.close(0_u32.into(), b"test complete");
+        endpoint_c.close(0_u32.into(), b"test complete");
+        fs::remove_dir_all(temp).expect("remove test identities");
+    }
+
+    #[tokio::test]
+    async fn single_peer_accept_uses_one_total_authentication_deadline() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-quic-total-deadline-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let b = std::sync::Arc::new(
+            Identity::load_or_create_at(temp.join("b/device.key")).expect("identity B"),
+        );
+        let c = Identity::load_or_create_at(temp.join("c/device.key")).expect("identity C");
+        let endpoint_b = peer_endpoint(&b, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .expect("endpoint B");
+        let endpoint_c = peer_endpoint(&c, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .expect("endpoint C");
+        let remote_addr = endpoint_b.local_addr().expect("B address");
+        let expected_peer_id = c.device_id();
+        let expected_peer_key = c.public_key();
+        let accept_endpoint = endpoint_b.clone();
+        let accept_identity = std::sync::Arc::clone(&b);
+        let started = tokio::time::Instant::now();
+        let accept = tokio::spawn(async move {
+            accept_peer_with_timeout(
+                &accept_endpoint,
+                "deadline-net",
+                &accept_identity,
+                Some((&expected_peer_id, expected_peer_key)),
+                Duration::from_millis(300),
+            )
+            .await
+        });
+        let stalled_connection = endpoint_c
+            .connect_with(
+                peer_client_config(
+                    b.public_key(),
+                    std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+                )
+                .expect("peer client config"),
+                remote_addr,
+                "mini-tunnel",
+            )
+            .expect("start peer connection")
+            .await
+            .expect("complete QUIC handshake");
+
+        let result = accept.await.expect("accept task");
+        assert!(result.is_err(), "stalled authentication must time out");
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        stalled_connection.close(0_u32.into(), b"test complete");
         endpoint_b.close(0_u32.into(), b"test complete");
         endpoint_c.close(0_u32.into(), b"test complete");
         fs::remove_dir_all(temp).expect("remove test identities");
