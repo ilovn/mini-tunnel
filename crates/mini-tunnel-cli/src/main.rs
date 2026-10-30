@@ -1743,6 +1743,44 @@ async fn select_ice_peer_address(
     }
 }
 
+async fn refresh_peer_snapshot_for_ice(
+    coordinator_url: &str,
+    network_id: &str,
+    expected_peer: &PeerInfo,
+    identity: &mini_tunnel_agent::Identity,
+) -> Result<PeerInfo, Box<dyn std::error::Error + Send + Sync>> {
+    let current = discover_peer(
+        coordinator_url,
+        network_id,
+        &expected_peer.device_id,
+        identity,
+    )
+    .await?;
+    if current.public_key != expected_peer.public_key
+        || current.assigned_ipv4 != expected_peer.assigned_ipv4
+    {
+        return Err("peer identity or overlay address changed during ICE recovery".into());
+    }
+    Ok(current)
+}
+
+async fn select_current_ice_peer_address(
+    endpoint: &TunnelEndpoint,
+    coordinator_url: &str,
+    network_id: &str,
+    expected_peer: &PeerInfo,
+    identity: &mini_tunnel_agent::Identity,
+) -> Option<SocketAddr> {
+    match refresh_peer_snapshot_for_ice(coordinator_url, network_id, expected_peer, identity).await
+    {
+        Ok(current) => select_ice_peer_address(endpoint, &current, identity).await,
+        Err(error) => {
+            tracing::warn!(peer_id = %expected_peer.device_id, %error, "could not refresh peer credentials for ICE recovery");
+            None
+        }
+    }
+}
+
 async fn connect_mesh_peer(
     endpoint: &TunnelEndpoint,
     network_id: &str,
@@ -1882,7 +1920,14 @@ fn build_mesh_peer_connectors(
                 let peer = peer.clone();
                 Box::pin(async move {
                     if !force_reliable {
-                        let _ = select_ice_peer_address(&endpoint, &peer, &identity).await;
+                        let _ = select_current_ice_peer_address(
+                            &endpoint,
+                            &coordinator_url,
+                            &network_id,
+                            &peer,
+                            &identity,
+                        )
+                        .await;
                     }
                     let direct_wait = if force_reliable { 35 } else { 65 };
                     if let Ok(Some(channel)) =
@@ -1935,14 +1980,25 @@ fn build_mesh_peer_connectors(
         let receiver = std::sync::Arc::clone(&receiver);
         let endpoint = endpoint.clone();
         let identity = std::sync::Arc::clone(&identity);
+        let coordinator_url = coordinator_url.clone();
+        let network_id = network_id.clone();
         let peer = peer.clone();
         std::sync::Arc::new(move |_| -> mini_tunnel_agent::tunnel::PeerConnectFuture {
             let receiver = std::sync::Arc::clone(&receiver);
             let endpoint = endpoint.clone();
             let identity = std::sync::Arc::clone(&identity);
+            let coordinator_url = coordinator_url.clone();
+            let network_id = network_id.clone();
             let peer = peer.clone();
             Box::pin(async move {
-                let _ = select_ice_peer_address(&endpoint, &peer, &identity).await;
+                let _ = select_current_ice_peer_address(
+                    &endpoint,
+                    &coordinator_url,
+                    &network_id,
+                    &peer,
+                    &identity,
+                )
+                .await;
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
                 loop {
                     let channel = tokio::time::timeout_at(deadline, async {
@@ -2986,6 +3042,12 @@ fn print_tunnel_ready(
 mod tests {
     use super::*;
 
+    async fn ice_peer_snapshot_handler(
+        axum::extract::State(peers): axum::extract::State<Vec<PeerInfo>>,
+    ) -> axum::Json<PeerListResponse> {
+        axum::Json(PeerListResponse { peers })
+    }
+
     #[tokio::test]
     async fn shutdown_signal_accepts_either_signal_source() {
         let result = select_shutdown_signal(
@@ -3001,6 +3063,62 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn passive_ice_recovery_refreshes_credentials_and_checks_member_identity() {
+        let temp =
+            std::env::temp_dir().join(format!("mini-tunnel-refresh-ice-{}", uuid::Uuid::new_v4()));
+        let identity = mini_tunnel_agent::Identity::load_or_create_at(temp.join("device.key"))
+            .expect("local identity");
+        let peer_identity = mini_tunnel_agent::Identity::load_or_create_at(temp.join("peer.key"))
+            .expect("peer identity");
+        let old_credentials =
+            mini_tunnel_agent::ice::generate_ice_credentials(1).expect("old peer ICE credentials");
+        let fresh_credentials = mini_tunnel_agent::ice::generate_ice_credentials(2)
+            .expect("fresh peer ICE credentials");
+        let expected_peer = PeerInfo {
+            device_id: peer_identity.device_id(),
+            assigned_ipv4: "10.77.0.2".to_owned(),
+            public_key: peer_identity.public_key_encoded(),
+            candidates: vec!["127.0.0.1:42000".to_owned()],
+            ice_credentials: Some(old_credentials),
+        };
+        let current_peer = PeerInfo {
+            ice_credentials: Some(fresh_credentials.clone()),
+            candidates: vec!["127.0.0.1:43000".to_owned()],
+            ..expected_peer.clone()
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock coordinator");
+        let coordinator = listener.local_addr().expect("coordinator address");
+        let app = Router::new()
+            .route(
+                "/v1/networks/restart-net/peers",
+                axum::routing::post(ice_peer_snapshot_handler),
+            )
+            .with_state(vec![current_peer.clone()]);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let base_url = format!("http://{coordinator}");
+
+        let refreshed =
+            refresh_peer_snapshot_for_ice(&base_url, "restart-net", &expected_peer, &identity)
+                .await
+                .expect("refresh peer snapshot");
+        assert_eq!(refreshed.ice_credentials, Some(fresh_credentials));
+        assert_eq!(refreshed.candidates, current_peer.candidates);
+
+        let mut changed_member = expected_peer.clone();
+        changed_member.assigned_ipv4 = "10.77.0.9".to_owned();
+        assert!(
+            refresh_peer_snapshot_for_ice(&base_url, "restart-net", &changed_member, &identity,)
+                .await
+                .is_err()
+        );
+
+        server.abort();
+        std::fs::remove_dir_all(temp).expect("remove test identities");
     }
 
     #[test]
