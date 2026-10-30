@@ -342,15 +342,6 @@ mod tests {
                 run(&["-n", namespace, "link", "set", "dev", device, "up"]);
             }
             run(&["-n", &client, "route", "add", "default", "via", "10.77.0.1"]);
-            run(&[
-                "-n",
-                &server,
-                "route",
-                "add",
-                "10.77.0.0/24",
-                "via",
-                "198.18.0.1",
-            ]);
             router(&router_ns, "sysctl", &["-w", "net.ipv4.ip_forward=1"]);
             router(
                 &router_ns,
