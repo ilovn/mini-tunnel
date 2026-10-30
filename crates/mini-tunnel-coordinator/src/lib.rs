@@ -1536,6 +1536,7 @@ async fn migrate_postgres(pool: &PgPool) -> io::Result<()> {
         "CREATE TABLE IF NOT EXISTS mini_tunnel_invites (network_id UUID NOT NULL REFERENCES mini_tunnel_networks(network_id) ON DELETE CASCADE, token_hash BYTEA NOT NULL CHECK (octet_length(token_hash) = 32), consumed_by TEXT, expires_at_ms BIGINT NOT NULL CHECK (expires_at_ms >= 0), PRIMARY KEY (network_id, token_hash))",
         "CREATE TABLE IF NOT EXISTS mini_tunnel_ice_credentials (network_id UUID NOT NULL, device_id TEXT NOT NULL, ufrag TEXT NOT NULL, password TEXT NOT NULL, generation BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL, request_timestamp_ms BIGINT NOT NULL, PRIMARY KEY (network_id, device_id))",
         "CREATE TABLE IF NOT EXISTS mini_tunnel_relay_pairs (network_id UUID NOT NULL, device_a TEXT NOT NULL, device_b TEXT NOT NULL, session_id BYTEA NOT NULL CHECK (octet_length(session_id) = 16), expires_at_ms BIGINT NOT NULL, first_device TEXT NOT NULL, PRIMARY KEY (network_id, device_a, device_b))",
+        "CREATE TABLE IF NOT EXISTS mini_tunnel_rate_limit_buckets (source_ip TEXT PRIMARY KEY, window_started_at TIMESTAMPTZ NOT NULL, request_count INTEGER NOT NULL CHECK (request_count > 0))",
     ];
     let mut transaction = pool.begin().await.map_err(database_sql_error)?;
     for statement in MIGRATIONS {
@@ -1940,6 +1941,82 @@ fn database_sql_error(error: sqlx::Error) -> io::Error {
     database_operation_error()
 }
 
+async fn allow_postgres_request(
+    pool: &PgPool,
+    source_ip: IpAddr,
+    max_requests: usize,
+    window: Duration,
+    max_sources: usize,
+) -> Result<bool, sqlx::Error> {
+    let source_ip = match source_ip {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(address)),
+        address => address,
+    }
+    .to_string();
+    let max_requests = i32::try_from(max_requests).unwrap_or(i32::MAX);
+    let window_ms = i64::try_from(window.as_millis()).unwrap_or(i64::MAX);
+    let mut transaction = pool.begin().await?;
+    if let Some(allowed) =
+        update_postgres_rate_limit_bucket(&mut transaction, &source_ip, max_requests, window_ms)
+            .await?
+    {
+        transaction.commit().await?;
+        return Ok(allowed);
+    }
+
+    // Serialize only new-source admission so the bucket table cannot grow beyond its cap.
+    sqlx::query("SELECT pg_advisory_xact_lock(778231904, 1)")
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query(
+        "DELETE FROM mini_tunnel_rate_limit_buckets WHERE window_started_at + ($1 * INTERVAL '1 millisecond') <= clock_timestamp()",
+    )
+    .bind(window_ms)
+    .execute(&mut *transaction)
+    .await?;
+    if let Some(allowed) =
+        update_postgres_rate_limit_bucket(&mut transaction, &source_ip, max_requests, window_ms)
+            .await?
+    {
+        transaction.commit().await?;
+        return Ok(allowed);
+    }
+    let sources: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mini_tunnel_rate_limit_buckets")
+        .fetch_one(&mut *transaction)
+        .await?;
+    if sources >= i64::try_from(max_sources).unwrap_or(i64::MAX) {
+        transaction.commit().await?;
+        return Ok(false);
+    }
+    sqlx::query(
+        "INSERT INTO mini_tunnel_rate_limit_buckets (source_ip, window_started_at, request_count) VALUES ($1, clock_timestamp(), 1)",
+    )
+    .bind(source_ip)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+async fn update_postgres_rate_limit_bucket(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    source_ip: &str,
+    max_requests: i32,
+    window_ms: i64,
+) -> Result<Option<bool>, sqlx::Error> {
+    sqlx::query_scalar(
+        "UPDATE mini_tunnel_rate_limit_buckets SET window_started_at = CASE WHEN window_started_at + ($2 * INTERVAL '1 millisecond') <= clock_timestamp() THEN clock_timestamp() ELSE window_started_at END, request_count = CASE WHEN window_started_at + ($2 * INTERVAL '1 millisecond') <= clock_timestamp() THEN 1 WHEN request_count <= $3 THEN request_count + 1 ELSE request_count END WHERE source_ip = $1 RETURNING request_count <= $3",
+    )
+    .bind(source_ip)
+    .bind(window_ms)
+    .bind(max_requests)
+    .fetch_optional(&mut **transaction)
+    .await
+}
+
 fn database_connection_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::ConnectionRefused,
@@ -2149,23 +2226,44 @@ async fn limit_requests(
     };
     let loopback_metrics = request.uri().path() == "/metrics" && remote.ip().is_loopback();
     let client_ip = client_ip_for_request(remote, request.headers(), &state.trusted_proxies);
-    if !loopback_metrics && !state.request_limiter.allow(client_ip, Instant::now()) {
-        state
-            .request_limiter
-            .rejected_total
-            .fetch_add(1, Ordering::Relaxed);
-        let mut response = (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(ApiErrorResponse {
-                error: "rate_limited".to_owned(),
-                message: "request rate limit exceeded".to_owned(),
-            }),
-        )
-            .into_response();
-        response
-            .headers_mut()
-            .insert("retry-after", HeaderValue::from_static("60"));
-        return response;
+    if !loopback_metrics {
+        let allowed = if let Some(pool) = &state.postgres {
+            match allow_postgres_request(
+                pool,
+                client_ip,
+                MAX_REQUESTS_PER_MINUTE_PER_IP,
+                RATE_LIMIT_WINDOW,
+                MAX_RATE_LIMIT_CLIENTS,
+            )
+            .await
+            {
+                Ok(allowed) => allowed,
+                Err(error) => {
+                    tracing::error!(error = %error, "coordinator PostgreSQL rate limiter failed");
+                    return database_unavailable_response();
+                }
+            }
+        } else {
+            state.request_limiter.allow(client_ip, Instant::now())
+        };
+        if !allowed {
+            state
+                .request_limiter
+                .rejected_total
+                .fetch_add(1, Ordering::Relaxed);
+            let mut response = (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ApiErrorResponse {
+                    error: "rate_limited".to_owned(),
+                    message: "request rate limit exceeded".to_owned(),
+                }),
+            )
+                .into_response();
+            response
+                .headers_mut()
+                .insert("retry-after", HeaderValue::from_static("60"));
+            return response;
+        }
     }
     let _permit = if matches!(request.uri().path(), "/healthz" | "/metrics") {
         None
@@ -4304,6 +4402,7 @@ mod tests {
         .await
         .expect("lock disposable database for reset");
         for table in [
+            "mini_tunnel_rate_limit_buckets",
             "mini_tunnel_ice_credentials",
             "mini_tunnel_relay_pairs",
             "mini_tunnel_invites",
@@ -4335,6 +4434,70 @@ mod tests {
         assert!(
             !can_create_schema_objects,
             "Coordinator runtime role must not have schema DDL privileges"
+        );
+        let mut rate_checks = tokio::task::JoinSet::new();
+        for _ in 0..12 {
+            let rate_pool = Arc::clone(app_pool);
+            rate_checks.spawn(async move {
+                allow_postgres_request(
+                    &rate_pool,
+                    IpAddr::V4(Ipv4Addr::new(192, 0, 2, 200)),
+                    2,
+                    Duration::from_secs(60),
+                    2,
+                )
+                .await
+                .expect("shared limiter query")
+            });
+        }
+        let mut allowed_rate_checks = 0;
+        while let Some(result) = rate_checks.join_next().await {
+            allowed_rate_checks += usize::from(result.expect("rate check task"));
+        }
+        assert_eq!(
+            allowed_rate_checks, 2,
+            "replicas share one atomic IP bucket"
+        );
+        sqlx::query(
+            "UPDATE mini_tunnel_rate_limit_buckets SET window_started_at = clock_timestamp() - INTERVAL '2 minutes', request_count = 2 WHERE source_ip = '192.0.2.200'",
+        )
+        .execute(app_pool.as_ref())
+        .await
+        .expect("expire rate limit bucket");
+        assert!(
+            allow_postgres_request(
+                app_pool,
+                IpAddr::V6("::ffff:192.0.2.200".parse().expect("mapped IPv6")),
+                2,
+                Duration::from_secs(60),
+                2,
+            )
+            .await
+            .expect("reset expired shared bucket"),
+            "mapped IPv6 shares and resets the canonical IPv4 bucket"
+        );
+        assert!(
+            allow_postgres_request(
+                app_pool,
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 201)),
+                2,
+                Duration::from_secs(60),
+                2,
+            )
+            .await
+            .expect("admit second source"),
+        );
+        assert!(
+            !allow_postgres_request(
+                app_pool,
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 202)),
+                2,
+                Duration::from_secs(60),
+                2,
+            )
+            .await
+            .expect("reject source beyond table cap"),
+            "rate limiter source table remains bounded"
         );
         let app_a = router_with_state(state_a.clone());
         let app_b = router_with_state(state_b.clone());
@@ -4611,7 +4774,34 @@ mod tests {
             .expect("readiness test pool")
             .close()
             .await;
-        let health = get_from_router(router_with_state(unavailable), "/healthz").await;
+        assert!(
+            allow_postgres_request(
+                unavailable
+                    .postgres
+                    .as_ref()
+                    .expect("closed rate-limit pool"),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                2,
+                Duration::from_secs(60),
+                2,
+            )
+            .await
+            .is_err(),
+            "shared limiter database errors must be observable and fail closed"
+        );
+        let unavailable_app = router_with_state(unavailable);
+        let unavailable_write = post_json(
+            unavailable_app.clone(),
+            "/v1/networks",
+            &create_request("unavailable", "10.253.0.0/24"),
+        )
+        .await;
+        assert_eq!(
+            unavailable_write.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "API writes must fail closed when the shared rate limiter cannot be read"
+        );
+        let health = get_from_router(unavailable_app, "/healthz").await;
         assert_eq!(
             health.status(),
             StatusCode::SERVICE_UNAVAILABLE,

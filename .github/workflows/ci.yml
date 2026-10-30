@@ -85,7 +85,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           cargo install cargo-audit --version 0.22.2 --locked
-          cargo audit
+          # rsa is an unbuilt optional dependency of SQLx's disabled MySQL driver; the advisory has no fix.
+          cargo audit --ignore RUSTSEC-2023-0071
 
       - name: Run workspace tests
         run: cargo +stable test --workspace
