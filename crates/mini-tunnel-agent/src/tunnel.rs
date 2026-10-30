@@ -1081,6 +1081,18 @@ mod tests {
             .expect("join accept task")
             .expect("accept peer");
         assert_eq!(channel_a.transport_name(), "QUIC/UDP");
+        let (received_tx, mut received_rx) = mpsc::channel(1);
+        let responder = Arc::new(channel_b);
+        let responder_task = {
+            let responder = Arc::clone(&responder);
+            tokio::spawn(async move {
+                while let Ok(packet) = responder.recv_packet().await {
+                    if received_tx.send(packet).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        };
         let missed_before = channel_a.health_snapshot().probes_missed;
         link.drop_left_egress();
         for _ in 0..24 {
@@ -1117,12 +1129,13 @@ mod tests {
             .send_packet(&large_packet)
             .await
             .expect("fragment maximum-sized overlay packet after reducing veth MTU");
-        let received = tokio::time::timeout(Duration::from_secs(3), channel_b.recv_packet())
+        let received = tokio::time::timeout(Duration::from_secs(3), received_rx.recv())
             .await
             .expect("receive reassembled packet over constrained veth")
-            .expect("reassemble packet");
+            .expect("responder receives reassembled packet");
         assert_eq!(received, large_packet);
 
+        responder_task.abort();
         endpoint_a.close(0_u32.into(), b"veth test complete");
         endpoint_b.close(0_u32.into(), b"veth test complete");
         drop(link);
