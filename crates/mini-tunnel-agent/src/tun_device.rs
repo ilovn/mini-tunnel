@@ -690,13 +690,21 @@ mod tests {
             .send_to(b"outbound through Wintun peer route", (peer_ipv4, 4242))
             .await
             .expect("send UDP datagram to peer overlay address");
-        let outbound = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            device.read_outbound_packet(),
-        )
+        let outbound = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let candidate = device
+                    .read_outbound_packet()
+                    .await
+                    .expect("read validated local-originated packet from Wintun");
+                if packet_addresses(&candidate).ok()
+                    == Some((IpAddr::V4(local_ipv4), IpAddr::V4(peer_ipv4)))
+                {
+                    break candidate;
+                }
+            }
+        })
         .await
-        .expect("kernel-routed datagram reaches Wintun")
-        .expect("read validated local-originated packet from Wintun");
+        .expect("kernel-routed datagram reaches Wintun");
         let (source, destination) =
             packet_addresses(&outbound).expect("parse outbound Wintun packet");
         assert_eq!(source, IpAddr::V4(local_ipv4));
