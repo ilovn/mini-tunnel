@@ -905,6 +905,110 @@ mod tests {
         peer_tcp_listener,
     };
 
+    #[cfg(target_os = "linux")]
+    struct TestVethPair {
+        left: String,
+        loss_active: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl TestVethPair {
+        fn create() -> (Self, SocketAddr, SocketAddr) {
+            fn run(command: &str, args: &[&str]) {
+                let output = std::process::Command::new(command)
+                    .args(args)
+                    .output()
+                    .unwrap_or_else(|error| panic!("run {command}: {error}"));
+                assert!(
+                    output.status.success(),
+                    "{command} {args:?} failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+
+            let pid = std::process::id();
+            let left = format!("mtl{}", pid % 10_000_000);
+            let right = format!("mtr{}", pid % 10_000_000);
+            let subnet = (pid % 250 + 1) as u8;
+            let local: SocketAddr = format!("198.18.{subnet}.1:0").parse().unwrap();
+            let remote: SocketAddr = format!("198.18.{subnet}.2:0").parse().unwrap();
+            run(
+                "ip",
+                &["link", "add", &left, "type", "veth", "peer", "name", &right],
+            );
+            let pair = Self {
+                left: left.clone(),
+                loss_active: false,
+            };
+            run(
+                "ip",
+                &[
+                    "address",
+                    "add",
+                    &format!("198.18.{subnet}.1/30"),
+                    "dev",
+                    &left,
+                ],
+            );
+            run(
+                "ip",
+                &[
+                    "address",
+                    "add",
+                    &format!("198.18.{subnet}.2/30"),
+                    "dev",
+                    &right,
+                ],
+            );
+            run("ip", &["link", "set", "dev", &left, "up"]);
+            run("ip", &["link", "set", "dev", &right, "up"]);
+            (pair, local, remote)
+        }
+
+        fn drop_left_egress(&mut self) {
+            let output = std::process::Command::new("tc")
+                .args([
+                    "qdisc", "replace", "dev", &self.left, "root", "netem", "loss", "100%",
+                ])
+                .output()
+                .expect("run tc to drop QUIC datagrams on veth egress");
+            assert!(
+                output.status.success(),
+                "tc netem loss failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            self.loss_active = true;
+        }
+
+        fn restore_left_egress(&mut self) {
+            if !self.loss_active {
+                return;
+            }
+            let output = std::process::Command::new("tc")
+                .args(["qdisc", "del", "dev", &self.left, "root"])
+                .output()
+                .expect("remove tc loss qdisc from veth egress");
+            assert!(
+                output.status.success(),
+                "could not remove tc loss qdisc: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            self.loss_active = false;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for TestVethPair {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tc")
+                .args(["qdisc", "del", "dev", &self.left, "root"])
+                .output();
+            let _ = std::process::Command::new("ip")
+                .args(["link", "del", "dev", &self.left])
+                .output();
+        }
+    }
+
     #[test]
     fn mesh_event_queue_capacity_is_bounded_at_maximum_network_size() {
         assert_eq!(mesh_event_queue_capacity(0), MESH_EVENT_QUEUE_PER_PEER);
@@ -918,6 +1022,88 @@ mod tests {
             MAX_MESH_EVENT_QUEUE_CAPACITY * crate::MAX_TUN_PACKET,
             9_216_000
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires root privileges, iproute2, and tc netem"]
+    async fn privileged_linux_veth_quic_probe_loss_and_recovery() {
+        let (mut link, local_address, remote_address) = TestVethPair::create();
+        let temp =
+            std::env::temp_dir().join(format!("mini-tunnel-veth-loss-{}", uuid::Uuid::new_v4()));
+        let identity_a = Identity::load_or_create_at(temp.join("a/device.key")).unwrap();
+        let identity_b = Identity::load_or_create_at(temp.join("b/device.key")).unwrap();
+        let endpoint_a = peer_endpoint(&identity_a, local_address).expect("endpoint A");
+        let endpoint_b = peer_endpoint(&identity_b, remote_address).expect("endpoint B");
+        let peer_id = identity_a.device_id();
+        let peer_key = identity_a.public_key();
+        let accept_endpoint = endpoint_b.clone();
+        let accept_identity = Arc::new(identity_b);
+        let accept_peer_identity = Arc::clone(&accept_identity);
+        let accept = tokio::spawn(async move {
+            accept_peer(
+                &accept_endpoint,
+                "veth-loss-test",
+                &accept_peer_identity,
+                &peer_id,
+                peer_key,
+            )
+            .await
+        });
+        let channel_a = connect_peer(
+            &endpoint_a,
+            endpoint_b.local_addr().expect("endpoint B socket address"),
+            "veth-loss-test",
+            &identity_a,
+            &accept_identity.device_id(),
+            accept_identity.public_key(),
+        )
+        .await
+        .expect("establish QUIC over veth before loss");
+        let channel_b = accept
+            .await
+            .expect("join accept task")
+            .expect("accept peer");
+        assert_eq!(channel_a.transport_name(), "QUIC/UDP");
+        let responder = Arc::new(channel_b);
+        let responder_task = {
+            let responder = Arc::clone(&responder);
+            tokio::spawn(async move { while responder.recv_packet().await.is_ok() {} })
+        };
+
+        let missed_before = channel_a.health_snapshot().probes_missed;
+        link.drop_left_egress();
+        for _ in 0..24 {
+            channel_a
+                .send_keepalive()
+                .await
+                .expect("QUIC accepts probe before network egress loss");
+            if channel_a.health_snapshot().probes_missed > missed_before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let lost = channel_a.health_snapshot();
+        assert!(
+            lost.probes_missed > missed_before,
+            "real veth loss did not increase missed probes: {lost:?}"
+        );
+        link.restore_left_egress();
+
+        let succeeded_before = channel_a.health_snapshot().probes_succeeded;
+        channel_a
+            .probe_health(3, Duration::from_secs(2))
+            .await
+            .expect("authenticated probes recover after removing network loss");
+        let recovered = channel_a.health_snapshot();
+        assert!(recovered.probes_succeeded >= succeeded_before + 3);
+        assert_eq!(channel_a.transport_name(), "QUIC/UDP");
+
+        responder_task.abort();
+        endpoint_a.close(0_u32.into(), b"veth test complete");
+        endpoint_b.close(0_u32.into(), b"veth test complete");
+        drop(link);
+        fs::remove_dir_all(temp).expect("remove test identities");
     }
 
     #[tokio::test]

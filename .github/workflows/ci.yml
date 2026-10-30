@@ -116,6 +116,8 @@ jobs:
           )"
           sudo modprobe tun || true
           sudo "$test_binary" --exact tun_device::tests::privileged_linux_tun_assigns_addresses_mtu_and_cleans_up --ignored --nocapture
+          command -v tc
+          sudo "$test_binary" --exact tunnel::tests::privileged_linux_veth_quic_probe_loss_and_recovery --ignored --nocapture
 
       - name: Run privileged Windows Wintun packet round trip
         if: runner.os == 'Windows'
