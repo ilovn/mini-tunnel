@@ -1161,8 +1161,8 @@ mod tests {
                 .unwrap(),
         );
         let remote_initial = accept_udp.await.unwrap().unwrap();
-        // Seed three poor samples, then keep raising the counters so each shortened test window
-        // observes sustained high RTT without waiting through production's 90-second hysteresis.
+        // Seed a high-RTT window, then drive >20% loss with healthy RTT so recovery covers both
+        // quality signals without waiting through production's 90-second hysteresis.
         {
             let mut health = initial.health.lock().unwrap();
             health.rtt = Some(Duration::from_millis(500));
@@ -1208,11 +1208,16 @@ mod tests {
         };
         let health_channel = Arc::clone(&initial);
         let health_driver = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            if let Ok(mut health) = health_channel.health.lock() {
+                health.rtt = Some(Duration::from_millis(50));
+            }
             for _ in 0..32 {
                 tokio::time::sleep(Duration::from_millis(20)).await;
-                let mut health = health_channel.health.lock().unwrap();
-                health.rtt = Some(Duration::from_millis(500));
-                health.probes_succeeded = health.probes_succeeded.saturating_add(1);
+                if let Ok(mut health) = health_channel.health.lock() {
+                    health.probes_succeeded = health.probes_succeeded.saturating_add(2);
+                    health.probes_missed = health.probes_missed.saturating_add(1);
+                }
             }
         });
         let pump = tokio::spawn(async move {
