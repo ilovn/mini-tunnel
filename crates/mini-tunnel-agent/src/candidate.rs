@@ -48,11 +48,11 @@ pub fn parse_signaled_candidate(value: &str) -> Option<SignaledCandidate> {
             CandidateType::Host,
         )
     };
-    if address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {
+    if !usable_candidate_address(address) {
         return None;
     }
     if let CandidateType::ServerReflexive { related_address } = candidate_type
-        && (related_address.port() == 0 || related_address.ip().is_multicast())
+        && !usable_candidate_address(related_address)
     {
         return None;
     }
@@ -61,6 +61,13 @@ pub fn parse_signaled_candidate(value: &str) -> Option<SignaledCandidate> {
         transport,
         candidate_type,
     })
+}
+
+fn usable_candidate_address(address: SocketAddr) -> bool {
+    if address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {
+        return false;
+    }
+    !matches!(address.ip(), std::net::IpAddr::V4(ip) if ip == std::net::Ipv4Addr::BROADCAST)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -241,5 +248,22 @@ mod tests {
             checklist.checks()[0].address,
             "203.0.113.7:5000".parse().unwrap()
         );
+    }
+
+    #[test]
+    fn rejects_broadcast_and_unusable_server_reflexive_related_addresses() {
+        for candidate in [
+            "255.255.255.255:42000",
+            "srflx://203.0.113.7:5000|0.0.0.0:4000",
+            "srflx://203.0.113.7:5000|255.255.255.255:4000",
+            "srflx://203.0.113.7:5000|224.0.0.1:4000",
+            "srflx://203.0.113.7:5000|[::]:4000",
+            "srflx://203.0.113.7:5000|192.168.1.4:0",
+        ] {
+            assert!(
+                parse_signaled_candidate(candidate).is_none(),
+                "accepted unusable candidate {candidate}"
+            );
+        }
     }
 }
