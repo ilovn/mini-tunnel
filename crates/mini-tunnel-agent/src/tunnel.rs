@@ -704,6 +704,47 @@ mod tests {
         assert!(tracker.observe(snapshot));
     }
 
+    #[test]
+    fn path_quality_uses_packet_loss_threshold_with_three_window_hysteresis() {
+        let mut tracker = PathQualityTracker::default();
+        let mut snapshot = crate::PeerHealthSnapshot {
+            rtt: Some(Duration::from_millis(50)),
+            probes_succeeded: 0,
+            probes_missed: 0,
+        };
+
+        // Exactly 20% loss is not above the configured degradation threshold.
+        snapshot.probes_succeeded += 4;
+        snapshot.probes_missed += 1;
+        assert!(!tracker.observe(snapshot));
+
+        // 1/3 loss is poor, but must persist for three consecutive windows.
+        for window in 0..2 {
+            snapshot.probes_succeeded += 2;
+            snapshot.probes_missed += 1;
+            assert!(
+                !tracker.observe(snapshot),
+                "packet loss window {window} must not trigger a switch"
+            );
+        }
+
+        // One healthy window clears the accumulated bad-window count.
+        snapshot.probes_succeeded += 5;
+        assert!(!tracker.observe(snapshot));
+
+        for window in 0..2 {
+            snapshot.probes_succeeded += 2;
+            snapshot.probes_missed += 1;
+            assert!(
+                !tracker.observe(snapshot),
+                "packet loss window {window} after reset must not trigger a switch"
+            );
+        }
+        snapshot.probes_succeeded += 2;
+        snapshot.probes_missed += 1;
+        assert!(tracker.observe(snapshot));
+    }
+
     struct MockPacketIo {
         outbound: Mutex<mpsc::Receiver<Vec<u8>>>,
         inbound: mpsc::Sender<Vec<u8>>,
