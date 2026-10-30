@@ -66,6 +66,14 @@ def main() -> None:
         if missing:
             details = ", ".join(f"{key}={value!r}" for key, value in missing.items())
             raise SystemExit(f"{unit}: missing or incorrect service settings: {details}")
+        if unit.startswith("mini-tunnel-coordinator"):
+            command = values.get("ExecStart", "")
+            if "--listen 127.0.0.1:8443" not in command:
+                raise SystemExit(f"{unit}: coordinator must stay bound to loopback")
+            if "--trusted-proxies 127.0.0.1/32" not in command:
+                raise SystemExit(
+                    f"{unit}: local reverse proxy CIDR must be trusted for client rate limits"
+                )
         print(f"{unit}: sandbox settings verified")
 
 
