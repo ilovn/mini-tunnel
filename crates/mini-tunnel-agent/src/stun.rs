@@ -998,6 +998,10 @@ mod tests {
         )
         .expect("construct client B ICE agent");
 
+        let mut sent_a = 0_usize;
+        let mut sent_b = 0_usize;
+        let mut received_a = Vec::new();
+        let mut received_b = Vec::new();
         for _ in 0..900 {
             let now = std::time::Instant::now();
             driver_a.handle_timeout(now).expect("tick client A ICE");
@@ -1007,16 +1011,19 @@ mod tests {
                     .send_to(&transmit.message, transmit.transport.peer_addr)
                     .await
                     .expect("send client A ICE check");
+                sent_a += 1;
             }
             for transmit in driver_b.poll_transmits() {
                 socket_b
                     .send_to(&transmit.message, transmit.transport.peer_addr)
                     .await
                     .expect("send client B ICE check");
+                sent_b += 1;
             }
 
             let mut packet = [0; MAX_STUN_MESSAGE];
             while let Ok((length, source)) = socket_a.try_recv_from(&mut packet) {
+                received_a.push(source);
                 assert!(
                     driver_a
                         .handle_datagram(now, source, None, &packet[..length])
@@ -1024,6 +1031,7 @@ mod tests {
                 );
             }
             while let Ok((length, source)) = socket_b.try_recv_from(&mut packet) {
+                received_b.push(source);
                 assert!(
                     driver_b
                         .handle_datagram(now, source, None, &packet[..length])
@@ -1036,12 +1044,13 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        let pair_a = driver_a
-            .selected_pair()
-            .expect("client A nominates direct pair through both NATs");
-        let pair_b = driver_b
-            .selected_pair()
-            .expect("client B nominates direct pair through both NATs");
+        let selected_a = driver_a.selected_pair();
+        let selected_b = driver_b.selected_pair();
+        eprintln!(
+            "dual-SNAT ICE: sent A={sent_a} B={sent_b}, received A={received_a:?} B={received_b:?}, selected A={selected_a:?} B={selected_b:?}"
+        );
+        let pair_a = selected_a.expect("client A nominates direct pair through both NATs");
+        let pair_b = selected_b.expect("client B nominates direct pair through both NATs");
         assert_eq!(pair_a.1, mapped_b);
         assert_eq!(pair_b.1, mapped_a);
         socket_a
