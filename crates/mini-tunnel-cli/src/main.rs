@@ -108,6 +108,19 @@ enum CoordinatorCommand {
         )]
         state_file: PathBuf,
     },
+    /// Validate and atomically back up a coordinator snapshot while the service is stopped.
+    BackupState {
+        /// Source coordinator state snapshot path.
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_COORDINATOR_STATE",
+            default_value_os_t = default_coordinator_state_path()
+        )]
+        state_file: PathBuf,
+        /// Destination snapshot path. Existing safe snapshots are atomically replaced.
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Check a running coordinator's health endpoint.
     Health {
         /// Coordinator base URL.
@@ -573,6 +586,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!(
                     "valid coordinator snapshot: {} networks, {} members, {} invites",
                     summary.networks, summary.members, summary.invites
+                );
+            }
+            CoordinatorCommand::BackupState { state_file, output } => {
+                let summary = mini_tunnel_coordinator::CoordinatorState::backup_persistent_state(
+                    &state_file,
+                    &output,
+                )
+                .await?;
+                println!(
+                    "backed up {} networks, {} members, {} invites to {}",
+                    summary.networks,
+                    summary.members,
+                    summary.invites,
+                    output.display()
                 );
             }
             CoordinatorCommand::Health { url } => {

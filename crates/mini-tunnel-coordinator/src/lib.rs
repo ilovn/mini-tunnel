@@ -342,6 +342,58 @@ impl IntoResponse for ApiError {
 }
 
 impl CoordinatorState {
+    /// Validate and atomically back up an existing snapshot while holding source and destination locks.
+    pub async fn backup_persistent_state(
+        source: impl Into<PathBuf>,
+        destination: impl Into<PathBuf>,
+    ) -> io::Result<StateSnapshotSummary> {
+        let source = source.into();
+        let destination = destination.into();
+        let source_metadata = fs::symlink_metadata(&source)?;
+        if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "coordinator backup source must be a regular non-symlink file",
+            ));
+        }
+        let source_path = fs::canonicalize(&source)?;
+        let source_state = Self::load(&source_path)?;
+        let destination_parent = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(FsPath::new("."));
+        fs::create_dir_all(destination_parent)?;
+        let destination_path = canonical_parented_path(&destination)?;
+        let source_lock_path = canonical_parented_path(&state_lock_path(&source_path)?)?;
+        let destination_lock_path = canonical_parented_path(&state_lock_path(&destination_path)?)?;
+        if source_path == destination_path
+            || source_path == destination_lock_path
+            || source_lock_path == destination_path
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "coordinator backup source and destination paths overlap",
+            ));
+        }
+        let _destination_lock = acquire_state_file_lock(&destination_path)?;
+        let store = source_state.inner.read().await;
+        let summary = StateSnapshotSummary {
+            networks: store.networks.len(),
+            members: store
+                .networks
+                .values()
+                .map(|network| network.members.len())
+                .sum(),
+            invites: store
+                .networks
+                .values()
+                .map(|network| network.invites.len())
+                .sum(),
+        };
+        persist_store(&destination_path, &store)?;
+        Ok(summary)
+    }
+
     /// Validate an existing snapshot while holding its process lock, then return aggregate counts.
     pub async fn verify_persistent_state(
         path: impl Into<PathBuf>,
@@ -922,20 +974,12 @@ impl CoordinatorState {
 }
 
 fn acquire_state_file_lock(path: &FsPath) -> io::Result<Arc<fs::File>> {
-    let file_name = path.file_name().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "coordinator state path has no filename",
-        )
-    })?;
+    let lock_path = state_lock_path(path)?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(FsPath::new("."));
     fs::create_dir_all(parent)?;
-    let mut lock_name = file_name.to_os_string();
-    lock_name.push(".lock");
-    let lock_path = path.with_file_name(lock_name);
     if let Ok(metadata) = fs::symlink_metadata(&lock_path) {
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(io::Error::new(
@@ -991,6 +1035,32 @@ fn acquire_state_file_lock(path: &FsPath) -> io::Result<Arc<fs::File>> {
         std::fs::TryLockError::Error(error) => error,
     })?;
     Ok(Arc::new(lock))
+}
+
+fn state_lock_path(path: &FsPath) -> io::Result<PathBuf> {
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "coordinator state path has no filename",
+        )
+    })?;
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".lock");
+    Ok(path.with_file_name(lock_name))
+}
+
+fn canonical_parented_path(path: &FsPath) -> io::Result<PathBuf> {
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "coordinator state path has no filename",
+        )
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(FsPath::new("."));
+    Ok(fs::canonicalize(parent)?.join(file_name))
 }
 
 fn open_regular_state_file(path: &FsPath) -> io::Result<fs::File> {
@@ -3559,6 +3629,123 @@ mod tests {
             CoordinatorState::verify_persistent_state(dir.join("missing.json"))
                 .await
                 .expect_err("missing state is not a valid backup")
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        fs::remove_dir_all(dir).expect("remove test directory");
+    }
+
+    #[tokio::test]
+    async fn snapshot_backup_is_atomic_locked_private_and_rejects_unsafe_sources() {
+        let dir = std::env::temp_dir().join(format!("mini-tunnel-state-backup-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create test directory");
+        let source = dir.join("coordinator.json");
+        let destination = dir.join("backups/coordinator.json");
+        fs::write(&source, br#"{"schema_version":1,"networks":[]}"#)
+            .expect("write source snapshot");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o600))
+                .expect("restrict source permissions");
+        }
+
+        let summary = CoordinatorState::backup_persistent_state(&source, &destination)
+            .await
+            .expect("create backup");
+        assert_eq!(
+            summary,
+            StateSnapshotSummary {
+                networks: 0,
+                members: 0,
+                invites: 0
+            }
+        );
+        assert_eq!(
+            CoordinatorState::verify_persistent_state(&destination)
+                .await
+                .expect("verify backup"),
+            summary
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&destination)
+                    .expect("backup metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        assert_eq!(
+            CoordinatorState::backup_persistent_state(&source, &source)
+                .await
+                .expect_err("reject source/destination alias")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let source_lock_path = state_lock_path(&source).expect("source lock path");
+        assert_eq!(
+            CoordinatorState::backup_persistent_state(&source, source_lock_path)
+                .await
+                .expect_err("reject a destination that aliases the source lock")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let live_source = CoordinatorState::load(&source).expect("lock source");
+        assert_eq!(
+            CoordinatorState::backup_persistent_state(&source, &destination)
+                .await
+                .expect_err("refuse a running source")
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(live_source);
+
+        let live_destination = CoordinatorState::load(&destination).expect("lock destination");
+        assert_eq!(
+            CoordinatorState::backup_persistent_state(&source, &destination)
+                .await
+                .expect_err("refuse to replace a running coordinator state")
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(live_destination);
+
+        #[cfg(unix)]
+        {
+            let target = dir.join("linked-target.json");
+            let symlink = dir.join("linked-backup.json");
+            fs::write(&target, b"preserve target").expect("write symlink target");
+            std::os::unix::fs::symlink(&target, &symlink).expect("create destination symlink");
+            assert_eq!(
+                CoordinatorState::backup_persistent_state(&source, &symlink)
+                    .await
+                    .expect_err("refuse symlink backup destination")
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                fs::read(&target).expect("target remains unchanged"),
+                b"preserve target"
+            );
+        }
+
+        fs::write(&source, b"corrupt").expect("corrupt source snapshot");
+        assert_eq!(
+            CoordinatorState::backup_persistent_state(&source, &destination)
+                .await
+                .expect_err("reject corrupt source")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            CoordinatorState::backup_persistent_state(dir.join("missing.json"), &destination)
+                .await
+                .expect_err("reject missing source")
                 .kind(),
             io::ErrorKind::NotFound
         );
