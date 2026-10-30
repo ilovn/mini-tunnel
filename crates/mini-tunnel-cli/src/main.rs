@@ -121,6 +121,19 @@ enum CoordinatorCommand {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Restore a validated snapshot into a stopped coordinator state path.
+    RestoreState {
+        /// Existing coordinator state path to replace.
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_COORDINATOR_STATE",
+            default_value_os_t = default_coordinator_state_path()
+        )]
+        state_file: PathBuf,
+        /// Backup snapshot to restore.
+        #[arg(long)]
+        backup: PathBuf,
+    },
     /// Check a running coordinator's health endpoint.
     Health {
         /// Coordinator base URL.
@@ -589,17 +602,33 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 );
             }
             CoordinatorCommand::BackupState { state_file, output } => {
-                let summary = mini_tunnel_coordinator::CoordinatorState::backup_persistent_state(
-                    &state_file,
-                    &output,
-                )
-                .await?;
+                let summary =
+                    mini_tunnel_coordinator::CoordinatorState::copy_persistent_state_snapshot(
+                        &state_file,
+                        &output,
+                    )
+                    .await?;
                 println!(
                     "backed up {} networks, {} members, {} invites to {}",
                     summary.networks,
                     summary.members,
                     summary.invites,
                     output.display()
+                );
+            }
+            CoordinatorCommand::RestoreState { state_file, backup } => {
+                let summary =
+                    mini_tunnel_coordinator::CoordinatorState::copy_persistent_state_snapshot(
+                        &backup,
+                        &state_file,
+                    )
+                    .await?;
+                println!(
+                    "restored {} networks, {} members, {} invites from {}",
+                    summary.networks,
+                    summary.members,
+                    summary.invites,
+                    backup.display()
                 );
             }
             CoordinatorCommand::Health { url } => {

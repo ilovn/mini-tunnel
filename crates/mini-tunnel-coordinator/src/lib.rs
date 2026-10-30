@@ -342,8 +342,10 @@ impl IntoResponse for ApiError {
 }
 
 impl CoordinatorState {
-    /// Validate and atomically back up an existing snapshot while holding source and destination locks.
-    pub async fn backup_persistent_state(
+    /// Validate and atomically copy a snapshot while holding source and destination locks.
+    ///
+    /// This operation supports both creating backups and restoring them into a stopped state path.
+    pub async fn copy_persistent_state_snapshot(
         source: impl Into<PathBuf>,
         destination: impl Into<PathBuf>,
     ) -> io::Result<StateSnapshotSummary> {
@@ -3636,27 +3638,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_backup_is_atomic_locked_private_and_rejects_unsafe_sources() {
+    async fn snapshot_copy_supports_backup_restore_and_rejects_unsafe_paths() {
         let dir = std::env::temp_dir().join(format!("mini-tunnel-state-backup-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).expect("create test directory");
         let source = dir.join("coordinator.json");
         let destination = dir.join("backups/coordinator.json");
-        fs::write(&source, br#"{"schema_version":1,"networks":[]}"#)
-            .expect("write source snapshot");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&source, fs::Permissions::from_mode(0o600))
-                .expect("restrict source permissions");
-        }
+        let source_state = CoordinatorState::load(&source).expect("open source state");
+        source_state
+            .create_network(create_request("source network", "10.83.0.0/16"))
+            .await
+            .expect("create source network");
+        drop(source_state);
 
-        let summary = CoordinatorState::backup_persistent_state(&source, &destination)
+        let summary = CoordinatorState::copy_persistent_state_snapshot(&source, &destination)
             .await
             .expect("create backup");
         assert_eq!(
             summary,
             StateSnapshotSummary {
-                networks: 0,
+                networks: 1,
                 members: 0,
                 invites: 0
             }
@@ -3680,8 +3680,36 @@ mod tests {
             );
         }
 
+        let restore_target = dir.join("restored/coordinator.json");
+        let old_target = CoordinatorState::load(&restore_target).expect("open old restore target");
+        old_target
+            .create_network(create_request("old target", "10.84.0.0/16"))
+            .await
+            .expect("create old target network");
+        drop(old_target);
         assert_eq!(
-            CoordinatorState::backup_persistent_state(&source, &source)
+            CoordinatorState::copy_persistent_state_snapshot(&destination, &restore_target)
+                .await
+                .expect("restore backup over old state"),
+            summary
+        );
+        let restored = CoordinatorState::load(&restore_target).expect("load restored state");
+        let restored_store = restored.inner.read().await;
+        assert_eq!(restored_store.networks.len(), 1);
+        assert_eq!(
+            restored_store
+                .networks
+                .values()
+                .next()
+                .expect("network")
+                .cidr,
+            "10.83.0.0/16".parse().expect("CIDR")
+        );
+        drop(restored_store);
+        drop(restored);
+
+        assert_eq!(
+            CoordinatorState::copy_persistent_state_snapshot(&source, &source)
                 .await
                 .expect_err("reject source/destination alias")
                 .kind(),
@@ -3689,7 +3717,7 @@ mod tests {
         );
         let source_lock_path = state_lock_path(&source).expect("source lock path");
         assert_eq!(
-            CoordinatorState::backup_persistent_state(&source, source_lock_path)
+            CoordinatorState::copy_persistent_state_snapshot(&source, source_lock_path)
                 .await
                 .expect_err("reject a destination that aliases the source lock")
                 .kind(),
@@ -3697,7 +3725,7 @@ mod tests {
         );
         let live_source = CoordinatorState::load(&source).expect("lock source");
         assert_eq!(
-            CoordinatorState::backup_persistent_state(&source, &destination)
+            CoordinatorState::copy_persistent_state_snapshot(&source, &destination)
                 .await
                 .expect_err("refuse a running source")
                 .kind(),
@@ -3707,7 +3735,7 @@ mod tests {
 
         let live_destination = CoordinatorState::load(&destination).expect("lock destination");
         assert_eq!(
-            CoordinatorState::backup_persistent_state(&source, &destination)
+            CoordinatorState::copy_persistent_state_snapshot(&source, &destination)
                 .await
                 .expect_err("refuse to replace a running coordinator state")
                 .kind(),
@@ -3722,7 +3750,7 @@ mod tests {
             fs::write(&target, b"preserve target").expect("write symlink target");
             std::os::unix::fs::symlink(&target, &symlink).expect("create destination symlink");
             assert_eq!(
-                CoordinatorState::backup_persistent_state(&source, &symlink)
+                CoordinatorState::copy_persistent_state_snapshot(&source, &symlink)
                     .await
                     .expect_err("refuse symlink backup destination")
                     .kind(),
@@ -3736,17 +3764,20 @@ mod tests {
 
         fs::write(&source, b"corrupt").expect("corrupt source snapshot");
         assert_eq!(
-            CoordinatorState::backup_persistent_state(&source, &destination)
+            CoordinatorState::copy_persistent_state_snapshot(&source, &destination)
                 .await
                 .expect_err("reject corrupt source")
                 .kind(),
             io::ErrorKind::InvalidData
         );
         assert_eq!(
-            CoordinatorState::backup_persistent_state(dir.join("missing.json"), &destination)
-                .await
-                .expect_err("reject missing source")
-                .kind(),
+            CoordinatorState::copy_persistent_state_snapshot(
+                dir.join("missing.json"),
+                &destination,
+            )
+            .await
+            .expect_err("reject missing source")
+            .kind(),
             io::ErrorKind::NotFound
         );
         fs::remove_dir_all(dir).expect("remove test directory");
