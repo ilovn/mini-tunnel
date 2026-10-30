@@ -908,6 +908,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     struct TestVethPair {
         left: String,
+        right: String,
         loss_active: bool,
     }
 
@@ -938,6 +939,7 @@ mod tests {
             );
             let pair = Self {
                 left: left.clone(),
+                right: right.clone(),
                 loss_active: false,
             };
             run(
@@ -963,6 +965,20 @@ mod tests {
             run("ip", &["link", "set", "dev", &left, "up"]);
             run("ip", &["link", "set", "dev", &right, "up"]);
             (pair, local, remote)
+        }
+
+        fn set_mtu(&self, mtu: &str) {
+            for device in [&self.left, &self.right] {
+                let output = std::process::Command::new("ip")
+                    .args(["link", "set", "dev", device, "mtu", mtu])
+                    .output()
+                    .expect("set veth MTU");
+                assert!(
+                    output.status.success(),
+                    "could not set veth MTU: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
         }
 
         fn drop_left_egress(&mut self) {
@@ -1029,6 +1045,7 @@ mod tests {
     #[ignore = "requires root privileges, iproute2, and tc netem"]
     async fn privileged_linux_veth_quic_probe_loss_and_recovery() {
         let (mut link, local_address, remote_address) = TestVethPair::create();
+        link.set_mtu("1280");
         let temp =
             std::env::temp_dir().join(format!("mini-tunnel-veth-loss-{}", uuid::Uuid::new_v4()));
         let identity_a = Identity::load_or_create_at(temp.join("a/device.key")).unwrap();
@@ -1065,12 +1082,6 @@ mod tests {
             .expect("join accept task")
             .expect("accept peer");
         assert_eq!(channel_a.transport_name(), "QUIC/UDP");
-        let responder = Arc::new(channel_b);
-        let responder_task = {
-            let responder = Arc::clone(&responder);
-            tokio::spawn(async move { while responder.recv_packet().await.is_ok() {} })
-        };
-
         let missed_before = channel_a.health_snapshot().probes_missed;
         link.drop_left_egress();
         for _ in 0..24 {
@@ -1099,7 +1110,19 @@ mod tests {
         assert!(recovered.probes_succeeded >= succeeded_before + 3);
         assert_eq!(channel_a.transport_name(), "QUIC/UDP");
 
-        responder_task.abort();
+        let large_packet = (0..crate::MAX_TUN_PACKET)
+            .map(|byte| (byte % 251) as u8)
+            .collect::<Vec<_>>();
+        channel_a
+            .send_packet(&large_packet)
+            .await
+            .expect("fragment maximum-sized overlay packet over 1280-byte veth");
+        let received = tokio::time::timeout(Duration::from_secs(3), channel_b.recv_packet())
+            .await
+            .expect("receive reassembled packet over constrained veth")
+            .expect("reassemble packet");
+        assert_eq!(received, large_packet);
+
         endpoint_a.close(0_u32.into(), b"veth test complete");
         endpoint_b.close(0_u32.into(), b"veth test complete");
         drop(link);
