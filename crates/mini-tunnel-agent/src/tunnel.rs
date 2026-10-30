@@ -7,7 +7,7 @@ use std::{
     ops::{Deref, DerefMut},
     pin::Pin,
     sync::Arc,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -26,10 +26,16 @@ fn mesh_event_queue_capacity(peer_count: usize) -> usize {
         .clamp(MESH_EVENT_QUEUE_PER_PEER, MAX_MESH_EVENT_QUEUE_CAPACITY)
 }
 
-/// Total inbound mesh packets dropped because the bounded TUN event queue was full.
+/// Total inbound mesh packets dropped because a global or per-peer TUN event quota was full.
 #[must_use]
 pub fn mesh_dropped_packets_total() -> u64 {
     MESH_DROPPED_PACKETS.load(Ordering::Relaxed)
+}
+
+struct MeshEvent {
+    address: Ipv4Addr,
+    result: Result<Vec<u8>, IdentityError>,
+    pending: Option<Arc<AtomicUsize>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -40,20 +46,55 @@ enum MeshPacketDelivery {
 }
 
 fn try_deliver_mesh_packet(
-    sender: &tokio::sync::mpsc::Sender<(Ipv4Addr, Result<Vec<u8>, IdentityError>)>,
+    sender: &tokio::sync::mpsc::Sender<MeshEvent>,
     address: Ipv4Addr,
     packet: Vec<u8>,
+    pending: &Arc<AtomicUsize>,
 ) -> MeshPacketDelivery {
-    match sender.try_send((address, Ok(packet))) {
+    let reserved = loop {
+        let current = pending.load(Ordering::Relaxed);
+        if current >= MESH_EVENT_QUEUE_PER_PEER {
+            break false;
+        }
+        if pending
+            .compare_exchange_weak(current, current + 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            break true;
+        }
+    };
+    if !reserved {
+        MESH_DROPPED_PACKETS.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(peer_address = %address, "dropping inbound mesh packet because the peer event quota is full");
+        return MeshPacketDelivery::Dropped;
+    }
+    let event = MeshEvent {
+        address,
+        result: Ok(packet),
+        pending: Some(Arc::clone(pending)),
+    };
+    match sender.try_send(event) {
         Ok(()) => MeshPacketDelivery::Queued,
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+        Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+            if let Some(pending) = event.pending {
+                pending.fetch_sub(1, Ordering::Relaxed);
+            }
             MESH_DROPPED_PACKETS.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(peer_address = %address, "dropping inbound mesh packet because the TUN event queue is full");
             MeshPacketDelivery::Dropped
         }
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(event)) => {
+            if let Some(pending) = event.pending {
+                pending.fetch_sub(1, Ordering::Relaxed);
+            }
             MeshPacketDelivery::ReceiverClosed
         }
+    }
+}
+
+fn release_mesh_event_quota(event: &MeshEvent) {
+    if let Some(pending) = &event.pending {
+        pending.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -125,6 +166,7 @@ struct MeshPeerRuntime {
     connector: Option<PeerConnector>,
     probe: Option<PeerConnector>,
     probe_cooldown: Duration,
+    pending_events: Arc<AtomicUsize>,
 }
 
 struct MeshReceiverTasks(HashMap<Ipv4Addr, tokio::task::JoinHandle<()>>);
@@ -293,7 +335,8 @@ async fn receive_mesh_peer(
     connector: Option<PeerConnector>,
     probe: Option<PeerConnector>,
     probe_cooldown: Duration,
-    event_tx: tokio::sync::mpsc::Sender<(Ipv4Addr, Result<Vec<u8>, IdentityError>)>,
+    pending_events: Arc<AtomicUsize>,
+    event_tx: tokio::sync::mpsc::Sender<MeshEvent>,
 ) {
     loop {
         let active = Arc::clone(&*channel.read().await);
@@ -321,7 +364,7 @@ async fn receive_mesh_peer(
                             last_received = tokio::time::Instant::now();
                             inbound = Box::pin(active.recv_packet());
                             if !packet.is_empty()
-                                && try_deliver_mesh_packet(&event_tx, address, packet)
+                                && try_deliver_mesh_packet(&event_tx, address, packet, &pending_events)
                                     == MeshPacketDelivery::ReceiverClosed
                             {
                                 return;
@@ -403,7 +446,13 @@ async fn receive_mesh_peer(
             "peer path failed; reconnecting"
         );
         if connector.is_none() {
-            let _ = event_tx.send((address, Err(failure))).await;
+            let _ = event_tx
+                .send(MeshEvent {
+                    address,
+                    result: Err(failure),
+                    pending: None,
+                })
+                .await;
             return;
         }
         let connector = connector.as_ref().expect("checked above");
@@ -431,7 +480,11 @@ async fn receive_mesh_peer(
                         "peer identity authorization failed during reconnect"
                     );
                     let _ = event_tx
-                        .send((address, Err(IdentityError::UnauthorizedPeer)))
+                        .send(MeshEvent {
+                            address,
+                            result: Err(IdentityError::UnauthorizedPeer),
+                            pending: None,
+                        })
                         .await;
                     return;
                 }
@@ -560,6 +613,7 @@ async fn pump_mesh<T: TunnelPacketIo>(
                     connector,
                     probe,
                     probe_cooldown,
+                    pending_events: Arc::new(AtomicUsize::new(0)),
                 },
             )
             .is_some()
@@ -603,9 +657,12 @@ async fn pump_mesh<T: TunnelPacketIo>(
                 }
             }
             inbound = event_rx.recv() => {
-                let Some((address, result)) = inbound else {
+                let Some(event) = inbound else {
                     return Err(PeerTunnelError::NoPeers);
                 };
+                release_mesh_event_quota(&event);
+                let address = event.address;
+                let result = event.result;
                 match result {
                     Ok(packet) => {
                         let Some(runtime) = channels.get(&address) else { continue };
@@ -661,6 +718,7 @@ async fn pump_mesh<T: TunnelPacketIo>(
                             connector: Some(peer.connector),
                             probe: peer.probe,
                             probe_cooldown: peer.probe_cooldown,
+                            pending_events: Arc::new(AtomicUsize::new(0)),
                         };
                         receivers.insert(address, spawn_mesh_receiver(address, &runtime, event_tx.clone()));
                         channels.insert(address, runtime);
@@ -697,7 +755,7 @@ async fn pump_mesh<T: TunnelPacketIo>(
 fn spawn_mesh_receiver(
     address: Ipv4Addr,
     runtime: &MeshPeerRuntime,
-    event_tx: tokio::sync::mpsc::Sender<(Ipv4Addr, Result<Vec<u8>, IdentityError>)>,
+    event_tx: tokio::sync::mpsc::Sender<MeshEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(receive_mesh_peer(
         address,
@@ -705,6 +763,7 @@ fn spawn_mesh_receiver(
         runtime.connector.clone(),
         runtime.probe.clone(),
         runtime.probe_cooldown,
+        Arc::clone(&runtime.pending_events),
         event_tx,
     ))
 }
@@ -743,37 +802,77 @@ mod tests {
     #[tokio::test]
     async fn mesh_packet_delivery_drops_on_full_queue_and_reports_closed_receiver() {
         let address = Ipv4Addr::new(10, 77, 0, 2);
-        let (sender, mut receiver) = mpsc::channel(1);
+        let (sender, mut receiver) = mpsc::channel(16);
+        let peer_a_pending = Arc::new(AtomicUsize::new(0));
+        let peer_b_pending = Arc::new(AtomicUsize::new(0));
         let before = mesh_dropped_packets_total();
 
+        for packet in 0..MESH_EVENT_QUEUE_PER_PEER {
+            assert_eq!(
+                try_deliver_mesh_packet(&sender, address, vec![packet as u8], &peer_a_pending),
+                MeshPacketDelivery::Queued
+            );
+        }
         assert_eq!(
-            try_deliver_mesh_packet(&sender, address, vec![1]),
-            MeshPacketDelivery::Queued
-        );
-        assert_eq!(
-            try_deliver_mesh_packet(&sender, address, vec![2]),
+            try_deliver_mesh_packet(&sender, address, vec![99], &peer_a_pending),
             MeshPacketDelivery::Dropped
         );
         assert!(mesh_dropped_packets_total() > before);
         assert_eq!(
-            receiver
-                .recv()
-                .await
-                .expect("queued packet")
-                .1
-                .expect("queued packet payload"),
-            vec![1]
+            peer_a_pending.load(Ordering::Relaxed),
+            MESH_EVENT_QUEUE_PER_PEER
+        );
+        assert_eq!(
+            try_deliver_mesh_packet(
+                &sender,
+                Ipv4Addr::new(10, 77, 0, 3),
+                vec![10],
+                &peer_b_pending,
+            ),
+            MeshPacketDelivery::Queued,
+            "another peer still gets queue capacity during peer A's burst"
+        );
+        assert_eq!(peer_b_pending.load(Ordering::Relaxed), 1);
+        let first = receiver.recv().await.expect("queued event");
+        assert_eq!(
+            first.result.as_ref().expect("queued packet payload"),
+            &vec![0]
+        );
+        release_mesh_event_quota(&first);
+        assert_eq!(
+            peer_a_pending.load(Ordering::Relaxed),
+            MESH_EVENT_QUEUE_PER_PEER - 1
+        );
+        assert_eq!(
+            try_deliver_mesh_packet(&sender, address, vec![11], &peer_a_pending),
+            MeshPacketDelivery::Queued,
+            "consuming an event releases capacity for its peer"
         );
 
-        assert_eq!(
-            try_deliver_mesh_packet(&sender, address, vec![3]),
-            MeshPacketDelivery::Queued
-        );
         drop(receiver);
+        let peer_c_pending = Arc::new(AtomicUsize::new(0));
         assert_eq!(
-            try_deliver_mesh_packet(&sender, address, vec![4]),
+            try_deliver_mesh_packet(&sender, address, vec![4], &peer_c_pending),
             MeshPacketDelivery::ReceiverClosed
         );
+
+        let (small_sender, _small_receiver) = mpsc::channel(1);
+        let small_peer_a_pending = Arc::new(AtomicUsize::new(0));
+        let global_full_pending = Arc::new(AtomicUsize::new(0));
+        assert_eq!(
+            try_deliver_mesh_packet(&small_sender, address, vec![5], &small_peer_a_pending),
+            MeshPacketDelivery::Queued
+        );
+        assert_eq!(
+            try_deliver_mesh_packet(
+                &small_sender,
+                Ipv4Addr::new(10, 77, 0, 3),
+                vec![6],
+                &global_full_pending,
+            ),
+            MeshPacketDelivery::Dropped
+        );
+        assert_eq!(global_full_pending.load(Ordering::Relaxed), 0);
     }
 
     #[test]
