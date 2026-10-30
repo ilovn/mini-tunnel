@@ -33,9 +33,9 @@ const MAX_SOCKET_QUEUE_CAPACITY: usize = 128;
 const MAX_UDP_DATAGRAM_SIZE: usize = u16::MAX as usize;
 const MAX_ICE_SESSIONS: usize = 1024;
 const MAX_SESSION_PEER_ADDRESSES: usize = 16;
-const ICE_CONSENT_INTERVAL: Duration = Duration::from_secs(2);
-const ICE_DISCONNECTED_TIMEOUT: Duration = Duration::from_secs(8);
-const ICE_FAILED_TIMEOUT: Duration = Duration::from_secs(24);
+const ICE_CONSENT_INTERVAL: Duration = Duration::from_secs(5);
+const ICE_DISCONNECTED_TIMEOUT: Duration = Duration::from_secs(15);
+const ICE_FAILED_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Generate an ephemeral ICE credential pair suitable for both rtc-ice and coordinator signaling.
 /// The coordinator accepts the RFC 8445 alphanumeric, `+`, and `/` alphabet; credentials are
@@ -1110,6 +1110,9 @@ mod tests {
         assert_eq!(config.keepalive_interval, Some(ICE_CONSENT_INTERVAL));
         assert_eq!(config.disconnected_timeout, Some(ICE_DISCONNECTED_TIMEOUT));
         assert_eq!(config.failed_timeout, Some(ICE_FAILED_TIMEOUT));
+        assert_eq!(ICE_CONSENT_INTERVAL, Duration::from_secs(5));
+        assert!(ICE_CONSENT_INTERVAL >= Duration::from_secs(4));
+        assert_eq!(ICE_FAILED_TIMEOUT, Duration::from_secs(30));
         assert!(ICE_CONSENT_INTERVAL < ICE_DISCONNECTED_TIMEOUT);
         assert!(ICE_DISCONNECTED_TIMEOUT < ICE_FAILED_TIMEOUT);
     }
@@ -1591,7 +1594,7 @@ mod tests {
         drop(driver_b);
         drop(ice_messages);
         let mut failed = monitor.failure_receiver();
-        tokio::time::timeout(Duration::from_secs(12), async {
+        tokio::time::timeout(Duration::from_secs(35), async {
             loop {
                 if *failed.borrow() {
                     break;
