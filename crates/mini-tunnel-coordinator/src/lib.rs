@@ -2216,6 +2216,10 @@ mod tests {
         StatusCode::OK
     }
 
+    async fn parse_json_body(Json(_body): Json<serde_json::Value>) -> StatusCode {
+        StatusCode::OK
+    }
+
     async fn metrics_for_timeout_test(
         State((state, _, _)): State<(CoordinatorState, Arc<tokio::sync::Notify>, Arc<AtomicU64>)>,
         request: Request,
@@ -2356,6 +2360,54 @@ mod tests {
             String::from_utf8_lossy(&body)
                 .contains("mini_tunnel_coordinator_request_timeouts_total 1\n")
         );
+    }
+
+    #[tokio::test]
+    async fn coordinator_times_out_stalled_json_body_and_releases_capacity() {
+        use std::convert::Infallible;
+
+        let state = CoordinatorState {
+            request_slots: RequestSlots(Arc::new(tokio::sync::Semaphore::new(1))),
+            request_timeout: RequestTimeout(Duration::from_millis(10)),
+            ..CoordinatorState::default()
+        };
+        let app = Router::new()
+            .route("/json", post(parse_json_body))
+            .route("/fast", get(|| async { StatusCode::OK }))
+            .layer(from_fn_with_state(state.clone(), limit_requests))
+            .with_state(state.clone());
+        let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12348);
+        let body_stream = futures_util::stream::unfold(0_u8, |state| async move {
+            if state == 0 {
+                Some((Ok::<_, Infallible>(b"{".to_vec()), 1))
+            } else {
+                std::future::pending::<Option<(Result<Vec<u8>, Infallible>, u8)>>().await
+            }
+        });
+        let mut request = HttpRequest::builder()
+            .method("POST")
+            .uri("/json")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from_stream(body_stream))
+            .expect("valid request");
+        request.extensions_mut().insert(ConnectInfo(source));
+
+        let timed_out = app
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("timeout response");
+        assert_eq!(timed_out.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(state.request_timeouts_total.load(Ordering::Relaxed), 1);
+
+        let mut fast_request = HttpRequest::builder()
+            .uri("/fast")
+            .body(Body::empty())
+            .expect("valid request");
+        fast_request.extensions_mut().insert(ConnectInfo(source));
+        let fast = app.oneshot(fast_request).await.expect("fast response");
+        assert_eq!(fast.status(), StatusCode::OK);
+        assert_eq!(state.request_slots.0.available_permits(), 1);
     }
 
     #[tokio::test]

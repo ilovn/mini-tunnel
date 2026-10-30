@@ -1722,6 +1722,7 @@ dependencies = [
  "axum-server",
  "base64 0.23.1",
  "ed25519-dalek",
+ "futures-util",
  "getrandom 0.4.3",
  "hyper-util",
  "ipnet",
