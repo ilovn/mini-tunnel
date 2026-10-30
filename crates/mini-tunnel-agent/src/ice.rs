@@ -956,10 +956,18 @@ impl IceAgentDriver {
             let now = Instant::now();
             self.handle_timeout(now)?;
             for transmit in self.poll_transmits() {
-                socket
+                if let Err(error) = socket
                     .send_to(&transmit.message, transmit.transport.peer_addr)
                     .await
-                    .map_err(|error| IceDriverError::Socket(error.to_string()))?;
+                {
+                    // A candidate-specific routing error must not abort the checklist: another
+                    // address family or server-reflexive candidate may still be reachable.
+                    tracing::debug!(
+                        candidate = %transmit.transport.peer_addr,
+                        %error,
+                        "ICE candidate send failed; continuing connectivity checks"
+                    );
+                }
             }
             if let Some(pair) = self.selected_pair() {
                 return Ok(pair);

@@ -604,6 +604,14 @@ mod tests {
             transport: crate::candidate::CandidateTransport::Udp,
             candidate_type: crate::candidate::CandidateType::Host,
         };
+        let private_route_error = peer
+            .send_to(&[], private_candidate)
+            .await
+            .expect_err("public peer has no route to the private candidate");
+        assert_eq!(
+            private_route_error.kind(),
+            std::io::ErrorKind::NetworkUnreachable
+        );
         let credentials_client = crate::ice::generate_ice_credentials(1).unwrap();
         let credentials_peer = crate::ice::generate_ice_credentials(1).unwrap();
         let mut driver_client = crate::ice::IceAgentDriver::for_peer_with_candidates_on_socket(
@@ -621,7 +629,7 @@ mod tests {
             &credentials_peer,
             &credentials_client,
             &[peer_candidate],
-            &[mapped_candidate],
+            &[host_candidate, mapped_candidate],
             false,
             std::time::Instant::now(),
         )
