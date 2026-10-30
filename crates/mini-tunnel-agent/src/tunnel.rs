@@ -316,8 +316,7 @@ async fn receive_mesh_peer(
             Ok(()) => continue,
             Err(failure) => failure,
         };
-        if active.transport_name() == "QUIC/UDP"
-            && matches!(&failure, IdentityError::Transport(message) if message.contains("keepalive timed out") || message.contains("path quality degraded"))
+        if active.transport_name() == "QUIC/UDP" && matches!(&failure, IdentityError::Transport(_))
         {
             force_reliable = true;
         }
@@ -869,6 +868,146 @@ mod tests {
         );
         pump.abort();
         drop(recovered);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn mesh_uses_reliable_fallback_after_unexpected_quic_disconnect() {
+        async fn tcp_pair(a: Arc<Identity>, b: Arc<Identity>) -> (PeerChannel, PeerChannel) {
+            let listener = peer_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let allowed = vec![(a.device_id(), a.public_key())];
+            let peer_id = b.device_id();
+            let accept = accept_tcp_peer_any(&listener, "mesh-udp-fallback", &b, &allowed);
+            let connect =
+                connect_tcp_peer(address, "mesh-udp-fallback", &a, &peer_id, b.public_key());
+            let (accepted, connected) = tokio::join!(accept, connect);
+            (connected.unwrap(), accepted.unwrap().1)
+        }
+
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-mesh-udp-fallback-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let a = Arc::new(Identity::load_or_create_at(temp.join("a/key")).unwrap());
+        let b = Arc::new(Identity::load_or_create_at(temp.join("b/key")).unwrap());
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let endpoint_a = peer_endpoint(&a, bind).unwrap();
+        let endpoint_b = peer_endpoint(&b, bind).unwrap();
+        let a_id = a.device_id();
+        let a_key = a.public_key();
+        let b_id = b.device_id();
+        let b_key = b.public_key();
+        let server_endpoint = endpoint_b.clone();
+        let server_identity = Arc::clone(&b);
+        let accept = tokio::spawn(async move {
+            accept_peer(
+                &server_endpoint,
+                "mesh-udp-fallback",
+                &server_identity,
+                &a_id,
+                a_key,
+            )
+            .await
+        });
+        let initial = connect_peer(
+            &endpoint_a,
+            endpoint_b.local_addr().unwrap(),
+            "mesh-udp-fallback",
+            &a,
+            &b_id,
+            b_key,
+        )
+        .await
+        .unwrap();
+        let remote_initial = accept.await.unwrap().unwrap();
+
+        let reliable_requested = Arc::new(Mutex::new(None));
+        let reliable_notify = Arc::new(tokio::sync::Notify::new());
+        let remote_channel = Arc::new(Mutex::new(None));
+        let connector: PeerConnector = {
+            let a = Arc::clone(&a);
+            let b = Arc::clone(&b);
+            let reliable_requested = Arc::clone(&reliable_requested);
+            let reliable_notify = Arc::clone(&reliable_notify);
+            let remote_channel = Arc::clone(&remote_channel);
+            Arc::new(move |force_reliable| -> PeerConnectFuture {
+                let a = Arc::clone(&a);
+                let b = Arc::clone(&b);
+                let reliable_requested = Arc::clone(&reliable_requested);
+                let reliable_notify = Arc::clone(&reliable_notify);
+                let remote_channel = Arc::clone(&remote_channel);
+                Box::pin(async move {
+                    *reliable_requested.lock().await = Some(force_reliable);
+                    reliable_notify.notify_one();
+                    let (local, remote) = tcp_pair(a, b).await;
+                    *remote_channel.lock().await = Some(remote);
+                    Ok(local)
+                })
+            })
+        };
+        let local_ip = Ipv4Addr::new(10, 80, 0, 1);
+        let peer_ip = Ipv4Addr::new(10, 80, 0, 2);
+        let (outbound_tx, outbound_rx) = mpsc::channel(4);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(4);
+        let io = Arc::new(MockPacketIo {
+            outbound: Mutex::new(outbound_rx),
+            inbound: inbound_tx,
+            local_ipv4: local_ip,
+            local_ipv6: None,
+            mtu: 1500,
+        });
+        let pump_io = Arc::clone(&io);
+        let pump = tokio::spawn(async move {
+            pump_peer_mesh_reconnecting(
+                &*pump_io,
+                vec![ReconnectingPeer {
+                    address: peer_ip,
+                    ipv6_address: None,
+                    channel: Arc::new(initial),
+                    connector,
+                    probe: None,
+                    probe_cooldown: Duration::from_secs(3600),
+                }],
+            )
+            .await
+        });
+        remote_initial.close();
+        tokio::time::timeout(Duration::from_secs(3), reliable_notify.notified())
+            .await
+            .expect("reconnect requested");
+        assert_eq!(*reliable_requested.lock().await, Some(true));
+
+        let recovered = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(channel) = remote_channel.lock().await.take() {
+                    break channel;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reliable peer channel established");
+        assert_eq!(recovered.transport_name(), "TLS/TCP");
+        outbound_tx
+            .send(packet(local_ip, peer_ip, 28))
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), recovered.recv_packet())
+                .await
+                .unwrap()
+                .unwrap()
+                .len(),
+            28
+        );
+
+        pump.abort();
+        recovered.close_async().await;
+        endpoint_a.close(0_u32.into(), b"test complete");
+        endpoint_b.close(0_u32.into(), b"test complete");
         fs::remove_dir_all(temp).unwrap();
     }
 
