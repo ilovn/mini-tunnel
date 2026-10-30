@@ -260,6 +260,133 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    struct Ipv4UdpCapture(std::os::fd::OwnedFd);
+
+    #[cfg(target_os = "linux")]
+    impl Ipv4UdpCapture {
+        fn in_namespace(namespace: &str, interface: &str) -> Self {
+            use std::{
+                ffi::CString,
+                os::fd::{AsRawFd, FromRawFd},
+            };
+
+            let namespace = namespace.to_owned();
+            let interface = interface.to_owned();
+            let fd = std::thread::spawn(move || {
+                let original =
+                    std::fs::File::open("/proc/self/ns/net").expect("open original netns");
+                let target = std::fs::File::open(format!("/var/run/netns/{namespace}"))
+                    .expect("open capture netns");
+                let result = unsafe { libc::setns(target.as_raw_fd(), libc::CLONE_NEWNET) };
+                assert_eq!(
+                    result,
+                    0,
+                    "enter capture netns: {}",
+                    std::io::Error::last_os_error()
+                );
+
+                let protocol = (libc::ETH_P_IP as u16).to_be();
+                let fd = unsafe {
+                    libc::socket(
+                        libc::AF_PACKET,
+                        libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                        protocol as i32,
+                    )
+                };
+                assert!(
+                    fd >= 0,
+                    "open packet capture socket: {}",
+                    std::io::Error::last_os_error()
+                );
+                let interface = CString::new(interface).expect("interface name has no NUL");
+                let index = unsafe { libc::if_nametoindex(interface.as_ptr()) };
+                assert_ne!(
+                    index,
+                    0,
+                    "find capture interface: {}",
+                    std::io::Error::last_os_error()
+                );
+                let address = libc::sockaddr_ll {
+                    sll_family: libc::AF_PACKET as u16,
+                    sll_protocol: protocol,
+                    sll_ifindex: index as i32,
+                    sll_hatype: 0,
+                    sll_pkttype: 0,
+                    sll_halen: 0,
+                    sll_addr: [0; 8],
+                };
+                let result = unsafe {
+                    libc::bind(
+                        fd,
+                        (&address as *const libc::sockaddr_ll).cast(),
+                        std::mem::size_of_val(&address) as libc::socklen_t,
+                    )
+                };
+                assert_eq!(
+                    result,
+                    0,
+                    "bind packet capture socket: {}",
+                    std::io::Error::last_os_error()
+                );
+                let result = unsafe { libc::setns(original.as_raw_fd(), libc::CLONE_NEWNET) };
+                assert_eq!(
+                    result,
+                    0,
+                    "restore capture netns: {}",
+                    std::io::Error::last_os_error()
+                );
+                unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+            })
+            .join()
+            .expect("capture socket setup thread");
+            Self(fd)
+        }
+
+        fn drain(&self) -> Vec<(std::net::Ipv4Addr, u16, std::net::Ipv4Addr, u16)> {
+            let mut packets = Vec::new();
+            loop {
+                let mut packet = [0_u8; 2048];
+                let length = unsafe {
+                    libc::recv(
+                        std::os::fd::AsRawFd::as_raw_fd(&self.0),
+                        packet.as_mut_ptr().cast(),
+                        packet.len(),
+                        libc::MSG_DONTWAIT,
+                    )
+                };
+                if length < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::WouldBlock {
+                        break;
+                    }
+                    panic!("read packet capture socket: {error}");
+                }
+                let packet = &packet[..length as usize];
+                if packet.len() < 20 || packet[0] >> 4 != 4 || packet[9] != libc::IPPROTO_UDP as u8
+                {
+                    continue;
+                }
+                let ip_header_length = usize::from(packet[0] & 0x0f) * 4;
+                if ip_header_length < 20 || packet.len() < ip_header_length + 8 {
+                    continue;
+                }
+                let source =
+                    std::net::Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+                let destination =
+                    std::net::Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+                let source_port =
+                    u16::from_be_bytes([packet[ip_header_length], packet[ip_header_length + 1]]);
+                let destination_port = u16::from_be_bytes([
+                    packet[ip_header_length + 2],
+                    packet[ip_header_length + 3],
+                ]);
+                packets.push((source, source_port, destination, destination_port));
+            }
+            packets
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     struct SnatTopology {
         client: String,
         router: String,
@@ -407,8 +534,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     struct DualSnatTopology {
         client_a: String,
+        client_a_if: String,
         router_a: String,
         client_b: String,
+        client_b_if: String,
         router_b: String,
         bridge: String,
     }
@@ -458,8 +587,10 @@ mod tests {
             let bridge_b_if = format!("bb{suffix}");
             let topology = Self {
                 client_a: client_a.clone(),
+                client_a_if: client_a_if.clone(),
                 router_a: router_a.clone(),
                 client_b: client_b.clone(),
+                client_b_if: client_b_if.clone(),
                 router_b: router_b.clone(),
                 bridge: bridge.clone(),
             };
@@ -909,6 +1040,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     async fn run_dual_snat_ice_scenario() {
         let _topology = DualSnatTopology::create();
+        let capture_a = Ipv4UdpCapture::in_namespace(&_topology.client_a, &_topology.client_a_if);
+        let capture_b = Ipv4UdpCapture::in_namespace(&_topology.client_b, &_topology.client_b_if);
         let stun_server = UdpSocket::bind("198.18.0.254:3478")
             .await
             .expect("bind transit STUN server");
@@ -1090,6 +1223,11 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(250), socket_b.recv_from(&mut raw_b),),
         );
         eprintln!("dual-SNAT raw probes received: A={raw_received_a:?} B={raw_received_b:?}");
+        eprintln!(
+            "dual-SNAT packet capture: A={:?} B={:?}",
+            capture_a.drain(),
+            capture_b.drain()
+        );
         eprintln!(
             "dual-SNAT ICE: mapped A={mapped_a} B={mapped_b}, host A={host_a} B={host_b}, sent A={sent_a} targets={targets_a:?} B={sent_b} targets={targets_b:?}, failed A={failed_candidates_a:?} B={failed_candidates_b:?}, received A={received_a:?} B={received_b:?}, selected A={selected_a:?} B={selected_b:?}"
         );
