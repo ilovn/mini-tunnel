@@ -468,6 +468,69 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[ignore = "requires permission to create and configure an OS TUN interface"]
+    async fn privileged_linux_tun_assigns_addresses_mtu_and_cleans_up() {
+        let pid = std::process::id();
+        let subnet = (pid % 250 + 1) as u8;
+        let address_a = Ipv4Addr::new(10, 253, subnet, 1);
+        let address_a_v6 = Ipv6Addr::new(0xfd18, 0x253, u16::from(subnet), 0, 0, 0, 0, 1);
+        let interface_name = format!("mtun{}", pid % 100_000);
+        let mut config = TunConfig::ipv4(address_a, 32).with_ipv6(address_a_v6, 128);
+        config.name = Some(interface_name.clone());
+        let device = TunDevice::create(config).expect("create privileged Linux TUN interface");
+        assert_eq!(device.local_ipv4(), address_a);
+        assert_eq!(device.local_ipv6(), Some(address_a_v6));
+        assert_eq!(device.mtu(), usize::from(DEFAULT_TUN_MTU));
+        assert_eq!(device.name().expect("read TUN name"), interface_name);
+
+        let up = std::process::Command::new("ip")
+            .args(["link", "set", "dev", &interface_name, "up"])
+            .output()
+            .expect("bring TUN interface up");
+        assert!(
+            up.status.success(),
+            "unable to bring TUN interface up: {}",
+            String::from_utf8_lossy(&up.stderr)
+        );
+
+        let addresses = std::process::Command::new("ip")
+            .args(["-o", "address", "show", "dev", &interface_name])
+            .output()
+            .expect("inspect assigned TUN addresses with iproute2");
+        assert!(
+            addresses.status.success(),
+            "iproute2 address inspection failed: {}",
+            String::from_utf8_lossy(&addresses.stderr)
+        );
+        let addresses = String::from_utf8_lossy(&addresses.stdout);
+        assert!(addresses.contains(&format!("{address_a}/32")));
+        assert!(addresses.contains(&format!("{address_a_v6}/128")));
+
+        let link = std::process::Command::new("ip")
+            .args(["-o", "link", "show", "dev", &interface_name])
+            .output()
+            .expect("inspect TUN MTU with iproute2");
+        assert!(link.status.success());
+        assert!(String::from_utf8_lossy(&link.stdout).contains("mtu 1280"));
+
+        let peer_address = Ipv4Addr::new(10, 253, subnet, 2);
+        device
+            .write_inbound_packet(&packet(peer_address, address_a, 28), peer_address)
+            .await
+            .expect("write authenticated peer packet to the OS TUN interface");
+
+        drop(device);
+        let removed = std::process::Command::new("ip")
+            .args(["link", "show", "dev", &interface_name])
+            .output()
+            .expect("verify TUN interface cleanup");
+        assert!(
+            !removed.status.success(),
+            "dropping TunDevice should remove its kernel interface"
+        );
+    }
+
     #[test]
     fn ipv6_packet_boundary_checks_length_mtu_and_peer_addresses() {
         let local: Ipv6Addr = "fd12:3456::2".parse().unwrap();

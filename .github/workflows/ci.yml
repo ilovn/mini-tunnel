@@ -93,3 +93,26 @@ jobs:
 
       - name: Run Clippy
         run: cargo +stable clippy --workspace --all-targets -- --deny warnings
+
+      - name: Run privileged Linux TUN packet round trip
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          build_messages="$RUNNER_TEMP/mini-tunnel-agent-test-build.jsonl"
+          cargo +stable test -p mini-tunnel-agent --lib --no-run --message-format=json > "$build_messages"
+          test_binary="$(python3 - "$build_messages" <<'PY'
+          import json
+          import sys
+
+          for line in open(sys.argv[1], encoding="utf-8"):
+              message = json.loads(line)
+              target = message.get("target", {})
+              if message.get("profile", {}).get("test") and target.get("name") == "mini_tunnel_agent":
+                  print(message["executable"])
+                  break
+          else:
+              raise SystemExit("mini-tunnel-agent test binary was not built")
+          PY
+          )"
+          sudo modprobe tun || true
+          sudo "$test_binary" --exact tun_device::tests::privileged_linux_tun_assigns_addresses_mtu_and_cleans_up --ignored --nocapture
