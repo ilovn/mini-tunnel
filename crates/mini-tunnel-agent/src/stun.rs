@@ -1094,11 +1094,19 @@ mod tests {
             "dual-SNAT ICE: mapped A={mapped_a} B={mapped_b}, host A={host_a} B={host_b}, sent A={sent_a} targets={targets_a:?} B={sent_b} targets={targets_b:?}, failed A={failed_candidates_a:?} B={failed_candidates_b:?}, received A={received_a:?} B={received_b:?}, selected A={selected_a:?} B={selected_b:?}"
         );
         if selected_a.is_none() || selected_b.is_none() {
-            for namespace in [&_topology.router_a, &_topology.router_b] {
+            for namespace in [
+                &_topology.router_a,
+                &_topology.client_a,
+                &_topology.router_b,
+                &_topology.client_b,
+            ] {
                 for (command, args) in [
                     ("ip", &["route", "show"][..]),
+                    ("ip", &["-s", "link", "show"][..]),
                     ("iptables", &["-nvx", "-L", "FORWARD"][..]),
+                    ("iptables", &["-nvx", "-L", "INPUT"][..]),
                     ("iptables", &["-t", "nat", "-nvx", "-L", "POSTROUTING"][..]),
+                    ("cat", &["/proc/net/udp"][..]),
                 ] {
                     let result = std::process::Command::new("ip")
                         .args(["netns", "exec", namespace, command])
