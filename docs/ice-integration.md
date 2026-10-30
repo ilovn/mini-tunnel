@@ -26,7 +26,7 @@ The opt-in CLI uses ICE only when both same-network peer snapshots contain curre
 
 ## Required verification before enabling by default
 
-- Deterministic Sans-I/O tests cover authenticated checks, controlling/controlled roles, simultaneous-controlling role-conflict recovery, peer-reflexive learning from a simulated mapped source, and nomination. Loopback restart tests now replace credentials on the same UDP socket, refresh a stale peer snapshot from the Coordinator, re-nominate, and transfer data over a new pinned QUIC channel. Longer-running consent/timeout behavior still needs dedicated tests.
+- Deterministic Sans-I/O tests cover authenticated checks, controlling/controlled roles, simultaneous-controlling role-conflict recovery, peer-reflexive learning from a simulated mapped source, and nomination. A loopback UDP mapping shim also rewrites source addresses while ICE checks and pinned QUIC payloads cross the shared socket. Restart tests replace credentials on the same UDP socket, refresh a stale peer snapshot from the Coordinator, re-nominate, and transfer data over a new pinned QUIC channel. Longer-running consent/timeout behavior still needs dedicated tests; the shim does not replace a public NAT matrix.
 - Same-socket UDP demultiplexer tests for valid STUN, QUIC-shaped datagrams, malformed packets, multi-datagram batches and a full bounded ICE queue.
 - End-to-end CLI loopback coverage publishes signed credentials, runs checks over the shared socket, nominates a pair, then transfers a packet over the pinned QUIC connection.
 - Regression tests proving older peers continue using the existing UDP/TCP/relay path.

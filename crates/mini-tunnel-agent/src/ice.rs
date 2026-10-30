@@ -1492,6 +1492,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ice_and_quic_work_through_bidirectional_nat_mapping_proxies() {
+        let temp =
+            std::env::temp_dir().join(format!("mini-tunnel-ice-nat-{}", uuid::Uuid::new_v4()));
+        let identity_a =
+            crate::Identity::load_or_create_at(temp.join("a/device.key")).expect("identity A");
+        let identity_b =
+            crate::Identity::load_or_create_at(temp.join("b/device.key")).expect("identity B");
+        let endpoint_a =
+            super::peer_endpoint_with_ice(&identity_a, "127.0.0.1:0".parse().unwrap(), 8)
+                .expect("ICE endpoint A");
+        let endpoint_b =
+            super::peer_endpoint_with_ice(&identity_b, "127.0.0.1:0".parse().unwrap(), 8)
+                .expect("ICE endpoint B");
+        let address_a = endpoint_a.endpoint.local_addr().expect("A address");
+        let address_b = endpoint_b.endpoint.local_addr().expect("B address");
+
+        // Each proxy exposes a different UDP port. Packets sent to B's mapping are forwarded to
+        // B from A's mapping, and vice versa, so the endpoints see translated source addresses.
+        let mapping_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("mapping A"));
+        let mapping_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("mapping B"));
+        let mapped_a = mapping_a.local_addr().expect("mapped A address");
+        let mapped_b = mapping_b.local_addr().expect("mapped B address");
+        let proxy_a = {
+            let mapping_a = Arc::clone(&mapping_a);
+            let mapping_b = Arc::clone(&mapping_b);
+            tokio::spawn(async move {
+                let mut packet = vec![0; 65_535];
+                while let Ok((length, _source)) = mapping_a.recv_from(&mut packet).await {
+                    if mapping_b
+                        .send_to(&packet[..length], address_a)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        };
+        let proxy_b = {
+            let mapping_a = Arc::clone(&mapping_a);
+            let mapping_b = Arc::clone(&mapping_b);
+            tokio::spawn(async move {
+                let mut packet = vec![0; 65_535];
+                while let Ok((length, _source)) = mapping_b.recv_from(&mut packet).await {
+                    if mapping_a
+                        .send_to(&packet[..length], address_b)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        };
+
+        let credentials_a = generate_ice_credentials(1).expect("credentials A");
+        let credentials_b = generate_ice_credentials(1).expect("credentials B");
+        let mut messages_a = endpoint_a
+            .ice_router
+            .register(credentials_a.ufrag.clone(), credentials_b.ufrag.clone(), 8)
+            .expect("register A session");
+        let mut messages_b = endpoint_b
+            .ice_router
+            .register(credentials_b.ufrag.clone(), credentials_a.ufrag.clone(), 8)
+            .expect("register B session");
+        let mut driver_a = IceAgentDriver::for_peer(
+            &credentials_a,
+            &credentials_b,
+            &[mapped_a],
+            &[mapped_b],
+            true,
+            Instant::now(),
+        )
+        .expect("construct A ICE session");
+        let mut driver_b = IceAgentDriver::for_peer(
+            &credentials_b,
+            &credentials_a,
+            &[mapped_b],
+            &[mapped_a],
+            false,
+            Instant::now(),
+        )
+        .expect("construct B ICE session");
+        let (pair_a, pair_b) = tokio::join!(
+            driver_a.run_checks(
+                &endpoint_a.socket,
+                &endpoint_a.ice_router,
+                &credentials_a.ufrag,
+                &credentials_b.ufrag,
+                &mut messages_a,
+                Duration::from_secs(3),
+            ),
+            driver_b.run_checks(
+                &endpoint_b.socket,
+                &endpoint_b.ice_router,
+                &credentials_b.ufrag,
+                &credentials_a.ufrag,
+                &mut messages_b,
+                Duration::from_secs(3),
+            ),
+        );
+        assert_eq!(pair_a.expect("A nominates mapped pair").1, mapped_b);
+        assert_eq!(pair_b.expect("B nominates mapped pair").1, mapped_a);
+        assert_eq!(mapping_a.local_addr().unwrap(), mapped_a);
+        assert_eq!(mapping_b.local_addr().unwrap(), mapped_b);
+
+        let peer_a_id = identity_a.device_id();
+        let peer_a_key = identity_a.public_key();
+        let peer_b_id = identity_b.device_id();
+        let peer_b_key = identity_b.public_key();
+        let server = endpoint_b.endpoint.clone();
+        let identity_b_path = temp.join("b/device.key");
+        let accept = tokio::spawn(async move {
+            let identity_b =
+                crate::Identity::load_or_create_at(identity_b_path).expect("reload identity B");
+            crate::accept_peer(&server, "ice-nat-test", &identity_b, &peer_a_id, peer_a_key).await
+        });
+        let channel_a = crate::connect_peer(
+            &endpoint_a.endpoint,
+            mapped_b,
+            "ice-nat-test",
+            &identity_a,
+            &peer_b_id,
+            peer_b_key,
+        )
+        .await
+        .expect("QUIC handshake through mapped UDP path");
+        let channel_b = accept.await.expect("accept task").expect("accept QUIC");
+        channel_a
+            .send_packet(b"ice-over-mapped-udp")
+            .await
+            .expect("send through NAT mapping proxies");
+        assert_eq!(
+            channel_b
+                .recv_packet()
+                .await
+                .expect("receive tunneled payload"),
+            b"ice-over-mapped-udp"
+        );
+        channel_a.close();
+        channel_b.close();
+        endpoint_a.endpoint.close(0_u32.into(), b"test complete");
+        endpoint_b.endpoint.close(0_u32.into(), b"test complete");
+        proxy_a.abort();
+        proxy_b.abort();
+        drop(mapping_a);
+        drop(mapping_b);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test]
     async fn ice_credentials_can_restart_on_the_same_udp_socket() {
         let temp =
             std::env::temp_dir().join(format!("mini-tunnel-ice-restart-{}", uuid::Uuid::new_v4()));
