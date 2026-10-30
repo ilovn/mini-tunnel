@@ -706,9 +706,24 @@ mod tests {
                 "10.77.1.0/24",
             ]);
 
-            for (namespace, inside, outside) in [
-                (&router_a, &router_a_lan, &router_a_wan),
-                (&router_b, &router_b_lan, &router_b_wan),
+            // MASQUERADE may allocate a different source port for each destination. Use a
+            // one-to-one address mapping here so the test specifically models an
+            // endpoint-independent UDP mapping while the filter still admits only tracked replies.
+            for (namespace, inside, outside, inside_ip, outside_ip) in [
+                (
+                    &router_a,
+                    &router_a_lan,
+                    &router_a_wan,
+                    "10.77.1.2",
+                    "198.18.0.1",
+                ),
+                (
+                    &router_b,
+                    &router_b_lan,
+                    &router_b_wan,
+                    "10.78.1.2",
+                    "198.18.0.2",
+                ),
             ] {
                 router(namespace, "sysctl", &["-w", "net.ipv4.ip_forward=1"]);
                 router(
@@ -718,11 +733,33 @@ mod tests {
                         "-t",
                         "nat",
                         "-A",
+                        "PREROUTING",
+                        "-i",
+                        outside,
+                        "-d",
+                        &format!("{outside_ip}/32"),
+                        "-j",
+                        "NETMAP",
+                        "--to",
+                        &format!("{inside_ip}/32"),
+                    ],
+                );
+                router(
+                    namespace,
+                    "iptables",
+                    &[
+                        "-t",
+                        "nat",
+                        "-A",
                         "POSTROUTING",
+                        "-s",
+                        &format!("{inside_ip}/32"),
                         "-o",
                         outside,
                         "-j",
-                        "MASQUERADE",
+                        "NETMAP",
+                        "--to",
+                        &format!("{outside_ip}/32"),
                     ],
                 );
                 router(
