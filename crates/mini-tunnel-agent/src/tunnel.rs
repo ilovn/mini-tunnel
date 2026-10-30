@@ -8,7 +8,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use thiserror::Error;
@@ -21,6 +21,7 @@ const MESH_EVENT_QUEUE_PER_PEER: usize = 8;
 const MAX_MESH_EVENT_QUEUE_CAPACITY: usize = 1024;
 // One 9000-byte outbound packet per each of 4096 peers caps this queue at about 35.2 MiB.
 const MESH_OUTBOUND_QUEUE_PER_PEER: usize = 1;
+const MESH_OUTBOUND_PACKET_TTL: Duration = Duration::from_secs(5);
 
 fn mesh_event_queue_capacity(peer_count: usize) -> usize {
     peer_count
@@ -101,11 +102,14 @@ fn release_mesh_event_quota(event: &MeshEvent) {
 }
 
 fn try_queue_mesh_packet(
-    sender: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    sender: &tokio::sync::mpsc::Sender<QueuedMeshPacket>,
     address: Ipv4Addr,
     packet: Vec<u8>,
 ) -> MeshPacketDelivery {
-    match sender.try_send(packet) {
+    match sender.try_send(QueuedMeshPacket {
+        payload: packet,
+        queued_at: Instant::now(),
+    }) {
         Ok(()) => MeshPacketDelivery::Queued,
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
             MESH_DROPPED_PACKETS.fetch_add(1, Ordering::Relaxed);
@@ -116,6 +120,30 @@ fn try_queue_mesh_packet(
             MeshPacketDelivery::ReceiverClosed
         }
     }
+}
+
+struct QueuedMeshPacket {
+    payload: Vec<u8>,
+    queued_at: Instant,
+}
+
+fn mesh_packet_expired(queued_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(queued_at) >= MESH_OUTBOUND_PACKET_TTL
+}
+
+fn discard_queued_mesh_packets(
+    receiver: &mut tokio::sync::mpsc::Receiver<QueuedMeshPacket>,
+    address: Ipv4Addr,
+) -> usize {
+    let mut dropped = 0_u64;
+    while receiver.try_recv().is_ok() {
+        dropped = dropped.saturating_add(1);
+    }
+    if dropped > 0 {
+        MESH_DROPPED_PACKETS.fetch_add(dropped, Ordering::Relaxed);
+        tracing::debug!(peer_address = %address, dropped, "discarding queued mesh packets after path failure");
+    }
+    usize::try_from(dropped).unwrap_or(usize::MAX)
 }
 
 pub type PeerConnectFuture =
@@ -187,7 +215,7 @@ struct MeshPeerRuntime {
     probe: Option<PeerConnector>,
     probe_cooldown: Duration,
     pending_events: Arc<AtomicUsize>,
-    outbound: tokio::sync::mpsc::Sender<Vec<u8>>,
+    outbound: tokio::sync::mpsc::Sender<QueuedMeshPacket>,
 }
 
 struct MeshPeerReceiver {
@@ -197,7 +225,7 @@ struct MeshPeerReceiver {
     probe: Option<PeerConnector>,
     probe_cooldown: Duration,
     pending_events: Arc<AtomicUsize>,
-    outbound_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    outbound_rx: tokio::sync::mpsc::Receiver<QueuedMeshPacket>,
     event_tx: tokio::sync::mpsc::Sender<MeshEvent>,
 }
 
@@ -207,7 +235,10 @@ fn new_mesh_peer_runtime(
     connector: Option<PeerConnector>,
     probe: Option<PeerConnector>,
     probe_cooldown: Duration,
-) -> (MeshPeerRuntime, tokio::sync::mpsc::Receiver<Vec<u8>>) {
+) -> (
+    MeshPeerRuntime,
+    tokio::sync::mpsc::Receiver<QueuedMeshPacket>,
+) {
     let (outbound, outbound_rx) = tokio::sync::mpsc::channel(MESH_OUTBOUND_QUEUE_PER_PEER);
     (
         MeshPeerRuntime {
@@ -434,7 +465,12 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                 }
                 outbound = outbound_rx.recv() => {
                     let Some(packet) = outbound else { return };
-                    if let Err(error) = active.send_packet(&packet).await {
+                    if mesh_packet_expired(packet.queued_at, Instant::now()) {
+                        MESH_DROPPED_PACKETS.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(peer_address = %address, "dropping expired queued mesh packet");
+                        continue;
+                    }
+                    if let Err(error) = active.send_packet(&packet.payload).await {
                         break Err(error);
                     }
                 }
@@ -496,6 +532,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
             Err(failure) => failure,
         };
         active.stop_ice_consent_monitor().await;
+        discard_queued_mesh_packets(&mut outbound_rx, address);
         if active.transport_name() == "QUIC/UDP" && matches!(&failure, IdentityError::Transport(_))
         {
             force_reliable = true;
@@ -812,7 +849,7 @@ async fn pump_mesh<T: TunnelPacketIo>(
 fn spawn_mesh_receiver(
     address: Ipv4Addr,
     runtime: &MeshPeerRuntime,
-    outbound_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    outbound_rx: tokio::sync::mpsc::Receiver<QueuedMeshPacket>,
     event_tx: tokio::sync::mpsc::Sender<MeshEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(receive_mesh_peer(MeshPeerReceiver {
@@ -956,8 +993,47 @@ mod tests {
             MeshPacketDelivery::Queued,
             "a slow peer's full queue does not consume another peer's capacity"
         );
-        assert_eq!(fast_receiver.recv().await, Some(vec![3]));
-        assert_eq!(slow_receiver.recv().await, Some(vec![1]));
+        assert_eq!(
+            fast_receiver
+                .recv()
+                .await
+                .expect("fast peer packet")
+                .payload,
+            vec![3]
+        );
+        assert_eq!(
+            slow_receiver
+                .recv()
+                .await
+                .expect("slow peer packet")
+                .payload,
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn queued_mesh_packets_expire_after_the_recovery_window() {
+        let now = Instant::now();
+        assert!(!mesh_packet_expired(now, now));
+        assert!(mesh_packet_expired(
+            now.checked_sub(MESH_OUTBOUND_PACKET_TTL)
+                .expect("subtract packet lifetime"),
+            now
+        ));
+    }
+
+    #[tokio::test]
+    async fn path_failure_discards_already_queued_mesh_packets() {
+        let address = Ipv4Addr::new(10, 77, 0, 2);
+        let (sender, mut receiver) = mpsc::channel(MESH_OUTBOUND_QUEUE_PER_PEER);
+        let before = mesh_dropped_packets_total();
+        assert_eq!(
+            try_queue_mesh_packet(&sender, address, vec![1]),
+            MeshPacketDelivery::Queued
+        );
+        assert_eq!(discard_queued_mesh_packets(&mut receiver, address), 1);
+        assert!(receiver.try_recv().is_err());
+        assert!(mesh_dropped_packets_total() > before);
     }
 
     #[test]
