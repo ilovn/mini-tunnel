@@ -34,6 +34,10 @@ jobs:
       - name: Check formatting
         run: cargo +stable fmt --all -- --check
 
+      - name: Check systemd service sandbox settings
+        if: runner.os == 'Linux'
+        run: python3 deploy/systemd/check_units.py
+
       - name: Run workspace tests
         run: cargo +stable test --workspace
 

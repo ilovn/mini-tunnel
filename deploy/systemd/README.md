@@ -29,7 +29,7 @@ The coordinator template binds HTTPS to loopback for a local reverse proxy. Conf
 
 On Unix, both services treat systemd's default `SIGTERM` and `Ctrl+C` as graceful shutdown signals. The relay waits up to its configured shutdown grace period for paired sessions to finish; the coordinator stops accepting new requests and completes in-flight requests.
 
-`ProtectSystem=strict`, `NoNewPrivileges`, and the dedicated account limit service access. The relay does not need TUN or network-administration capabilities. These services do not run the peer TUN client; client-side interface and route setup requires a separate, explicit privilege model.
+`ProtectSystem=strict`, `NoNewPrivileges`, and the dedicated account limit service access. Both units drop all Linux capabilities, hide device nodes, and protect kernel control interfaces. The relay does not need TUN or network-administration capabilities. These services do not run the peer TUN client; client-side interface and route setup requires a separate, explicit privilege model.
 
 ## Upgrade and rollback
 

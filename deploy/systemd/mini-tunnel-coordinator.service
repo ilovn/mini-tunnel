@@ -20,8 +20,17 @@ StateDirectory=mini-tunnel
 StateDirectoryMode=0700
 ReadOnlyPaths=/etc/mini-tunnel/tls
 ReadWritePaths=/var/lib/mini-tunnel
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectHostname=true
 LockPersonality=true
 RestrictSUIDSGID=true
+RestrictRealtime=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LimitNOFILE=65536
 
