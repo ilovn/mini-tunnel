@@ -6,8 +6,8 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     ops::{Deref, DerefMut},
     pin::Pin,
-    sync::Arc,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -150,6 +150,85 @@ pub type PeerConnectFuture =
     Pin<Box<dyn Future<Output = Result<PeerChannel, IdentityError>> + Send>>;
 pub type PeerConnector = Arc<dyn Fn(bool) -> PeerConnectFuture + Send + Sync>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PathQualityPolicy {
+    max_rtt: Duration,
+    max_loss_percent: u8,
+    bad_windows: u8,
+}
+
+impl Default for PathQualityPolicy {
+    fn default() -> Self {
+        Self {
+            max_rtt: Duration::from_millis(350),
+            max_loss_percent: 20,
+            bad_windows: 3,
+        }
+    }
+}
+
+impl PathQualityPolicy {
+    fn from_values(
+        rtt_ms: Option<&str>,
+        loss_percent: Option<&str>,
+        windows: Option<&str>,
+    ) -> Self {
+        let defaults = Self::default();
+        let parse = |name: &str, value: Option<&str>, min: u64, max: u64, default: u64| {
+            value.map_or(default, |raw| match raw.parse::<u64>() {
+                Ok(value) if (min..=max).contains(&value) => value,
+                _ => {
+                    tracing::warn!(
+                        variable = name,
+                        value = raw,
+                        "invalid path quality setting; using default"
+                    );
+                    default
+                }
+            })
+        };
+        Self {
+            max_rtt: Duration::from_millis(parse(
+                "MINI_TUNNEL_QUALITY_RTT_THRESHOLD_MS",
+                rtt_ms,
+                1,
+                60_000,
+                defaults.max_rtt.as_millis() as u64,
+            )),
+            max_loss_percent: parse(
+                "MINI_TUNNEL_QUALITY_LOSS_THRESHOLD_PERCENT",
+                loss_percent,
+                0,
+                100,
+                defaults.max_loss_percent as u64,
+            ) as u8,
+            bad_windows: parse(
+                "MINI_TUNNEL_QUALITY_BAD_WINDOWS",
+                windows,
+                1,
+                30,
+                defaults.bad_windows as u64,
+            ) as u8,
+        }
+    }
+
+    fn from_environment() -> Self {
+        Self::from_values(
+            std::env::var("MINI_TUNNEL_QUALITY_RTT_THRESHOLD_MS")
+                .ok()
+                .as_deref(),
+            std::env::var("MINI_TUNNEL_QUALITY_LOSS_THRESHOLD_PERCENT")
+                .ok()
+                .as_deref(),
+            std::env::var("MINI_TUNNEL_QUALITY_BAD_WINDOWS")
+                .ok()
+                .as_deref(),
+        )
+    }
+}
+
+static PATH_QUALITY_POLICY: OnceLock<PathQualityPolicy> = OnceLock::new();
+
 #[derive(Default)]
 pub struct PathQualityTracker {
     last_successes: u64,
@@ -158,6 +237,7 @@ pub struct PathQualityTracker {
     window_missed: u64,
     bad_windows: u8,
     degraded: bool,
+    policy: Option<PathQualityPolicy>,
 }
 
 impl PathQualityTracker {
@@ -174,11 +254,12 @@ impl PathQualityTracker {
         if self.window_probes < 3 || self.degraded {
             return self.degraded;
         }
-        let loss_ratio = self.window_missed as f64 / self.window_probes as f64;
-        let bad = loss_ratio > 0.20
-            || snapshot
-                .rtt
-                .is_some_and(|rtt| rtt > Duration::from_millis(350));
+        let policy = *self.policy.get_or_insert_with(|| {
+            *PATH_QUALITY_POLICY.get_or_init(PathQualityPolicy::from_environment)
+        });
+        let bad = u128::from(self.window_missed) * 100
+            > u128::from(policy.max_loss_percent) * u128::from(self.window_probes)
+            || snapshot.rtt.is_some_and(|rtt| rtt > policy.max_rtt);
         self.bad_windows = if bad {
             self.bad_windows.saturating_add(1)
         } else {
@@ -186,7 +267,7 @@ impl PathQualityTracker {
         };
         self.window_probes = 0;
         self.window_missed = 0;
-        self.degraded = self.bad_windows >= 3;
+        self.degraded = self.bad_windows >= policy.bad_windows;
         self.degraded
     }
 }
@@ -1774,6 +1855,40 @@ mod tests {
         }
         snapshot.probes_succeeded += 2;
         snapshot.probes_missed += 1;
+        assert!(tracker.observe(snapshot));
+    }
+
+    #[test]
+    fn path_quality_policy_parses_and_bounds_environment_settings() {
+        assert_eq!(
+            PathQualityPolicy::from_values(Some("900"), Some("35"), Some("2")),
+            PathQualityPolicy {
+                max_rtt: Duration::from_millis(900),
+                max_loss_percent: 35,
+                bad_windows: 2,
+            }
+        );
+        assert_eq!(
+            PathQualityPolicy::from_values(Some("0"), Some("101"), Some("31")),
+            PathQualityPolicy::default()
+        );
+    }
+
+    #[test]
+    fn custom_path_quality_policy_controls_degradation() {
+        let mut tracker = PathQualityTracker {
+            policy: Some(PathQualityPolicy {
+                max_rtt: Duration::from_millis(100),
+                max_loss_percent: 10,
+                bad_windows: 1,
+            }),
+            ..PathQualityTracker::default()
+        };
+        let snapshot = crate::PeerHealthSnapshot {
+            rtt: Some(Duration::from_millis(101)),
+            probes_succeeded: 3,
+            probes_missed: 0,
+        };
         assert!(tracker.observe(snapshot));
     }
 

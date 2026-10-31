@@ -109,6 +109,8 @@ The agent crate exposes an async Layer 3 IPv4/IPv6 TUN adapter (`mini_tunnel_age
 
 The tunnel commands keep one authenticated peer session open and pump IP packets both ways. The listener must advertise its reachable UDP address first and start before the connector:
 
+Peer UDP path quality thresholds are configurable per agent process. `MINI_TUNNEL_QUALITY_RTT_THRESHOLD_MS` defaults to `350` and accepts `1`–`60000`; `MINI_TUNNEL_QUALITY_LOSS_THRESHOLD_PERCENT` defaults to `20` and accepts `0`–`100`; `MINI_TUNNEL_QUALITY_BAD_WINDOWS` defaults to `3` and accepts `1`–`30`. A window needs at least three probes; RTT or loss must be strictly greater than its threshold for the configured consecutive windows before switching from UDP. Invalid values are logged and replaced with their defaults. Settings are read once when the first peer quality window is evaluated.
+
 ```sh
 # Peer B: publish the listener's reachable UDP candidate, then wait for peer A
 cargo run -p mini-tunnel -- network advertise --network-id '<network-id>' --candidate '203.0.113.20:42000'
