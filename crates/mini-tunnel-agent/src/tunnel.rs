@@ -435,6 +435,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         let mut last_received = tokio::time::Instant::now();
         let mut inbound = Box::pin(active.recv_packet());
         let mut quality = PathQualityTracker::default();
+        let mut health_status_windows = 0_u8;
         let mut force_reliable = false;
         let mut probe_interval =
             tokio::time::interval_at(tokio::time::Instant::now() + probe_cooldown, probe_cooldown);
@@ -478,6 +479,18 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                 }
                 _ = keepalive.tick() => {
                     let health = active.health_snapshot();
+                    health_status_windows += 1;
+                    if health_status_windows == 6 {
+                        health_status_windows = 0;
+                        tracing::debug!(
+                            peer_address = %address,
+                            path = active.transport_name(),
+                            rtt_ms = health.rtt.map(|rtt| rtt.as_millis() as u64),
+                            probes_succeeded = health.probes_succeeded,
+                            probes_missed = health.probes_missed,
+                            "peer path health snapshot"
+                        );
+                    }
                     if active.transport_name() == "QUIC/UDP" && quality.observe(health) {
                         tracing::warn!(
                             peer_address = %address,
