@@ -279,7 +279,7 @@ enum NetworkCommand {
         )]
         coordinator_url: String,
     },
-    /// List signed same-network peer snapshots.
+    /// List peers and candidates from the same-network Coordinator snapshot.
     Peers {
         #[arg(long)]
         network_id: String,

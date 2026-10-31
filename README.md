@@ -95,7 +95,7 @@ cargo run -p mini-tunnel -- peer send --remote '<receiver-ip>:42000' --network-i
 
 This diagnostic requires a directly reachable UDP address and an explicitly opened inbound UDP port. QUIC encrypts the datagram; TLS pins the receiver key and the receiver verifies a fresh Ed25519 proof from the sender. Datagrams are bounded and have an application replay window. It is not NAT traversal and does not use advertised candidates automatically; use `peer tunnel` below for a sustained TUN data path.
 
-With both devices enrolled and their reachable UDP addresses advertised, the sender can fetch the signed same-network peer snapshot and try the selected peer's candidates automatically:
+With both devices enrolled and their reachable UDP addresses advertised, the sender signs its peer-list request with its device identity, fetches the Coordinator's same-network peer snapshot over the configured connection, and tries the selected peer's candidates automatically:
 
 ```sh
 cargo run -p mini-tunnel -- peer connect --network-id '<network-id>' --peer-id '<receiver-device-id>' --message 'hello'

@@ -10,7 +10,7 @@ Status: **not yet executed**. The loopback ICE mapping proxy verifies packet rew
 - Record the client OS/kernel, mini-tunnel commit, Coordinator/STUN/Relay versions, NAT/router model and firmware, ISP/access type, public IPv4/IPv6 addresses (redacted in shared reports), and UTC test interval. Do not record admin, invite, ICE password, or private-key values.
 - Preserve access to each router/firewall for packet capture and targeted UDP impairment. Keep Coordinator HTTPS and Relay TCP reachable while impairing peer UDP.
 
-Create the network and enroll both devices using the [Quick start](../README.md#quick-start). Confirm each device appears in the same signed peer snapshot before testing.
+Create the network and enroll both devices using the [Quick start](../README.md#quick-start). Confirm each device appears in the same-network peer snapshot returned for the enrolled device's identity-signed request before testing.
 
 ## Start the two peers
 
