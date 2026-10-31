@@ -1892,6 +1892,31 @@ mod tests {
         assert!(tracker.observe(snapshot));
     }
 
+    #[test]
+    fn custom_packet_loss_threshold_uses_strict_greater_than_boundary() {
+        let mut tracker = PathQualityTracker {
+            policy: Some(PathQualityPolicy {
+                max_rtt: Duration::from_millis(1_000),
+                max_loss_percent: 25,
+                bad_windows: 1,
+            }),
+            ..PathQualityTracker::default()
+        };
+        let mut snapshot = crate::PeerHealthSnapshot {
+            rtt: Some(Duration::from_millis(50)),
+            probes_succeeded: 3,
+            probes_missed: 1,
+        };
+        assert!(!tracker.observe(snapshot), "exactly 25% loss is acceptable");
+
+        snapshot.probes_succeeded += 2;
+        snapshot.probes_missed += 1;
+        assert!(
+            tracker.observe(snapshot),
+            "loss above 25% degrades the path"
+        );
+    }
+
     #[tokio::test]
     async fn mesh_switches_to_tcp_after_sustained_udp_quality_degradation() {
         let temp = std::env::temp_dir().join(format!(
