@@ -368,11 +368,22 @@ pub async fn pump_peer_packets<T: TunnelPacketIo>(
     peer_ipv4: Ipv4Addr,
     peer_ipv6: Option<Ipv6Addr>,
 ) -> Result<(), PeerTunnelError> {
+    let key = format!("peer@{peer_ipv4}");
     let mut keepalive = tokio::time::interval(Duration::from_secs(10));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     keepalive.tick().await;
     let mut last_received = tokio::time::Instant::now();
     let mut inbound = Box::pin(peer.recv_packet());
+    let initial_health = peer.health_snapshot();
+    crate::status::update(
+        key.clone(),
+        true,
+        peer.transport_name(),
+        initial_health.rtt.map(|rtt| rtt.as_millis() as u64),
+        initial_health.probes_succeeded,
+        initial_health.probes_missed,
+        None,
+    );
     let outcome = loop {
         tokio::select! {
             _ = peer.wait_ice_consent_failure() => {
@@ -405,6 +416,12 @@ pub async fn pump_peer_packets<T: TunnelPacketIo>(
                 inbound = Box::pin(peer.recv_packet());
             }
             _ = keepalive.tick() => {
+                let health = peer.health_snapshot();
+                crate::status::update(
+                    key.clone(), true, peer.transport_name(),
+                    health.rtt.map(|rtt| rtt.as_millis() as u64),
+                    health.probes_succeeded, health.probes_missed, None,
+                );
                 if let Err(error) = peer.send_keepalive().await {
                     break Err(error.into());
                 }
@@ -412,6 +429,16 @@ pub async fn pump_peer_packets<T: TunnelPacketIo>(
         }
     };
     peer.stop_ice_consent_monitor().await;
+    let health = peer.health_snapshot();
+    crate::status::update(
+        key,
+        false,
+        peer.transport_name(),
+        health.rtt.map(|rtt| rtt.as_millis() as u64),
+        health.probes_succeeded,
+        health.probes_missed,
+        None,
+    );
     outcome
 }
 
@@ -436,6 +463,16 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         let mut inbound = Box::pin(active.recv_packet());
         let mut quality = PathQualityTracker::default();
         let mut health_status_windows = 0_u8;
+        let initial_health = active.health_snapshot();
+        crate::status::update(
+            address.to_string(),
+            true,
+            active.transport_name(),
+            initial_health.rtt.map(|rtt| rtt.as_millis() as u64),
+            initial_health.probes_succeeded,
+            initial_health.probes_missed,
+            None,
+        );
         let mut force_reliable = false;
         let mut probe_interval =
             tokio::time::interval_at(tokio::time::Instant::now() + probe_cooldown, probe_cooldown);
@@ -479,6 +516,11 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                 }
                 _ = keepalive.tick() => {
                     let health = active.health_snapshot();
+                    crate::status::update(
+                        address.to_string(), true, active.transport_name(),
+                        health.rtt.map(|rtt| rtt.as_millis() as u64),
+                        health.probes_succeeded, health.probes_missed, None,
+                    );
                     health_status_windows += 1;
                     if health_status_windows == 6 {
                         health_status_windows = 0;
@@ -500,6 +542,11 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                             probes_missed = health.probes_missed,
                             reason = "quality_threshold",
                             "peer path quality degraded; switching to reliable fallback"
+                        );
+                        crate::status::update(
+                            address.to_string(), true, active.transport_name(),
+                            health.rtt.map(|rtt| rtt.as_millis() as u64),
+                            health.probes_succeeded, health.probes_missed, Some("quality_threshold"),
                         );
                         force_reliable = true;
                         break Err(IdentityError::Transport("peer path quality degraded".to_owned()));
@@ -531,6 +578,12 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                             "peer path promoted"
                         );
                         *channel.write().await = Arc::new(candidate);
+                        let health = channel.read().await.health_snapshot();
+                        crate::status::update(
+                            address.to_string(), true, promoted_path,
+                            health.rtt.map(|rtt| rtt.as_millis() as u64),
+                            health.probes_succeeded, health.probes_missed, Some("healthy_direct_probe"),
+                        );
                         break Ok(());
                     }
                 }
@@ -547,6 +600,16 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
             Err(failure) => failure,
         };
         active.stop_ice_consent_monitor().await;
+        let health = active.health_snapshot();
+        crate::status::update(
+            address.to_string(),
+            false,
+            active.transport_name(),
+            health.rtt.map(|rtt| rtt.as_millis() as u64),
+            health.probes_succeeded,
+            health.probes_missed,
+            None,
+        );
         discard_queued_mesh_packets(&mut outbound_rx, address);
         if active.transport_name() == "QUIC/UDP" && matches!(&failure, IdentityError::Transport(_))
         {
@@ -1807,6 +1870,24 @@ mod tests {
             .unwrap()
             .1;
         assert!(requested_reliable.load(Ordering::SeqCst));
+        let fallback_status = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(status) = crate::status::snapshot().into_iter().find(|status| {
+                    status.peer == peer_ip.to_string()
+                        && status.online
+                        && status.active_path == "TLS/TCP"
+                }) {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("live mesh status did not report reliable fallback");
+        assert_eq!(
+            fallback_status.last_switch_reason.as_deref(),
+            Some("quality_threshold")
+        );
         outbound_tx
             .send(packet(local_ip, peer_ip, 28))
             .await
@@ -2293,6 +2374,24 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(received.len(), 28);
+        let promoted_status = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(status) = crate::status::snapshot().into_iter().find(|status| {
+                    status.peer == peer_ip.to_string()
+                        && status.online
+                        && status.active_path == "QUIC/UDP"
+                }) {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("live mesh status did not report direct UDP promotion");
+        assert_eq!(
+            promoted_status.last_switch_reason.as_deref(),
+            Some("healthy_direct_probe")
+        );
         pump.abort();
         endpoint_a.close(0_u32.into(), b"test complete");
         endpoint_b.close(0_u32.into(), b"test complete");

@@ -310,6 +310,11 @@ enum PeerCommand {
         #[command(subcommand)]
         command: TunnelCommand,
     },
+    /// Query the running tunnel process live peer status over loopback HTTP.
+    Status {
+        #[arg(long, default_value = "http://127.0.0.1:42003")]
+        url: String,
+    },
     /// Discover an authorized peer from the signed snapshot and send one diagnostic datagram.
     Connect {
         #[arg(long, default_value = "0.0.0.0:0")]
@@ -478,6 +483,35 @@ struct HealthResponse {
     status: String,
     service: String,
     version: String,
+}
+
+async fn peer_status() -> axum::Json<Vec<mini_tunnel_agent::status::PeerStatus>> {
+    axum::Json(mini_tunnel_agent::status::snapshot())
+}
+
+fn validate_status_address(address: SocketAddr) -> Result<(), &'static str> {
+    if address.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err("peer status listener must use a loopback address")
+    }
+}
+
+async fn spawn_peer_status_server()
+-> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error + Send + Sync>> {
+    let address = std::env::var("MINI_TUNNEL_STATUS_LISTEN")
+        .unwrap_or_else(|_| "127.0.0.1:42003".to_owned())
+        .parse::<SocketAddr>()?;
+    validate_status_address(address)?;
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    let address = listener.local_addr()?;
+    println!("Live peer status available at http://{address}/status");
+    let app = Router::new().route("/status", get(peer_status));
+    Ok(tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app).await {
+            tracing::error!(%error, "peer status listener stopped");
+        }
+    }))
 }
 
 #[tokio::main]
@@ -819,6 +853,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     manage_route,
                     coordinator_url,
                 } => {
+                    let _status_server = spawn_peer_status_server().await?;
                     let identity =
                         std::sync::Arc::new(mini_tunnel_agent::Identity::load_or_create()?);
                     let (local_ipv4, prefix_len) =
@@ -913,6 +948,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     manage_route,
                     coordinator_url,
                 } => {
+                    let _status_server = spawn_peer_status_server().await?;
                     let identity =
                         std::sync::Arc::new(mini_tunnel_agent::Identity::load_or_create()?);
                     let (local_ipv4, prefix_len) =
@@ -1038,6 +1074,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     manage_route,
                     coordinator_url,
                 } => {
+                    let _status_server = spawn_peer_status_server().await?;
                     let identity = mini_tunnel_agent::Identity::load_or_create()?;
                     let (local_ipv4, prefix_len) =
                         resolve_tun_parameters(&network_id, &identity, local_ipv4, prefix_len)?;
@@ -1306,6 +1343,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     result?;
                 }
             },
+            PeerCommand::Status { url } => {
+                let response = reqwest::get(format!("{}/status", url.trim_end_matches('/')))
+                    .await?
+                    .error_for_status()?;
+                let peers: Vec<mini_tunnel_agent::status::PeerStatus> = response.json().await?;
+                println!("{}", serde_json::to_string_pretty(&peers)?);
+            }
             PeerCommand::Connect {
                 bind,
                 network_id,
@@ -3400,6 +3444,25 @@ fn print_tunnel_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_status_listener_refuses_non_loopback_addresses() {
+        assert!(validate_status_address("127.0.0.1:42003".parse().unwrap()).is_ok());
+        assert!(validate_status_address("[::1]:42003".parse().unwrap()).is_ok());
+        assert!(validate_status_address("0.0.0.0:42003".parse().unwrap()).is_err());
+        assert!(validate_status_address("192.0.2.1:42003".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn peer_status_command_is_available_without_network_credentials() {
+        let cli = Cli::try_parse_from(["mini-tunnel", "peer", "status"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Peer {
+                command: PeerCommand::Status { .. }
+            }
+        ));
+    }
 
     #[test]
     fn peer_diagnostics_summarize_candidates_without_exposing_addresses_or_keys() {

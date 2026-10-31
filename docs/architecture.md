@@ -107,7 +107,7 @@ UDP “不稳定”的判定需区分丢包、拥塞和运营商 QoS：用户数
 
 核心控制消息：`RegisterDevice, Heartbeat, ListPeers, CandidateUpdate, ConnectivityCheck, SessionReady, RelayTicket, NetworkConfig, Revoke, Error`。核心数据消息只运 overlay IP packet；传输层必须提供 peer 身份、会话 epoch 和防重放属性。消息采用 protobuf 或 postcard/CBOR 的带版本 schema，首版选 protobuf 以方便跨版本诊断；不要把任意 serde 内部表示当长期 wire contract。
 
-**当前实现与原建议的差异**：Coordinator 当前是版本化路径的 HTTPS REST API，消息体为 JSON，没有 WebSocket、protobuf/CBOR schema 或通用协议版本协商。直连优先使用 QUIC；RFC 8445 ICE 是显式 `--ice` 的实验性能力，未启用时使用候选拨号器。Relay 目前只实现 ticket 授权的 TCP 不透明转发，没有 UDP relay。CLI 的 `network diagnose` 能检查 peer snapshot 和已发布候选，但不能查询运行中 peer 的活动路径/RTT/loss；运行隧道时可从路径切换日志观察这些数据。相关设计项仍是目标，不应视为已交付能力。
+**当前实现与原建议的差异**：Coordinator 当前是版本化路径的 HTTPS REST API，消息体为 JSON，没有 WebSocket、protobuf/CBOR schema 或通用协议版本协商。直连优先使用 QUIC；RFC 8445 ICE 是显式 `--ice` 的实验性能力，未启用时使用候选拨号器。Relay 目前只实现 ticket 授权的 TCP 不透明转发，没有 UDP relay。`network diagnose` 检查 peer snapshot 和候选发布；运行中的 peer 活动路径、RTT、探测 loss 和最近切换原因可通过 loopback 本机 status 接口查询。
 
 TCP fallback 的帧格式：`u32_be frame_length | encrypted_packet`，最大 frame 长度受 MTU/实现上限约束；接收端先验证长度再分配内存。TCP 本身有序可靠，拥塞和丢包会阻塞该连接后续所有 packet；因此按 peer 建连接、限制队列、丢弃过期的非必要包，不做无界缓存。
 
@@ -152,7 +152,7 @@ Coordinator 现可使用 PostgreSQL 作为多实例共享事实源：网络、�
 
 **阶段 0：原型验证**：单平台 TUN + 两端 QUIC 直连；随后加 STUN/候选交换和 TLS/TCP relay；确认数据路径与权限模型。
 
-**阶段 1：MVP（原始路线）**：Linux/macOS agent、Coordinator、邀请加入、设备密钥、IPv4 地址分配、UDP 直连、UDP relay、status/诊断、撤销、断线重连。当前已有前三类核心组网能力、直接 UDP/TCP peer path、TCP relay fallback、撤销和重连；UDP relay 与运行中 status/诊断尚未实现。此阶段是项目启动时的计划记录，以上状态优先于原始路线清单。
+**阶段 1：MVP（原始路线）**：Linux/macOS agent、Coordinator、邀请加入、设备密钥、IPv4 地址分配、UDP 直连、UDP relay、status/诊断、撤销、断线重连。当前已有前三类核心组网能力、直接 UDP/TCP peer path、TCP relay fallback、运行时 peer status、撤销和重连；UDP relay 尚未实现。此阶段是项目启动时的计划记录，以上状态优先于原始路线清单。
 
 **阶段 2：网络兼容（原始路线）**：TCP 直连和 TLS/TCP relay、自动降级/恢复迟滞、Windows TUN、IPv6、服务端多副本、升级/密钥轮换。TCP/TLS fallback、IPv6 overlay、peer mesh 和路径降级/恢复现已实现；Coordinator 已有事务化 PostgreSQL 多实例模式与 JSON 文件模式，写吞吐仍受全局写锁限制；Linux、macOS 和 Windows 的 TUN runtime 与 host-route 生命周期已在特权 CI 验收，公网实网互通仍未完成验收。
 
@@ -160,7 +160,7 @@ Coordinator 现可使用 PostgreSQL 作为多实例共享事实源：网络、�
 
 **阶段 3：规模和策略**：子网路由、多网络、管理员策略、区域 relay 调度、可选 DNS、容量和抗滥用加强。广播、多播、L2 VLAN 桥接需单独评审，不属于首版。
 
-**仍需工程完成或实网验收**：运行中路径/质量 status 命令、UDP relay（如果产品仍需要它）、ICE 默认启用前的独立公网 NAT/防火墙/QoS 矩阵，以及拥塞/重启/网络切换场景验证。子网路由、L2、DNS 和区域 relay 属于阶段 3 范围，需另行定义需求，不计入当前 MVP 完成度。
+**仍需工程完成或实网验收**：UDP relay（如果产品仍需要它）、ICE 默认启用前的独立公网 NAT/防火墙/QoS 矩阵，以及拥塞/重启/网络切换场景验证。子网路由、L2、DNS 和区域 relay 属于阶段 3 范围，需另行定义需求，不计入当前 MVP 完成度。
 
 建议验收目标（压测与实网数据验证后调整，不构成现有能力承诺）：
 

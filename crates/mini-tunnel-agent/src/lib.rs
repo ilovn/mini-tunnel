@@ -4,6 +4,7 @@ pub mod candidate;
 pub mod ice;
 pub mod membership;
 pub mod routing;
+pub mod status;
 pub mod stun;
 pub mod tun_device;
 pub mod tunnel;
