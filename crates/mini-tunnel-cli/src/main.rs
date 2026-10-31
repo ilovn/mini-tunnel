@@ -3464,6 +3464,50 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn peer_status_http_endpoint_returns_live_quality_without_credentials() {
+        let peer = format!("status-http-{}", uuid::Uuid::new_v4());
+        mini_tunnel_agent::status::update(
+            peer.clone(),
+            true,
+            "TLS/TCP",
+            Some(57),
+            18,
+            2,
+            Some("quality_threshold"),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind status listener");
+        let address = listener.local_addr().expect("status listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/status", get(peer_status))).await
+        });
+        let response = reqwest::get(format!("http://{address}/status"))
+            .await
+            .expect("query live peer status")
+            .error_for_status()
+            .expect("status response");
+        let body = response.text().await.expect("status body");
+        let peers: Vec<mini_tunnel_agent::status::PeerStatus> =
+            serde_json::from_str(&body).expect("deserialize status response");
+        let status = peers
+            .into_iter()
+            .find(|status| status.peer == peer)
+            .expect("test peer is present in live status response");
+        assert!(status.online);
+        assert_eq!(status.active_path, "TLS/TCP");
+        assert_eq!(status.rtt_ms, Some(57));
+        assert_eq!(status.loss_percent, Some(10));
+        assert_eq!(
+            status.last_switch_reason.as_deref(),
+            Some("quality_threshold")
+        );
+        assert!(!body.contains("credential"));
+        assert!(!body.contains("candidate"));
+        server.abort();
+    }
+
     #[test]
     fn peer_diagnostics_summarize_candidates_without_exposing_addresses_or_keys() {
         let peers = vec![PeerInfo {
