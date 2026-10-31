@@ -290,6 +290,17 @@ enum NetworkCommand {
         )]
         coordinator_url: String,
     },
+    /// Check coordinator peer discovery and summarize direct-connect readiness.
+    Diagnose {
+        #[arg(long)]
+        network_id: String,
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_COORDINATOR_URL",
+            default_value = "http://127.0.0.1:8080"
+        )]
+        coordinator_url: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1540,9 +1551,64 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     );
                 }
             }
+            NetworkCommand::Diagnose {
+                network_id,
+                coordinator_url,
+            } => {
+                let identity = mini_tunnel_agent::Identity::load_or_create()?;
+                let timestamp_ms = now_ms()?;
+                let device_id = identity.device_id();
+                let request = PeerListRequest {
+                    device_id: device_id.clone(),
+                    timestamp_ms,
+                    signature: identity.sign(&peers_signing_bytes(
+                        &network_id,
+                        &device_id,
+                        timestamp_ms,
+                    )),
+                };
+                let path = format!("/v1/networks/{network_id}/peers");
+                let response: PeerListResponse =
+                    post_json(&coordinator_url, &path, &request).await?;
+                println!("Coordinator peer discovery: reachable");
+                println!("Local device: {device_id}");
+                print!("{}", format_peer_diagnostics(&response.peers));
+                println!(
+                    "Candidate presence does not prove reachability or report an active tunnel path."
+                );
+            }
         },
     }
     Ok(())
+}
+
+fn format_peer_diagnostics(peers: &[PeerInfo]) -> String {
+    let mut output = format!("Same-network peers: {}\n", peers.len());
+    if peers.is_empty() {
+        output.push_str("No other enrolled peers were returned.\n");
+        return output;
+    }
+    for peer in peers {
+        let tcp_candidates = peer
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.starts_with("tcp://"))
+            .count();
+        let udp_candidates = peer.candidates.len().saturating_sub(tcp_candidates);
+        output.push_str(&format!(
+            "Peer {} ({}): UDP candidates={}, TCP candidates={}, ICE credentials={}\n",
+            peer.device_id,
+            peer.assigned_ipv4,
+            udp_candidates,
+            tcp_candidates,
+            if peer.ice_credentials.is_some() {
+                "published"
+            } else {
+                "missing"
+            }
+        ));
+    }
+    output
 }
 
 fn decode_peer_key(encoded: &str) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
@@ -3334,6 +3400,27 @@ fn print_tunnel_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_diagnostics_summarize_candidates_without_exposing_addresses_or_keys() {
+        let peers = vec![PeerInfo {
+            device_id: "device-1".to_owned(),
+            assigned_ipv4: "10.42.0.2".to_owned(),
+            public_key: "private-looking-public-key".to_owned(),
+            candidates: vec![
+                "192.0.2.10:42000".to_owned(),
+                "srflx://198.51.100.20:53000|10.0.0.2:42000".to_owned(),
+                "tcp://203.0.113.5:443".to_owned(),
+            ],
+            ice_credentials: None,
+        }];
+
+        let output = format_peer_diagnostics(&peers);
+        assert!(output.contains("Same-network peers: 1"));
+        assert!(output.contains("UDP candidates=2, TCP candidates=1, ICE credentials=missing"));
+        assert!(!output.contains("192.0.2.10"));
+        assert!(!output.contains("private-looking-public-key"));
+    }
 
     async fn ice_peer_snapshot_handler(
         axum::extract::State(peers): axum::extract::State<Vec<PeerInfo>>,

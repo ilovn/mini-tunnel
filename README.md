@@ -71,8 +71,11 @@ Members publish socket candidates and request same-network peers:
 ```sh
 cargo run -p mini-tunnel -- network advertise --network-id '<network-id>' --candidate '203.0.113.10:42000'
 cargo run -p mini-tunnel -- network peers --network-id '<network-id>'
+cargo run -p mini-tunnel -- network diagnose --network-id '<network-id>'
 MINI_TUNNEL_ADMIN_TOKEN='<admin-token>' cargo run -p mini-tunnel -- network revoke --network-id '<network-id>' --device-id '<device-id>'
 ```
+
+`network diagnose` checks that the enrolled device can fetch its same-network peer snapshot and summarizes each peer's published UDP/TCP candidates and ICE-credential presence. Candidate signaling is not a reachability test; active tunnel path and live RTT/loss remain visible in the running tunnel's path-change logs (`RUST_LOG=info`).
 
 Candidate updates are signed, limited to eight usable socket addresses, and reject timestamps outside a five-minute window or replayed updates. This only exchanges control-plane information; it does not open a tunnel or prove that a candidate is reachable. Each invite expires after one hour and can enroll one device. Network admins can revoke a member with `network revoke`; the assigned address is released for later enrollment.
 

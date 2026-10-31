@@ -107,7 +107,7 @@ UDP “不稳定”的判定需区分丢包、拥塞和运营商 QoS：用户数
 
 核心控制消息：`RegisterDevice, Heartbeat, ListPeers, CandidateUpdate, ConnectivityCheck, SessionReady, RelayTicket, NetworkConfig, Revoke, Error`。核心数据消息只运 overlay IP packet；传输层必须提供 peer 身份、会话 epoch 和防重放属性。消息采用 protobuf 或 postcard/CBOR 的带版本 schema，首版选 protobuf 以方便跨版本诊断；不要把任意 serde 内部表示当长期 wire contract。
 
-**当前实现与原建议的差异**：Coordinator 当前是版本化路径的 HTTPS REST API，消息体为 JSON，没有 WebSocket、protobuf/CBOR schema 或通用协议版本协商。直连优先使用 QUIC；RFC 8445 ICE 是显式 `--ice` 的实验性能力，未启用时使用候选拨号器。Relay 目前只实现 ticket 授权的 TCP 不透明转发，没有 UDP relay。CLI 有 identity、health、网络加入/发现和隧道命令，但没有可查询运行中 peer 路径/RTT/loss 的 status 命令。相关设计项仍是目标，不应视为已交付能力。
+**当前实现与原建议的差异**：Coordinator 当前是版本化路径的 HTTPS REST API，消息体为 JSON，没有 WebSocket、protobuf/CBOR schema 或通用协议版本协商。直连优先使用 QUIC；RFC 8445 ICE 是显式 `--ice` 的实验性能力，未启用时使用候选拨号器。Relay 目前只实现 ticket 授权的 TCP 不透明转发，没有 UDP relay。CLI 的 `network diagnose` 能检查 peer snapshot 和已发布候选，但不能查询运行中 peer 的活动路径/RTT/loss；运行隧道时可从路径切换日志观察这些数据。相关设计项仍是目标，不应视为已交付能力。
 
 TCP fallback 的帧格式：`u32_be frame_length | encrypted_packet`，最大 frame 长度受 MTU/实现上限约束；接收端先验证长度再分配内存。TCP 本身有序可靠，拥塞和丢包会阻塞该连接后续所有 packet；因此按 peer 建连接、限制队列、丢弃过期的非必要包，不做无界缓存。
 
