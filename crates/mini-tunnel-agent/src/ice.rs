@@ -19,7 +19,7 @@ use thiserror::Error;
 use tokio::{
     io::Interest,
     net::UdpSocket,
-    sync::{mpsc, watch},
+    sync::{mpsc, oneshot, watch},
 };
 
 use mini_tunnel_protocol::IceCredentials;
@@ -33,6 +33,7 @@ const MAX_SOCKET_QUEUE_CAPACITY: usize = 128;
 const MAX_UDP_DATAGRAM_SIZE: usize = u16::MAX as usize;
 const MAX_ICE_SESSIONS: usize = 1024;
 const MAX_SESSION_PEER_ADDRESSES: usize = 16;
+const MAX_PENDING_STUN_QUERIES: usize = 8;
 const ICE_CONSENT_INTERVAL: Duration = Duration::from_secs(5);
 const ICE_DISCONNECTED_TIMEOUT: Duration = Duration::from_secs(15);
 const ICE_FAILED_TIMEOUT: Duration = Duration::from_secs(30);
@@ -171,6 +172,46 @@ impl IceDatagramRouterHandle {
         Ok(accepted)
     }
 
+    /// Query a STUN mapping through the same UDP socket used by Quinn and ICE.
+    ///
+    /// The sole socket receiver routes this request's Binding success response by transaction ID;
+    /// the response is never consumed by Quinn or delivered as a peer ICE check.
+    pub async fn discover_mapped_address(
+        &self,
+        socket: &IceSocketHandle,
+        server: SocketAddr,
+    ) -> Result<SocketAddr, crate::stun::StunError> {
+        for _ in 0..crate::stun::RETRIES {
+            let transaction_id = crate::stun::new_transaction_id()?;
+            let (sender, receiver) = oneshot::channel();
+            {
+                let mut router = self.router.lock().map_err(|_| {
+                    crate::stun::StunError::Io(io::Error::other("ICE router lock is poisoned"))
+                })?;
+                router.register_stun_query(transaction_id, server, sender)?;
+            }
+            if let Err(error) = socket
+                .send_to(&crate::stun::binding_request(transaction_id), server)
+                .await
+            {
+                self.remove_pending_stun_query(transaction_id);
+                return Err(error.into());
+            }
+            match tokio::time::timeout(crate::stun::RESPONSE_TIMEOUT, receiver).await {
+                Ok(Ok(result)) => return result,
+                Ok(Err(_)) => self.remove_pending_stun_query(transaction_id),
+                Err(_) => self.remove_pending_stun_query(transaction_id),
+            }
+        }
+        Err(crate::stun::StunError::Timeout)
+    }
+
+    fn remove_pending_stun_query(&self, transaction_id: [u8; 12]) {
+        if let Ok(mut router) = self.router.lock() {
+            router.pending_stun.remove(&transaction_id);
+        }
+    }
+
     pub fn unregister(
         &self,
         local_ufrag: &str,
@@ -184,7 +225,7 @@ impl IceDatagramRouterHandle {
     }
 
     fn route(&self, datagram: IceDatagram) {
-        if let Ok(router) = self.router.lock() {
+        if let Ok(mut router) = self.router.lock() {
             let _ = router.route(datagram);
         }
     }
@@ -206,13 +247,37 @@ struct IceSessionKey {
 /// Binding requests are routed by both ufrags in USERNAME, which allows one local ufrag to serve
 /// multiple peer sessions. Responses without USERNAME are routed only after the owning agent
 /// confirms an authenticated request via `associate_authenticated_peer`.
+struct PendingStunQuery {
+    server: SocketAddr,
+    response: oneshot::Sender<Result<SocketAddr, crate::stun::StunError>>,
+}
+
 #[derive(Default)]
 pub struct IceDatagramRouter {
     sessions: HashMap<IceSessionKey, IceRoute>,
     peer_sessions: HashMap<SocketAddr, IceSessionKey>,
+    pending_stun: HashMap<[u8; 12], PendingStunQuery>,
 }
 
 impl IceDatagramRouter {
+    fn register_stun_query(
+        &mut self,
+        transaction_id: [u8; 12],
+        server: SocketAddr,
+        response: oneshot::Sender<Result<SocketAddr, crate::stun::StunError>>,
+    ) -> Result<(), crate::stun::StunError> {
+        if self.pending_stun.len() >= MAX_PENDING_STUN_QUERIES
+            || self.pending_stun.contains_key(&transaction_id)
+        {
+            return Err(crate::stun::StunError::Io(io::Error::other(
+                "too many pending STUN mapping queries",
+            )));
+        }
+        self.pending_stun
+            .insert(transaction_id, PendingStunQuery { server, response });
+        Ok(())
+    }
+
     pub fn register(
         &mut self,
         local_ufrag: String,
@@ -306,7 +371,19 @@ impl IceDatagramRouter {
     }
 
     /// Route one demultiplexed STUN datagram without blocking the shared UDP receive loop.
-    pub fn route(&self, datagram: IceDatagram) -> bool {
+    pub fn route(&mut self, datagram: IceDatagram) -> bool {
+        if let Some(transaction_id) = crate::stun::binding_success_transaction_id(&datagram.payload)
+            && self
+                .pending_stun
+                .get(&transaction_id)
+                .is_some_and(|query| query.server == datagram.peer_addr)
+        {
+            if let Some(query) = self.pending_stun.remove(&transaction_id) {
+                let result = crate::stun::parse_binding_response(&datagram.payload, transaction_id);
+                let _ = query.response.send(result);
+            }
+            return true;
+        }
         let route = if let Some(username) = crate::stun::ice_username(&datagram.payload) {
             let Some(key) = ice_session_key(username) else {
                 return false;
@@ -1130,6 +1207,86 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn shared_socket_stun_refresh_observes_nat_mapping_changes() {
+        let temp =
+            std::env::temp_dir().join(format!("mini-tunnel-stun-refresh-{}", uuid::Uuid::new_v4()));
+        let identity = crate::Identity::load_or_create_at(temp.join("device.key")).unwrap();
+        let endpoint = peer_endpoint_with_ice(&identity, "127.0.0.1:0".parse().unwrap(), 16)
+            .expect("create shared ICE/QUIC endpoint");
+        let mut ice_receiver = endpoint
+            .ice_router
+            .register("local".to_owned(), "remote".to_owned(), 2)
+            .expect("register an ICE route during STUN refresh");
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_address = server.local_addr().unwrap();
+        let mappings = [
+            "198.51.100.10:41000".parse::<SocketAddr>().unwrap(),
+            "198.51.100.11:52000".parse::<SocketAddr>().unwrap(),
+        ];
+        let responder = tokio::spawn(async move {
+            for mapping in mappings {
+                let mut request = [0; 1500];
+                let (length, source) = server.recv_from(&mut request).await.unwrap();
+                assert_eq!(length, 20);
+                let transaction: [u8; 12] = request[8..20].try_into().unwrap();
+                server
+                    .send_to(&binding_success(mapping, transaction), source)
+                    .await
+                    .unwrap();
+            }
+        });
+        let local = endpoint.socket.local_addr().unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        peer.send_to(&ice_packet("local:remote", local).payload, local)
+            .await
+            .expect("send ICE datagram while mapping query is pending");
+        let first = endpoint
+            .ice_router
+            .discover_mapped_address(&endpoint.socket, server_address)
+            .await
+            .expect("initial mapping discovery over shared socket");
+        let second = endpoint
+            .ice_router
+            .discover_mapped_address(&endpoint.socket, server_address)
+            .await
+            .expect("mapping refresh over shared socket");
+        responder.await.unwrap();
+        let routed = tokio::time::timeout(Duration::from_secs(1), ice_receiver.recv())
+            .await
+            .expect("ICE datagram is routed during STUN refresh")
+            .expect("ICE route remains open");
+        assert_eq!(routed.peer_addr, peer.local_addr().unwrap());
+        assert_eq!(first, "198.51.100.10:41000".parse().unwrap());
+        assert_eq!(second, "198.51.100.11:52000".parse().unwrap());
+        assert_eq!(endpoint.socket.local_addr().unwrap(), local);
+        endpoint.endpoint.close(0_u32.into(), b"test complete");
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    fn binding_success(address: SocketAddr, transaction: [u8; 12]) -> Vec<u8> {
+        let mut response = vec![0; 20];
+        response[..2].copy_from_slice(&crate::stun::BINDING_SUCCESS.to_be_bytes());
+        response[2..4].copy_from_slice(&12_u16.to_be_bytes());
+        response[4..8].copy_from_slice(&0x2112_A442_u32.to_be_bytes());
+        response[8..20].copy_from_slice(&transaction);
+        response.extend_from_slice(&0x0020_u16.to_be_bytes());
+        response.extend_from_slice(&8_u16.to_be_bytes());
+        response.extend_from_slice(&[0, 1]);
+        let port = address.port() ^ 0x2112;
+        response.extend_from_slice(&port.to_be_bytes());
+        let ip = match address.ip() {
+            std::net::IpAddr::V4(ip) => ip.octets(),
+            std::net::IpAddr::V6(_) => panic!("test expects IPv4 mapping"),
+        };
+        response.extend(
+            ip.into_iter()
+                .zip(0x2112_A442_u32.to_be_bytes())
+                .map(|(a, b)| a ^ b),
+        );
+        response
+    }
 
     #[test]
     fn generated_credentials_match_the_agent_config_and_are_valid_for_signaling() {

@@ -8,13 +8,13 @@ use tokio::net::UdpSocket;
 const HEADER_LEN: usize = 20;
 const MAGIC_COOKIE: u32 = 0x2112_A442;
 const BINDING_REQUEST: u16 = 0x0001;
-const BINDING_SUCCESS: u16 = 0x0101;
+pub(crate) const BINDING_SUCCESS: u16 = 0x0101;
 const MAPPED_ADDRESS: u16 = 0x0001;
 const XOR_MAPPED_ADDRESS: u16 = 0x0020;
 const USERNAME: u16 = 0x0006;
 const MAX_STUN_MESSAGE: usize = 1500;
-const RETRIES: usize = 3;
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
+pub(crate) const RETRIES: usize = 3;
+pub(crate) const RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Error)]
 pub enum StunError {
@@ -111,7 +111,7 @@ pub async fn discover_mapped_address(
     Err(StunError::Timeout)
 }
 
-fn binding_request(transaction_id: [u8; 12]) -> [u8; HEADER_LEN] {
+pub(crate) fn binding_request(transaction_id: [u8; 12]) -> [u8; HEADER_LEN] {
     let mut request = [0_u8; HEADER_LEN];
     request[..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
     request[4..8].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
@@ -119,7 +119,23 @@ fn binding_request(transaction_id: [u8; 12]) -> [u8; HEADER_LEN] {
     request
 }
 
-fn parse_binding_response(
+pub(crate) fn new_transaction_id() -> Result<[u8; 12], StunError> {
+    let mut transaction_id = [0_u8; 12];
+    getrandom::fill(&mut transaction_id).map_err(|_| StunError::Random)?;
+    Ok(transaction_id)
+}
+
+pub(crate) fn binding_success_transaction_id(message: &[u8]) -> Option<[u8; 12]> {
+    if !is_stun_datagram(message)
+        || message.len() < HEADER_LEN
+        || u16::from_be_bytes([message[0], message[1]]) != BINDING_SUCCESS
+    {
+        return None;
+    }
+    message[8..20].try_into().ok()
+}
+
+pub(crate) fn parse_binding_response(
     message: &[u8],
     expected_transaction_id: [u8; 12],
 ) -> Result<SocketAddr, StunError> {

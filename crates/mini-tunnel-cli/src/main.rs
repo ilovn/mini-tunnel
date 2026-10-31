@@ -1967,7 +1967,8 @@ async fn select_ice_peer_address(
     let local = endpoint.ice.as_ref()?;
     let remote = peer.ice_credentials.as_ref()?;
     let remote_candidates = udp_ice_candidates(&peer.candidates);
-    if remote_candidates.is_empty() || local.local_candidates.is_empty() {
+    let local_candidates = local.local_candidates.read().await.clone();
+    if remote_candidates.is_empty() || local_candidates.is_empty() {
         return None;
     }
     let mut datagrams = match local.router.register(
@@ -1988,7 +1989,7 @@ async fn select_ice_peer_address(
             local.local_socket_addr,
             &local.credentials,
             remote,
-            &local.local_candidates,
+            &local_candidates,
             &remote_candidates,
             controlling,
             std::time::Instant::now(),
@@ -2977,7 +2978,8 @@ struct TunnelIceState {
     socket: mini_tunnel_agent::ice::IceSocketHandle,
     router: mini_tunnel_agent::ice::IceDatagramRouterHandle,
     local_socket_addr: SocketAddr,
-    local_candidates: Vec<mini_tunnel_agent::candidate::SignaledCandidate>,
+    local_candidates:
+        std::sync::Arc<tokio::sync::RwLock<Vec<mini_tunnel_agent::candidate::SignaledCandidate>>>,
 }
 
 impl std::ops::Deref for TunnelEndpoint {
@@ -3061,12 +3063,61 @@ async fn create_tunnel_endpoint(
         );
         let refresh_network = network_id.to_owned();
         let refresh_url = coordinator_url.to_owned();
-        let refresh_candidates = request.candidates.clone();
-        let refresh_credentials = credentials.clone();
+        let refresh_candidates =
+            std::sync::Arc::new(tokio::sync::RwLock::new(request.candidates.clone()));
+        let refresh_local_candidates =
+            std::sync::Arc::new(tokio::sync::RwLock::new(local_candidates));
         let refresh_device_id = device_id.clone();
+        let refresh_socket = iced.socket.clone();
+        let refresh_router = iced.ice_router.clone();
+        let refresh_stun_server = stun_server;
+        let refresh_related_address = related_address;
+        let refresh_bound_address = bound_address;
+        let refresh_credentials = credentials.clone();
+        let task_candidates = std::sync::Arc::clone(&refresh_candidates);
+        let task_local_candidates = std::sync::Arc::clone(&refresh_local_candidates);
         tokio::spawn(async move {
+            let mut mapped_address = mapped_address;
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
+                if let Some(server) = refresh_stun_server {
+                    match refresh_router
+                        .discover_mapped_address(&refresh_socket, server)
+                        .await
+                    {
+                        Ok(next_mapping) if Some(next_mapping) != mapped_address => {
+                            let related = if refresh_bound_address.ip().is_unspecified() {
+                                route_selected_local_address(server, refresh_bound_address.port())
+                                    .unwrap_or(refresh_related_address)
+                            } else {
+                                refresh_bound_address
+                            };
+                            let mut candidates = task_candidates.write().await;
+                            if replace_server_reflexive_candidate(
+                                &mut candidates,
+                                mapped_address,
+                                next_mapping,
+                                related,
+                            ) {
+                                mapped_address = Some(next_mapping);
+                                *task_local_candidates.write().await =
+                                    udp_ice_candidates(&candidates);
+                                tracing::info!(
+                                    reason = "nat_mapping_changed",
+                                    "refreshed ICE server-reflexive candidate"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "STUN mapping changed but the published candidate list had no matching server-reflexive entry"
+                                );
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "could not refresh ICE server-reflexive mapping")
+                        }
+                    }
+                }
                 let identity = match mini_tunnel_agent::Identity::load_or_create() {
                     Ok(identity) if identity.device_id() == refresh_device_id => identity,
                     Ok(_) => {
@@ -3085,6 +3136,7 @@ async fn create_tunnel_endpoint(
                         continue;
                     }
                 };
+                let refresh_candidates = task_candidates.read().await.clone();
                 let request = CandidateUpdateRequest {
                     device_id: refresh_device_id.clone(),
                     timestamp_ms,
@@ -3095,7 +3147,7 @@ async fn create_tunnel_endpoint(
                         &refresh_candidates,
                         &refresh_credentials,
                     )),
-                    candidates: refresh_candidates.clone(),
+                    candidates: refresh_candidates,
                     ice_credentials: Some(refresh_credentials.clone()),
                 };
                 let path = format!("/v1/networks/{refresh_network}/candidates");
@@ -3113,7 +3165,7 @@ async fn create_tunnel_endpoint(
                 socket: iced.socket,
                 router: iced.ice_router,
                 local_socket_addr: bound_address,
-                local_candidates,
+                local_candidates: refresh_local_candidates,
             }),
         });
     }
@@ -3123,13 +3175,30 @@ async fn create_tunnel_endpoint(
             ice: None,
         });
     }
-    let (endpoint, mapped_address) = match stun_server {
+    let (endpoint, mapped_address, stun_refresh) = match stun_server {
         Some(server) => {
-            let (endpoint, mapped) =
-                mini_tunnel_agent::peer_endpoint_with_stun(identity, bind, server).await?;
-            (endpoint, Some(mapped))
+            // Use the same shared-socket dispatcher as ICE so periodic STUN refresh responses
+            // cannot race Quinn's receive loop or be mistaken for tunnel data.
+            let (iced, mapped) =
+                mini_tunnel_agent::ice::peer_endpoint_with_ice_and_stun(identity, bind, server, 64)
+                    .await?;
+            let bound = iced.socket.local_addr()?;
+            let related = if bound.ip().is_unspecified() {
+                route_selected_local_address(server, bound.port())?
+            } else {
+                bound
+            };
+            (
+                iced.endpoint,
+                Some(mapped),
+                Some((iced.socket, iced.ice_router, bound, related)),
+            )
         }
-        None => (mini_tunnel_agent::peer_endpoint(identity, bind)?, None),
+        None => (
+            mini_tunnel_agent::peer_endpoint(identity, bind)?,
+            None,
+            None,
+        ),
     };
     let device_id = identity.device_id();
     let timestamp_ms = now_ms()?;
@@ -3158,6 +3227,80 @@ async fn create_tunnel_endpoint(
     let path = format!("/v1/networks/{network_id}/candidates");
     let _: CandidateUpdateResponse = post_json(coordinator_url, &path, &request).await?;
     println!("Published {candidate_count} peer candidate(s)");
+    if let (Some(server), Some((socket, router, bound, related))) = (stun_server, stun_refresh) {
+        let refresh_network = network_id.to_owned();
+        let refresh_url = coordinator_url.to_owned();
+        let refresh_device_id = device_id.clone();
+        let candidates = std::sync::Arc::new(tokio::sync::RwLock::new(request.candidates));
+        let refresh_candidates = std::sync::Arc::clone(&candidates);
+        tokio::spawn(async move {
+            let mut mapped_address = mapped_address;
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                match router.discover_mapped_address(&socket, server).await {
+                    Ok(next_mapping) if Some(next_mapping) != mapped_address => {
+                        let mut current = refresh_candidates.write().await;
+                        if replace_plain_mapped_candidate(
+                            &mut current,
+                            mapped_address,
+                            next_mapping,
+                        ) {
+                            mapped_address = Some(next_mapping);
+                            tracing::info!(
+                                reason = "nat_mapping_changed",
+                                "refreshed server-reflexive candidate"
+                            );
+                        } else {
+                            tracing::warn!(
+                                "STUN mapping changed but the published candidate list had no matching mapped address"
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, %bound, %related, "could not refresh server-reflexive mapping")
+                    }
+                }
+                let identity = match mini_tunnel_agent::Identity::load_or_create() {
+                    Ok(identity) if identity.device_id() == refresh_device_id => identity,
+                    Ok(_) => {
+                        tracing::error!("device identity changed; stopping candidate refresh");
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "could not load identity for candidate refresh");
+                        continue;
+                    }
+                };
+                let timestamp_ms = match now_ms() {
+                    Ok(timestamp_ms) => timestamp_ms,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not timestamp candidate refresh");
+                        continue;
+                    }
+                };
+                let candidates = refresh_candidates.read().await.clone();
+                let request = CandidateUpdateRequest {
+                    device_id: refresh_device_id.clone(),
+                    timestamp_ms,
+                    signature: identity.sign(&candidate_signing_bytes(
+                        &refresh_network,
+                        &refresh_device_id,
+                        timestamp_ms,
+                        &candidates,
+                    )),
+                    candidates,
+                    ice_credentials: None,
+                };
+                let path = format!("/v1/networks/{refresh_network}/candidates");
+                if let Err(error) =
+                    post_json::<_, CandidateUpdateResponse>(&refresh_url, &path, &request).await
+                {
+                    tracing::warn!(%error, "server-reflexive candidate refresh failed");
+                }
+            }
+        });
+    }
     Ok(TunnelEndpoint {
         endpoint,
         ice: None,
@@ -3259,6 +3402,51 @@ fn compose_ice_candidates(
         }
     }
     Ok(candidates)
+}
+
+fn replace_plain_mapped_candidate(
+    candidates: &mut [String],
+    previous_mapping: Option<SocketAddr>,
+    new_mapping: SocketAddr,
+) -> bool {
+    let Some(previous_mapping) = previous_mapping else {
+        return false;
+    };
+    if previous_mapping == new_mapping {
+        return false;
+    }
+    let previous = previous_mapping.to_string();
+    let Some(candidate) = candidates
+        .iter_mut()
+        .find(|candidate| **candidate == previous)
+    else {
+        return false;
+    };
+    *candidate = new_mapping.to_string();
+    true
+}
+
+fn replace_server_reflexive_candidate(
+    candidates: &mut [String],
+    previous_mapping: Option<SocketAddr>,
+    new_mapping: SocketAddr,
+    related_address: SocketAddr,
+) -> bool {
+    let Some(previous_mapping) = previous_mapping else {
+        return false;
+    };
+    if previous_mapping == new_mapping {
+        return false;
+    }
+    let previous = format!("srflx://{previous_mapping}|{related_address}");
+    let Some(candidate) = candidates
+        .iter_mut()
+        .find(|candidate| **candidate == previous)
+    else {
+        return false;
+    };
+    *candidate = format!("srflx://{new_mapping}|{related_address}");
+    true
 }
 
 fn udp_ice_candidates(
@@ -3446,6 +3634,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plain_stun_candidate_refresh_replaces_only_changed_mapping() {
+        let old: SocketAddr = "198.51.100.4:40000".parse().unwrap();
+        let new: SocketAddr = "203.0.113.9:52000".parse().unwrap();
+        let mut candidates = vec![old.to_string(), "tcp://203.0.113.9:443".to_owned()];
+        assert!(replace_plain_mapped_candidate(
+            &mut candidates,
+            Some(old),
+            new
+        ));
+        assert_eq!(candidates[0], new.to_string());
+        assert!(!replace_plain_mapped_candidate(
+            &mut candidates,
+            Some(new),
+            new
+        ));
+        assert!(!replace_plain_mapped_candidate(
+            &mut candidates,
+            Some(old),
+            new
+        ));
+    }
+
+    #[test]
+    fn server_reflexive_candidate_refresh_replaces_only_changed_mapping() {
+        let old: SocketAddr = "198.51.100.4:40000".parse().unwrap();
+        let new: SocketAddr = "203.0.113.9:52000".parse().unwrap();
+        let related: SocketAddr = "10.0.0.4:40000".parse().unwrap();
+        let mut candidates = vec![
+            format!("srflx://{old}|{related}"),
+            "10.0.0.4:40000".to_owned(),
+        ];
+        assert!(replace_server_reflexive_candidate(
+            &mut candidates,
+            Some(old),
+            new,
+            related
+        ));
+        assert_eq!(candidates[0], format!("srflx://{new}|{related}"));
+        assert!(!replace_server_reflexive_candidate(
+            &mut candidates,
+            Some(new),
+            new,
+            related
+        ));
+        assert!(!replace_server_reflexive_candidate(
+            &mut candidates,
+            Some(old),
+            new,
+            related
+        ));
+    }
+
+    #[test]
     fn peer_status_listener_refuses_non_loopback_addresses() {
         assert!(validate_status_address("127.0.0.1:42003".parse().unwrap()).is_ok());
         assert!(validate_status_address("[::1]:42003".parse().unwrap()).is_ok());
@@ -3590,7 +3831,7 @@ mod tests {
                             socket: iced.socket,
                             router: iced.ice_router,
                             local_socket_addr: address,
-                            local_candidates: vec![
+                            local_candidates: std::sync::Arc::new(tokio::sync::RwLock::new(vec![
                                 mini_tunnel_agent::candidate::SignaledCandidate {
                                     address,
                                     transport:
@@ -3598,7 +3839,7 @@ mod tests {
                                     candidate_type:
                                         mini_tunnel_agent::candidate::CandidateType::Host,
                                 },
-                            ],
+                            ])),
                         }),
                     },
                     address,
@@ -4051,11 +4292,13 @@ mod tests {
                 socket: iced.socket,
                 router: iced.ice_router,
                 local_socket_addr: local,
-                local_candidates: vec![mini_tunnel_agent::candidate::SignaledCandidate {
-                    address: local,
-                    transport: mini_tunnel_agent::candidate::CandidateTransport::Udp,
-                    candidate_type: mini_tunnel_agent::candidate::CandidateType::Host,
-                }],
+                local_candidates: std::sync::Arc::new(tokio::sync::RwLock::new(vec![
+                    mini_tunnel_agent::candidate::SignaledCandidate {
+                        address: local,
+                        transport: mini_tunnel_agent::candidate::CandidateTransport::Udp,
+                        candidate_type: mini_tunnel_agent::candidate::CandidateType::Host,
+                    },
+                ])),
             }),
         };
         let endpoint_a = endpoint(iced_a, credentials_a.clone(), address_a);
