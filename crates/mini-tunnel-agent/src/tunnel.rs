@@ -765,6 +765,23 @@ pub async fn pump_peer_mesh_dynamic<T: TunnelPacketIo>(
     .await
 }
 
+async fn mark_mesh_peer_offline(
+    address: Ipv4Addr,
+    channel: &tokio::sync::RwLock<Arc<PeerChannel>>,
+) {
+    let channel = Arc::clone(&*channel.read().await);
+    let health = channel.health_snapshot();
+    crate::status::update(
+        address.to_string(),
+        false,
+        channel.transport_name(),
+        health.rtt.map(|rtt| rtt.as_millis() as u64),
+        health.probes_succeeded,
+        health.probes_missed,
+        None,
+    );
+}
+
 async fn pump_mesh<T: TunnelPacketIo>(
     packet_io: &T,
     peers: Vec<MeshPeerInput>,
@@ -862,6 +879,7 @@ async fn pump_mesh_with_quality_interval<T: TunnelPacketIo>(
                     }
                     Err(_) => {
                         if let Some(runtime) = channels.remove(&address) {
+                            mark_mesh_peer_offline(address, &runtime.channel).await;
                             if let Some(ipv6_address) = runtime.ipv6_address {
                                 ipv6_routes.remove(&ipv6_address);
                             }
@@ -918,6 +936,7 @@ async fn pump_mesh_with_quality_interval<T: TunnelPacketIo>(
                     }
                     Some(MeshPeerUpdate::Remove(address)) => {
                         if let Some(runtime) = channels.remove(&address) {
+                            mark_mesh_peer_offline(address, &runtime.channel).await;
                             if let Some(ipv6_address) = runtime.ipv6_address {
                                 ipv6_routes.remove(&ipv6_address);
                             }
@@ -2916,6 +2935,15 @@ mod tests {
             .unwrap();
         assert_eq!(remote_channel.recv_packet().await.unwrap().len(), 28);
 
+        crate::status::update(
+            peer_ip.to_string(),
+            true,
+            "QUIC/UDP",
+            Some(12),
+            5,
+            1,
+            Some("quality_threshold"),
+        );
         update_tx
             .send(MeshPeerUpdate::Remove(peer_ip))
             .await
@@ -2926,6 +2954,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(result, Err(PeerTunnelError::NoPeers)));
+        let status = crate::status::snapshot()
+            .into_iter()
+            .find(|status| status.peer == peer_ip.to_string())
+            .expect("removed mesh peer remains visible as offline");
+        assert!(!status.online);
+        assert_eq!(
+            status.last_switch_reason.as_deref(),
+            Some("quality_threshold")
+        );
         endpoint_a.close(0_u32.into(), b"test complete");
         endpoint_b.close(0_u32.into(), b"test complete");
         fs::remove_dir_all(temp).unwrap();
