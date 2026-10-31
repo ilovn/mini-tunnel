@@ -1225,12 +1225,28 @@ mod tests {
             "198.51.100.10:41000".parse::<SocketAddr>().unwrap(),
             "198.51.100.11:52000".parse::<SocketAddr>().unwrap(),
         ];
+        let (request_seen, request_seen_rx) = oneshot::channel();
+        let (release_response_tx, release_response) = oneshot::channel();
         let responder = tokio::spawn(async move {
-            for mapping in mappings {
+            let mut request_seen = Some(request_seen);
+            let mut release_response = Some(release_response);
+            for (index, mapping) in mappings.into_iter().enumerate() {
                 let mut request = [0; 1500];
                 let (length, source) = server.recv_from(&mut request).await.unwrap();
                 assert_eq!(length, 20);
                 let transaction: [u8; 12] = request[8..20].try_into().unwrap();
+                if index == 0 {
+                    request_seen
+                        .take()
+                        .unwrap()
+                        .send(())
+                        .expect("test is waiting for the pending STUN request");
+                    release_response
+                        .take()
+                        .unwrap()
+                        .await
+                        .expect("release the first STUN response after the ICE packet");
+                }
                 server
                     .send_to(&binding_success(mapping, transaction), source)
                     .await
@@ -1239,13 +1255,30 @@ mod tests {
         });
         let local = endpoint.socket.local_addr().unwrap();
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let router = endpoint.ice_router.clone();
+        let socket = endpoint.socket.clone();
+        let first_query = tokio::spawn(async move {
+            router
+                .discover_mapped_address(&socket, server_address)
+                .await
+        });
+        request_seen_rx
+            .await
+            .expect("STUN request is in flight before sending ICE");
         peer.send_to(&ice_packet("local:remote", local).payload, local)
             .await
             .expect("send ICE datagram while mapping query is pending");
-        let first = endpoint
-            .ice_router
-            .discover_mapped_address(&endpoint.socket, server_address)
+        let routed = tokio::time::timeout(Duration::from_secs(1), ice_receiver.recv())
             .await
+            .expect("ICE datagram is routed before the pending STUN response")
+            .expect("ICE route remains open");
+        assert_eq!(routed.peer_addr, peer.local_addr().unwrap());
+        release_response_tx
+            .send(())
+            .expect("allow the pending STUN query to complete");
+        let first = first_query
+            .await
+            .expect("join initial mapping query")
             .expect("initial mapping discovery over shared socket");
         let second = endpoint
             .ice_router
@@ -1253,11 +1286,6 @@ mod tests {
             .await
             .expect("mapping refresh over shared socket");
         responder.await.unwrap();
-        let routed = tokio::time::timeout(Duration::from_secs(1), ice_receiver.recv())
-            .await
-            .expect("ICE datagram is routed during STUN refresh")
-            .expect("ICE route remains open");
-        assert_eq!(routed.peer_addr, peer.local_addr().unwrap());
         assert_eq!(first, "198.51.100.10:41000".parse().unwrap());
         assert_eq!(second, "198.51.100.11:52000".parse().unwrap());
         assert_eq!(endpoint.socket.local_addr().unwrap(), local);
