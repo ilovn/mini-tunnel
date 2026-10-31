@@ -276,6 +276,44 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn bind_tcp_listener_in_namespace(
+        namespace: &str,
+        address: SocketAddr,
+    ) -> tokio::net::TcpListener {
+        use std::os::fd::AsRawFd;
+
+        let namespace = namespace.to_owned();
+        let listener = std::thread::spawn(move || {
+            let original = std::fs::File::open("/proc/self/ns/net").expect("open original netns");
+            let target = std::fs::File::open(format!("/var/run/netns/{namespace}"))
+                .expect("open target netns");
+            let result = unsafe { libc::setns(target.as_raw_fd(), libc::CLONE_NEWNET) };
+            assert_eq!(
+                result,
+                0,
+                "enter {namespace}: {}",
+                std::io::Error::last_os_error()
+            );
+            let listener =
+                std::net::TcpListener::bind(address).expect("bind namespaced TCP listener");
+            listener
+                .set_nonblocking(true)
+                .expect("set TCP listener nonblocking");
+            let result = unsafe { libc::setns(original.as_raw_fd(), libc::CLONE_NEWNET) };
+            assert_eq!(
+                result,
+                0,
+                "restore netns: {}",
+                std::io::Error::last_os_error()
+            );
+            listener
+        })
+        .join()
+        .expect("namespace TCP listener setup thread");
+        tokio::net::TcpListener::from_std(listener).expect("adopt namespaced TCP listener")
+    }
+
+    #[cfg(target_os = "linux")]
     struct Ipv4UdpCapture(std::os::fd::OwnedFd);
 
     #[cfg(target_os = "linux")]
@@ -794,6 +832,28 @@ mod tests {
                             ],
                         );
                     }
+                    // Keep reliable TCP reachable with a stable address mapping while UDP uses
+                    // destination-dependent source ports above.
+                    router(
+                        namespace,
+                        "iptables",
+                        &[
+                            "-t",
+                            "nat",
+                            "-A",
+                            "POSTROUTING",
+                            "-s",
+                            &format!("{inside_ip}/32"),
+                            "-o",
+                            outside,
+                            "-p",
+                            "tcp",
+                            "-j",
+                            "SNAT",
+                            "--to-source",
+                            outside_ip,
+                        ],
+                    );
                 } else {
                     router(
                         namespace,
@@ -818,6 +878,14 @@ mod tests {
                     namespace,
                     "iptables",
                     &["-A", "FORWARD", "-i", inside, "-o", outside, "-j", "ACCEPT"],
+                );
+                router(
+                    namespace,
+                    "iptables",
+                    &[
+                        "-A", "FORWARD", "-i", outside, "-o", inside, "-p", "tcp", "--dport",
+                        "42001", "-j", "ACCEPT",
+                    ],
                 );
                 router(
                     namespace,
@@ -1417,6 +1485,7 @@ mod tests {
                 raw_received_a.is_none() && raw_received_b.is_none(),
                 "peer packets to the STUN-only mappings must be filtered"
             );
+            verify_tls_tcp_fallback_through_restrictive_nat(&_topology, mapped_b).await;
             return;
         }
         let raw_source_a =
@@ -1443,6 +1512,72 @@ mod tests {
                 .expect("read client B overlay payload");
         assert_eq!(&payload[..length], b"overlay-through-dual-snat");
         assert_eq!(source, mapped_a);
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn verify_tls_tcp_fallback_through_restrictive_nat(
+        topology: &DualSnatTopology,
+        unreachable_udp_candidate: SocketAddr,
+    ) {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-dual-nat-tcp-fallback-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let identity_a = crate::Identity::load_or_create_at(temp.join("a/device.key"))
+            .expect("create client A identity");
+        let identity_b = crate::Identity::load_or_create_at(temp.join("b/device.key"))
+            .expect("create client B identity");
+        let listener =
+            bind_tcp_listener_in_namespace(&topology.client_b, "10.78.1.2:42001".parse().unwrap());
+        let expected_peer_id = identity_b.device_id();
+        let expected_peer_key = identity_b.public_key();
+        let allowed = vec![(identity_a.device_id(), identity_a.public_key())];
+        let accept_identity = identity_b;
+        let accept = tokio::spawn(async move {
+            crate::accept_tcp_peer_any(&listener, "dual-nat-fallback", &accept_identity, &allowed)
+                .await
+        });
+        let endpoint = crate::peer_endpoint(
+            &identity_a,
+            "0.0.0.0:0".parse().expect("client A endpoint bind"),
+        )
+        .expect("create client A candidate endpoint");
+        let candidates = vec![
+            unreachable_udp_candidate.to_string(),
+            "tcp://198.18.0.2:42001".to_owned(),
+        ];
+        let (channel_a, remote) = crate::connect_peer_candidates(
+            &endpoint,
+            &candidates,
+            "dual-nat-fallback",
+            &identity_a,
+            &expected_peer_id,
+            expected_peer_key,
+        )
+        .await
+        .expect("candidate dialer falls back from filtered UDP to forwarded TLS/TCP");
+        assert_eq!(remote, "198.18.0.2:42001".parse().unwrap());
+        assert_eq!(channel_a.transport_name(), "TLS/TCP");
+        let (peer_id, channel_b) = accept
+            .await
+            .expect("join TLS/TCP accept task")
+            .expect("accept and authenticate the authorized peer");
+        assert_eq!(peer_id, identity_a.device_id());
+        channel_a
+            .send_packet(b"overlay-through-restrictive-nat-tcp")
+            .await
+            .expect("send authenticated overlay payload over TCP fallback");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), channel_b.recv_packet())
+                .await
+                .expect("receive overlay payload over TLS/TCP")
+                .expect("read authenticated TCP peer payload"),
+            b"overlay-through-restrictive-nat-tcp"
+        );
+        channel_a.close();
+        channel_b.close();
+        endpoint.close(0_u32.into(), b"dual NAT TCP fallback test complete");
+        std::fs::remove_dir_all(temp).expect("remove fallback identities");
     }
 
     #[cfg(target_os = "linux")]
