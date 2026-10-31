@@ -3412,14 +3412,20 @@ mod tests {
                 "srflx://198.51.100.20:53000|10.0.0.2:42000".to_owned(),
                 "tcp://203.0.113.5:443".to_owned(),
             ],
-            ice_credentials: None,
+            ice_credentials: Some(mini_tunnel_protocol::IceCredentials {
+                ufrag: "secret-fragment".to_owned(),
+                password: "secret-password".to_owned(),
+                generation: 7,
+            }),
         }];
 
         let output = format_peer_diagnostics(&peers);
         assert!(output.contains("Same-network peers: 1"));
-        assert!(output.contains("UDP candidates=2, TCP candidates=1, ICE credentials=missing"));
+        assert!(output.contains("UDP candidates=2, TCP candidates=1, ICE credentials=published"));
         assert!(!output.contains("192.0.2.10"));
         assert!(!output.contains("private-looking-public-key"));
+        assert!(!output.contains("secret-fragment"));
+        assert!(!output.contains("secret-password"));
     }
 
     async fn ice_peer_snapshot_handler(
