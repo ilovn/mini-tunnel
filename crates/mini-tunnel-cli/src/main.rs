@@ -2710,7 +2710,7 @@ async fn validate_udp_probe(
     channel: mini_tunnel_agent::PeerChannel,
 ) -> Result<mini_tunnel_agent::PeerChannel, mini_tunnel_agent::IdentityError> {
     let rtt = channel.probe_health(3, Duration::from_secs(2)).await?;
-    if rtt > Duration::from_millis(350) {
+    if !mini_tunnel_agent::tunnel::path_quality_rtt_is_acceptable(rtt) {
         return Err(mini_tunnel_agent::IdentityError::Transport(
             "direct path probe exceeded RTT threshold".to_owned(),
         ));

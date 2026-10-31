@@ -229,6 +229,20 @@ impl PathQualityPolicy {
 
 static PATH_QUALITY_POLICY: OnceLock<PathQualityPolicy> = OnceLock::new();
 
+fn path_quality_policy() -> &'static PathQualityPolicy {
+    PATH_QUALITY_POLICY.get_or_init(PathQualityPolicy::from_environment)
+}
+
+/// Whether an authenticated direct UDP recovery probe meets the configured RTT limit.
+#[must_use]
+pub fn path_quality_rtt_is_acceptable(rtt: Duration) -> bool {
+    path_quality_rtt_is_acceptable_with_policy(rtt, *path_quality_policy())
+}
+
+fn path_quality_rtt_is_acceptable_with_policy(rtt: Duration, policy: PathQualityPolicy) -> bool {
+    rtt <= policy.max_rtt
+}
+
 #[derive(Default)]
 pub struct PathQualityTracker {
     last_successes: u64,
@@ -254,9 +268,7 @@ impl PathQualityTracker {
         if self.window_probes < 3 || self.degraded {
             return self.degraded;
         }
-        let policy = *self.policy.get_or_insert_with(|| {
-            *PATH_QUALITY_POLICY.get_or_init(PathQualityPolicy::from_environment)
-        });
+        let policy = *self.policy.get_or_insert_with(|| *path_quality_policy());
         let bad = u128::from(self.window_missed) * 100
             > u128::from(policy.max_loss_percent) * u128::from(self.window_probes)
             || snapshot.rtt.is_some_and(|rtt| rtt > policy.max_rtt);
@@ -1915,6 +1927,19 @@ mod tests {
             tracker.observe(snapshot),
             "loss above 25% degrades the path"
         );
+    }
+
+    #[test]
+    fn udp_recovery_rtt_check_uses_the_path_quality_policy() {
+        let policy = PathQualityPolicy::from_values(Some("900"), None, None);
+        assert!(path_quality_rtt_is_acceptable_with_policy(
+            Duration::from_millis(900),
+            policy
+        ));
+        assert!(!path_quality_rtt_is_acceptable_with_policy(
+            Duration::from_millis(901),
+            policy
+        ));
     }
 
     #[tokio::test]
