@@ -567,7 +567,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     impl DualSnatTopology {
-        fn create() -> Self {
+        fn create_with_destination_dependent_mappings(
+            destination_dependent_mappings: bool,
+        ) -> Self {
             fn run(args: &[&str]) {
                 let output = std::process::Command::new("ip")
                     .args(args)
@@ -706,9 +708,9 @@ mod tests {
                 "10.77.1.0/24",
             ]);
 
-            // MASQUERADE may allocate a different source port for each destination. Use a
-            // one-to-one address mapping here so the test specifically models an
-            // endpoint-independent UDP mapping while the filter still admits only tracked replies.
+            // The default profile uses one-to-one address mapping for endpoint-independent UDP
+            // ports. The alternate profile reserves different public ports for STUN and peer
+            // destinations to model destination-dependent mappings.
             for (namespace, inside, outside, inside_ip, outside_ip) in [
                 (
                     &router_a,
@@ -726,6 +728,11 @@ mod tests {
                 ),
             ] {
                 router(namespace, "sysctl", &["-w", "net.ipv4.ip_forward=1"]);
+                let peer_ip = if outside_ip == "198.18.0.1" {
+                    "198.18.0.2"
+                } else {
+                    "198.18.0.1"
+                };
                 router(
                     namespace,
                     "iptables",
@@ -744,24 +751,53 @@ mod tests {
                         &format!("{inside_ip}/32"),
                     ],
                 );
-                router(
-                    namespace,
-                    "iptables",
-                    &[
-                        "-t",
-                        "nat",
-                        "-A",
-                        "POSTROUTING",
-                        "-s",
-                        &format!("{inside_ip}/32"),
-                        "-o",
-                        outside,
-                        "-j",
-                        "NETMAP",
-                        "--to",
-                        &format!("{outside_ip}/32"),
-                    ],
-                );
+                if destination_dependent_mappings {
+                    for (destination_ip, external_port) in
+                        [("198.18.0.254", "41000"), (peer_ip, "41001")]
+                    {
+                        router(
+                            namespace,
+                            "iptables",
+                            &[
+                                "-t",
+                                "nat",
+                                "-A",
+                                "POSTROUTING",
+                                "-s",
+                                &format!("{inside_ip}/32"),
+                                "-o",
+                                outside,
+                                "-p",
+                                "udp",
+                                "-d",
+                                &format!("{destination_ip}/32"),
+                                "-j",
+                                "SNAT",
+                                "--to-source",
+                                &format!("{outside_ip}:{external_port}"),
+                            ],
+                        );
+                    }
+                } else {
+                    router(
+                        namespace,
+                        "iptables",
+                        &[
+                            "-t",
+                            "nat",
+                            "-A",
+                            "POSTROUTING",
+                            "-s",
+                            &format!("{inside_ip}/32"),
+                            "-o",
+                            outside,
+                            "-j",
+                            "NETMAP",
+                            "--to",
+                            &format!("{outside_ip}/32"),
+                        ],
+                    );
+                }
                 router(
                     namespace,
                     "iptables",
@@ -1096,12 +1132,15 @@ mod tests {
                 .expect("read overlay payload");
         assert_eq!(&payload[..length], b"overlay-through-snat");
         assert_eq!(source, mapped);
-        run_dual_snat_ice_scenario().await;
+        run_dual_snat_ice_scenario(false).await;
+        run_dual_snat_ice_scenario(true).await;
     }
 
     #[cfg(target_os = "linux")]
-    async fn run_dual_snat_ice_scenario() {
-        let _topology = DualSnatTopology::create();
+    async fn run_dual_snat_ice_scenario(destination_dependent_mappings: bool) {
+        let _topology = DualSnatTopology::create_with_destination_dependent_mappings(
+            destination_dependent_mappings,
+        );
         let capture_a = Ipv4UdpCapture::in_namespace(&_topology.client_a, &_topology.client_a_if);
         let capture_b = Ipv4UdpCapture::in_namespace(&_topology.client_b, &_topology.client_b_if);
         let capture_wan_a =
@@ -1295,10 +1334,11 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(250), socket_a.recv_from(&mut raw_a),),
             tokio::time::timeout(Duration::from_millis(250), socket_b.recv_from(&mut raw_b),),
         );
-        if selected_a.is_none()
-            || selected_b.is_none()
-            || raw_received_a.is_err()
-            || raw_received_b.is_err()
+        if !destination_dependent_mappings
+            && (selected_a.is_none()
+                || selected_b.is_none()
+                || raw_received_a.is_err()
+                || raw_received_b.is_err())
         {
             eprintln!("dual-SNAT raw probes received: A={raw_received_a:?} B={raw_received_b:?}");
             eprintln!(
@@ -1338,6 +1378,22 @@ mod tests {
                     );
                 }
             }
+        }
+        if destination_dependent_mappings {
+            assert_eq!(mapped_a.port(), 41000, "STUN mapping for client A");
+            assert_eq!(mapped_b.port(), 41000, "STUN mapping for client B");
+            assert!(sent_a > 0 && sent_b > 0, "both ICE agents sent checks");
+            assert!(targets_a.contains(&mapped_b));
+            assert!(targets_b.contains(&mapped_a));
+            assert!(
+                selected_a.is_none() && selected_b.is_none(),
+                "destination-dependent mappings must not nominate STUN-only ports: A={selected_a:?}, B={selected_b:?}"
+            );
+            assert!(
+                raw_received_a.is_err() && raw_received_b.is_err(),
+                "peer packets to the STUN-only mappings must be filtered"
+            );
+            return;
         }
         let (raw_length_a, raw_source_a) = raw_received_a
             .expect("client A receives a UDP datagram through both NATs")
