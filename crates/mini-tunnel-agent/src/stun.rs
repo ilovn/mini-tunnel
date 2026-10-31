@@ -1328,17 +1328,25 @@ mod tests {
             send_b.expect("send raw probe from client B"),
             b"diagnostic-from-b".len()
         );
-        let mut raw_a = [0; 64];
-        let mut raw_b = [0; 64];
         let (raw_received_a, raw_received_b) = tokio::join!(
-            tokio::time::timeout(Duration::from_millis(250), socket_a.recv_from(&mut raw_a),),
-            tokio::time::timeout(Duration::from_millis(250), socket_b.recv_from(&mut raw_b),),
+            receive_udp_payload_while_servicing_ice(
+                &socket_a,
+                &mut driver_a,
+                b"diagnostic-from-b",
+                Duration::from_millis(250),
+            ),
+            receive_udp_payload_while_servicing_ice(
+                &socket_b,
+                &mut driver_b,
+                b"diagnostic-from-a",
+                Duration::from_millis(250),
+            ),
         );
         if !destination_dependent_mappings
             && (selected_a.is_none()
                 || selected_b.is_none()
-                || raw_received_a.is_err()
-                || raw_received_b.is_err())
+                || raw_received_a.is_none()
+                || raw_received_b.is_none())
         {
             eprintln!("dual-SNAT raw probes received: A={raw_received_a:?} B={raw_received_b:?}");
             eprintln!(
@@ -1390,21 +1398,17 @@ mod tests {
                 "destination-dependent mappings must not nominate STUN-only ports: A={selected_a:?}, B={selected_b:?}"
             );
             assert!(
-                raw_received_a.is_err() && raw_received_b.is_err(),
+                raw_received_a.is_none() && raw_received_b.is_none(),
                 "peer packets to the STUN-only mappings must be filtered"
             );
             return;
         }
-        let (raw_length_a, raw_source_a) = raw_received_a
-            .expect("client A receives a UDP datagram through both NATs")
-            .expect("read client A raw probe");
+        let raw_source_a =
+            raw_received_a.expect("client A receives a UDP datagram through both NATs");
         assert_eq!(raw_source_a, mapped_b);
-        assert_eq!(&raw_a[..raw_length_a], b"diagnostic-from-b");
-        let (raw_length_b, raw_source_b) = raw_received_b
-            .expect("client B receives a UDP datagram through both NATs")
-            .expect("read client B raw probe");
+        let raw_source_b =
+            raw_received_b.expect("client B receives a UDP datagram through both NATs");
         assert_eq!(raw_source_b, mapped_a);
-        assert_eq!(&raw_b[..raw_length_b], b"diagnostic-from-a");
         assert!(failed_candidates_a.contains(&host_b));
         assert!(failed_candidates_b.contains(&host_a));
         let pair_a = selected_a.expect("client A nominates direct pair through both NATs");
@@ -1423,6 +1427,38 @@ mod tests {
                 .expect("read client B overlay payload");
         assert_eq!(&payload[..length], b"overlay-through-dual-snat");
         assert_eq!(source, mapped_a);
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn receive_udp_payload_while_servicing_ice(
+        socket: &UdpSocket,
+        driver: &mut crate::ice::IceAgentDriver,
+        expected_payload: &[u8],
+        wait: Duration,
+    ) -> Option<SocketAddr> {
+        tokio::time::timeout(wait, async {
+            let mut packet = [0; MAX_STUN_MESSAGE];
+            loop {
+                let (length, source) = socket.recv_from(&mut packet).await.ok()?;
+                if &packet[..length] == expected_payload {
+                    return Some(source);
+                }
+                let handled = driver
+                    .handle_datagram(std::time::Instant::now(), source, None, &packet[..length])
+                    .ok()?;
+                if handled {
+                    for transmit in driver.poll_transmits() {
+                        socket
+                            .send_to(&transmit.message, transmit.transport.peer_addr)
+                            .await
+                            .ok()?;
+                    }
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     #[tokio::test]
