@@ -135,6 +135,53 @@ const RELAY_TICKET_DOMAIN: &[u8] = b"mini-tunnel/relay-ticket/v1\0";
 const RELAY_AUTH_DOMAIN: &[u8] = b"mini-tunnel/relay-auth/v1\0";
 const MAX_RELAY_TICKET_BYTES: usize = 2048;
 
+/// Fixed header for an opaque QUIC datagram carried by the UDP relay.
+pub const UDP_RELAY_DATA_MAGIC: &[u8; 8] = b"MTUDATA1";
+/// The relay forwarding header: magic plus the ticket-paired session ID.
+pub const UDP_RELAY_DATA_HEADER_LEN: usize = UDP_RELAY_DATA_MAGIC.len() + 16;
+/// Keep the relay's outer datagram within a conservative IPv4/IPv6 path budget.
+pub const UDP_RELAY_MAX_DATAGRAM_LEN: usize = 1200;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum UdpRelayFrameError {
+    #[error("UDP relay frame is truncated or has an invalid header")]
+    Invalid,
+    #[error("UDP relay payload exceeds the datagram limit")]
+    TooLarge,
+}
+
+/// Add the fixed session-routing header to an already-encrypted QUIC datagram.
+pub fn encode_udp_relay_datagram(
+    session_id: &[u8; 16],
+    payload: &[u8],
+) -> Result<Vec<u8>, UdpRelayFrameError> {
+    if payload.is_empty() {
+        return Err(UdpRelayFrameError::Invalid);
+    }
+    if payload.len() + UDP_RELAY_DATA_HEADER_LEN > UDP_RELAY_MAX_DATAGRAM_LEN {
+        return Err(UdpRelayFrameError::TooLarge);
+    }
+    let mut frame = Vec::with_capacity(UDP_RELAY_DATA_HEADER_LEN + payload.len());
+    frame.extend_from_slice(UDP_RELAY_DATA_MAGIC);
+    frame.extend_from_slice(session_id);
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+/// Validate and remove a UDP relay routing header, returning session ID and opaque payload.
+pub fn decode_udp_relay_datagram(frame: &[u8]) -> Result<([u8; 16], &[u8]), UdpRelayFrameError> {
+    if frame.len() <= UDP_RELAY_DATA_HEADER_LEN || &frame[..8] != UDP_RELAY_DATA_MAGIC {
+        return Err(UdpRelayFrameError::Invalid);
+    }
+    if frame.len() > UDP_RELAY_MAX_DATAGRAM_LEN {
+        return Err(UdpRelayFrameError::TooLarge);
+    }
+    let session_id = frame[8..UDP_RELAY_DATA_HEADER_LEN]
+        .try_into()
+        .map_err(|_| UdpRelayFrameError::Invalid)?;
+    Ok((session_id, &frame[UDP_RELAY_DATA_HEADER_LEN..]))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayTicketRequest {
@@ -550,6 +597,40 @@ mod tests {
         assert_eq!(
             verify_relay_ticket(&secret, &tampered, 4999),
             Err(RelayTicketError::Invalid)
+        );
+    }
+
+    #[test]
+    fn udp_relay_datagram_frame_round_trips_and_enforces_outer_mtu() {
+        let session = [0x42; 16];
+        let payload = [0x7f; 1000];
+        let encoded = encode_udp_relay_datagram(&session, &payload).expect("encode relay frame");
+        assert_eq!(encoded.len(), UDP_RELAY_DATA_HEADER_LEN + payload.len());
+        assert_eq!(
+            decode_udp_relay_datagram(&encoded).expect("decode relay frame"),
+            (session, payload.as_slice())
+        );
+
+        assert_eq!(
+            encode_udp_relay_datagram(&session, &[]),
+            Err(UdpRelayFrameError::Invalid)
+        );
+        assert_eq!(
+            encode_udp_relay_datagram(
+                &session,
+                &vec![0; UDP_RELAY_MAX_DATAGRAM_LEN - UDP_RELAY_DATA_HEADER_LEN + 1]
+            ),
+            Err(UdpRelayFrameError::TooLarge)
+        );
+        assert_eq!(
+            decode_udp_relay_datagram(b"MTUDATA1"),
+            Err(UdpRelayFrameError::Invalid)
+        );
+        let mut invalid = encoded;
+        invalid[0] ^= 1;
+        assert_eq!(
+            decode_udp_relay_datagram(&invalid),
+            Err(UdpRelayFrameError::Invalid)
         );
     }
 
