@@ -23,9 +23,6 @@ jobs:
     steps:
       - name: Install build prerequisites
         run: |
-          # Ubuntu 20.04 is past standard support; its archived package mirror
-          # keeps the reproducible glibc 2.31 build environment available.
-          sed -i 's|archive.ubuntu.com|old-releases.ubuntu.com|g; s|security.ubuntu.com|old-releases.ubuntu.com|g' /etc/apt/sources.list
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
             build-essential ca-certificates curl pkg-config tar gzip
