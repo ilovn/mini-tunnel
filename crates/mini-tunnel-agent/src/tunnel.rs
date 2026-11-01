@@ -22,6 +22,7 @@ const MAX_MESH_EVENT_QUEUE_CAPACITY: usize = 1024;
 // One 9000-byte outbound packet per each of 4096 peers caps this queue at about 35.2 MiB.
 const MESH_OUTBOUND_QUEUE_PER_PEER: usize = 1;
 const MESH_OUTBOUND_PACKET_TTL: Duration = Duration::from_secs(5);
+const ICE_EARLY_FALLBACK_MISSES: u64 = 1;
 
 fn mesh_event_queue_capacity(peer_count: usize) -> usize {
     peer_count
@@ -350,17 +351,77 @@ fn new_mesh_peer_runtime(
 
 struct MeshReceiverTasks(HashMap<Ipv4Addr, tokio::task::JoinHandle<()>>);
 
-struct AbortOnDropTask(tokio::task::JoinHandle<()>);
+struct AbortOnDropTask(Option<tokio::task::JoinHandle<()>>);
 
 impl AbortOnDropTask {
     fn abort(&self) {
-        self.0.abort();
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+
+    async fn abort_and_wait(mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+            let _ = task.await;
+        }
     }
 }
 
 impl Drop for AbortOnDropTask {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
+
+fn spawn_reliable_fallback_task(
+    connector: &PeerConnector,
+    address: Ipv4Addr,
+    sender: tokio::sync::mpsc::Sender<Result<PeerChannel, IdentityError>>,
+) -> AbortOnDropTask {
+    let connector = Arc::clone(connector);
+    AbortOnDropTask(Some(tokio::spawn(async move {
+        let mut attempt = 0_u32;
+        loop {
+            tokio::time::sleep(crate::reconnect_delay(attempt)).await;
+            attempt = attempt.saturating_add(1);
+            match connector(true).await {
+                Ok(candidate) => {
+                    let _ = sender.send(Ok(candidate)).await;
+                    break;
+                }
+                Err(IdentityError::UnauthorizedPeer) => {
+                    let _ = sender.send(Err(IdentityError::UnauthorizedPeer)).await;
+                    break;
+                }
+                Err(error) => tracing::warn!(
+                    peer_address = %address,
+                    attempt,
+                    error = %error,
+                    "reliable fallback connection attempt failed"
+                ),
+            }
+        }
+    })))
+}
+
+async fn cancel_prepared_fallback(
+    fallback_task: &mut Option<AbortOnDropTask>,
+    fallback_rx: &mut tokio::sync::mpsc::Receiver<Result<PeerChannel, IdentityError>>,
+    ready_fallback: &mut Option<PeerChannel>,
+) {
+    if let Some(task) = fallback_task.take() {
+        task.abort_and_wait().await;
+    }
+    while let Ok(result) = fallback_rx.try_recv() {
+        if let Ok(candidate) = result {
+            candidate.close_async().await;
+        }
+    }
+    if let Some(candidate) = ready_fallback.take() {
+        candidate.close_async().await;
     }
 }
 
@@ -571,6 +632,10 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         let mut quality = PathQualityTracker::default();
         let mut health_status_windows = 0_u8;
         let initial_health = active.health_snapshot();
+        let mut last_health_successes = initial_health.probes_succeeded;
+        let mut last_health_missed = initial_health.probes_missed;
+        let mut consecutive_health_misses = 0_u64;
+        let mut fallback_cooldown_until = tokio::time::Instant::now();
         crate::status::update(
             address.to_string(),
             true,
@@ -588,6 +653,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         let mut probe_task = None;
         let (fallback_tx, mut fallback_rx) = tokio::sync::mpsc::channel(1);
         let mut fallback_task = None;
+        let mut ready_fallback = None;
         let outcome = loop {
             tokio::select! {
                 result = tokio::time::timeout_at(last_received + Duration::from_secs(30), &mut inbound) => {
@@ -625,6 +691,15 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                 }
                 _ = keepalive.tick() => {
                     let health = active.health_snapshot();
+                    let new_successes = health.probes_succeeded.saturating_sub(last_health_successes);
+                    let new_missed = health.probes_missed.saturating_sub(last_health_missed);
+                    last_health_successes = health.probes_succeeded;
+                    last_health_missed = health.probes_missed;
+                    if new_successes > 0 {
+                        consecutive_health_misses = 0;
+                    } else {
+                        consecutive_health_misses = consecutive_health_misses.saturating_add(new_missed);
+                    }
                     crate::status::update(
                         address.to_string(), true, active.transport_name(),
                         health.rtt.map(|rtt| rtt.as_millis() as u64),
@@ -642,10 +717,45 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                             "peer path health snapshot"
                         );
                     }
-                    if active.transport_name() == "QUIC/UDP"
-                        && quality.observe(health)
-                        && !force_reliable
+                    let previous_window_probes = quality.window_probes;
+                    let quality_degraded = quality.observe(health);
+                    let completed_healthy_window = previous_window_probes
+                        + new_successes
+                        + new_missed
+                        >= 3
+                        && quality.bad_windows == 0;
+                    if !force_reliable
+                        && active.transport_name() == "QUIC/UDP"
+                        && active.has_ice_consent_monitor()
+                        && consecutive_health_misses >= ICE_EARLY_FALLBACK_MISSES
+                        && tokio::time::Instant::now() >= fallback_cooldown_until
+                        && fallback_task.is_none()
+                        && ready_fallback.is_none()
+                        && let Some(connector) = connector.as_ref()
                     {
+                        tracing::debug!(
+                            peer_address = %address,
+                            consecutive_missed_probes = consecutive_health_misses,
+                            "preparing reliable fallback before ICE consent expires"
+                        );
+                        fallback_task = Some(spawn_reliable_fallback_task(
+                            connector,
+                            address,
+                            fallback_tx.clone(),
+                        ));
+                    }
+                    if (new_successes > 0 || completed_healthy_window)
+                        && !force_reliable
+                        && (fallback_task.is_some() || ready_fallback.is_some())
+                    {
+                        cancel_prepared_fallback(
+                            &mut fallback_task,
+                            &mut fallback_rx,
+                            &mut ready_fallback,
+                        )
+                        .await;
+                    }
+                    if active.transport_name() == "QUIC/UDP" && quality_degraded && !force_reliable {
                         tracing::warn!(
                             peer_address = %address,
                             path = active.transport_name(),
@@ -666,35 +776,35 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                                 "peer path quality degraded".to_owned(),
                             ));
                         };
+                        if let Some(candidate) = ready_fallback.take()
+                            && path_rank(candidate.transport_name())
+                                > path_rank(active.transport_name())
+                        {
+                            let previous_path = active.transport_name();
+                            let fallback_path = candidate.transport_name();
+                            tracing::info!(
+                                peer_address = %address,
+                                from_path = previous_path,
+                                to_path = fallback_path,
+                                reason = "quality_threshold",
+                                "peer path switched to prepared reliable fallback"
+                            );
+                            *channel.write().await = Arc::new(candidate);
+                            let health = channel.read().await.health_snapshot();
+                            crate::status::update(
+                                address.to_string(), true, fallback_path,
+                                health.rtt.map(|rtt| rtt.as_millis() as u64),
+                                health.probes_succeeded, health.probes_missed,
+                                Some("quality_threshold"),
+                            );
+                            break Ok(());
+                        }
                         if fallback_task.is_none() {
-                            let connector = Arc::clone(connector);
-                            let sender = fallback_tx.clone();
-                            let peer_address = address;
-                            fallback_task = Some(AbortOnDropTask(tokio::spawn(async move {
-                                let mut attempt = 0_u32;
-                                loop {
-                                    tokio::time::sleep(crate::reconnect_delay(attempt)).await;
-                                    attempt = attempt.saturating_add(1);
-                                    match connector(true).await {
-                                        Ok(candidate) => {
-                                            let _ = sender.send(Ok(candidate)).await;
-                                            break;
-                                        }
-                                        Err(IdentityError::UnauthorizedPeer) => {
-                                            let _ = sender
-                                                .send(Err(IdentityError::UnauthorizedPeer))
-                                                .await;
-                                            break;
-                                        }
-                                        Err(error) => tracing::warn!(
-                                            peer_address = %peer_address,
-                                            attempt,
-                                            error = %error,
-                                            "reliable fallback connection attempt failed"
-                                        ),
-                                    }
-                                }
-                            })));
+                            fallback_task = Some(spawn_reliable_fallback_task(
+                                connector,
+                                address,
+                                fallback_tx.clone(),
+                            ));
                         }
                     }
                     if let Err(error) = active.send_keepalive().await {
@@ -739,26 +849,43 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                         Some(Ok(candidate))
                             if path_rank(candidate.transport_name()) > path_rank(active.transport_name()) =>
                         {
-                            let previous_path = active.transport_name();
-                            let fallback_path = candidate.transport_name();
-                            tracing::info!(
+                            if force_reliable {
+                                let previous_path = active.transport_name();
+                                let fallback_path = candidate.transport_name();
+                                tracing::info!(
+                                    peer_address = %address,
+                                    from_path = previous_path,
+                                    to_path = fallback_path,
+                                    reason = "quality_threshold",
+                                    "peer path switched to reliable fallback"
+                                );
+                                *channel.write().await = Arc::new(candidate);
+                                let health = channel.read().await.health_snapshot();
+                                crate::status::update(
+                                    address.to_string(), true, fallback_path,
+                                    health.rtt.map(|rtt| rtt.as_millis() as u64),
+                                    health.probes_succeeded, health.probes_missed,
+                                    Some("quality_threshold"),
+                                );
+                                break Ok(());
+                            }
+                            tracing::debug!(
                                 peer_address = %address,
-                                from_path = previous_path,
-                                to_path = fallback_path,
-                                reason = "quality_threshold",
-                                "peer path switched to reliable fallback"
+                                path = candidate.transport_name(),
+                                "reliable fallback is ready; retaining the active path until degradation"
                             );
-                            *channel.write().await = Arc::new(candidate);
-                            let health = channel.read().await.health_snapshot();
-                            crate::status::update(
-                                address.to_string(), true, fallback_path,
-                                health.rtt.map(|rtt| rtt.as_millis() as u64),
-                                health.probes_succeeded, health.probes_missed,
-                                Some("quality_threshold"),
-                            );
-                            break Ok(());
+                            ready_fallback = Some(candidate);
                         }
-                        Some(Ok(_)) => {}
+                        Some(Ok(candidate)) => candidate.close_async().await,
+                        Some(Err(error)) if !force_reliable => {
+                            fallback_cooldown_until = tokio::time::Instant::now()
+                                + Duration::from_secs(30);
+                            tracing::warn!(
+                                peer_address = %address,
+                                error = %error,
+                                "early reliable fallback preparation failed while the active path remains usable"
+                            );
+                        }
                         Some(Err(error)) => break Err(error),
                         None => break Err(IdentityError::Transport(
                             "reliable fallback task stopped".to_owned(),
@@ -782,6 +909,44 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         };
         active.stop_ice_consent_monitor().await;
         let health = active.health_snapshot();
+        if active.transport_name() == "QUIC/UDP" && matches!(&failure, IdentityError::Transport(_))
+        {
+            force_reliable = true;
+        }
+        if let Some(candidate) = ready_fallback.take() {
+            if path_rank(candidate.transport_name()) > path_rank(active.transport_name()) {
+                discard_queued_mesh_packets(&mut outbound_rx, address);
+                let fallback_path = candidate.transport_name();
+                let switch_reason = if quality.degraded {
+                    "quality_threshold"
+                } else if active.has_ice_consent_monitor() {
+                    "ice_consent_expired"
+                } else {
+                    "transport_failure"
+                };
+                tracing::info!(
+                    peer_address = %address,
+                    from_path = active.transport_name(),
+                    to_path = fallback_path,
+                    reason = switch_reason,
+                    "peer path recovered immediately with a prepared reliable channel"
+                );
+                active.close_async().await;
+                *channel.write().await = Arc::new(candidate);
+                let recovered_health = channel.read().await.health_snapshot();
+                crate::status::update(
+                    address.to_string(),
+                    true,
+                    fallback_path,
+                    recovered_health.rtt.map(|rtt| rtt.as_millis() as u64),
+                    recovered_health.probes_succeeded,
+                    recovered_health.probes_missed,
+                    Some(switch_reason),
+                );
+                continue;
+            }
+            candidate.close_async().await;
+        }
         crate::status::update(
             address.to_string(),
             false,
@@ -792,10 +957,6 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
             None,
         );
         discard_queued_mesh_packets(&mut outbound_rx, address);
-        if active.transport_name() == "QUIC/UDP" && matches!(&failure, IdentityError::Transport(_))
-        {
-            force_reliable = true;
-        }
         tracing::warn!(
             peer_address = %address,
             path = active.transport_name(),
@@ -2485,14 +2646,17 @@ mod tests {
             .await
             .unwrap();
         let recovered = remote_channel.lock().await.take().unwrap();
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(3), recovered.recv_packet())
-                .await
-                .unwrap()
-                .unwrap()
-                .len(),
-            28
-        );
+        let delivered = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let packet = recovered.recv_packet().await.unwrap();
+                if !packet.is_empty() {
+                    break packet;
+                }
+            }
+        })
+        .await
+        .expect("overlay packet delivered after fallback");
+        assert_eq!(delivered.len(), 28);
         let outbound_ipv6 = ipv6_packet(local_ipv6, peer_ipv6, 8);
         outbound_tx.send(outbound_ipv6.clone()).await.unwrap();
         assert_eq!(
