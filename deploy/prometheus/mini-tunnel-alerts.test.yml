@@ -36,3 +36,32 @@ tests:
       - eval_time: 7m
         alertname: MiniTunnelCoordinatorSlowRequests
         exp_alerts: []
+
+  - name: fires for repeated relay handshake failures
+    interval: 1m
+    input_series:
+      - series: 'mini_tunnel_relay_handshake_failures_total{job="mini-tunnel-relay",instance="relay.internal:42002"}'
+        values: '0 5 10 15 20 25 30 35 40 45 50'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: MiniTunnelRelayHandshakeFailures
+        exp_alerts:
+          - exp_labels:
+              job: mini-tunnel-relay
+              instance: relay.internal:42002
+              severity: warning
+              alertname: MiniTunnelRelayHandshakeFailures
+            exp_annotations:
+              summary: mini-tunnel Relay is seeing repeated handshake failures
+              description: More than 20 relay handshakes failed in five minutes for at least two minutes; inspect relay logs and source network activity.
+              runbook: deploy/systemd/README.md#monitoring-and-alerts
+
+  - name: stays quiet for occasional relay handshake failures
+    interval: 1m
+    input_series:
+      - series: 'mini_tunnel_relay_handshake_failures_total{job="mini-tunnel-relay",instance="relay.internal:42002"}'
+        values: '0 1 2 3 4 5 6 7 8 9 10'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: MiniTunnelRelayHandshakeFailures
+        exp_alerts: []
