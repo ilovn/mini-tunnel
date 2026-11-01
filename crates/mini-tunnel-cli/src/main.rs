@@ -28,6 +28,7 @@ use serde::Deserialize;
 
 const PEER_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(5);
 const ICE_PATH_PROMOTION_PROBATION: Duration = Duration::from_secs(31);
+const ICE_PATH_PROBATION_HEALTH_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Parser)]
 #[command(name = "mini-tunnel", version, about = "A minimal peer-to-peer tunnel")]
@@ -3032,6 +3033,21 @@ async fn validate_udp_probe_with_window(
     require_ice_consent: bool,
     consent_window: Duration,
 ) -> Result<mini_tunnel_agent::PeerChannel, mini_tunnel_agent::IdentityError> {
+    validate_udp_probe_with_timing(
+        channel,
+        require_ice_consent,
+        consent_window,
+        ICE_PATH_PROBATION_HEALTH_INTERVAL,
+    )
+    .await
+}
+
+async fn validate_udp_probe_with_timing(
+    channel: mini_tunnel_agent::PeerChannel,
+    require_ice_consent: bool,
+    consent_window: Duration,
+    health_interval: Duration,
+) -> Result<mini_tunnel_agent::PeerChannel, mini_tunnel_agent::IdentityError> {
     let rtt = channel.probe_health(3, Duration::from_secs(2)).await?;
     if !mini_tunnel_agent::tunnel::path_quality_rtt_is_acceptable(rtt) {
         return Err(mini_tunnel_agent::IdentityError::Transport(
@@ -3044,13 +3060,22 @@ async fn validate_udp_probe_with_window(
                 "direct candidate is missing ICE consent".to_owned(),
             ));
         }
-        if tokio::time::timeout(consent_window, channel.wait_ice_consent_failure())
-            .await
-            .is_ok()
-        {
-            return Err(mini_tunnel_agent::IdentityError::Transport(
-                "ICE consent expired during direct path probation".to_owned(),
-            ));
+        let deadline = tokio::time::Instant::now() + consent_window;
+        let mut health_probes = tokio::time::interval(health_interval);
+        health_probes.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        health_probes.tick().await;
+        loop {
+            tokio::select! {
+                () = channel.wait_ice_consent_failure() => {
+                    return Err(mini_tunnel_agent::IdentityError::Transport(
+                        "ICE consent expired during direct path probation".to_owned(),
+                    ));
+                }
+                _ = tokio::time::sleep_until(deadline) => break,
+                _ = health_probes.tick() => {
+                    channel.probe_health(1, Duration::from_secs(2)).await?;
+                }
+            }
         }
     }
     Ok(channel)
@@ -5032,11 +5057,17 @@ mod tests {
             .await;
         candidate.set_ice_consent_monitor(monitor);
         let started = tokio::time::Instant::now();
-        let candidate = validate_udp_probe_with_window(candidate, true, Duration::from_millis(50))
-            .await
-            .expect("candidate with live consent survives probation");
-        assert!(started.elapsed() >= Duration::from_millis(50));
+        let candidate = validate_udp_probe_with_timing(
+            candidate,
+            true,
+            Duration::from_millis(125),
+            Duration::from_millis(25),
+        )
+        .await
+        .expect("candidate with live consent survives probation");
+        assert!(started.elapsed() >= Duration::from_millis(125));
         assert!(candidate.has_ice_consent_monitor());
+        assert!(candidate.health_snapshot().probes_succeeded >= 7);
         candidate.stop_ice_consent_monitor().await;
         candidate_responder.abort();
         endpoint_a.close(0_u32.into(), b"test complete");
