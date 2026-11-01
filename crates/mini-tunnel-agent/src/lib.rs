@@ -1048,17 +1048,59 @@ async fn connect_peer_with_client_config(
     expected_peer_key: [u8; 32],
     config: quinn::ClientConfig,
 ) -> Result<PeerChannel, IdentityError> {
+    connect_peer_with_client_config_timeout(
+        endpoint,
+        PeerConnectAttempt {
+            remote_addr,
+            network_id,
+            identity,
+            expected_peer_id,
+            expected_peer_key,
+            config,
+            timeout: PEER_HANDSHAKE_TIMEOUT,
+        },
+    )
+    .await
+}
+
+struct PeerConnectAttempt<'a> {
+    remote_addr: SocketAddr,
+    network_id: &'a str,
+    identity: &'a Identity,
+    expected_peer_id: &'a str,
+    expected_peer_key: [u8; 32],
+    config: quinn::ClientConfig,
+    timeout: Duration,
+}
+
+async fn connect_peer_with_client_config_timeout(
+    endpoint: &Endpoint,
+    attempt: PeerConnectAttempt<'_>,
+) -> Result<PeerChannel, IdentityError> {
+    let PeerConnectAttempt {
+        remote_addr,
+        network_id,
+        identity,
+        expected_peer_id,
+        expected_peer_key,
+        config,
+        timeout,
+    } = attempt;
     if expected_peer_id != mini_tunnel_protocol::device_id_from_public_key(&expected_peer_key) {
         return Err(IdentityError::UnauthorizedPeer);
     }
-    let connection = endpoint
-        .connect_with(config, remote_addr, "mini-tunnel")
-        .map_err(|error| IdentityError::Transport(error.to_string()))?
-        .await
-        .map_err(|error| IdentityError::Transport(error.to_string()))?;
-    verify_connection_identity(&connection, &expected_peer_key)?;
-    client_authenticate(&connection, network_id, identity, expected_peer_id).await?;
-    Ok(new_channel(connection, network_id))
+    tokio::time::timeout(timeout, async {
+        let connection = endpoint
+            .connect_with(config, remote_addr, "mini-tunnel")
+            .map_err(|error| IdentityError::Transport(error.to_string()))?
+            .await
+            .map_err(|error| IdentityError::Transport(error.to_string()))?;
+        verify_connection_identity(&connection, &expected_peer_key)?;
+        client_authenticate(&connection, network_id, identity, expected_peer_id).await?;
+        Ok(new_channel(connection, network_id))
+    })
+    .await
+    .map_err(|error| IdentityError::Transport(error.to_string()))?
 }
 
 fn peer_udp_relay_transport_config() -> quinn::TransportConfig {
@@ -3360,6 +3402,54 @@ mod tests {
         assert!(result.is_none());
         assert!(started.elapsed() < Duration::from_secs(1));
         drop(client_socket);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn single_peer_connect_uses_one_total_handshake_deadline() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-quic-connect-deadline-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let local = Identity::load_or_create_at(temp.join("local/device.key")).unwrap();
+        let remote = Identity::load_or_create_at(temp.join("remote/device.key")).unwrap();
+        let local_endpoint =
+            peer_endpoint(&local, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+        let blackhole =
+            tokio::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await
+                .unwrap();
+        let remote_addr = blackhole.local_addr().unwrap();
+        let remote_id = remote.device_id();
+        let remote_key = remote.public_key();
+        let config = peer_client_config(
+            remote_key,
+            std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .unwrap();
+        let started = tokio::time::Instant::now();
+        let result = connect_peer_with_client_config_timeout(
+            &local_endpoint,
+            PeerConnectAttempt {
+                remote_addr,
+                network_id: "connect-deadline",
+                identity: &local,
+                expected_peer_id: &remote_id,
+                expected_peer_key: remote_key,
+                config,
+                timeout: Duration::from_millis(100),
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(IdentityError::Transport(message)) if message == "deadline has elapsed"
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        local_endpoint.close(0_u32.into(), b"test complete");
+        drop(blackhole);
         fs::remove_dir_all(temp).unwrap();
     }
 
