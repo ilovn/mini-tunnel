@@ -23,6 +23,16 @@ groups:
 
   - name: mini-tunnel-capacity
     rules:
+      - alert: MiniTunnelCoordinatorSlowRequests
+        expr: increase(mini_tunnel_coordinator_request_duration_seconds_bucket{job="mini-tunnel-coordinator", le="+Inf"}[5m]) > on(job, instance) increase(mini_tunnel_coordinator_request_duration_seconds_bucket{job="mini-tunnel-coordinator", le="5.000"}[5m])
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: mini-tunnel Coordinator has requests taking longer than five seconds
+          description: One or more Coordinator requests exceeded the highest finite latency histogram bucket during each recent evaluation window.
+          runbook: deploy/systemd/README.md#monitoring-and-alerts
+
       - alert: MiniTunnelCoordinatorRequestTimeouts
         expr: increase(mini_tunnel_coordinator_request_timeouts_total[5m]) > 0
         for: 2m

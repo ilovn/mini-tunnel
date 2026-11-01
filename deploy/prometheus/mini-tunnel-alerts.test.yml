@@ -1,0 +1,38 @@
+rule_files:
+  - mini-tunnel-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: fires for sustained requests over five seconds
+    interval: 1m
+    input_series:
+      - series: 'mini_tunnel_coordinator_request_duration_seconds_bucket{job="mini-tunnel-coordinator",instance="coordinator.internal:8443",le="+Inf"}'
+        values: '0 0 1 2 3 4 5 6 7 8 9'
+      - series: 'mini_tunnel_coordinator_request_duration_seconds_bucket{job="mini-tunnel-coordinator",instance="coordinator.internal:8443",le="5.000"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: MiniTunnelCoordinatorSlowRequests
+        exp_alerts:
+          - exp_labels:
+              job: mini-tunnel-coordinator
+              instance: coordinator.internal:8443
+              severity: warning
+              alertname: MiniTunnelCoordinatorSlowRequests
+            exp_annotations:
+              summary: mini-tunnel Coordinator has requests taking longer than five seconds
+              description: One or more Coordinator requests exceeded the highest finite latency histogram bucket during each recent evaluation window.
+              runbook: deploy/systemd/README.md#monitoring-and-alerts
+
+  - name: does not fire when requests stay within five seconds
+    interval: 1m
+    input_series:
+      - series: 'mini_tunnel_coordinator_request_duration_seconds_bucket{job="mini-tunnel-coordinator",instance="coordinator.internal:8443",le="+Inf"}'
+        values: '0 1 2 3 4 5 6 7 8 9 10'
+      - series: 'mini_tunnel_coordinator_request_duration_seconds_bucket{job="mini-tunnel-coordinator",instance="coordinator.internal:8443",le="5.000"}'
+        values: '0 1 2 3 4 5 6 7 8 9 10'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: MiniTunnelCoordinatorSlowRequests
+        exp_alerts: []
