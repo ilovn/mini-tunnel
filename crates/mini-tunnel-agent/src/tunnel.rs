@@ -1972,6 +1972,22 @@ mod tests {
             "loss-triggered fallback must filter unreliable UDP"
         );
 
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if crate::status::snapshot().into_iter().any(|status| {
+                    status.peer == peer_ip.to_string()
+                        && status.online
+                        && status.active_path == "TLS/TCP"
+                        && status.last_switch_reason.as_deref() == Some("quality_threshold")
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("degraded UDP quality should promote the prepared TCP path before forwarding");
+
         outbound_tx
             .send(packet(local_ip, peer_ip, 28))
             .await
