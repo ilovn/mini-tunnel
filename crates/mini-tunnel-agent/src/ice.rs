@@ -34,6 +34,8 @@ const MAX_UDP_DATAGRAM_SIZE: usize = u16::MAX as usize;
 const MAX_ICE_SESSIONS: usize = 1024;
 const MAX_SESSION_PEER_ADDRESSES: usize = 16;
 const MAX_PENDING_STUN_QUERIES: usize = 8;
+const MAX_PENDING_ICE_TRANSACTIONS: usize = 4096;
+const ICE_TRANSACTION_TTL: Duration = Duration::from_secs(30);
 const ICE_CONSENT_INTERVAL: Duration = Duration::from_secs(5);
 const ICE_DISCONNECTED_TIMEOUT: Duration = Duration::from_secs(15);
 const ICE_FAILED_TIMEOUT: Duration = Duration::from_secs(30);
@@ -153,6 +155,28 @@ impl IceDatagramRouterHandle {
             .associate_authenticated_peer(local_ufrag, remote_ufrag, peer_addr)
     }
 
+    fn register_ice_request(
+        &self,
+        local_ufrag: &str,
+        remote_ufrag: &str,
+        peer_addr: SocketAddr,
+        payload: &[u8],
+    ) -> Result<(), IceRouterError> {
+        let Some(transaction_id) = crate::stun::binding_request_transaction_id(payload) else {
+            return Ok(());
+        };
+        self.router
+            .lock()
+            .map_err(|_| IceRouterError::Poisoned)?
+            .register_ice_transaction(
+                local_ufrag,
+                remote_ufrag,
+                peer_addr,
+                transaction_id,
+                Instant::now(),
+            )
+    }
+
     /// Deliver a routed datagram to its ICE agent and bind the source address only when the
     /// agent accepts the authenticated STUN check.
     pub fn handle_datagram(
@@ -252,11 +276,18 @@ struct PendingStunQuery {
     response: oneshot::Sender<Result<SocketAddr, crate::stun::StunError>>,
 }
 
+struct PendingIceTransaction {
+    session: IceSessionKey,
+    peer_addr: SocketAddr,
+    expires_at: Instant,
+}
+
 #[derive(Default)]
 pub struct IceDatagramRouter {
     sessions: HashMap<IceSessionKey, IceRoute>,
     peer_sessions: HashMap<SocketAddr, IceSessionKey>,
     pending_stun: HashMap<[u8; 12], PendingStunQuery>,
+    pending_ice: HashMap<[u8; 12], PendingIceTransaction>,
 }
 
 impl IceDatagramRouter {
@@ -349,6 +380,39 @@ impl IceDatagramRouter {
         Ok(())
     }
 
+    fn register_ice_transaction(
+        &mut self,
+        local_ufrag: &str,
+        remote_ufrag: &str,
+        peer_addr: SocketAddr,
+        transaction_id: [u8; 12],
+        now: Instant,
+    ) -> Result<(), IceRouterError> {
+        self.pending_ice
+            .retain(|_, pending| pending.expires_at > now);
+        let session = IceSessionKey {
+            local_ufrag: local_ufrag.to_owned(),
+            remote_ufrag: remote_ufrag.to_owned(),
+        };
+        if !self.sessions.contains_key(&session) {
+            return Err(IceRouterError::UnknownUfrag);
+        }
+        if !self.pending_ice.contains_key(&transaction_id)
+            && self.pending_ice.len() >= MAX_PENDING_ICE_TRANSACTIONS
+        {
+            return Err(IceRouterError::TransactionLimit);
+        }
+        self.pending_ice.insert(
+            transaction_id,
+            PendingIceTransaction {
+                session,
+                peer_addr,
+                expires_at: now + ICE_TRANSACTION_TTL,
+            },
+        );
+        Ok(())
+    }
+
     /// Remove a peer session and all authenticated address bindings it owned.
     pub fn unregister(&mut self, local_ufrag: &str, remote_ufrag: &str) -> bool {
         let key = IceSessionKey {
@@ -358,6 +422,7 @@ impl IceDatagramRouter {
         let Some(route) = self.sessions.remove(&key) else {
             return false;
         };
+        self.pending_ice.retain(|_, pending| pending.session != key);
         for address in route.peer_addresses {
             if self
                 .peer_sessions
@@ -390,6 +455,21 @@ impl IceDatagramRouter {
                 return false;
             };
             self.sessions.get(&key)
+        } else if let Some(transaction_id) =
+            crate::stun::binding_response_transaction_id(&datagram.payload)
+        {
+            if let Some(pending) = self.pending_ice.get(&transaction_id) {
+                if pending.peer_addr != datagram.peer_addr || pending.expires_at <= Instant::now() {
+                    return false;
+                }
+                let key = pending.session.clone();
+                self.pending_ice.remove(&transaction_id);
+                self.sessions.get(&key)
+            } else {
+                self.peer_sessions
+                    .get(&datagram.peer_addr)
+                    .and_then(|key| self.sessions.get(key))
+            }
         } else {
             self.peer_sessions
                 .get(&datagram.peer_addr)
@@ -425,6 +505,8 @@ pub enum IceRouterError {
     UnknownUfrag,
     #[error("maximum authenticated peer addresses reached for ICE session")]
     PeerAddressLimit,
+    #[error("maximum pending ICE transaction count reached")]
+    TransactionLimit,
     #[error("peer address is not usable")]
     InvalidPeerAddress,
     #[error("ICE datagram router lock is poisoned")]
@@ -974,7 +1056,7 @@ impl IceAgentDriver {
         Ok(Self::new(agent, local_socket_addr))
     }
 
-    /// Feed one datagram to ICE. `false` means it was not a complete STUN message envelope.
+    /// Feed one datagram to ICE. `false` means it was not STUN or rtc-ice rejected the message.
     pub fn handle_datagram(
         &mut self,
         now: Instant,
@@ -985,7 +1067,7 @@ impl IceAgentDriver {
         if !is_stun_datagram(message) {
             return Ok(false);
         }
-        if let Err(error) = self.agent.handle_read(TaggedBytesMut {
+        match self.agent.handle_read(TaggedBytesMut {
             now,
             transport: TransportContext {
                 local_addr: self.local_addr,
@@ -995,12 +1077,15 @@ impl IceAgentDriver {
             },
             message: BytesMut::from(message),
         }) {
-            // Incoming STUN is untrusted network input. rtc-ice can update role or checklist
-            // state while still returning a per-message error (for example after rejecting a
-            // conflicting or unauthenticated request); that must not abort the whole ICE session.
-            tracing::trace!(peer = %peer_addr, %error, "discarded ICE datagram");
+            Ok(()) => Ok(true),
+            Err(error) => {
+                // Incoming STUN is untrusted network input. rtc-ice can update role or checklist
+                // state while still returning a per-message error (for example after rejecting a
+                // conflicting or unauthenticated request); that must not abort the whole ICE session.
+                tracing::trace!(peer = %peer_addr, %error, "discarded ICE datagram");
+                Ok(false)
+            }
         }
-        Ok(true)
     }
 
     /// Advance ICE retransmission and state timers to `now`.
@@ -1063,6 +1148,14 @@ impl IceAgentDriver {
             let now = Instant::now();
             self.handle_timeout(now)?;
             for transmit in self.poll_transmits() {
+                router
+                    .register_ice_request(
+                        local_ufrag,
+                        remote_ufrag,
+                        transmit.transport.peer_addr,
+                        &transmit.message,
+                    )
+                    .map_err(|error| IceDriverError::Router(error.to_string()))?;
                 if let Err(error) = socket
                     .send_to(&transmit.message, transmit.transport.peer_addr)
                     .await
@@ -1119,6 +1212,14 @@ impl IceAgentDriver {
             let now = Instant::now();
             self.handle_timeout(now)?;
             for transmit in self.poll_transmits() {
+                router
+                    .register_ice_request(
+                        local_ufrag,
+                        remote_ufrag,
+                        transmit.transport.peer_addr,
+                        &transmit.message,
+                    )
+                    .map_err(|error| IceDriverError::Router(error.to_string()))?;
                 socket
                     .send_to(&transmit.message, transmit.transport.peer_addr)
                     .await
@@ -1540,18 +1641,14 @@ mod tests {
             let from_a = driver_a.poll_transmits();
             let from_b = driver_b.poll_transmits();
             for message in from_a {
-                assert!(
-                    driver_b
-                        .handle_datagram(now, address_a, message.transport.ecn, &message.message)
-                        .expect("deliver A check")
-                );
+                driver_b
+                    .handle_datagram(now, address_a, message.transport.ecn, &message.message)
+                    .expect("deliver A check");
             }
             for message in from_b {
-                assert!(
-                    driver_a
-                        .handle_datagram(now, address_b, message.transport.ecn, &message.message)
-                        .expect("deliver B check")
-                );
+                driver_a
+                    .handle_datagram(now, address_b, message.transport.ecn, &message.message)
+                    .expect("deliver B check");
             }
             if driver_a.selected_pair().is_some() && driver_b.selected_pair().is_some() {
                 break;
@@ -1681,6 +1778,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ice_router_routes_initial_responses_by_transaction_before_peer_authentication() {
+        let mut router = IceDatagramRouter::default();
+        let mut session_a = router
+            .register("localA".to_owned(), "remoteA".to_owned(), 2)
+            .unwrap();
+        let mut session_b = router
+            .register("localB".to_owned(), "remoteB".to_owned(), 2)
+            .unwrap();
+        let peer: SocketAddr = "198.51.100.7:42000".parse().unwrap();
+        let stranger: SocketAddr = "198.51.100.8:42000".parse().unwrap();
+        let mut request_a = ice_packet("remoteA:localA", peer);
+        let mut request_b = ice_packet("remoteB:localB", peer);
+        request_a.payload[8..20].copy_from_slice(&[1; 12]);
+        request_b.payload[8..20].copy_from_slice(&[2; 12]);
+        let transaction_a = crate::stun::binding_request_transaction_id(&request_a.payload)
+            .expect("ICE request transaction A");
+        let transaction_b = crate::stun::binding_request_transaction_id(&request_b.payload)
+            .expect("ICE request transaction B");
+        let now = Instant::now();
+        router
+            .register_ice_transaction("localA", "remoteA", peer, transaction_a, now)
+            .unwrap();
+        router
+            .register_ice_transaction("localB", "remoteB", peer, transaction_b, now)
+            .unwrap();
+
+        assert!(!router.route(ice_response(transaction_b, stranger)));
+        assert!(router.route(ice_response(transaction_b, peer)));
+        assert_eq!(session_b.recv().await.unwrap().peer_addr, peer);
+        assert!(session_a.try_recv().is_err());
+        assert!(router.route(ice_response(transaction_a, peer)));
+        assert_eq!(session_a.recv().await.unwrap().peer_addr, peer);
+        assert!(!router.route(ice_response(transaction_a, peer)));
+    }
+
+    #[tokio::test]
     async fn ice_router_bounds_sessions_and_does_not_block_on_a_full_peer_queue() {
         let mut router = IceDatagramRouter::default();
         assert_eq!(
@@ -1724,6 +1857,18 @@ mod tests {
         let mut payload = vec![0; 20];
         payload[..2].copy_from_slice(&1_u16.to_be_bytes());
         payload[4..8].copy_from_slice(&0x2112_A442_u32.to_be_bytes());
+        IceDatagram {
+            local_addr: "127.0.0.1:40000".parse().unwrap(),
+            peer_addr,
+            payload,
+        }
+    }
+
+    fn ice_response(transaction_id: [u8; 12], peer_addr: SocketAddr) -> IceDatagram {
+        let mut payload = vec![0; 20];
+        payload[..2].copy_from_slice(&crate::stun::BINDING_SUCCESS.to_be_bytes());
+        payload[4..8].copy_from_slice(&0x2112_A442_u32.to_be_bytes());
+        payload[8..20].copy_from_slice(&transaction_id);
         IceDatagram {
             local_addr: "127.0.0.1:40000".parse().unwrap(),
             peer_addr,
@@ -1825,10 +1970,39 @@ mod tests {
             let _ = router.unregister(&local_ufrag, &remote_ufrag);
         });
         monitor.set_task(task).await;
-        drop(driver_b);
-        drop(ice_messages);
+        let (monitor_b, mut cancel_b, failure_sender_b) = IceConsentMonitor::new();
+        let router_b = endpoint_b.ice_router.clone();
+        let socket_b = endpoint_b.socket.clone();
+        let local_ufrag_b = credentials_b.ufrag.clone();
+        let remote_ufrag_b = credentials_a.ufrag.clone();
+        let task_b = tokio::spawn(async move {
+            if driver_b
+                .monitor_consent(
+                    &socket_b,
+                    &router_b,
+                    &local_ufrag_b,
+                    &remote_ufrag_b,
+                    &mut ice_messages,
+                    &mut cancel_b,
+                )
+                .await
+                .is_err()
+            {
+                failure_sender_b.send_replace(true);
+            }
+            let _ = router_b.unregister(&local_ufrag_b, &remote_ufrag_b);
+        });
+        monitor_b.set_task(task_b).await;
+
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        assert!(
+            !*monitor.failure_receiver().borrow() && !*monitor_b.failure_receiver().borrow(),
+            "both nominated ICE sessions must maintain consent over the shared UDP sockets"
+        );
+
+        monitor_b.stop().await;
         let mut failed = monitor.failure_receiver();
-        tokio::time::timeout(Duration::from_secs(35), async {
+        tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 if *failed.borrow() {
                     break;
@@ -1839,9 +2013,7 @@ mod tests {
         .await
         .expect("ICE consent loss is detected after the selected peer stops responding");
         monitor.stop().await;
-        let _ = endpoint_b
-            .ice_router
-            .unregister(&credentials_b.ufrag, &credentials_a.ufrag);
+        monitor_b.stop().await;
 
         let identity_a_id = identity_a.device_id();
         let identity_a_key = identity_a.public_key();

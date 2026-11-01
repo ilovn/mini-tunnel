@@ -9,6 +9,7 @@ const HEADER_LEN: usize = 20;
 const MAGIC_COOKIE: u32 = 0x2112_A442;
 const BINDING_REQUEST: u16 = 0x0001;
 pub(crate) const BINDING_SUCCESS: u16 = 0x0101;
+const BINDING_ERROR: u16 = 0x0111;
 const MAPPED_ADDRESS: u16 = 0x0001;
 const XOR_MAPPED_ADDRESS: u16 = 0x0020;
 const USERNAME: u16 = 0x0006;
@@ -129,6 +130,31 @@ pub(crate) fn binding_success_transaction_id(message: &[u8]) -> Option<[u8; 12]>
     if !is_stun_datagram(message)
         || message.len() < HEADER_LEN
         || u16::from_be_bytes([message[0], message[1]]) != BINDING_SUCCESS
+    {
+        return None;
+    }
+    message[8..20].try_into().ok()
+}
+
+/// Extract the transaction ID from an ICE Binding request so its response can be routed before
+/// an authenticated peer address has been learned.
+pub(crate) fn binding_request_transaction_id(message: &[u8]) -> Option<[u8; 12]> {
+    if !is_stun_datagram(message)
+        || u16::from_be_bytes([message[0], message[1]]) != BINDING_REQUEST
+        || ice_username(message).is_none()
+    {
+        return None;
+    }
+    message[8..20].try_into().ok()
+}
+
+/// Extract the transaction ID from either a successful or error Binding response.
+pub(crate) fn binding_response_transaction_id(message: &[u8]) -> Option<[u8; 12]> {
+    if !is_stun_datagram(message)
+        || !matches!(
+            u16::from_be_bytes([message[0], message[1]]),
+            BINDING_SUCCESS | BINDING_ERROR
+        )
     {
         return None;
     }
