@@ -841,6 +841,7 @@ impl CoordinatorState {
         Ok(RelayTicketResponse {
             ticket,
             expires_at_ms,
+            session_id,
         })
     }
 
@@ -4865,6 +4866,8 @@ mod tests {
             claims_a.session_id, claims_b.session_id,
             "relay pairing state must be shared across instances"
         );
+        assert_eq!(ticket_a.session_id, claims_a.session_id);
+        assert_eq!(ticket_b.session_id, claims_b.session_id);
 
         let restored = CoordinatorState::connect_postgres(&app_database_url)
             .await
@@ -5046,6 +5049,8 @@ mod tests {
         let claims_b =
             mini_tunnel_protocol::verify_relay_ticket(&[9; 32], &ticket_b.ticket, now).unwrap();
         assert_eq!(claims_a.session_id, claims_b.session_id);
+        assert_eq!(ticket_a.session_id, claims_a.session_id);
+        assert_eq!(ticket_b.session_id, claims_b.session_id);
         assert_ne!(claims_a.ticket_id, claims_b.ticket_id);
         assert!(matches!(
             state

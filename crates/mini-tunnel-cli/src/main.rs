@@ -379,6 +379,9 @@ enum TunnelCommand {
         /// Optional ticket-authorized relay TCP endpoint used after direct UDP/TCP attempts fail.
         #[arg(long, env = "MINI_TUNNEL_RELAY_SERVER")]
         relay_server: Option<SocketAddr>,
+        /// Optional ticket-authorized UDP relay endpoint tried before TCP relay.
+        #[arg(long, env = "MINI_TUNNEL_UDP_RELAY_SERVER")]
+        udp_relay_server: Option<SocketAddr>,
         /// RFC 8489 STUN server used to discover this UDP socket's mapped address; may be repeated (up to four).
         #[arg(long = "stun-server", action = clap::ArgAction::Append)]
         stun_servers: Vec<SocketAddr>,
@@ -415,6 +418,9 @@ enum TunnelCommand {
         /// Optional ticket-authorized relay TCP endpoint used when no direct peer connects.
         #[arg(long, env = "MINI_TUNNEL_RELAY_SERVER")]
         relay_server: Option<SocketAddr>,
+        /// Optional ticket-authorized UDP relay endpoint tried before TCP relay.
+        #[arg(long, env = "MINI_TUNNEL_UDP_RELAY_SERVER")]
+        udp_relay_server: Option<SocketAddr>,
         /// Optional TLS/TCP listener for fallback candidates such as tcp://198.51.100.2:443.
         #[arg(long)]
         tcp_bind: Option<SocketAddr>,
@@ -457,6 +463,9 @@ enum TunnelCommand {
         /// Optional ticket-authorized relay TCP endpoint used after direct UDP/TCP attempts fail.
         #[arg(long, env = "MINI_TUNNEL_RELAY_SERVER")]
         relay_server: Option<SocketAddr>,
+        /// Optional ticket-authorized UDP relay endpoint tried before TCP relay.
+        #[arg(long, env = "MINI_TUNNEL_UDP_RELAY_SERVER")]
+        udp_relay_server: Option<SocketAddr>,
         /// RFC 8489 STUN server used to discover this UDP socket's mapped address; may be repeated (up to four).
         #[arg(long = "stun-server", action = clap::ArgAction::Append)]
         stun_servers: Vec<SocketAddr>,
@@ -906,6 +915,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 TunnelCommand::Connect {
                     bind,
                     relay_server,
+                    udp_relay_server,
                     stun_servers,
                     ice,
                     candidates,
@@ -917,6 +927,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     manage_route,
                     coordinator_url,
                 } => {
+                    let relay_endpoints = RelayEndpoints {
+                        tcp: relay_server,
+                        udp: udp_relay_server,
+                    };
                     let _status_server = spawn_peer_status_server().await?;
                     let identity =
                         std::sync::Arc::new(mini_tunnel_agent::Identity::load_or_create()?);
@@ -946,7 +960,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 &network_id,
                                 &identity,
                                 peer_key,
-                                relay_server,
+                                relay_endpoints,
                                 &coordinator_url,
                             )
                             .await?;
@@ -956,7 +970,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 network_id.clone(),
                                 coordinator_url.clone(),
                                 peer.clone(),
-                                relay_server,
+                                relay_endpoints,
                             );
                             let accept_tasks = spawn_single_peer_acceptors(
                                 endpoint.clone(),
@@ -1000,6 +1014,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 TunnelCommand::Listen {
                     bind,
                     relay_server,
+                    udp_relay_server,
                     tcp_bind,
                     stun_servers,
                     ice,
@@ -1012,6 +1027,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     manage_route,
                     coordinator_url,
                 } => {
+                    let relay_endpoints = RelayEndpoints {
+                        tcp: relay_server,
+                        udp: udp_relay_server,
+                    };
                     let _status_server = spawn_peer_status_server().await?;
                     let identity =
                         std::sync::Arc::new(mini_tunnel_agent::Identity::load_or_create()?);
@@ -1058,12 +1077,24 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     channel.await
                                 }
                             };
-                            let mut channel = if let Some(relay) = relay_server {
+                            let mut channel = if relay_endpoints.tcp.is_some() || relay_endpoints.udp.is_some() {
                                 match tokio::time::timeout(Duration::from_secs(35), accept_direct).await {
                                     Ok(result) => result?,
-                                    Err(_) => connect_peer_via_relay(
-                                        relay, &coordinator_url, &network_id, &identity, &peer,
-                                    ).await?,
+                                    Err(_) => {
+                                        if let Some(relay) = relay_endpoints.udp {
+                                            match connect_peer_via_udp_relay(relay, &coordinator_url, &network_id, &identity, &peer).await {
+                                                Ok(channel) => channel,
+                                                Err(error) => {
+                                                    eprintln!("UDP relay failed, trying TCP relay: {error}");
+                                                    if let Some(relay) = relay_endpoints.tcp {
+                                                        connect_peer_via_relay(relay, &coordinator_url, &network_id, &identity, &peer).await?
+                                                    } else { return Err(error.into()); }
+                                                }
+                                            }
+                                        } else if let Some(relay) = relay_endpoints.tcp {
+                                            connect_peer_via_relay(relay, &coordinator_url, &network_id, &identity, &peer).await?
+                                        } else { return Err("no peer accepted before timeout".into()); }
+                                    }
                                 }
                             } else {
                                 accept_direct.await?
@@ -1084,7 +1115,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 network_id.clone(),
                                 coordinator_url.clone(),
                                 peer.clone(),
-                                relay_server,
+                                relay_endpoints,
                             );
                             let accept_tasks = spawn_single_peer_acceptors(
                                 endpoint.clone(),
@@ -1128,6 +1159,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     bind,
                     tcp_bind,
                     relay_server,
+                    udp_relay_server,
                     stun_servers,
                     ice,
                     candidates,
@@ -1138,6 +1170,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     manage_route,
                     coordinator_url,
                 } => {
+                    let relay_endpoints = RelayEndpoints {
+                        tcp: relay_server,
+                        udp: udp_relay_server,
+                    };
                     let _status_server = spawn_peer_status_server().await?;
                     let identity = mini_tunnel_agent::Identity::load_or_create()?;
                     let (local_ipv4, prefix_len) =
@@ -1174,7 +1210,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             network_id.clone(),
                             coordinator_url.clone(),
                             peer.clone(),
-                            relay_server,
+                            relay_endpoints,
                         );
                         accepted_peer_senders.insert(peer.device_id.clone(), accepted_peer_tx);
                         peer_connectors.insert(peer.device_id.clone(), connector);
@@ -1190,7 +1226,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 &coordinator_url,
                                 &identity,
                                 &peer,
-                                relay_server,
+                                relay_endpoints,
                                 false,
                             )
                             .await;
@@ -1389,7 +1425,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         network_id: network_id.clone(),
                         identity: std::sync::Arc::clone(&identity),
                         endpoint: endpoint.clone(),
-                        relay_server,
+                        relay_endpoints,
                         snapshot_tx,
                         allowlist_tx,
                         registry,
@@ -1963,13 +1999,19 @@ async fn run_peer_tunnel(
     tunnel_result
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct RelayEndpoints {
+    tcp: Option<SocketAddr>,
+    udp: Option<SocketAddr>,
+}
+
 async fn connect_tunnel_peer(
     endpoint: &TunnelEndpoint,
     peer: &PeerInfo,
     network_id: &str,
     identity: &mini_tunnel_agent::Identity,
     peer_key: [u8; 32],
-    relay_server: Option<SocketAddr>,
+    relay_endpoints: RelayEndpoints,
     coordinator_url: &str,
 ) -> Result<(mini_tunnel_agent::PeerChannel, SocketAddr), mini_tunnel_agent::IdentityError> {
     if let Some((remote, monitor)) = select_ice_peer_address(endpoint, peer, identity).await {
@@ -2012,11 +2054,34 @@ async fn connect_tunnel_peer(
             Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer)
         }
         Err(direct_error) => {
-            let relay = relay_server.ok_or_else(|| {
-                mini_tunnel_agent::IdentityError::Transport(direct_error.to_string())
-            })?;
-            let channel =
-                connect_peer_via_relay(relay, coordinator_url, network_id, identity, peer).await?;
+            let channel = if let Some(relay) = relay_endpoints.udp {
+                match connect_peer_via_udp_relay(relay, coordinator_url, network_id, identity, peer)
+                    .await
+                {
+                    Ok(channel) => channel,
+                    Err(udp_error) => {
+                        tracing::warn!(%udp_error, "UDP relay failed; trying TCP relay");
+                        if let Some(relay) = relay_endpoints.tcp {
+                            connect_peer_via_relay(
+                                relay,
+                                coordinator_url,
+                                network_id,
+                                identity,
+                                peer,
+                            )
+                            .await?
+                        } else {
+                            return Err(udp_error);
+                        }
+                    }
+                }
+            } else if let Some(relay) = relay_endpoints.tcp {
+                connect_peer_via_relay(relay, coordinator_url, network_id, identity, peer).await?
+            } else {
+                return Err(mini_tunnel_agent::IdentityError::Transport(
+                    direct_error.to_string(),
+                ));
+            };
             let remote = channel.remote_address();
             Ok((channel, remote))
         }
@@ -2157,7 +2222,7 @@ async fn connect_mesh_peer(
     coordinator_url: &str,
     identity: &mini_tunnel_agent::Identity,
     peer: &PeerInfo,
-    relay_server: Option<SocketAddr>,
+    relay_endpoints: RelayEndpoints,
     reliable_only: bool,
 ) -> Result<(mini_tunnel_agent::PeerChannel, SocketAddr), mini_tunnel_agent::IdentityError> {
     let mut peer = peer.clone();
@@ -2225,11 +2290,40 @@ async fn connect_mesh_peer(
             ) {
                 return Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer);
             }
-            let relay = relay_server.ok_or_else(|| {
-                mini_tunnel_agent::IdentityError::Transport(direct_error.to_string())
-            })?;
-            let channel =
-                connect_peer_via_relay(relay, coordinator_url, network_id, identity, &peer).await?;
+            let channel = if !reliable_only && let Some(relay) = relay_endpoints.udp {
+                match connect_peer_via_udp_relay(
+                    relay,
+                    coordinator_url,
+                    network_id,
+                    identity,
+                    &peer,
+                )
+                .await
+                {
+                    Ok(channel) => channel,
+                    Err(udp_error) => {
+                        tracing::warn!(peer_id = %peer.device_id, %udp_error, "UDP relay failed; trying TCP relay");
+                        if let Some(relay) = relay_endpoints.tcp {
+                            connect_peer_via_relay(
+                                relay,
+                                coordinator_url,
+                                network_id,
+                                identity,
+                                &peer,
+                            )
+                            .await?
+                        } else {
+                            return Err(udp_error);
+                        }
+                    }
+                }
+            } else if let Some(relay) = relay_endpoints.tcp {
+                connect_peer_via_relay(relay, coordinator_url, network_id, identity, &peer).await?
+            } else {
+                return Err(mini_tunnel_agent::IdentityError::Transport(
+                    direct_error.to_string(),
+                ));
+            };
             let remote = channel.remote_address();
             Ok((channel, remote))
         }
@@ -2242,7 +2336,7 @@ fn build_mesh_peer_connectors(
     network_id: String,
     coordinator_url: String,
     peer: PeerInfo,
-    relay_server: Option<SocketAddr>,
+    relay_endpoints: RelayEndpoints,
 ) -> (
     mini_tunnel_agent::tunnel::PeerConnector,
     mini_tunnel_agent::tunnel::PeerConnector,
@@ -2272,7 +2366,7 @@ fn build_mesh_peer_connectors(
                         &coordinator_url,
                         &identity,
                         &peer,
-                        relay_server,
+                        relay_endpoints,
                         force_reliable,
                     )
                     .await
@@ -2309,7 +2403,13 @@ fn build_mesh_peer_connectors(
                     } else {
                         None
                     };
-                    let direct_wait = if force_reliable { 35 } else { 65 };
+                    let direct_wait = if relay_endpoints.udp.is_some() {
+                        10
+                    } else if force_reliable {
+                        35
+                    } else {
+                        65
+                    };
                     if let Some(mut channel) = receive_reconnect_channel(
                         receiver,
                         force_reliable,
@@ -2328,13 +2428,47 @@ fn build_mesh_peer_connectors(
                     if let Some(monitor) = monitor {
                         monitor.stop().await;
                     }
-                    let relay = relay_server.ok_or_else(|| {
-                        mini_tunnel_agent::IdentityError::Transport(
-                            "timed out waiting for peer redial".to_owned(),
+                    if !force_reliable && let Some(relay) = relay_endpoints.udp {
+                        match connect_peer_via_udp_relay(
+                            relay,
+                            &coordinator_url,
+                            &network_id,
+                            &identity,
+                            &peer,
                         )
-                    })?;
-                    connect_peer_via_relay(relay, &coordinator_url, &network_id, &identity, &peer)
                         .await
+                        {
+                            Ok(channel) => Ok(channel),
+                            Err(udp_error) => {
+                                tracing::warn!(%udp_error, "UDP relay failed; trying TCP relay");
+                                if let Some(relay) = relay_endpoints.tcp {
+                                    connect_peer_via_relay(
+                                        relay,
+                                        &coordinator_url,
+                                        &network_id,
+                                        &identity,
+                                        &peer,
+                                    )
+                                    .await
+                                } else {
+                                    Err(udp_error)
+                                }
+                            }
+                        }
+                    } else if let Some(relay) = relay_endpoints.tcp {
+                        connect_peer_via_relay(
+                            relay,
+                            &coordinator_url,
+                            &network_id,
+                            &identity,
+                            &peer,
+                        )
+                        .await
+                    } else {
+                        Err(mini_tunnel_agent::IdentityError::Transport(
+                            "timed out waiting for peer redial".to_owned(),
+                        ))
+                    }
                 })
             },
         )
@@ -2359,7 +2493,7 @@ fn build_mesh_peer_connectors(
                     &coordinator_url,
                     &identity,
                     &peer,
-                    None,
+                    RelayEndpoints::default(),
                     false,
                 )
                 .await?;
@@ -2591,7 +2725,7 @@ struct MeshMembershipRefresh {
     network_id: String,
     identity: std::sync::Arc<mini_tunnel_agent::Identity>,
     endpoint: TunnelEndpoint,
-    relay_server: Option<SocketAddr>,
+    relay_endpoints: RelayEndpoints,
     snapshot_tx: tokio::sync::watch::Sender<Vec<PeerInfo>>,
     allowlist_tx: tokio::sync::watch::Sender<Vec<(String, [u8; 32])>>,
     registry: AcceptedPeerRegistry,
@@ -2605,7 +2739,7 @@ fn spawn_mesh_membership_refresh(config: MeshMembershipRefresh) -> tokio::task::
         network_id,
         identity,
         endpoint,
-        relay_server,
+        relay_endpoints,
         snapshot_tx,
         allowlist_tx,
         registry,
@@ -2699,7 +2833,7 @@ fn spawn_mesh_membership_refresh(config: MeshMembershipRefresh) -> tokio::task::
                     network_id.clone(),
                     coordinator_url.clone(),
                     peer.clone(),
-                    relay_server,
+                    relay_endpoints,
                 );
                 registry
                     .write()
@@ -2801,8 +2935,54 @@ async fn connect_peer_via_relay(
     identity: &mini_tunnel_agent::Identity,
     peer: &PeerInfo,
 ) -> Result<mini_tunnel_agent::PeerChannel, mini_tunnel_agent::IdentityError> {
+    let ticket = request_peer_relay_ticket(coordinator_url, network_id, identity, peer).await?;
     let peer_key = decode_peer_key(&peer.public_key)
         .map_err(|_| mini_tunnel_agent::IdentityError::UnauthorizedPeer)?;
+    mini_tunnel_agent::connect_relay_peer(
+        relay,
+        &ticket.ticket,
+        network_id,
+        identity,
+        &peer.device_id,
+        peer_key,
+    )
+    .await
+}
+
+async fn connect_peer_via_udp_relay(
+    relay: SocketAddr,
+    coordinator_url: &str,
+    network_id: &str,
+    identity: &mini_tunnel_agent::Identity,
+    peer: &PeerInfo,
+) -> Result<mini_tunnel_agent::PeerChannel, mini_tunnel_agent::IdentityError> {
+    let ticket = request_peer_relay_ticket(coordinator_url, network_id, identity, peer).await?;
+    if ticket.session_id == [0; 16] {
+        return Err(mini_tunnel_agent::IdentityError::Transport(
+            "Coordinator does not expose UDP relay session IDs; use TCP relay or upgrade it"
+                .to_owned(),
+        ));
+    }
+    let peer_key = decode_peer_key(&peer.public_key)
+        .map_err(|_| mini_tunnel_agent::IdentityError::UnauthorizedPeer)?;
+    mini_tunnel_agent::connect_udp_relay_peer(
+        relay,
+        &ticket.ticket,
+        ticket.session_id,
+        network_id,
+        identity,
+        &peer.device_id,
+        peer_key,
+    )
+    .await
+}
+
+async fn request_peer_relay_ticket(
+    coordinator_url: &str,
+    network_id: &str,
+    identity: &mini_tunnel_agent::Identity,
+    peer: &PeerInfo,
+) -> Result<RelayTicketResponse, mini_tunnel_agent::IdentityError> {
     let device_id = identity.device_id();
     let timestamp_ms =
         now_ms().map_err(|error| mini_tunnel_agent::IdentityError::Transport(error.to_string()))?;
@@ -2817,22 +2997,13 @@ async fn connect_peer_via_relay(
             timestamp_ms,
         )),
     };
-    let ticket: RelayTicketResponse = post_json(
+    post_json(
         coordinator_url,
         &format!("/v1/networks/{network_id}/relay-ticket"),
         &request,
     )
     .await
-    .map_err(|error| mini_tunnel_agent::IdentityError::Transport(error.to_string()))?;
-    mini_tunnel_agent::connect_relay_peer(
-        relay,
-        &ticket.ticket,
-        network_id,
-        identity,
-        &peer.device_id,
-        peer_key,
-    )
-    .await
+    .map_err(|error| mini_tunnel_agent::IdentityError::Transport(error.to_string()))
 }
 
 async fn run_peer_mesh(
@@ -4518,7 +4689,7 @@ mod tests {
             "restart-net".to_owned(),
             base_url.clone(),
             expected_peer.clone(),
-            None,
+            RelayEndpoints::default(),
         );
         let local_id = identity.device_id();
         let local_key = identity.public_key();
@@ -4604,6 +4775,8 @@ mod tests {
                 "peer-a",
                 "--relay-server",
                 "127.0.0.1:42001",
+                "--udp-relay-server",
+                "127.0.0.1:42003",
             ],
             [
                 "mini-tunnel",
@@ -4616,6 +4789,8 @@ mod tests {
                 "peer-a",
                 "--relay-server",
                 "127.0.0.1:42001",
+                "--udp-relay-server",
+                "127.0.0.1:42003",
             ],
         ] {
             let cli = Cli::try_parse_from(args).expect("valid relay-enabled tunnel command");
@@ -4626,9 +4801,18 @@ mod tests {
                 panic!("expected peer tunnel command");
             };
             match command {
-                TunnelCommand::Connect { relay_server, .. }
-                | TunnelCommand::Listen { relay_server, .. } => {
+                TunnelCommand::Connect {
+                    relay_server,
+                    udp_relay_server,
+                    ..
+                }
+                | TunnelCommand::Listen {
+                    relay_server,
+                    udp_relay_server,
+                    ..
+                } => {
                     assert_eq!(relay_server, Some("127.0.0.1:42001".parse().unwrap()));
+                    assert_eq!(udp_relay_server, Some("127.0.0.1:42003".parse().unwrap()));
                 }
                 _ => panic!("expected connect or listen command"),
             }
@@ -4946,7 +5130,7 @@ mod tests {
                 "test-network",
                 &identity_a,
                 peer_key_b,
-                None,
+                RelayEndpoints::default(),
                 "http://127.0.0.1:1",
             ),
             select_ice_peer_address(&endpoint_b, &peer_a, &identity_b),

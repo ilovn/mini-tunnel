@@ -8,6 +8,9 @@ pub mod status;
 pub mod stun;
 pub mod tun_device;
 pub mod tunnel;
+mod udp_relay;
+
+pub use udp_relay::connect_udp_relay_peer;
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -334,6 +337,7 @@ pub struct PeerChannel {
     pending_probe_packets: Mutex<PendingProbePackets>,
     health: Mutex<PeerHealth>,
     ice_consent: Option<ice::IceConsentMonitor>,
+    _relay_endpoint: Option<Endpoint>,
 }
 
 const HEALTH_PING: u8 = 0xf0;
@@ -483,6 +487,10 @@ impl FragmentReassembler {
 }
 
 impl PeerChannel {
+    pub(crate) fn retain_relay_endpoint(&mut self, endpoint: Endpoint) {
+        self._relay_endpoint = Some(endpoint);
+    }
+
     /// Attach the nominated ICE session whose consent lifetime follows this channel.
     pub fn set_ice_consent_monitor(&mut self, monitor: ice::IceConsentMonitor) {
         self.ice_consent = Some(monitor);
@@ -522,10 +530,9 @@ impl PeerChannel {
 
     #[must_use]
     pub fn transport_name(&self) -> &'static str {
-        if self.relay {
-            return "Relay/TLS";
-        }
         match &self.transport {
+            PeerTransport::Quic(_) if self.relay => "Relay/QUIC/UDP",
+            PeerTransport::Tcp(_) if self.relay => "Relay/TLS",
             PeerTransport::Quic(_) => "QUIC/UDP",
             PeerTransport::Tcp(_) => "TLS/TCP",
         }
@@ -918,6 +925,18 @@ fn peer_client_config(
     expected_key: [u8; 32],
     provider: std::sync::Arc<rustls::crypto::CryptoProvider>,
 ) -> Result<quinn::ClientConfig, IdentityError> {
+    peer_client_config_with_transport(
+        expected_key,
+        provider,
+        std::sync::Arc::new(peer_transport_config()),
+    )
+}
+
+fn peer_client_config_with_transport(
+    expected_key: [u8; 32],
+    provider: std::sync::Arc<rustls::crypto::CryptoProvider>,
+    transport: std::sync::Arc<quinn::TransportConfig>,
+) -> Result<quinn::ClientConfig, IdentityError> {
     let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .map_err(|error| IdentityError::Transport(error.to_string()))?
@@ -932,7 +951,7 @@ fn peer_client_config(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls)
             .map_err(|error| IdentityError::Transport(error.to_string()))?,
     ));
-    config.transport_config(std::sync::Arc::new(peer_transport_config()));
+    config.transport_config(transport);
     Ok(config)
 }
 
@@ -992,11 +1011,32 @@ pub async fn connect_peer(
     expected_peer_id: &str,
     expected_peer_key: [u8; 32],
 ) -> Result<PeerChannel, IdentityError> {
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let config = peer_client_config(expected_peer_key, provider)?;
+    connect_peer_with_client_config(
+        endpoint,
+        remote_addr,
+        network_id,
+        identity,
+        expected_peer_id,
+        expected_peer_key,
+        config,
+    )
+    .await
+}
+
+async fn connect_peer_with_client_config(
+    endpoint: &Endpoint,
+    remote_addr: SocketAddr,
+    network_id: &str,
+    identity: &Identity,
+    expected_peer_id: &str,
+    expected_peer_key: [u8; 32],
+    config: quinn::ClientConfig,
+) -> Result<PeerChannel, IdentityError> {
     if expected_peer_id != mini_tunnel_protocol::device_id_from_public_key(&expected_peer_key) {
         return Err(IdentityError::UnauthorizedPeer);
     }
-    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
-    let config = peer_client_config(expected_peer_key, provider)?;
     let connection = endpoint
         .connect_with(config, remote_addr, "mini-tunnel")
         .map_err(|error| IdentityError::Transport(error.to_string()))?
@@ -1005,6 +1045,52 @@ pub async fn connect_peer(
     verify_connection_identity(&connection, &expected_peer_key)?;
     client_authenticate(&connection, network_id, identity, expected_peer_id).await?;
     Ok(new_channel(connection, network_id))
+}
+
+fn peer_udp_relay_transport_config() -> quinn::TransportConfig {
+    let mut transport = peer_transport_config();
+    let payload_limit = (mini_tunnel_protocol::UDP_RELAY_MAX_DATAGRAM_LEN
+        - mini_tunnel_protocol::UDP_RELAY_DATA_HEADER_LEN) as u16;
+    transport.initial_mtu(payload_limit);
+    transport.min_mtu(payload_limit);
+    let mut discovery = quinn::MtuDiscoveryConfig::default();
+    discovery.upper_bound(payload_limit);
+    transport.mtu_discovery_config(Some(discovery));
+    transport
+}
+
+fn peer_server_config_with_udp_relay(
+    identity: &Identity,
+) -> Result<quinn::ServerConfig, IdentityError> {
+    let mut config = peer_server_config(identity)?;
+    config.transport = std::sync::Arc::new(peer_udp_relay_transport_config());
+    Ok(config)
+}
+
+async fn connect_peer_with_udp_relay_transport(
+    endpoint: &Endpoint,
+    remote_addr: SocketAddr,
+    network_id: &str,
+    identity: &Identity,
+    expected_peer_id: &str,
+    expected_peer_key: [u8; 32],
+) -> Result<PeerChannel, IdentityError> {
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let config = peer_client_config_with_transport(
+        expected_peer_key,
+        provider,
+        std::sync::Arc::new(peer_udp_relay_transport_config()),
+    )?;
+    connect_peer_with_client_config(
+        endpoint,
+        remote_addr,
+        network_id,
+        identity,
+        expected_peer_id,
+        expected_peer_key,
+        config,
+    )
+    .await
 }
 
 /// Connect to a peer using a TLS-pinned TCP stream for reliable fallback transport.
@@ -1669,6 +1755,7 @@ fn new_channel(connection: Connection, network_id: &str) -> PeerChannel {
         pending_probe_packets: Mutex::new(PendingProbePackets::default()),
         health: Mutex::new(PeerHealth::default()),
         ice_consent: None,
+        _relay_endpoint: None,
     }
 }
 
@@ -1696,6 +1783,7 @@ fn new_tcp_channel(
         pending_probe_packets: Mutex::new(PendingProbePackets::default()),
         health: Mutex::new(PeerHealth::default()),
         ice_consent: None,
+        _relay_endpoint: None,
     }
 }
 

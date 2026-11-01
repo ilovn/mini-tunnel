@@ -140,7 +140,7 @@ pub const UDP_RELAY_DATA_MAGIC: &[u8; 8] = b"MTUDATA1";
 /// The relay forwarding header: magic plus the ticket-paired session ID.
 pub const UDP_RELAY_DATA_HEADER_LEN: usize = UDP_RELAY_DATA_MAGIC.len() + 16;
 /// Keep the relay's outer datagram within a conservative IPv4/IPv6 path budget.
-pub const UDP_RELAY_MAX_DATAGRAM_LEN: usize = 1200;
+pub const UDP_RELAY_MAX_DATAGRAM_LEN: usize = 1232;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum UdpRelayFrameError {
@@ -195,6 +195,9 @@ pub struct RelayTicketRequest {
 pub struct RelayTicketResponse {
     pub ticket: String,
     pub expires_at_ms: u64,
+    /// Session routing key for UDP relay; zero means an older Coordinator omitted it.
+    #[serde(default)]
+    pub session_id: [u8; 16],
 }
 
 /// MAC-authenticated claim carried from the coordinator to one relay node.
@@ -653,5 +656,14 @@ mod tests {
             verify_relay_ticket(&secret, &URL_SAFE_NO_PAD.encode(bytes), 4999),
             Err(RelayTicketError::Invalid)
         );
+    }
+
+    #[test]
+    fn relay_ticket_response_accepts_older_coordinators_without_udp_session_id() {
+        let response: RelayTicketResponse =
+            serde_json::from_str(r#"{"ticket":"legacy-ticket","expires_at_ms":5000}"#)
+                .expect("legacy relay ticket response");
+        assert_eq!(response.ticket, "legacy-ticket");
+        assert_eq!(response.session_id, [0; 16]);
     }
 }
