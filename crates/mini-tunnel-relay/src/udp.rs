@@ -40,6 +40,7 @@ const AUTH_RATE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const AUTH_RATE_BURST: u32 = 20;
 const AUTH_RATE_PER_SECOND: u32 = 10;
 const AUTH_RATE_TOKEN_MILLI: u32 = 1000;
+const STATE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct UdpRelayConfig {
@@ -112,6 +113,28 @@ struct State {
     auth_rate_limits: HashMap<IpAddr, AuthRateLimit>,
 }
 
+fn prune_expired_state(state: &mut State, now: tokio::time::Instant, now_ms: u64) {
+    state.sessions.retain(|_, session| {
+        if session.endpoints.iter().all(Option::is_some) {
+            now.saturating_duration_since(session.last_activity) < SESSION_IDLE_TIMEOUT
+                && session.bytes_forwarded < MAX_SESSION_BYTES
+        } else {
+            session.expires_at_ms > now_ms
+                && now.saturating_duration_since(session.created_at) < PAIR_TIMEOUT
+        }
+    });
+    state.pending.retain(|_, pending| pending.expires_at > now);
+    state
+        .used_tickets
+        .retain(|_, expires_at_ms| *expires_at_ms > now_ms);
+    state
+        .accepted_proofs
+        .retain(|_, proof| proof.expires_at_ms > now_ms);
+    state.auth_rate_limits.retain(|_, bucket| {
+        now.saturating_duration_since(bucket.last_seen) < AUTH_RATE_IDLE_TIMEOUT
+    });
+}
+
 struct Pending {
     claims: RelayTicketClaims,
     public_key: [u8; 32],
@@ -156,7 +179,12 @@ impl UdpRelayServer {
     }
 
     pub async fn stats(&self) -> UdpRelayStats {
-        let state = self.inner.state.lock().await;
+        let mut state = self.inner.state.lock().await;
+        prune_expired_state(
+            &mut state,
+            tokio::time::Instant::now(),
+            unix_time_ms().unwrap_or(0),
+        );
         UdpRelayStats {
             active_sessions: state.sessions.len(),
             pending_authentications: state.pending.len(),
@@ -168,12 +196,28 @@ impl UdpRelayServer {
 
     /// Serve a bound UDP socket until shutdown. Malformed and unauthorized packets are dropped.
     pub async fn run(&self, socket: UdpSocket) -> io::Result<()> {
+        self.run_with_maintenance_interval(socket, STATE_MAINTENANCE_INTERVAL)
+            .await
+    }
+
+    async fn run_with_maintenance_interval(
+        &self,
+        socket: UdpSocket,
+        maintenance_interval: Duration,
+    ) -> io::Result<()> {
         let mut shutdown = self.inner.shutdown.subscribe();
         let mut buffer = vec![0; MAX_UDP_PACKET];
+        let first_maintenance = tokio::time::Instant::now() + maintenance_interval;
+        let mut maintenance = tokio::time::interval_at(first_maintenance, maintenance_interval);
+        maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let (length, source) = tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() { return Ok(()); }
+                    continue;
+                }
+                _ = maintenance.tick() => {
+                    self.prune_expired_state().await;
                     continue;
                 }
                 received = socket.recv_from(&mut buffer) => received?,
@@ -189,6 +233,15 @@ impl UdpRelayServer {
 
     pub fn shutdown(&self) {
         self.inner.shutdown.send_replace(true);
+    }
+
+    async fn prune_expired_state(&self) {
+        let mut state = self.inner.state.lock().await;
+        prune_expired_state(
+            &mut state,
+            tokio::time::Instant::now(),
+            unix_time_ms().unwrap_or(0),
+        );
     }
 
     async fn handle_packet(
@@ -312,23 +365,8 @@ impl UdpRelayServer {
             return Ok(false);
         }
         let mut state = self.inner.state.lock().await;
-        let now_ms = unix_time_ms().unwrap_or(0);
-        state.sessions.retain(|_, session| {
-            if session.endpoints.iter().all(Option::is_some) {
-                session.last_activity.elapsed() < SESSION_IDLE_TIMEOUT
-                    && session.bytes_forwarded < MAX_SESSION_BYTES
-            } else {
-                session.expires_at_ms > now_ms && session.created_at.elapsed() < PAIR_TIMEOUT
-            }
-        });
         let now = tokio::time::Instant::now();
-        state.pending.retain(|_, pending| pending.expires_at > now);
-        state
-            .used_tickets
-            .retain(|_, expires_at_ms| *expires_at_ms > now_ms);
-        state
-            .accepted_proofs
-            .retain(|_, proof| proof.expires_at_ms > now_ms);
+        prune_expired_state(&mut state, now, now_ms);
         if state.used_tickets.contains_key(&claims.ticket_id) {
             return Ok(false);
         }
@@ -391,12 +429,8 @@ impl UdpRelayServer {
         let mut state = self.inner.state.lock().await;
         let now_ms =
             unix_time_ms().ok_or_else(|| io::Error::other("system clock is before epoch"))?;
-        state
-            .used_tickets
-            .retain(|_, expires_at_ms| *expires_at_ms > now_ms);
-        state
-            .accepted_proofs
-            .retain(|_, proof| proof.expires_at_ms > now_ms);
+        let now = tokio::time::Instant::now();
+        prune_expired_state(&mut state, now, now_ms);
         let ticket_id = match verify_relay_ticket(&self.inner.config.ticket_key, ticket, now_ms)
             .or_else(|error| {
                 self.inner
@@ -480,16 +514,6 @@ impl UdpRelayServer {
         }
         let claims = pending.claims;
         let session_id = claims.session_id;
-        let now = tokio::time::Instant::now();
-        state.sessions.retain(|_, session| {
-            if session.endpoints.iter().all(Option::is_some) {
-                now.duration_since(session.last_activity) < SESSION_IDLE_TIMEOUT
-                    && session.bytes_forwarded < MAX_SESSION_BYTES
-            } else {
-                session.expires_at_ms > now_ms
-                    && now.duration_since(session.created_at) < PAIR_TIMEOUT
-            }
-        });
         let target_index = if claims.source_device_id < claims.target_device_id {
             0
         } else {
@@ -669,6 +693,178 @@ mod tests {
 
     fn device_id(identity: &SigningKey) -> String {
         mini_tunnel_protocol::device_id_from_public_key(&identity.verifying_key().to_bytes())
+    }
+
+    fn seed_expired_and_live_state(server: &UdpRelayServer) {
+        let now = tokio::time::Instant::now();
+        let now_ms = unix_time_ms().expect("system time");
+        let expired_at_ms = now_ms.saturating_sub(1);
+        let stale_since = now - SESSION_IDLE_TIMEOUT - Duration::from_secs(1);
+        let mut state = server.inner.state.try_lock().expect("relay state lock");
+        state.sessions.insert(
+            [1; 16],
+            Session {
+                expires_at_ms: expired_at_ms,
+                created_at: stale_since,
+                last_activity: stale_since,
+                bytes_forwarded: 0,
+                endpoints: [Some("127.0.0.1:43001".parse().unwrap()), None],
+            },
+        );
+        state.sessions.insert(
+            [2; 16],
+            Session {
+                expires_at_ms: expired_at_ms,
+                created_at: stale_since,
+                last_activity: now,
+                bytes_forwarded: MAX_SESSION_BYTES,
+                endpoints: [
+                    Some("127.0.0.1:43002".parse().unwrap()),
+                    Some("127.0.0.1:43003".parse().unwrap()),
+                ],
+            },
+        );
+        state.sessions.insert(
+            [3; 16],
+            Session {
+                expires_at_ms: expired_at_ms,
+                created_at: now,
+                last_activity: now,
+                bytes_forwarded: 0,
+                endpoints: [
+                    Some("127.0.0.1:43004".parse().unwrap()),
+                    Some("127.0.0.1:43005".parse().unwrap()),
+                ],
+            },
+        );
+        state.sessions.insert(
+            [4; 16],
+            Session {
+                expires_at_ms: now_ms + 60_000,
+                created_at: now,
+                last_activity: now,
+                bytes_forwarded: 0,
+                endpoints: [Some("127.0.0.1:43006".parse().unwrap()), None],
+            },
+        );
+        state.sessions.insert(
+            [5; 16],
+            Session {
+                expires_at_ms: now_ms + 60_000,
+                created_at: now - PAIR_TIMEOUT - Duration::from_secs(1),
+                last_activity: now,
+                bytes_forwarded: 0,
+                endpoints: [Some("127.0.0.1:43007".parse().unwrap()), None],
+            },
+        );
+        state.pending.insert(
+            "127.0.0.1:43001".parse().unwrap(),
+            Pending {
+                claims: RelayTicketClaims {
+                    version: RELAY_TICKET_VERSION,
+                    network_id: "expired".to_owned(),
+                    source_device_id: "source".to_owned(),
+                    target_device_id: "target".to_owned(),
+                    session_id: [1; 16],
+                    ticket_id: [1; 16],
+                    expires_at_ms: expired_at_ms,
+                },
+                public_key: [1; 32],
+                challenge: [1; 32],
+                expires_at: now - Duration::from_secs(1),
+            },
+        );
+        state.pending.insert(
+            "127.0.0.1:43006".parse().unwrap(),
+            Pending {
+                claims: RelayTicketClaims {
+                    version: RELAY_TICKET_VERSION,
+                    network_id: "live".to_owned(),
+                    source_device_id: "source".to_owned(),
+                    target_device_id: "target".to_owned(),
+                    session_id: [4; 16],
+                    ticket_id: [4; 16],
+                    expires_at_ms: now_ms + 60_000,
+                },
+                public_key: [4; 32],
+                challenge: [4; 32],
+                expires_at: now + CHALLENGE_TTL,
+            },
+        );
+        state.used_tickets.insert([1; 16], expired_at_ms);
+        state.used_tickets.insert([4; 16], now_ms + 60_000);
+        state.accepted_proofs.insert(
+            [1; 16],
+            AcceptedProof {
+                expires_at_ms: expired_at_ms,
+                packet: b"expired".to_vec(),
+            },
+        );
+        state.accepted_proofs.insert(
+            [4; 16],
+            AcceptedProof {
+                expires_at_ms: now_ms + 60_000,
+                packet: b"live".to_vec(),
+            },
+        );
+        state.auth_rate_limits.insert(
+            "192.0.2.1".parse().unwrap(),
+            AuthRateLimit {
+                tokens_milli: 0,
+                last_refill: stale_since,
+                last_seen: stale_since,
+            },
+        );
+        state.auth_rate_limits.insert(
+            "192.0.2.2".parse().unwrap(),
+            AuthRateLimit {
+                tokens_milli: AUTH_RATE_TOKEN_MILLI,
+                last_refill: now,
+                last_seen: now,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_prunes_expired_state_and_keeps_live_records() {
+        let relay = UdpRelayServer::new(UdpRelayConfig::new([21; 32]));
+        seed_expired_and_live_state(&relay);
+
+        let stats = relay.stats().await;
+        assert_eq!(stats.active_sessions, 2);
+        assert_eq!(stats.pending_authentications, 1);
+        let state = relay.inner.state.lock().await;
+        assert_eq!(state.used_tickets.len(), 1);
+        assert_eq!(state.accepted_proofs.len(), 1);
+        assert_eq!(state.auth_rate_limits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn periodic_maintenance_prunes_state_without_traffic() {
+        let relay = UdpRelayServer::new(UdpRelayConfig::new([22; 32]));
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("relay socket");
+        let server = {
+            let relay = relay.clone();
+            tokio::spawn(async move {
+                relay
+                    .run_with_maintenance_interval(socket, Duration::from_millis(10))
+                    .await
+                    .expect("relay run")
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        seed_expired_and_live_state(&relay);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let state = relay.inner.state.lock().await;
+        assert_eq!(state.sessions.len(), 2);
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(state.used_tickets.len(), 1);
+        assert_eq!(state.accepted_proofs.len(), 1);
+        assert_eq!(state.auth_rate_limits.len(), 1);
+        drop(state);
+
+        relay.shutdown();
+        server.await.expect("relay task");
     }
 
     #[test]

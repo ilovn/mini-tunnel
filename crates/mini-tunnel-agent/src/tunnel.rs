@@ -2227,8 +2227,8 @@ mod tests {
                 })
             })
         };
-        let local_ip = Ipv4Addr::new(10, 0, 0, 1);
-        let peer_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let local_ip = Ipv4Addr::new(10, 254, 252, 1);
+        let peer_ip = Ipv4Addr::new(10, 254, 252, 2);
         let local_ipv6: Ipv6Addr = "fd00::1".parse().unwrap();
         let peer_ipv6: Ipv6Addr = "fd00::2".parse().unwrap();
         let (outbound_tx, outbound_rx) = mpsc::channel(4);
@@ -2517,8 +2517,8 @@ mod tests {
                 Ok(channel)
             })
         });
-        let local_ip = Ipv4Addr::new(10, 0, 0, 1);
-        let peer_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let local_ip = Ipv4Addr::new(10, 254, 251, 1);
+        let peer_ip = Ipv4Addr::new(10, 254, 251, 2);
         let (outbound_tx, outbound_rx) = mpsc::channel(2);
         let (inbound_tx, _inbound_rx) = mpsc::channel(2);
         let io = Arc::new(MockPacketIo {
@@ -2691,8 +2691,8 @@ mod tests {
             })
         });
 
-        let local_ip = Ipv4Addr::new(10, 0, 0, 1);
-        let peer_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let local_ip = Ipv4Addr::new(10, 254, 250, 1);
+        let peer_ip = Ipv4Addr::new(10, 254, 250, 2);
         let (outbound_tx, outbound_rx) = mpsc::channel(2);
         let (inbound_tx, _inbound_rx) = mpsc::channel(2);
         let packet_io = Arc::new(MockPacketIo {
