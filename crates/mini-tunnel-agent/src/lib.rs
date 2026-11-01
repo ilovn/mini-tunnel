@@ -1190,9 +1190,7 @@ pub async fn connect_tcp_peer_over_stream(
     if expected_peer_id != mini_tunnel_protocol::device_id_from_public_key(&expected_peer_key) {
         return Err(IdentityError::UnauthorizedPeer);
     }
-    socket
-        .set_nodelay(true)
-        .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    set_tcp_nodelay(&socket)?;
     let server_name = ServerName::try_from("mini-tunnel")
         .map_err(|error| IdentityError::Transport(error.to_string()))?;
     let connector = tokio_rustls::TlsConnector::from(peer_tcp_client_config(expected_peer_key)?);
@@ -1238,6 +1236,7 @@ pub async fn connect_relay_peer(
     .await
     .map_err(|error| IdentityError::Transport(error.to_string()))?
     .map_err(|error| IdentityError::Transport(error.to_string()))?;
+    set_tcp_nodelay(&socket)?;
     let ticket_len: u16 = ticket
         .len()
         .try_into()
@@ -1301,6 +1300,12 @@ pub async fn connect_relay_peer(
         channel.relay = true;
         Ok(channel)
     }
+}
+
+fn set_tcp_nodelay(socket: &tokio::net::TcpStream) -> Result<(), IdentityError> {
+    socket
+        .set_nodelay(true)
+        .map_err(|error| IdentityError::Transport(error.to_string()))
 }
 
 /// Bind a TCP listener for authenticated TCP fallback sessions.
@@ -3072,6 +3077,39 @@ mod tests {
         drop(channel_a);
         drop(channel_b);
         fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tcp_peer_socket_enables_nodelay() {
+        use std::os::fd::AsRawFd;
+
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind TCP listener");
+        let address = listener.local_addr().expect("listener address");
+        let accept = tokio::spawn(async move { listener.accept().await.expect("accept TCP") });
+        let socket = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect TCP");
+        set_tcp_nodelay(&socket).expect("enable TCP_NODELAY");
+
+        let mut enabled: libc::c_int = 0;
+        let mut length = std::mem::size_of_val(&enabled) as libc::socklen_t;
+        // SAFETY: getsockopt writes one c_int to the valid socket option buffer.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_NODELAY,
+                (&mut enabled as *mut libc::c_int).cast(),
+                &mut length,
+            )
+        };
+        assert_eq!(result, 0, "getsockopt(TCP_NODELAY) should succeed");
+        assert_ne!(enabled, 0);
+        drop(socket);
+        drop(accept.await.expect("join TCP accept"));
     }
 
     #[tokio::test]
