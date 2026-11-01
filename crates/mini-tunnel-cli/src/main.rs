@@ -1489,7 +1489,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                                 channel.close();
                                                 eprintln!("Peer {} direct ICE session had no consent monitor; waiting for reliable fallback", peer.device_id);
                                             }
-                                        } else if keep_outbound || channel.transport_name() == "Relay/TLS" {
+                                        } else if mesh_channel_is_elected(
+                                            keep_outbound,
+                                            channel.transport_name(),
+                                        ) {
                                             if connected.iter().any(|known| known.0.device_id == peer.device_id) {
                                                 channel.close();
                                             } else {
@@ -3463,6 +3466,10 @@ fn mesh_address_family_label(ipv6_enabled: bool) -> &'static str {
     }
 }
 
+fn mesh_channel_is_elected(keep_outbound: bool, transport: &str) -> bool {
+    keep_outbound || matches!(transport, "Relay/TLS" | "Relay/QUIC/UDP")
+}
+
 #[derive(Clone)]
 struct TunnelEndpoint {
     endpoint: quinn::Endpoint,
@@ -4485,6 +4492,15 @@ mod tests {
         assert_eq!(mesh_peer_ipv6_address(true, peer_ipv6), Some(peer_ipv6));
         assert_eq!(mesh_address_family_label(false), "IPv4 only");
         assert_eq!(mesh_peer_ipv6_address(false, peer_ipv6), None);
+    }
+
+    #[test]
+    fn mesh_elects_udp_relay_channel_on_both_peer_roles() {
+        assert!(mesh_channel_is_elected(true, "Relay/QUIC/UDP"));
+        assert!(mesh_channel_is_elected(false, "Relay/QUIC/UDP"));
+        assert!(mesh_channel_is_elected(false, "Relay/TLS"));
+        assert!(!mesh_channel_is_elected(false, "QUIC/UDP"));
+        assert!(mesh_channel_is_elected(true, "QUIC/UDP"));
     }
 
     #[test]
