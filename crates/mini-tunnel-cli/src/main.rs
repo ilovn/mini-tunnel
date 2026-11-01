@@ -18,11 +18,11 @@ use clap::{Parser, Subcommand};
 use futures_util::future::join_all;
 use mini_tunnel_protocol::{
     ApiErrorResponse, CandidateUpdateRequest, CandidateUpdateResponse, CreateInviteRequest,
-    CreateInviteResponse, CreateNetworkRequest, CreateNetworkResponse, JoinNetworkRequest,
-    JoinNetworkResponse, PeerInfo, PeerListRequest, PeerListResponse, RelayTicketRequest,
-    RelayTicketResponse, RevokeMemberRequest, RevokeMemberResponse, candidate_signing_bytes,
-    candidate_signing_bytes_with_ice, join_signing_bytes, peers_signing_bytes,
-    relay_ticket_request_signing_bytes,
+    CreateInviteResponse, CreateNetworkRequest, CreateNetworkResponse, IceCredentials,
+    JoinNetworkRequest, JoinNetworkResponse, PeerInfo, PeerListRequest, PeerListResponse,
+    RelayTicketRequest, RelayTicketResponse, RevokeMemberRequest, RevokeMemberResponse,
+    candidate_signing_bytes, candidate_signing_bytes_with_ice, join_signing_bytes,
+    peers_signing_bytes, relay_ticket_request_signing_bytes,
 };
 use serde::Deserialize;
 
@@ -3481,13 +3481,14 @@ async fn create_tunnel_endpoint(
         let request = CandidateUpdateRequest {
             device_id: device_id.clone(),
             timestamp_ms,
-            signature: identity.sign(&candidate_signing_bytes_with_ice(
+            signature: sign_candidate_update(
+                identity,
                 network_id,
                 &device_id,
                 timestamp_ms,
                 &candidates,
-                &credentials,
-            )),
+                Some(&credentials),
+            ),
             candidates,
             ice_credentials: Some(credentials.clone()),
         };
@@ -3601,13 +3602,14 @@ async fn create_tunnel_endpoint(
                 let request = CandidateUpdateRequest {
                     device_id: refresh_device_id.clone(),
                     timestamp_ms,
-                    signature: identity.sign(&candidate_signing_bytes_with_ice(
+                    signature: sign_candidate_update(
+                        &identity,
                         &refresh_network,
                         &refresh_device_id,
                         timestamp_ms,
                         &refresh_candidates,
-                        &refresh_credentials,
-                    )),
+                        Some(&refresh_credentials),
+                    ),
                     candidates: refresh_candidates,
                     ice_credentials: Some(refresh_credentials.clone()),
                 };
@@ -3695,12 +3697,14 @@ async fn create_tunnel_endpoint(
     let request = CandidateUpdateRequest {
         device_id: device_id.clone(),
         timestamp_ms,
-        signature: identity.sign(&candidate_signing_bytes(
+        signature: sign_candidate_update(
+            identity,
             network_id,
             &device_id,
             timestamp_ms,
             &candidates,
-        )),
+            None,
+        ),
         candidates,
         ice_credentials: None,
     };
@@ -3781,12 +3785,14 @@ async fn create_tunnel_endpoint(
                 let request = CandidateUpdateRequest {
                     device_id: refresh_device_id.clone(),
                     timestamp_ms,
-                    signature: identity.sign(&candidate_signing_bytes(
+                    signature: sign_candidate_update(
+                        &identity,
                         &refresh_network,
                         &refresh_device_id,
                         timestamp_ms,
                         &candidates,
-                    )),
+                        None,
+                    ),
                     candidates,
                     ice_credentials: None,
                 };
@@ -3870,6 +3876,31 @@ fn filtered_host_candidates(
     candidates.sort();
     candidates.dedup();
     candidates
+}
+
+fn sign_candidate_update(
+    identity: &mini_tunnel_agent::Identity,
+    network_id: &str,
+    device_id: &str,
+    timestamp_ms: u64,
+    candidates: &[String],
+    ice_credentials: Option<&IceCredentials>,
+) -> String {
+    // The Coordinator verifies and stores candidate lists in sorted order.
+    // Keep the advertised order intact, but sign that canonical ordering.
+    let mut canonical_candidates = candidates.to_vec();
+    canonical_candidates.sort();
+    let bytes = match ice_credentials {
+        Some(credentials) => candidate_signing_bytes_with_ice(
+            network_id,
+            device_id,
+            timestamp_ms,
+            &canonical_candidates,
+            credentials,
+        ),
+        None => candidate_signing_bytes(network_id, device_id, timestamp_ms, &canonical_candidates),
+    };
+    identity.sign(&bytes)
 }
 
 fn compose_ice_candidates(
@@ -4170,6 +4201,58 @@ fn print_tunnel_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_update_signatures_use_coordinator_canonical_order() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-candidate-signature-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let identity = mini_tunnel_agent::Identity::load_or_create_at(temp.join("device.key"))
+            .expect("test identity");
+        let device_id = identity.device_id();
+        let candidates = vec!["198.51.100.9:42000".to_owned(), "10.0.0.2:42000".to_owned()];
+        let mut canonical = candidates.clone();
+        canonical.sort();
+        assert_ne!(candidates, canonical);
+
+        let signature =
+            sign_candidate_update(&identity, "test-network", &device_id, 42, &candidates, None);
+        assert_eq!(
+            signature,
+            identity.sign(&candidate_signing_bytes(
+                "test-network",
+                &device_id,
+                42,
+                &canonical,
+            ))
+        );
+
+        let credentials = IceCredentials {
+            ufrag: "local-ufrag".to_owned(),
+            password: "local-password".to_owned(),
+            generation: 1,
+        };
+        let ice_signature = sign_candidate_update(
+            &identity,
+            "test-network",
+            &device_id,
+            42,
+            &candidates,
+            Some(&credentials),
+        );
+        assert_eq!(
+            ice_signature,
+            identity.sign(&candidate_signing_bytes_with_ice(
+                "test-network",
+                &device_id,
+                42,
+                &canonical,
+                &credentials,
+            ))
+        );
+        std::fs::remove_dir_all(temp).expect("remove test identity");
+    }
 
     fn secret_fixture(contents: &str) -> (PathBuf, PathBuf) {
         let directory = std::env::temp_dir().join(format!(
@@ -5339,13 +5422,15 @@ mod tests {
         assert_eq!(published.len(), 2);
         for (identity, request) in [(&identity_a, &published[0]), (&identity_b, &published[1])] {
             let credentials = request.ice_credentials.as_ref().expect("ICE credentials");
+            let mut canonical_candidates = request.candidates.clone();
+            canonical_candidates.sort();
             assert_eq!(
                 request.signature,
                 identity.sign(&candidate_signing_bytes_with_ice(
                     "test-network",
                     &request.device_id,
                     request.timestamp_ms,
-                    &request.candidates,
+                    &canonical_candidates,
                     credentials,
                 ))
             );
