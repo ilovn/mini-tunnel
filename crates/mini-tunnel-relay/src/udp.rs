@@ -89,7 +89,7 @@ struct Inner {
 struct State {
     pending: HashMap<SocketAddr, Pending>,
     used_tickets: HashMap<[u8; 16], u64>,
-    accepted_proofs: HashMap<[u8; 16], Vec<u8>>,
+    accepted_proofs: HashMap<[u8; 16], AcceptedProof>,
     sessions: HashMap<[u8; 16], Session>,
 }
 
@@ -98,6 +98,11 @@ struct Pending {
     public_key: [u8; 32],
     challenge: [u8; 32],
     expires_at: tokio::time::Instant,
+}
+
+struct AcceptedProof {
+    expires_at_ms: u64,
+    packet: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -273,6 +278,9 @@ impl UdpRelayServer {
         state
             .used_tickets
             .retain(|_, expires_at_ms| *expires_at_ms > now_ms);
+        state
+            .accepted_proofs
+            .retain(|_, proof| proof.expires_at_ms > now_ms);
         if state.used_tickets.contains_key(&claims.ticket_id) {
             return Ok(false);
         }
@@ -335,6 +343,12 @@ impl UdpRelayServer {
         let mut state = self.inner.state.lock().await;
         let now_ms =
             unix_time_ms().ok_or_else(|| io::Error::other("system clock is before epoch"))?;
+        state
+            .used_tickets
+            .retain(|_, expires_at_ms| *expires_at_ms > now_ms);
+        state
+            .accepted_proofs
+            .retain(|_, proof| proof.expires_at_ms > now_ms);
         let ticket_id = match verify_relay_ticket(&self.inner.config.ticket_key, ticket, now_ms)
             .or_else(|error| {
                 self.inner
@@ -366,7 +380,7 @@ impl UdpRelayServer {
                 session.endpoints.iter().all(Option::is_some)
                     && session.endpoints.contains(&Some(source))
             });
-            if existing.as_slice() != packet || !paired {
+            if existing.packet.as_slice() != packet || !paired {
                 return Ok(false);
             }
             drop(state);
@@ -458,9 +472,13 @@ impl UdpRelayServer {
         state
             .used_tickets
             .insert(claims.ticket_id, claims.expires_at_ms);
-        state
-            .accepted_proofs
-            .insert(claims.ticket_id, packet.to_vec());
+        state.accepted_proofs.insert(
+            claims.ticket_id,
+            AcceptedProof {
+                expires_at_ms: claims.expires_at_ms,
+                packet: packet.to_vec(),
+            },
+        );
         drop(state);
         if ready_endpoints.iter().all(Option::is_some) {
             let mut response = Vec::with_capacity(24);
@@ -575,7 +593,7 @@ mod tests {
         relay: SocketAddr,
         ticket: &str,
         identity: &SigningKey,
-    ) {
+    ) -> Vec<u8> {
         let hello = udp_relay_hello(ticket, &identity.verifying_key().to_bytes()).expect("hello");
         socket.send_to(&hello, relay).await.expect("send hello");
         let mut response = [0; 64];
@@ -595,6 +613,7 @@ mod tests {
             &response[..length],
             b"MTUREADY\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09"
         );
+        proof
     }
 
     #[tokio::test]
@@ -613,11 +632,37 @@ mod tests {
         };
         let alice_socket = UdpSocket::bind("127.0.0.1:0").await.expect("alice socket");
         let bob_socket = UdpSocket::bind("127.0.0.1:0").await.expect("bob socket");
-        tokio::join!(
+        let (alice_proof, _bob_proof) = tokio::join!(
             authenticate(&alice_socket, relay_address, &alice_ticket, &alice),
             authenticate(&bob_socket, relay_address, &bob_ticket, &bob),
         );
+        alice_socket
+            .send_to(&alice_proof, relay_address)
+            .await
+            .expect("retry alice proof");
+        let mut ready = [0; 64];
+        let (ready_length, _) = timeout(Duration::from_secs(1), alice_socket.recv_from(&mut ready))
+            .await
+            .expect("retry ready timeout")
+            .expect("retry ready");
+        assert_eq!(
+            &ready[..ready_length],
+            b"MTUREADY\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09"
+        );
         tokio::time::sleep(Duration::from_millis(1_050)).await;
+
+        let fresh_ticket = ticket(&key, &alice, &bob, 5, 1_000);
+        let fresh_hello =
+            udp_relay_hello(&fresh_ticket, &alice.verifying_key().to_bytes()).expect("hello");
+        alice_socket
+            .send_to(&fresh_hello, relay_address)
+            .await
+            .expect("send fresh hello");
+        let _ = timeout(Duration::from_secs(1), alice_socket.recv(&mut ready))
+            .await
+            .expect("fresh challenge timeout")
+            .expect("fresh challenge");
+        assert!(relay.inner.state.lock().await.accepted_proofs.is_empty());
 
         let mut datagram = Vec::from(UDP_RELAY_DATA_MAGIC.as_slice());
         datagram.extend_from_slice(&[9; 16]);
