@@ -3056,6 +3056,21 @@ fn update_mapping_related_addresses(
     }
 }
 
+fn current_primary_host(
+    bound: SocketAddr,
+    mappings: &[StunMapping],
+    host_candidates: &[SocketAddr],
+) -> Option<SocketAddr> {
+    if !bound.ip().is_unspecified() {
+        return Some(bound);
+    }
+    mappings
+        .iter()
+        .map(|mapping| mapping.related)
+        .find(|related| host_candidates.contains(related))
+        .or_else(|| host_candidates.first().copied())
+}
+
 fn merge_stun_mappings(current: &mut Vec<StunMapping>, refreshed: Vec<StunMapping>) -> bool {
     let mut changed = false;
     for mapping in refreshed {
@@ -3119,10 +3134,7 @@ async fn create_tunnel_endpoint(
             Vec::new()
         };
         update_mapping_related_addresses(&mut mappings, bound_address, &gathered_hosts);
-        let related_address = mappings
-            .first()
-            .map_or(bound_address, |mapping| mapping.related);
-        let primary_host = (!related_address.ip().is_unspecified()).then_some(related_address);
+        let primary_host = current_primary_host(bound_address, &mappings, &gathered_hosts);
         let candidates = compose_ice_candidates(
             extra_candidates,
             primary_host,
@@ -3170,13 +3182,12 @@ async fn create_tunnel_endpoint(
         let refresh_router = iced.ice_router.clone();
         let refresh_bound_address = bound_address;
         let refresh_stun_servers = stun_servers.clone();
-        let refresh_host_candidates = if bound_address.ip().is_unspecified() {
+        let initial_host_candidates = if bound_address.ip().is_unspecified() {
             local_interface_host_candidates(bound_address)?
         } else {
             Vec::new()
         };
         let refresh_explicit = extra_candidates.to_vec();
-        let refresh_primary_host = primary_host;
         let refresh_reservation =
             stun_reservation(unique_candidate_count(extra_candidates), stun_servers.len());
         let refresh_credentials = credentials.clone();
@@ -3184,8 +3195,16 @@ async fn create_tunnel_endpoint(
         let task_local_candidates = std::sync::Arc::clone(&refresh_local_candidates);
         tokio::spawn(async move {
             let mut active_mappings = mappings;
+            let mut active_host_candidates = initial_host_candidates;
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
+                let observed_hosts = if refresh_bound_address.ip().is_unspecified() {
+                    local_interface_host_candidates(refresh_bound_address)
+                } else {
+                    Ok(Vec::new())
+                };
+                active_host_candidates =
+                    refreshed_host_candidate_snapshot(&active_host_candidates, observed_hosts);
                 let mut refreshed = gather_stun_mappings(
                     &refresh_router,
                     &refresh_socket,
@@ -3196,18 +3215,19 @@ async fn create_tunnel_endpoint(
                 update_mapping_related_addresses(
                     &mut refreshed,
                     refresh_bound_address,
-                    &refresh_host_candidates,
+                    &active_host_candidates,
                 );
                 let mapping_set_changed = merge_stun_mappings(&mut active_mappings, refreshed);
-                let primary_host = active_mappings
-                    .first()
-                    .map(|mapping| mapping.related)
-                    .or(refresh_primary_host);
+                let primary_host = current_primary_host(
+                    refresh_bound_address,
+                    &active_mappings,
+                    &active_host_candidates,
+                );
                 match compose_ice_candidates(
                     &refresh_explicit,
                     primary_host,
                     &active_mappings,
-                    refresh_host_candidates.clone(),
+                    active_host_candidates.clone(),
                     refresh_reservation,
                 ) {
                     Ok(next_candidates) => {
@@ -3317,11 +3337,11 @@ async fn create_tunnel_endpoint(
             Some(bound) if bound.ip().is_unspecified() => {
                 let hosts = local_interface_host_candidates(bound)?;
                 update_mapping_related_addresses(&mut mappings, bound, &hosts);
-                (mappings.first().map(|mapping| mapping.related), hosts)
+                (current_primary_host(bound, &mappings, &hosts), hosts)
             }
             Some(bound) => {
                 update_mapping_related_addresses(&mut mappings, bound, &[]);
-                (Some(bound), Vec::new())
+                (current_primary_host(bound, &mappings, &[]), Vec::new())
             }
             None => (None, Vec::new()),
         }
@@ -3367,7 +3387,7 @@ async fn create_tunnel_endpoint(
         let refresh_device_id = device_id.clone();
         let refresh_explicit = extra_candidates.to_vec();
         let refresh_stun_servers = stun_servers.clone();
-        let refresh_host_candidates = if bound.ip().is_unspecified() {
+        let initial_host_candidates = if bound.ip().is_unspecified() {
             local_interface_host_candidates(bound)?
         } else {
             Vec::new()
@@ -3377,18 +3397,27 @@ async fn create_tunnel_endpoint(
         let refresh_candidates = std::sync::Arc::clone(&candidates);
         tokio::spawn(async move {
             let mut active_mappings = mappings;
+            let mut active_host_candidates = initial_host_candidates;
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
+                let observed_hosts = if bound.ip().is_unspecified() {
+                    local_interface_host_candidates(bound)
+                } else {
+                    Ok(Vec::new())
+                };
+                active_host_candidates =
+                    refreshed_host_candidate_snapshot(&active_host_candidates, observed_hosts);
                 let mut refreshed =
                     gather_stun_mappings(&router, &socket, &refresh_stun_servers, bound).await;
-                update_mapping_related_addresses(&mut refreshed, bound, &refresh_host_candidates);
+                update_mapping_related_addresses(&mut refreshed, bound, &active_host_candidates);
                 let mapping_set_changed = merge_stun_mappings(&mut active_mappings, refreshed);
-                let related = active_mappings.first().map(|mapping| mapping.related);
+                let related =
+                    current_primary_host(bound, &active_mappings, &active_host_candidates);
                 let next_candidates = compose_non_ice_candidates(
                     &refresh_explicit,
                     related,
                     &active_mappings,
-                    refresh_host_candidates.clone(),
+                    active_host_candidates.clone(),
                     refresh_reservation,
                 );
                 match next_candidates {
@@ -3476,6 +3505,23 @@ fn local_interface_host_candidates(bound_address: SocketAddr) -> std::io::Result
             _ => None,
         });
     Ok(filtered_host_candidates(addresses, bound_address.port()))
+}
+
+fn refreshed_host_candidate_snapshot(
+    previous: &[SocketAddr],
+    observed: std::io::Result<Vec<SocketAddr>>,
+) -> Vec<SocketAddr> {
+    match observed {
+        Ok(mut candidates) => {
+            candidates.sort();
+            candidates.dedup();
+            candidates
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not refresh active interface host candidates; retaining previous candidates");
+            previous.to_vec()
+        }
+    }
 }
 
 fn filtered_host_candidates(
@@ -3878,6 +3924,53 @@ mod tests {
         assert!(candidates.contains(&format!("srflx://{}|{related}", changed_a.mapped)));
         assert!(!candidates.contains(&format!("srflx://{}|{related}", mapping_a.mapped)));
         assert!(candidates.contains(&format!("srflx://{}|{related}", mapping_b.mapped)));
+    }
+
+    #[test]
+    fn host_candidate_refresh_replaces_old_addresses_and_retains_snapshot_on_error() {
+        let old_host: SocketAddr = "10.0.0.4:42000".parse().unwrap();
+        let current_host: SocketAddr = "10.1.0.4:42000".parse().unwrap();
+        let explicit = vec!["tcp://203.0.113.9:443".to_owned()];
+        let current_hosts =
+            refreshed_host_candidate_snapshot(&[old_host], Ok(vec![current_host, current_host]));
+        assert_eq!(current_hosts, vec![current_host]);
+        let mapping = StunMapping {
+            server: "192.0.2.53:3478".parse().unwrap(),
+            mapped: "198.51.100.25:52000".parse().unwrap(),
+            related: old_host,
+        };
+        let wildcard: SocketAddr = "0.0.0.0:42000".parse().unwrap();
+        let primary_host =
+            current_primary_host(wildcard, std::slice::from_ref(&mapping), &current_hosts);
+        assert_eq!(primary_host, Some(current_host));
+        let ice_candidates = compose_ice_candidates(
+            &explicit,
+            primary_host,
+            std::slice::from_ref(&mapping),
+            current_hosts.clone(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(ice_candidates[0], explicit[0]);
+        assert!(ice_candidates.contains(&current_host.to_string()));
+        assert!(!ice_candidates.contains(&old_host.to_string()));
+
+        let failed_refresh = refreshed_host_candidate_snapshot(
+            &current_hosts,
+            Err(std::io::Error::other("interface enumeration unavailable")),
+        );
+        assert_eq!(failed_refresh, current_hosts);
+        let non_ice_candidates = compose_non_ice_candidates(
+            &explicit,
+            current_primary_host(wildcard, std::slice::from_ref(&mapping), &failed_refresh),
+            std::slice::from_ref(&mapping),
+            failed_refresh,
+            1,
+        )
+        .unwrap();
+        assert_eq!(non_ice_candidates[0], explicit[0]);
+        assert!(non_ice_candidates.contains(&current_host.to_string()));
+        assert!(!non_ice_candidates.contains(&old_host.to_string()));
     }
 
     #[tokio::test]
