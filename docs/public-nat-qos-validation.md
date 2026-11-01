@@ -14,6 +14,17 @@ Create the network and enroll both devices using the [Quick start](../README.md#
 
 ## Start the two peers
 
+Record the path-quality policy used for every test. Defaults are RTT threshold `350 ms`, loss threshold `20%`, and `3` consecutive poor windows; each quality window requires at least three probes. These values can be overridden on both peers with `MINI_TUNNEL_QUALITY_RTT_THRESHOLD_MS` (`1`–`60000`), `MINI_TUNNEL_QUALITY_LOSS_THRESHOLD_PERCENT` (`0`–`100`), and `MINI_TUNNEL_QUALITY_BAD_WINDOWS` (`1`–`30`). Invalid values fall back to defaults with a warning. The settings are loaded once per process when its first quality check or recovery probe runs, so set them before launching either peer.
+
+For example, to use a 250 ms RTT threshold and two poor windows on both peers:
+
+```sh
+export MINI_TUNNEL_QUALITY_RTT_THRESHOLD_MS=250
+export MINI_TUNNEL_QUALITY_BAD_WINDOWS=2
+```
+
+The packet-loss comparison is strictly greater than the configured percentage. After a reliable fallback, the peer probes for a better direct path every 60 seconds by default. A candidate must pass three authenticated health probes and meet the configured RTT threshold before promotion; there is no separate 30-second stability timer.
+
 On both clients, set the Coordinator URL and start a mesh with ICE, STUN, route management, and the deployed Relay endpoint. Use real numeric STUN and Relay addresses because the CLI accepts `SocketAddr` values for both.
 
 ```sh
@@ -68,15 +79,15 @@ Do not apply these root qdiscs to a shared client interface carrying the Coordin
 | Mild | 80 ms added RTT, 20 ms jitter, 2% random UDP loss | Hysteresis prevents one-window flapping; report quality and selected path |
 | Degraded | 200 ms added RTT, 30 ms jitter, 10% random UDP loss | Once configured bad windows are reached, move to TCP/Relay and keep overlay connectivity |
 | Reordering | 50 ms delay with 5% packet reordering and 2% loss | Session remains authenticated; record packet loss, recovery time, and path changes |
-| Recovery | Remove impairment after reliable fallback | Direct UDP is reprobed and promoted only after successful authenticated checks and the configured healthy period |
+| Recovery | Remove impairment after reliable fallback | The peer probes every 60 seconds by default; direct UDP is promoted only after three authenticated health probes meet the configured RTT threshold |
 
-The current quality thresholds and hold-down values are implementation defaults; this runbook measures behavior and does not redefine them. TCP can perform worse under congestion and is not itself a congestion remedy. Record results rather than treating a path switch as proof of improved throughput.
+The 60-second recovery probe interval is the current implementation default. Record each peer's effective RTT, loss, and bad-window settings when reporting results. TCP can perform worse under congestion and is not itself a congestion remedy. Record results rather than treating a path switch as proof of improved throughput.
 
 ## Pass/fail and evidence
 
 A case passes when its expected path behavior occurs, overlay probes reach the intended peer, packet source/destination validation remains enforced, and the selected transport is visible in logs. For fallback cases, record impairment start, fallback start, first successful reliable probe, and any data loss window. A test fails if the process accepts an unauthenticated peer, writes a packet from the wrong overlay source, loops between paths without respecting hysteresis, or leaves peer routes after clean shutdown.
 
-For every case, save a sanitized report row with: case ID, client network/NAT description, mapping observations, selected path sequence, start/end UTC, p50/p95 RTT, sent/received/lost probes, traffic throughput, reconnect count, fallback/recovery time, route cleanup result, and links or hashes for logs/pcaps. Redact public IPs and all credentials before sharing.
+For every case, save a sanitized report row with: case ID, client network/NAT description, mapping observations, effective RTT/loss/bad-window settings, selected path sequence, start/end UTC, p50/p95 RTT, sent/received/lost probes, traffic throughput, reconnect count, fallback/recovery time, route cleanup result, and links or hashes for logs/pcaps. Redact public IPs and all credentials before sharing.
 
 After each phase, stop both clients cleanly, verify their peer routes are gone, remove any test `tc` rules, and revoke/delete the temporary network and enrollment credentials. A `SIGKILL` may bypass route cleanup; inspect and remove only the test peer host routes if that occurs.
 
