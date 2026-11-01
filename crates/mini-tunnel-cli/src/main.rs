@@ -2982,6 +2982,35 @@ struct TunnelIceState {
         std::sync::Arc<tokio::sync::RwLock<Vec<mini_tunnel_agent::candidate::SignaledCandidate>>>,
 }
 
+const MAX_PEER_CANDIDATES: usize = 8;
+
+async fn peer_endpoint_with_optional_stun(
+    identity: &mini_tunnel_agent::Identity,
+    bind: SocketAddr,
+    stun_server: Option<SocketAddr>,
+    queue_capacity: usize,
+) -> Result<
+    (mini_tunnel_agent::ice::IcedPeerEndpoint, Option<SocketAddr>),
+    mini_tunnel_agent::IdentityError,
+> {
+    let endpoint = mini_tunnel_agent::ice::peer_endpoint_with_ice(identity, bind, queue_capacity)?;
+    let Some(server) = stun_server else {
+        return Ok((endpoint, None));
+    };
+    let mapped = match endpoint
+        .ice_router
+        .discover_mapped_address(&endpoint.socket, server)
+        .await
+    {
+        Ok(address) => Some(address),
+        Err(error) => {
+            tracing::warn!(%error, %server, "initial STUN discovery failed; continuing with available host candidates and retrying periodically");
+            None
+        }
+    };
+    Ok((endpoint, mapped))
+}
+
 impl std::ops::Deref for TunnelEndpoint {
     type Target = quinn::Endpoint;
 
@@ -3000,23 +3029,21 @@ async fn create_tunnel_endpoint(
     coordinator_url: &str,
 ) -> Result<TunnelEndpoint, Box<dyn std::error::Error + Send + Sync>> {
     if enable_ice {
-        let (iced, mapped_address) = match stun_server {
-            Some(server) => {
-                let (endpoint, mapped) = mini_tunnel_agent::ice::peer_endpoint_with_ice_and_stun(
-                    identity, bind, server, 64,
-                )
-                .await?;
-                (endpoint, Some(mapped))
-            }
-            None => (
-                mini_tunnel_agent::ice::peer_endpoint_with_ice(identity, bind, 64)?,
-                None,
-            ),
-        };
+        let (iced, mapped_address) =
+            peer_endpoint_with_optional_stun(identity, bind, stun_server, 64).await?;
         let bound_address = iced.socket.local_addr()?;
         let related_address = match stun_server {
             Some(server) if bound_address.ip().is_unspecified() => {
-                route_selected_local_address(server, bound_address.port())?
+                match route_selected_local_address(server, bound_address.port()) {
+                    Ok(address) => address,
+                    Err(error) => {
+                        tracing::warn!(%error, %server, "could not probe the STUN route; using an active local host candidate as the related address");
+                        local_interface_host_candidates(bound_address)?
+                            .into_iter()
+                            .find(|address| address.is_ipv4() == server.is_ipv4())
+                            .unwrap_or(bound_address)
+                    }
+                }
             }
             _ => bound_address,
         };
@@ -3031,11 +3058,12 @@ async fn create_tunnel_endpoint(
             primary_host,
             mapped_address.map(|mapped| (mapped, related_address)),
             gathered_hosts,
+            stun_server.is_some(),
         )?;
         if candidates.is_empty() {
             return Err("ICE needs a usable local interface, --stun-server, or --candidate".into());
         }
-        if candidates.len() > 8 {
+        if candidates.len() > MAX_PEER_CANDIDATES {
             return Err("at most eight peer candidates can be published".into());
         }
         let local_candidates = udp_ice_candidates(&candidates);
@@ -3074,10 +3102,12 @@ async fn create_tunnel_endpoint(
         let refresh_related_address = related_address;
         let refresh_bound_address = bound_address;
         let refresh_credentials = credentials.clone();
+        let refresh_explicit_candidate_count = unique_candidate_count(extra_candidates);
         let task_candidates = std::sync::Arc::clone(&refresh_candidates);
         let task_local_candidates = std::sync::Arc::clone(&refresh_local_candidates);
         tokio::spawn(async move {
             let mut mapped_address = mapped_address;
+            let mut related_address = refresh_related_address;
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 if let Some(server) = refresh_stun_server {
@@ -3085,34 +3115,40 @@ async fn create_tunnel_endpoint(
                         .discover_mapped_address(&refresh_socket, server)
                         .await
                     {
-                        Ok(next_mapping) if Some(next_mapping) != mapped_address => {
-                            let related = if refresh_bound_address.ip().is_unspecified() {
+                        Ok(next_mapping) => {
+                            let next_related = if refresh_bound_address.ip().is_unspecified() {
                                 route_selected_local_address(server, refresh_bound_address.port())
-                                    .unwrap_or(refresh_related_address)
+                                    .unwrap_or(related_address)
                             } else {
                                 refresh_bound_address
                             };
-                            let mut candidates = task_candidates.write().await;
-                            if replace_server_reflexive_candidate(
-                                &mut candidates,
-                                mapped_address,
-                                next_mapping,
-                                related,
-                            ) {
-                                mapped_address = Some(next_mapping);
-                                *task_local_candidates.write().await =
-                                    udp_ice_candidates(&candidates);
-                                tracing::info!(
-                                    reason = "nat_mapping_changed",
-                                    "refreshed ICE server-reflexive candidate"
-                                );
-                            } else {
-                                tracing::warn!(
-                                    "STUN mapping changed but the published candidate list had no matching server-reflexive entry"
-                                );
+                            if Some(next_mapping) != mapped_address
+                                || next_related != related_address
+                            {
+                                let mut candidates = task_candidates.write().await;
+                                if replace_server_reflexive_candidate(
+                                    &mut candidates,
+                                    mapped_address,
+                                    next_mapping,
+                                    related_address,
+                                    next_related,
+                                    refresh_explicit_candidate_count,
+                                ) {
+                                    mapped_address = Some(next_mapping);
+                                    related_address = next_related;
+                                    *task_local_candidates.write().await =
+                                        udp_ice_candidates(&candidates);
+                                    tracing::info!(
+                                        reason = "nat_mapping_changed",
+                                        "refreshed ICE server-reflexive candidate"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        "STUN mapping changed but the published candidate list had no matching server-reflexive entry or available slot"
+                                    );
+                                }
                             }
                         }
-                        Ok(_) => {}
                         Err(error) => {
                             tracing::warn!(%error, "could not refresh ICE server-reflexive mapping")
                         }
@@ -3180,17 +3216,25 @@ async fn create_tunnel_endpoint(
             // Use the same shared-socket dispatcher as ICE so periodic STUN refresh responses
             // cannot race Quinn's receive loop or be mistaken for tunnel data.
             let (iced, mapped) =
-                mini_tunnel_agent::ice::peer_endpoint_with_ice_and_stun(identity, bind, server, 64)
-                    .await?;
+                peer_endpoint_with_optional_stun(identity, bind, Some(server), 64).await?;
             let bound = iced.socket.local_addr()?;
             let related = if bound.ip().is_unspecified() {
-                route_selected_local_address(server, bound.port())?
+                match route_selected_local_address(server, bound.port()) {
+                    Ok(address) => address,
+                    Err(error) => {
+                        tracing::warn!(%error, %server, "could not probe the STUN route; using an active local host candidate as the related address");
+                        local_interface_host_candidates(bound)?
+                            .into_iter()
+                            .find(|address| address.is_ipv4() == server.is_ipv4())
+                            .unwrap_or(bound)
+                    }
+                }
             } else {
                 bound
             };
             (
                 iced.endpoint,
-                Some(mapped),
+                mapped,
                 Some((iced.socket, iced.ice_router, bound, related)),
             )
         }
@@ -3200,16 +3244,43 @@ async fn create_tunnel_endpoint(
             None,
         ),
     };
+    let (related_host, gathered_hosts) = if let Some(server) = stun_server {
+        let bound = stun_refresh
+            .as_ref()
+            .map(|(socket, _, _, _)| socket.local_addr())
+            .transpose()?;
+        match bound {
+            Some(bound) if bound.ip().is_unspecified() => (
+                Some(match route_selected_local_address(server, bound.port()) {
+                    Ok(address) => address,
+                    Err(_) => local_interface_host_candidates(bound)?
+                        .into_iter()
+                        .find(|address| address.is_ipv4() == server.is_ipv4())
+                        .unwrap_or(bound),
+                }),
+                local_interface_host_candidates(bound)?,
+            ),
+            Some(bound) => (Some(bound), Vec::new()),
+            None => (None, Vec::new()),
+        }
+    } else {
+        (None, Vec::new())
+    };
     let device_id = identity.device_id();
     let timestamp_ms = now_ms()?;
-    let mut candidates = extra_candidates.to_vec();
-    if let Some(mapped_address) = mapped_address {
-        candidates.push(mapped_address.to_string());
-    }
-    candidates.sort();
-    candidates.dedup();
-    if candidates.len() > 8 {
-        return Err("at most eight peer candidates can be published".into());
+    let explicit_candidate_count = unique_candidate_count(extra_candidates);
+    let candidates = compose_non_ice_candidates(
+        extra_candidates,
+        related_host,
+        mapped_address,
+        gathered_hosts,
+        stun_server.is_some(),
+    )?;
+    if candidates.is_empty() {
+        return Err(
+            "no usable peer candidates; configure --candidate or an active network interface"
+                .into(),
+        );
     }
     let candidate_count = candidates.len();
     let request = CandidateUpdateRequest {
@@ -3231,6 +3302,7 @@ async fn create_tunnel_endpoint(
         let refresh_network = network_id.to_owned();
         let refresh_url = coordinator_url.to_owned();
         let refresh_device_id = device_id.clone();
+        let refresh_explicit_candidate_count = explicit_candidate_count;
         let candidates = std::sync::Arc::new(tokio::sync::RwLock::new(request.candidates));
         let refresh_candidates = std::sync::Arc::clone(&candidates);
         tokio::spawn(async move {
@@ -3244,6 +3316,7 @@ async fn create_tunnel_endpoint(
                             &mut current,
                             mapped_address,
                             next_mapping,
+                            refresh_explicit_candidate_count,
                         ) {
                             mapped_address = Some(next_mapping);
                             tracing::info!(
@@ -3252,7 +3325,7 @@ async fn create_tunnel_endpoint(
                             );
                         } else {
                             tracing::warn!(
-                                "STUN mapping changed but the published candidate list had no matching mapped address"
+                                "STUN mapping changed but the published candidate list had no matching mapped address or available slot"
                             );
                         }
                     }
@@ -3362,6 +3435,7 @@ fn compose_ice_candidates(
     primary_host: Option<SocketAddr>,
     mapped: Option<(SocketAddr, SocketAddr)>,
     other_hosts: Vec<SocketAddr>,
+    reserve_mapped_slot: bool,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     let mut candidates = Vec::new();
     for candidate in explicit {
@@ -3369,13 +3443,16 @@ fn compose_ice_candidates(
             candidates.push(candidate.clone());
         }
     }
-    if candidates.len() > 8 {
+    if candidates.len() > MAX_PEER_CANDIDATES {
         return Err("at most eight explicit peer candidates can be published".into());
+    }
+    if mapped.is_none() && reserve_mapped_slot && candidates.len() == MAX_PEER_CANDIDATES {
+        return Err("explicit candidates leave no room for the STUN mapped candidate".into());
     }
     if let Some((mapped, related)) = mapped {
         let srflx = format!("srflx://{mapped}|{related}");
         if !candidates.contains(&srflx) {
-            if candidates.len() == 8 {
+            if candidates.len() == MAX_PEER_CANDIDATES {
                 return Err(
                     "explicit candidates leave no room for the STUN mapped candidate".into(),
                 );
@@ -3392,12 +3469,78 @@ fn compose_ice_candidates(
     other_hosts.dedup();
     hosts.extend(other_hosts);
     let mut seen_hosts = std::collections::HashSet::new();
+    let candidate_limit = if mapped.is_none() && reserve_mapped_slot {
+        MAX_PEER_CANDIDATES - 1
+    } else {
+        MAX_PEER_CANDIDATES
+    };
     for host in hosts {
         if !seen_hosts.insert(host) {
             continue;
         }
         let signal = host.to_string();
-        if !candidates.contains(&signal) && candidates.len() < 8 {
+        if !candidates.contains(&signal) && candidates.len() < candidate_limit {
+            candidates.push(signal);
+        }
+    }
+    Ok(candidates)
+}
+
+fn unique_candidate_count(candidates: &[String]) -> usize {
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(index, candidate)| !candidates[..*index].contains(candidate))
+        .count()
+}
+
+fn compose_non_ice_candidates(
+    explicit: &[String],
+    primary_host: Option<SocketAddr>,
+    mapped: Option<SocketAddr>,
+    other_hosts: Vec<SocketAddr>,
+    reserve_mapped_slot: bool,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut candidates = Vec::new();
+    for candidate in explicit {
+        if !candidates.contains(candidate) {
+            candidates.push(candidate.clone());
+        }
+    }
+    if candidates.len() > MAX_PEER_CANDIDATES {
+        return Err("at most eight explicit peer candidates can be published".into());
+    }
+    if mapped.is_none() && reserve_mapped_slot && candidates.len() == MAX_PEER_CANDIDATES {
+        return Err("explicit candidates leave no room for the STUN mapped candidate".into());
+    }
+    if let Some(mapped) = mapped {
+        let mapped = mapped.to_string();
+        if !candidates.contains(&mapped) {
+            if candidates.len() == MAX_PEER_CANDIDATES {
+                return Err(
+                    "explicit candidates leave no room for the STUN mapped candidate".into(),
+                );
+            }
+            candidates.push(mapped);
+        }
+    }
+    let candidate_limit = if mapped.is_none() && reserve_mapped_slot {
+        MAX_PEER_CANDIDATES - 1
+    } else {
+        MAX_PEER_CANDIDATES
+    };
+    let mut hosts = Vec::new();
+    if let Some(primary_host) = primary_host {
+        hosts.push(primary_host);
+    }
+    hosts.extend(other_hosts);
+    let mut seen_hosts = std::collections::HashSet::new();
+    for host in hosts {
+        if !seen_hosts.insert(host) {
+            continue;
+        }
+        let signal = host.to_string();
+        if !candidates.contains(&signal) && candidates.len() < candidate_limit {
             candidates.push(signal);
         }
     }
@@ -3405,47 +3548,64 @@ fn compose_ice_candidates(
 }
 
 fn replace_plain_mapped_candidate(
-    candidates: &mut [String],
+    candidates: &mut Vec<String>,
     previous_mapping: Option<SocketAddr>,
     new_mapping: SocketAddr,
+    explicit_candidate_count: usize,
 ) -> bool {
-    let Some(previous_mapping) = previous_mapping else {
-        return false;
-    };
-    if previous_mapping == new_mapping {
+    let next = new_mapping.to_string();
+    if let Some(previous_mapping) = previous_mapping {
+        if previous_mapping == new_mapping {
+            return false;
+        }
+        let previous = previous_mapping.to_string();
+        let Some(candidate) = candidates
+            .iter_mut()
+            .find(|candidate| **candidate == previous)
+        else {
+            return false;
+        };
+        *candidate = next;
+        return true;
+    }
+    if candidates.contains(&next) || candidates.len() >= MAX_PEER_CANDIDATES {
         return false;
     }
-    let previous = previous_mapping.to_string();
-    let Some(candidate) = candidates
-        .iter_mut()
-        .find(|candidate| **candidate == previous)
-    else {
-        return false;
-    };
-    *candidate = new_mapping.to_string();
+    candidates.insert(explicit_candidate_count.min(candidates.len()), next);
     true
 }
 
 fn replace_server_reflexive_candidate(
-    candidates: &mut [String],
+    candidates: &mut Vec<String>,
     previous_mapping: Option<SocketAddr>,
     new_mapping: SocketAddr,
+    previous_related: SocketAddr,
     related_address: SocketAddr,
+    explicit_candidate_count: usize,
 ) -> bool {
-    let Some(previous_mapping) = previous_mapping else {
-        return false;
-    };
-    if previous_mapping == new_mapping {
+    let next = format!("srflx://{new_mapping}|{related_address}");
+    if let Some(previous_mapping) = previous_mapping {
+        if previous_mapping == new_mapping && previous_related == related_address {
+            return false;
+        }
+        let previous = format!("srflx://{previous_mapping}|{previous_related}");
+        let Some(candidate) = candidates
+            .iter_mut()
+            .find(|candidate| **candidate == previous)
+        else {
+            return false;
+        };
+        *candidate = next;
+        return true;
+    }
+    if candidates
+        .iter()
+        .any(|candidate| candidate.starts_with("srflx://"))
+        || candidates.len() >= MAX_PEER_CANDIDATES
+    {
         return false;
     }
-    let previous = format!("srflx://{previous_mapping}|{related_address}");
-    let Some(candidate) = candidates
-        .iter_mut()
-        .find(|candidate| **candidate == previous)
-    else {
-        return false;
-    };
-    *candidate = format!("srflx://{new_mapping}|{related_address}");
+    candidates.insert(explicit_candidate_count.min(candidates.len()), next);
     true
 }
 
@@ -3641,19 +3801,58 @@ mod tests {
         assert!(replace_plain_mapped_candidate(
             &mut candidates,
             Some(old),
-            new
+            new,
+            1,
         ));
         assert_eq!(candidates[0], new.to_string());
         assert!(!replace_plain_mapped_candidate(
             &mut candidates,
             Some(new),
-            new
+            new,
+            1,
         ));
         assert!(!replace_plain_mapped_candidate(
             &mut candidates,
             Some(old),
-            new
+            new,
+            1,
         ));
+    }
+
+    #[test]
+    fn plain_stun_candidate_refresh_inserts_after_explicit_candidates_when_initial_mapping_failed()
+    {
+        let mapped: SocketAddr = "203.0.113.9:52000".parse().unwrap();
+        let mut candidates = vec![
+            "tcp://198.51.100.9:443".to_owned(),
+            "10.0.0.4:42000".to_owned(),
+        ];
+        assert!(replace_plain_mapped_candidate(
+            &mut candidates,
+            None,
+            mapped,
+            1,
+        ));
+        assert_eq!(
+            candidates,
+            vec![
+                "tcp://198.51.100.9:443",
+                "203.0.113.9:52000",
+                "10.0.0.4:42000",
+            ]
+        );
+        assert!(!replace_plain_mapped_candidate(
+            &mut candidates,
+            None,
+            mapped,
+            1,
+        ));
+        let mut full = (1..=MAX_PEER_CANDIDATES)
+            .map(|host| format!("10.0.0.{host}:42000"))
+            .collect::<Vec<_>>();
+        let full_before = full.clone();
+        assert!(!replace_plain_mapped_candidate(&mut full, None, mapped, 0));
+        assert_eq!(full, full_before);
     }
 
     #[test]
@@ -3669,21 +3868,172 @@ mod tests {
             &mut candidates,
             Some(old),
             new,
-            related
+            related,
+            related,
+            0,
         ));
         assert_eq!(candidates[0], format!("srflx://{new}|{related}"));
         assert!(!replace_server_reflexive_candidate(
             &mut candidates,
             Some(new),
             new,
-            related
+            related,
+            related,
+            0,
         ));
         assert!(!replace_server_reflexive_candidate(
             &mut candidates,
             Some(old),
             new,
-            related
+            related,
+            related,
+            0,
         ));
+    }
+
+    #[tokio::test]
+    async fn tunnel_endpoint_survives_initial_stun_failure_for_later_mapping_refresh() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-stun-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let identity = mini_tunnel_agent::Identity::load_or_create_at(temp.join("device.key"))
+            .expect("load identity");
+        let unavailable_stun = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind silent STUN endpoint");
+        let (endpoint, initial_mapping) = tokio::time::timeout(
+            Duration::from_secs(10),
+            peer_endpoint_with_optional_stun(
+                &identity,
+                "127.0.0.1:0".parse().unwrap(),
+                Some(unavailable_stun.local_addr().unwrap()),
+                8,
+            ),
+        )
+        .await
+        .expect("initial STUN retries are bounded")
+        .expect("STUN failure does not prevent endpoint startup");
+        assert_eq!(initial_mapping, None);
+        let local_address = endpoint.socket.local_addr().expect("tunnel UDP socket");
+
+        let recovery_stun = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind recovery STUN endpoint");
+        let recovery_address = recovery_stun.local_addr().expect("STUN address");
+        let responder = tokio::spawn(async move {
+            let mut request = [0; 128];
+            let (length, peer) = recovery_stun
+                .recv_from(&mut request)
+                .await
+                .expect("receive later STUN refresh");
+            assert_eq!(length, 20);
+            let transaction: [u8; 12] = request[8..20].try_into().expect("transaction ID");
+            let mapped: SocketAddr = "198.51.100.50:52345".parse().unwrap();
+            let cookie = 0x2112_A442_u32;
+            let mut response = vec![0; 32];
+            response[..2].copy_from_slice(&0x0101_u16.to_be_bytes());
+            response[2..4].copy_from_slice(&12_u16.to_be_bytes());
+            response[4..8].copy_from_slice(&cookie.to_be_bytes());
+            response[8..20].copy_from_slice(&transaction);
+            response[20..22].copy_from_slice(&0x0020_u16.to_be_bytes());
+            response[22..24].copy_from_slice(&8_u16.to_be_bytes());
+            response[25] = 1;
+            response[26..28]
+                .copy_from_slice(&(mapped.port() ^ (cookie >> 16) as u16).to_be_bytes());
+            let mapped_ip = match mapped.ip() {
+                std::net::IpAddr::V4(address) => address.octets(),
+                std::net::IpAddr::V6(_) => unreachable!("test mapping is IPv4"),
+            };
+            for (target, (address, mask)) in response[28..32]
+                .iter_mut()
+                .zip(mapped_ip.into_iter().zip(cookie.to_be_bytes()))
+            {
+                *target = address ^ mask;
+            }
+            recovery_stun
+                .send_to(&response, peer)
+                .await
+                .expect("send later mapping response");
+            mapped
+        });
+        let recovered_mapping = endpoint
+            .ice_router
+            .discover_mapped_address(&endpoint.socket, recovery_address)
+            .await
+            .expect("later STUN refresh succeeds on the surviving tunnel socket");
+        assert_eq!(
+            recovered_mapping,
+            responder.await.expect("join STUN responder")
+        );
+        assert_eq!(
+            endpoint.socket.local_addr().expect("same tunnel socket"),
+            local_address
+        );
+        endpoint.endpoint.close(0_u32.into(), b"test complete");
+        std::fs::remove_dir_all(temp).expect("remove test identity");
+    }
+
+    #[test]
+    fn ice_candidate_refresh_recovers_mapping_and_updates_changed_related_address() {
+        let mapping: SocketAddr = "203.0.113.9:52000".parse().unwrap();
+        let new_mapping: SocketAddr = "203.0.113.10:53000".parse().unwrap();
+        let old_related: SocketAddr = "10.0.0.4:42000".parse().unwrap();
+        let new_related: SocketAddr = "10.1.0.4:42000".parse().unwrap();
+        let mut candidates = vec![
+            "tcp://198.51.100.9:443".to_owned(),
+            "10.0.0.4:42000".to_owned(),
+        ];
+        assert!(replace_server_reflexive_candidate(
+            &mut candidates,
+            None,
+            mapping,
+            old_related,
+            old_related,
+            1,
+        ));
+        assert_eq!(
+            candidates,
+            vec![
+                "tcp://198.51.100.9:443".to_owned(),
+                format!("srflx://{mapping}|{old_related}"),
+                "10.0.0.4:42000".to_owned(),
+            ]
+        );
+        assert!(replace_server_reflexive_candidate(
+            &mut candidates,
+            Some(mapping),
+            mapping,
+            old_related,
+            new_related,
+            1,
+        ));
+        assert_eq!(candidates[1], format!("srflx://{mapping}|{new_related}"));
+        assert!(replace_server_reflexive_candidate(
+            &mut candidates,
+            Some(mapping),
+            new_mapping,
+            new_related,
+            new_related,
+            1,
+        ));
+        assert_eq!(
+            candidates[1],
+            format!("srflx://{new_mapping}|{new_related}")
+        );
+        let mut full = (1..=MAX_PEER_CANDIDATES)
+            .map(|host| format!("10.0.0.{host}:42000"))
+            .collect::<Vec<_>>();
+        let full_before = full.clone();
+        assert!(!replace_server_reflexive_candidate(
+            &mut full,
+            None,
+            mapping,
+            old_related,
+            old_related,
+            0,
+        ));
+        assert_eq!(full, full_before);
     }
 
     #[test]
@@ -4075,6 +4425,7 @@ mod tests {
                 "192.168.1.3:42000".parse().unwrap(),
                 "192.168.1.5:42000".parse().unwrap(),
             ],
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -4095,13 +4446,46 @@ mod tests {
             None,
             None,
             filtered_host_candidates(many.into_iter().map(Into::into), 42000),
+            false,
         )
         .unwrap();
-        assert_eq!(truncated.len(), 8);
+        assert_eq!(truncated.len(), MAX_PEER_CANDIDATES);
+        let hosts = (1..=12)
+            .map(|last| Ipv4Addr::new(10, 0, 1, last))
+            .collect::<Vec<_>>();
+        let reserved = compose_ice_candidates(
+            &["198.51.100.9:42000".to_owned()],
+            None,
+            None,
+            filtered_host_candidates(hosts.into_iter().map(Into::into), 42000),
+            true,
+        )
+        .unwrap();
+        assert_eq!(reserved.len(), MAX_PEER_CANDIDATES - 1);
+        let recovered_mapping: SocketAddr = "203.0.113.1:50000".parse().unwrap();
+        let related: SocketAddr = "10.0.1.1:42000".parse().unwrap();
+        let mut recovered = reserved;
+        assert!(replace_server_reflexive_candidate(
+            &mut recovered,
+            None,
+            recovered_mapping,
+            related,
+            related,
+            1,
+        ));
+        assert_eq!(recovered.len(), MAX_PEER_CANDIDATES);
+        assert_eq!(
+            recovered[1],
+            format!("srflx://{recovered_mapping}|{related}")
+        );
         let nine_explicit = (1..=9)
             .map(|port| format!("192.0.2.1:{port}"))
             .collect::<Vec<_>>();
-        assert!(compose_ice_candidates(&nine_explicit, None, None, Vec::new()).is_err());
+        assert!(compose_ice_candidates(&nine_explicit, None, None, Vec::new(), false).is_err());
+        let eight_explicit = (1..=8)
+            .map(|port| format!("192.0.2.1:{port}"))
+            .collect::<Vec<_>>();
+        assert!(compose_ice_candidates(&eight_explicit, None, None, Vec::new(), true).is_err());
         assert_eq!(
             compose_ice_candidates(
                 &[
@@ -4111,10 +4495,43 @@ mod tests {
                 None,
                 None,
                 Vec::new(),
+                false,
             )
             .unwrap(),
             vec!["198.51.100.9:42000"]
         );
+    }
+
+    #[test]
+    fn non_ice_candidate_composition_reserves_slot_for_recovered_mapping() {
+        let explicit = vec!["tcp://198.51.100.8:443".to_owned()];
+        let hosts = (1..=12)
+            .map(|last| Ipv4Addr::new(10, 0, 2, last))
+            .collect::<Vec<_>>();
+        let candidates = compose_non_ice_candidates(
+            &explicit,
+            None,
+            None,
+            hosts
+                .into_iter()
+                .map(|address| SocketAddr::new(address.into(), 42000))
+                .collect(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), MAX_PEER_CANDIDATES - 1);
+        assert_eq!(candidates[0], explicit[0]);
+
+        let mapping: SocketAddr = "203.0.113.2:52000".parse().unwrap();
+        let mut recovered = candidates;
+        assert!(replace_plain_mapped_candidate(
+            &mut recovered,
+            None,
+            mapping,
+            1
+        ));
+        assert_eq!(recovered.len(), MAX_PEER_CANDIDATES);
+        assert_eq!(recovered[1], mapping.to_string());
     }
 
     #[test]
