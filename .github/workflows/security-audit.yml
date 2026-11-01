@@ -21,4 +21,6 @@ jobs:
         run: cargo install cargo-audit --version 0.22.2 --locked
 
       - name: Check RustSec advisories
-        run: cargo audit
+        # SQLx's disabled MySQL driver leaves rsa in Cargo.lock; no fixed release is available.
+        # CI ignores only this advisory while continuing to check every other dependency.
+        run: cargo audit --ignore RUSTSEC-2023-0071
