@@ -1017,6 +1017,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     )
                     .await?;
                     let tun = create_tun(&network_id, local_ipv4, prefix_len, mtu)?;
+                    endpoint.exclude_tun_interface(&tun)?;
                     let mut attempt = 0_u32;
                     loop {
                         let result = async {
@@ -1123,6 +1124,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     )
                     .await?;
                     let tun = create_tun(&network_id, local_ipv4, prefix_len, mtu)?;
+                    endpoint.exclude_tun_interface(&tun)?;
                     println!(
                         "Waiting for authenticated peer on {}",
                         endpoint.local_addr()?
@@ -1522,6 +1524,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         );
                     }
                     let tun = create_tun(&network_id, local_ipv4, prefix_len, mtu)?;
+                    endpoint.exclude_tun_interface(&tun)?;
                     let initially_connected = connected
                         .iter()
                         .map(|(peer, _, _, _, _)| peer.clone())
@@ -3435,6 +3438,25 @@ async fn run_peer_mesh(
 struct TunnelEndpoint {
     endpoint: quinn::Endpoint,
     ice: Option<TunnelIceState>,
+    excluded_candidate_interfaces:
+        std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+}
+
+impl TunnelEndpoint {
+    fn exclude_tun_interface(
+        &self,
+        tun: &mini_tunnel_agent::tun_device::TunDevice,
+    ) -> std::io::Result<()> {
+        self.exclude_candidate_interface(tun.name()?)
+    }
+
+    fn exclude_candidate_interface(&self, name: String) -> std::io::Result<()> {
+        self.excluded_candidate_interfaces
+            .write()
+            .map_err(|_| std::io::Error::other("candidate interface exclusion lock poisoned"))?
+            .insert(name);
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -3588,12 +3610,14 @@ async fn create_tunnel_endpoint(
     coordinator_url: &str,
 ) -> Result<TunnelEndpoint, Box<dyn std::error::Error + Send + Sync>> {
     let stun_servers = normalize_stun_servers(stun_servers)?;
+    let excluded_candidate_interfaces =
+        std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
     if enable_ice {
         let (iced, mut mappings) =
             peer_endpoint_with_optional_stun(identity, bind, &stun_servers, 64).await?;
         let bound_address = iced.socket.local_addr()?;
         let gathered_hosts = if bound_address.ip().is_unspecified() {
-            local_interface_host_candidates(bound_address)?
+            local_interface_host_candidates(bound_address, &std::collections::HashSet::new())?
         } else {
             Vec::new()
         };
@@ -3648,7 +3672,7 @@ async fn create_tunnel_endpoint(
         let refresh_bound_address = bound_address;
         let refresh_stun_servers = stun_servers.clone();
         let initial_host_candidates = if bound_address.ip().is_unspecified() {
-            local_interface_host_candidates(bound_address)?
+            local_interface_host_candidates(bound_address, &std::collections::HashSet::new())?
         } else {
             Vec::new()
         };
@@ -3658,13 +3682,19 @@ async fn create_tunnel_endpoint(
         let refresh_credentials = credentials.clone();
         let task_candidates = std::sync::Arc::clone(&refresh_candidates);
         let task_local_candidates = std::sync::Arc::clone(&refresh_local_candidates);
+        let task_excluded_candidate_interfaces =
+            std::sync::Arc::clone(&excluded_candidate_interfaces);
         tokio::spawn(async move {
             let mut active_mappings = mappings;
             let mut active_host_candidates = initial_host_candidates;
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 let observed_hosts = if refresh_bound_address.ip().is_unspecified() {
-                    local_interface_host_candidates(refresh_bound_address)
+                    let excluded = task_excluded_candidate_interfaces
+                        .read()
+                        .map(|names| names.clone())
+                        .unwrap_or_default();
+                    local_interface_host_candidates(refresh_bound_address, &excluded)
                 } else {
                     Ok(Vec::new())
                 };
@@ -3761,6 +3791,7 @@ async fn create_tunnel_endpoint(
         });
         return Ok(TunnelEndpoint {
             endpoint: iced.endpoint,
+            excluded_candidate_interfaces,
             ice: Some(TunnelIceState {
                 credentials,
                 socket: iced.socket,
@@ -3773,6 +3804,7 @@ async fn create_tunnel_endpoint(
     if stun_servers.is_empty() && extra_candidates.is_empty() {
         return Ok(TunnelEndpoint {
             endpoint: mini_tunnel_agent::peer_endpoint(identity, bind)?,
+            excluded_candidate_interfaces,
             ice: None,
         });
     }
@@ -3801,7 +3833,8 @@ async fn create_tunnel_endpoint(
             .transpose()?;
         match bound {
             Some(bound) if bound.ip().is_unspecified() => {
-                let hosts = local_interface_host_candidates(bound)?;
+                let hosts =
+                    local_interface_host_candidates(bound, &std::collections::HashSet::new())?;
                 update_mapping_related_addresses(&mut mappings, bound, &hosts);
                 (current_primary_host(bound, &mappings, &hosts), hosts)
             }
@@ -3856,20 +3889,26 @@ async fn create_tunnel_endpoint(
         let refresh_explicit = extra_candidates.to_vec();
         let refresh_stun_servers = stun_servers.clone();
         let initial_host_candidates = if bound.ip().is_unspecified() {
-            local_interface_host_candidates(bound)?
+            local_interface_host_candidates(bound, &std::collections::HashSet::new())?
         } else {
             Vec::new()
         };
         let refresh_reservation = reserve_mapping_slots;
         let candidates = std::sync::Arc::new(tokio::sync::RwLock::new(request.candidates));
         let refresh_candidates = std::sync::Arc::clone(&candidates);
+        let task_excluded_candidate_interfaces =
+            std::sync::Arc::clone(&excluded_candidate_interfaces);
         tokio::spawn(async move {
             let mut active_mappings = mappings;
             let mut active_host_candidates = initial_host_candidates;
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 let observed_hosts = if bound.ip().is_unspecified() {
-                    local_interface_host_candidates(bound)
+                    let excluded = task_excluded_candidate_interfaces
+                        .read()
+                        .map(|names| names.clone())
+                        .unwrap_or_default();
+                    local_interface_host_candidates(bound, &excluded)
                 } else {
                     Ok(Vec::new())
                 };
@@ -3945,6 +3984,7 @@ async fn create_tunnel_endpoint(
     }
     Ok(TunnelEndpoint {
         endpoint,
+        excluded_candidate_interfaces,
         ice: None,
     })
 }
@@ -3964,17 +4004,42 @@ fn route_selected_local_address(
     Ok(SocketAddr::new(selected.ip(), port))
 }
 
-fn local_interface_host_candidates(bound_address: SocketAddr) -> std::io::Result<Vec<SocketAddr>> {
+fn local_interface_host_candidates(
+    bound_address: SocketAddr,
+    excluded_interfaces: &std::collections::HashSet<String>,
+) -> std::io::Result<Vec<SocketAddr>> {
     let interfaces = if_addrs::get_if_addrs()?;
     let addresses = interfaces
         .into_iter()
         .filter(|interface| interface.is_oper_up() && !interface.is_loopback())
         .filter_map(|interface| match (bound_address, interface.addr) {
-            (SocketAddr::V4(_), if_addrs::IfAddr::V4(address)) => Some(address.ip.into()),
-            (SocketAddr::V6(_), if_addrs::IfAddr::V6(address)) => Some(address.ip.into()),
+            (SocketAddr::V4(_), if_addrs::IfAddr::V4(address)) => {
+                Some((interface.name, address.ip.into()))
+            }
+            (SocketAddr::V6(_), if_addrs::IfAddr::V6(address)) => {
+                Some((interface.name, address.ip.into()))
+            }
             _ => None,
         });
-    Ok(filtered_host_candidates(addresses, bound_address.port()))
+    Ok(filtered_interface_host_candidates(
+        addresses,
+        bound_address.port(),
+        excluded_interfaces,
+    ))
+}
+
+fn filtered_interface_host_candidates(
+    interfaces: impl IntoIterator<Item = (String, std::net::IpAddr)>,
+    port: u16,
+    excluded_interfaces: &std::collections::HashSet<String>,
+) -> Vec<SocketAddr> {
+    filtered_host_candidates(
+        interfaces
+            .into_iter()
+            .filter(|(name, _)| !excluded_interfaces.contains(name))
+            .map(|(_, address)| address),
+        port,
+    )
 }
 
 fn refreshed_host_candidate_snapshot(
@@ -5403,6 +5468,9 @@ mod tests {
                 (
                     TunnelEndpoint {
                         endpoint: iced.endpoint,
+                        excluded_candidate_interfaces: std::sync::Arc::new(std::sync::RwLock::new(
+                            std::collections::HashSet::new(),
+                        )),
                         ice: Some(TunnelIceState {
                             credentials,
                             socket: iced.socket,
@@ -5676,6 +5744,45 @@ mod tests {
             vec![
                 "10.0.0.9:42000".parse().unwrap(),
                 "192.168.1.2:42000".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn refreshed_host_candidates_exclude_only_the_local_tunnel_interface() {
+        let excluded = std::collections::HashSet::from(["tun0".to_owned()]);
+        let candidates = filtered_interface_host_candidates(
+            [
+                ("eth0".to_owned(), Ipv4Addr::new(192, 0, 2, 10).into()),
+                ("tun0".to_owned(), Ipv4Addr::new(10, 239, 242, 1).into()),
+                ("wg0".to_owned(), Ipv4Addr::new(198, 51, 100, 7).into()),
+                (
+                    "eth0".to_owned(),
+                    "2001:db8::10".parse::<std::net::Ipv6Addr>().unwrap().into(),
+                ),
+                (
+                    "tun0".to_owned(),
+                    "fdf6:7977:99c1:dd4b::aef:f201"
+                        .parse::<std::net::Ipv6Addr>()
+                        .unwrap()
+                        .into(),
+                ),
+                (
+                    "wg0".to_owned(),
+                    "2001:db8::70".parse::<std::net::Ipv6Addr>().unwrap().into(),
+                ),
+            ],
+            42000,
+            &excluded,
+        );
+
+        assert_eq!(
+            candidates,
+            vec![
+                "192.0.2.10:42000".parse().unwrap(),
+                "198.51.100.7:42000".parse().unwrap(),
+                "[2001:db8::10]:42000".parse().unwrap(),
+                "[2001:db8::70]:42000".parse().unwrap(),
             ]
         );
     }
@@ -6009,6 +6116,9 @@ mod tests {
                         credentials: mini_tunnel_protocol::IceCredentials,
                         local: SocketAddr| TunnelEndpoint {
             endpoint: iced.endpoint,
+            excluded_candidate_interfaces: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashSet::new(),
+            )),
             ice: Some(TunnelIceState {
                 credentials,
                 socket: iced.socket,
