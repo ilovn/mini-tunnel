@@ -30,7 +30,16 @@ sudo install -d -o root -g mini-tunnel -m 0750 /etc/mini-tunnel/tls
 sudo install -d -o mini-tunnel -g mini-tunnel -m 0700 /var/lib/mini-tunnel
 ```
 
-Install TLS files readable by the service account and not writable by it. Put environment files in `/etc/mini-tunnel`, owned by `root:mini-tunnel` with mode `0640`. `coordinator.env` should contain `MINI_TUNNEL_RELAY_TICKET_KEY` with a URL-safe base64 encoded random 32-byte value. `relay.env` must contain the same key. Do not put secrets in unit files, command-line arguments, source control, or logs. During key rotation, set the relay's `MINI_TUNNEL_RELAY_PREVIOUS_TICKET_KEY` as described in the main README.
+Install TLS files readable by the service account and not writable by it. Put environment files in `/etc/mini-tunnel`, owned by `root:mini-tunnel` with mode `0640`. The units load the Relay ticket signing key through systemd credentials from `/etc/mini-tunnel/relay-ticket-key`; its contents must be URL-safe base64 without padding for a random 32-byte value. Create the same credential file on the Coordinator and Relay hosts, with ownership `root:root` and mode `0600`:
+
+```sh
+sudo install -o root -g root -m 0600 /dev/null /etc/mini-tunnel/relay-ticket-key
+python3 -c 'import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("="))' | sudo tee /etc/mini-tunnel/relay-ticket-key >/dev/null
+```
+
+Transfer the generated value securely to the other host without printing it in a shared terminal or shell history. The services receive a private runtime copy under systemd's credential directory; their environments contain only its path. Do not put key values in environment files, unit files, command-line arguments, source control, or logs. Environment-based key configuration remains supported for non-systemd deployments.
+
+During key rotation, provision `/etc/mini-tunnel/previous-relay-ticket-key` on each Relay host with root ownership and mode `0600`, add `LoadCredential=previous-relay-ticket-key:/etc/mini-tunnel/previous-relay-ticket-key` and `Environment=MINI_TUNNEL_RELAY_PREVIOUS_TICKET_KEY_FILE=%d/previous-relay-ticket-key` to the Relay unit, and restart it with the new current key credential while the Coordinator still uses the old key. Then switch the Coordinator credential to the new key, wait at least the maximum ticket lifetime (currently two minutes) plus deployment margin, remove the previous-key unit directives and file, and restart the Relay. Protect and transfer both files as secrets.
 
 For PostgreSQL mode, add `MINI_TUNNEL_COORDINATOR_DATABASE_URL` to the protected `coordinator.env` file and use `mini-tunnel-coordinator-postgres.service` instead of the JSON-file unit. The URL should use `sslmode=verify-full`; do not set `MINI_TUNNEL_COORDINATOR_STATE` or pass `--state-file` in this mode. First run `mini-tunnel coordinator migrate-postgres` with a separate schema-owner environment file. Then change `coordinator.env` to the restricted runtime database role that has only schema usage and table DML rights (including `UPDATE` on the transaction-lock row and DML on `mini_tunnel_rate_limit_buckets`). Keep migration credentials out of the running service environment. The shared per-source request limiter fails closed when PostgreSQL is unavailable.
 

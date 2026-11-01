@@ -74,6 +74,11 @@ def main() -> None:
                 raise SystemExit(
                     f"{unit}: local reverse proxy CIDR must be trusted for client rate limits"
                 )
+        credentials = values.get("LoadCredential", "")
+        if credentials != "relay-ticket-key:/etc/mini-tunnel/relay-ticket-key":
+            raise SystemExit(f"{unit}: relay signing key must use a systemd credential")
+        if values.get("Environment") != "MINI_TUNNEL_RELAY_TICKET_KEY_FILE=%d/relay-ticket-key":
+            raise SystemExit(f"{unit}: relay signing key credential path must be configured")
         print(f"{unit}: sandbox settings verified")
 
 

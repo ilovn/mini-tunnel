@@ -1,7 +1,7 @@
 use std::{
     future::Future,
     net::{Ipv4Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
     time::Duration,
 };
@@ -675,6 +675,36 @@ fn default_coordinator_state_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("mini-tunnel-state.json"))
 }
 
+fn decode_ticket_key(value: &str, source: &str) -> Result<[u8; 32], String> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value.trim())
+        .map_err(|_| format!("{source} must be base64url encoding of exactly 32 bytes"))?;
+    <[u8; 32]>::try_from(bytes)
+        .map_err(|_| format!("{source} must be base64url encoding of exactly 32 bytes"))
+}
+
+fn load_ticket_key(
+    encoded_environment_value: Option<&str>,
+    credential_file: Option<&Path>,
+    environment_name: &str,
+    file_environment_name: &str,
+) -> Result<Option<[u8; 32]>, String> {
+    if let Some(path) = credential_file {
+        let contents = std::fs::read_to_string(path).map_err(|_| {
+            format!("could not read the ticket key credential named by {file_environment_name}")
+        })?;
+        return decode_ticket_key(&contents, file_environment_name).map(Some);
+    }
+
+    encoded_environment_value
+        .map(|value| decode_ticket_key(value, environment_name))
+        .transpose()
+}
+
+fn ticket_key_file_from_env(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name).map(PathBuf::from)
+}
+
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match cli.command {
         Command::Coordinator { command } => match command {
@@ -686,14 +716,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 tls_reload_interval_seconds,
                 trusted_proxies,
             } => {
-                let relay_key = std::env::var("MINI_TUNNEL_RELAY_TICKET_KEY")
-                    .ok()
-                    .map(|value| {
-                        URL_SAFE_NO_PAD.decode(value).ok()
-                            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-                            .ok_or_else(|| "MINI_TUNNEL_RELAY_TICKET_KEY must be base64url encoding of exactly 32 bytes".to_owned())
-                    })
-                    .transpose()?;
+                let relay_key = load_ticket_key(
+                    std::env::var("MINI_TUNNEL_RELAY_TICKET_KEY")
+                        .ok()
+                        .as_deref(),
+                    ticket_key_file_from_env("MINI_TUNNEL_RELAY_TICKET_KEY_FILE").as_deref(),
+                    "MINI_TUNNEL_RELAY_TICKET_KEY",
+                    "MINI_TUNNEL_RELAY_TICKET_KEY_FILE",
+                )?;
                 let tls_files = match (tls_cert, tls_key) {
                     (Some(certificate), Some(private_key)) => Some((certificate, private_key)),
                     (None, None) => None,
@@ -843,21 +873,22 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 max_session_bytes,
                 shutdown_grace_seconds,
             } => {
-                let key = std::env::var("MINI_TUNNEL_RELAY_TICKET_KEY")
-                    .map_err(|_| "MINI_TUNNEL_RELAY_TICKET_KEY is required for relay service")?;
-                let key = URL_SAFE_NO_PAD.decode(key)?;
-                let key: [u8; 32] = key
-                    .try_into()
-                    .map_err(|_| "relay ticket key must decode to exactly 32 bytes")?;
-                let previous_key =
-                    if let Some(previous) = previous_ticket_key {
-                        let previous = URL_SAFE_NO_PAD.decode(previous)?;
-                        Some(<[u8; 32]>::try_from(previous).map_err(
-                            |_| "previous relay ticket key must decode to exactly 32 bytes",
-                        )?)
-                    } else {
-                        None
-                    };
+                let key = load_ticket_key(
+                    std::env::var("MINI_TUNNEL_RELAY_TICKET_KEY").ok().as_deref(),
+                    ticket_key_file_from_env("MINI_TUNNEL_RELAY_TICKET_KEY_FILE").as_deref(),
+                    "MINI_TUNNEL_RELAY_TICKET_KEY",
+                    "MINI_TUNNEL_RELAY_TICKET_KEY_FILE",
+                )?
+                .ok_or_else(|| {
+                    "MINI_TUNNEL_RELAY_TICKET_KEY or MINI_TUNNEL_RELAY_TICKET_KEY_FILE is required for relay service".to_owned()
+                })?;
+                let previous_key = load_ticket_key(
+                    previous_ticket_key.as_deref(),
+                    ticket_key_file_from_env("MINI_TUNNEL_RELAY_PREVIOUS_TICKET_KEY_FILE")
+                        .as_deref(),
+                    "MINI_TUNNEL_RELAY_PREVIOUS_TICKET_KEY",
+                    "MINI_TUNNEL_RELAY_PREVIOUS_TICKET_KEY_FILE",
+                )?;
                 let mut config = mini_tunnel_relay::RelayConfig::new(key)
                     .with_max_session_bytes(max_session_bytes)
                     .with_max_connections(max_connections)
@@ -4101,6 +4132,70 @@ fn print_tunnel_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn secret_fixture(contents: &str) -> (PathBuf, PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "mini-tunnel-secret-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("ticket-key");
+        std::fs::write(&path, contents).unwrap();
+        (directory, path)
+    }
+
+    #[test]
+    fn ticket_key_credential_file_takes_precedence_and_trims_whitespace() {
+        let expected = [0x42; 32];
+        let (directory, path) =
+            secret_fixture(&format!(" \n{}\n\t", URL_SAFE_NO_PAD.encode(expected)));
+        let actual = load_ticket_key(
+            Some("this environment value must not be used"),
+            Some(&path),
+            "TICKET_KEY",
+            "TICKET_KEY_FILE",
+        )
+        .unwrap();
+        assert_eq!(actual, Some(expected));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ticket_key_environment_value_remains_supported_and_trims_whitespace() {
+        let expected = [0x24; 32];
+        let encoded = format!("\n{} \t", URL_SAFE_NO_PAD.encode(expected));
+        assert_eq!(
+            load_ticket_key(Some(&encoded), None, "TICKET_KEY", "TICKET_KEY_FILE").unwrap(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn ticket_key_credential_file_errors_do_not_disclose_secret_contents() {
+        let (directory, missing_path) = secret_fixture("unused");
+        std::fs::remove_file(&missing_path).unwrap();
+        let missing_error =
+            load_ticket_key(None, Some(&missing_path), "TICKET_KEY", "TICKET_KEY_FILE")
+                .unwrap_err();
+        assert!(missing_error.contains("TICKET_KEY_FILE"));
+
+        std::fs::write(&missing_path, "not-a-ticket-key").unwrap();
+        let malformed_error =
+            load_ticket_key(None, Some(&missing_path), "TICKET_KEY", "TICKET_KEY_FILE")
+                .unwrap_err();
+        assert!(malformed_error.contains("TICKET_KEY_FILE"));
+        assert!(!malformed_error.contains("not-a-ticket-key"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ticket_key_environment_value_is_optional_for_coordinator() {
+        assert_eq!(
+            load_ticket_key(None, None, "TICKET_KEY", "TICKET_KEY_FILE").unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn stun_servers_are_deduplicated_and_bounded() {
