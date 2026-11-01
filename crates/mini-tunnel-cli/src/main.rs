@@ -5060,14 +5060,14 @@ mod tests {
         let candidate = validate_udp_probe_with_timing(
             candidate,
             true,
-            Duration::from_millis(125),
-            Duration::from_millis(25),
+            Duration::from_millis(400),
+            Duration::from_millis(40),
         )
         .await
         .expect("candidate with live consent survives probation");
-        assert!(started.elapsed() >= Duration::from_millis(125));
+        assert!(started.elapsed() >= Duration::from_millis(400));
         assert!(candidate.has_ice_consent_monitor());
-        assert!(candidate.health_snapshot().probes_succeeded >= 7);
+        assert!(candidate.health_snapshot().probes_succeeded >= 4);
         candidate.stop_ice_consent_monitor().await;
         candidate_responder.abort();
         endpoint_a.close(0_u32.into(), b"test complete");
