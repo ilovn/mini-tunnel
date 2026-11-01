@@ -37,6 +37,7 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build and package
+        shell: bash
         run: |
           set -euo pipefail
           cargo build --locked --release --bin mini-tunnel
