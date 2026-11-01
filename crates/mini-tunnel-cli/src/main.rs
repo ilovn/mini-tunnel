@@ -4150,13 +4150,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn passive_ice_recovery_refreshes_credentials_and_checks_member_identity() {
+    async fn mesh_recovery_connector_uses_fresh_ice_credentials_and_checks_member_identity() {
         let temp =
             std::env::temp_dir().join(format!("mini-tunnel-refresh-ice-{}", uuid::Uuid::new_v4()));
         let identity = mini_tunnel_agent::Identity::load_or_create_at(temp.join("device.key"))
             .expect("local identity");
-        let peer_identity = mini_tunnel_agent::Identity::load_or_create_at(temp.join("peer.key"))
-            .expect("peer identity");
+        let mut peer_identity =
+            mini_tunnel_agent::Identity::load_or_create_at(temp.join("peer.key"))
+                .expect("peer identity");
+        let mut identity_paths = vec![temp.join("peer.key")];
+        while identity.device_id() > peer_identity.device_id() {
+            let path = temp.join(format!("peer-{}.key", identity_paths.len()));
+            peer_identity = mini_tunnel_agent::Identity::load_or_create_at(path.clone())
+                .expect("peer identity with outbound recovery ordering");
+            identity_paths.push(path);
+        }
         let local_credentials =
             mini_tunnel_agent::ice::generate_ice_credentials(1).expect("local ICE credentials");
         let old_credentials =
@@ -4237,37 +4245,21 @@ mod tests {
             candidates: vec![local_address.to_string()],
             ice_credentials: Some(local_credentials),
         };
-        let (recovered_address, peer_selected_address) = tokio::join!(
-            select_current_ice_peer_address(
-                &local_endpoint,
-                &base_url,
-                "restart-net",
-                &expected_peer,
-                &identity,
+        let (recovery_connector, _, _) = build_mesh_peer_connectors(
+            local_endpoint.clone(),
+            std::sync::Arc::new(
+                mini_tunnel_agent::Identity::load_or_create_at(temp.join("device.key"))
+                    .expect("reload local identity"),
             ),
-            select_ice_peer_address(&peer_endpoint, &local_peer, &peer_identity),
+            "restart-net".to_owned(),
+            base_url.clone(),
+            expected_peer.clone(),
+            None,
         );
-        assert_eq!(
-            recovered_address.map(|(address, monitor)| {
-                drop(monitor);
-                address
-            }),
-            Some(peer_address)
-        );
-        assert_eq!(
-            peer_selected_address.map(|(address, monitor)| {
-                drop(monitor);
-                address
-            }),
-            Some(local_address)
-        );
-
-        let peer_id = peer_identity.device_id();
-        let peer_key = peer_identity.public_key();
         let local_id = identity.device_id();
         let local_key = identity.public_key();
         let server_endpoint = peer_endpoint.endpoint.clone();
-        let peer_identity_path = temp.join("peer.key");
+        let peer_identity_path = identity_paths.last().expect("peer identity path").clone();
         let accept = tokio::spawn(async move {
             let peer_identity = mini_tunnel_agent::Identity::load_or_create_at(peer_identity_path)
                 .expect("reload peer identity");
@@ -4280,16 +4272,19 @@ mod tests {
             )
             .await
         });
-        let channel_local = mini_tunnel_agent::connect_peer(
-            &local_endpoint.endpoint,
-            peer_address,
-            "restart-net",
-            &identity,
-            &peer_id,
-            peer_key,
-        )
-        .await
-        .expect("connect after refreshing ICE credentials");
+        let (peer_selected_address, recovered) = tokio::join!(
+            select_ice_peer_address(&peer_endpoint, &local_peer, &peer_identity),
+            recovery_connector(false),
+        );
+        assert_eq!(
+            peer_selected_address.map(|(address, monitor)| {
+                drop(monitor);
+                address
+            }),
+            Some(local_address)
+        );
+        let channel_local =
+            recovered.expect("mesh recovery connector reconnects from fresh snapshot");
         let channel_peer = accept.await.expect("accept task").expect("accept peer");
         channel_local
             .send_packet(b"coordinator-refreshed-ice")
@@ -4309,6 +4304,16 @@ mod tests {
         changed_member.assigned_ipv4 = "10.77.0.9".to_owned();
         assert!(
             refresh_peer_snapshot_for_ice(&base_url, "restart-net", &changed_member, &identity,)
+                .await
+                .is_err()
+        );
+        let mut changed_key = expected_peer.clone();
+        changed_key.public_key =
+            mini_tunnel_agent::Identity::load_or_create_at(temp.join("other-member.key"))
+                .expect("other member identity")
+                .public_key_encoded();
+        assert!(
+            refresh_peer_snapshot_for_ice(&base_url, "restart-net", &changed_key, &identity,)
                 .await
                 .is_err()
         );
