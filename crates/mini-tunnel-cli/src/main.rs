@@ -3275,6 +3275,7 @@ async fn run_peer_mesh(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let interface = tun.name()?;
+    let ipv6_enabled = tun.local_ipv6().is_some();
     let runner = SystemRouteRunner;
     let mut routes: std::collections::HashMap<Ipv4Addr, RouteLease> =
         std::collections::HashMap::new();
@@ -3299,45 +3300,58 @@ async fn run_peer_mesh(
                     return Err(error.into());
                 }
             }
-            match install_peer_ipv6_route(
-                &runner,
-                RoutingPlatform::current(),
-                &interface,
-                peer_ipv6,
-            )
-            .await
-            {
-                Ok(route) => {
-                    routes_v6.insert(peer_ipv6, route);
-                }
-                Err(error) => {
-                    if let Some(route) = routes.remove(&peer_ipv4) {
-                        let _ = route.remove(&runner).await;
+            if let Some(peer_ipv6) = mesh_peer_ipv6_address(ipv6_enabled, peer_ipv6) {
+                match install_peer_ipv6_route(
+                    &runner,
+                    RoutingPlatform::current(),
+                    &interface,
+                    peer_ipv6,
+                )
+                .await
+                {
+                    Ok(route) => {
+                        routes_v6.insert(peer_ipv6, route);
                     }
-                    for route in routes_v6.drain().map(|(_, route)| route) {
-                        let _ = route.remove(&runner).await;
+                    Err(error) => {
+                        if let Some(route) = routes.remove(&peer_ipv4) {
+                            let _ = route.remove(&runner).await;
+                        }
+                        for route in routes_v6.drain().map(|(_, route)| route) {
+                            let _ = route.remove(&runner).await;
+                        }
+                        for route in routes.drain().map(|(_, route)| route) {
+                            let _ = route.remove(&runner).await;
+                        }
+                        return Err(error.into());
                     }
-                    for route in routes.drain().map(|(_, route)| route) {
-                        let _ = route.remove(&runner).await;
-                    }
-                    return Err(error.into());
                 }
             }
         }
-        println!(
-            "Mesh peer {device_id} {peer_ipv4} ({peer_ipv6}) via {} at {remote}",
-            channel.transport_name()
-        );
+        let peer_ipv6 = mesh_peer_ipv6_address(ipv6_enabled, peer_ipv6);
+        if let Some(peer_ipv6) = peer_ipv6 {
+            println!(
+                "Mesh peer {device_id} {peer_ipv4} ({peer_ipv6}) via {} at {remote}",
+                channel.transport_name()
+            );
+        } else {
+            println!(
+                "Mesh peer {device_id} {peer_ipv4} via {} at {remote}",
+                channel.transport_name()
+            );
+        }
         reconnecting_peers.push(mini_tunnel_agent::tunnel::ReconnectingPeer {
             address: peer_ipv4,
-            ipv6_address: Some(peer_ipv6),
+            ipv6_address: peer_ipv6,
             channel: std::sync::Arc::new(channel),
             connector,
             probe: Some(probe),
             probe_cooldown: Duration::from_secs(60),
         });
     }
-    println!("Mesh established on TUN interface {interface} (IPv4/IPv6)");
+    println!(
+        "Mesh established on TUN interface {interface} ({})",
+        mesh_address_family_label(ipv6_enabled)
+    );
     let (pump_updates_tx, pump_updates_rx) = tokio::sync::mpsc::channel(64);
     let pump =
         mini_tunnel_agent::tunnel::pump_peer_mesh_dynamic(tun, reconnecting_peers, pump_updates_rx);
@@ -3432,6 +3446,21 @@ async fn run_peer_mesh(
         return Err(error.into());
     }
     tunnel_result
+}
+
+fn mesh_peer_ipv6_address(
+    local_ipv6_enabled: bool,
+    peer_ipv6: std::net::Ipv6Addr,
+) -> Option<std::net::Ipv6Addr> {
+    local_ipv6_enabled.then_some(peer_ipv6)
+}
+
+fn mesh_address_family_label(ipv6_enabled: bool) -> &'static str {
+    if ipv6_enabled {
+        "IPv4/IPv6"
+    } else {
+        "IPv4 only"
+    }
 }
 
 #[derive(Clone)]
@@ -4447,6 +4476,16 @@ fn print_tunnel_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mesh_uses_only_ip_families_available_on_its_tun() {
+        let peer_ipv6 = "fd00::2".parse().unwrap();
+
+        assert_eq!(mesh_address_family_label(true), "IPv4/IPv6");
+        assert_eq!(mesh_peer_ipv6_address(true, peer_ipv6), Some(peer_ipv6));
+        assert_eq!(mesh_address_family_label(false), "IPv4 only");
+        assert_eq!(mesh_peer_ipv6_address(false, peer_ipv6), None);
+    }
 
     #[test]
     fn tun_uses_ipv4_only_when_optional_ipv6_setup_is_denied() {
