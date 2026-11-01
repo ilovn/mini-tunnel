@@ -524,6 +524,16 @@ async fn peer_status() -> axum::Json<Vec<mini_tunnel_agent::status::PeerStatus>>
     axum::Json(mini_tunnel_agent::status::snapshot())
 }
 
+async fn peer_metrics() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        mini_tunnel_agent::status::prometheus(),
+    )
+}
+
 fn validate_status_address(address: SocketAddr) -> Result<(), &'static str> {
     if address.ip().is_loopback() {
         Ok(())
@@ -540,8 +550,10 @@ async fn spawn_peer_status_server()
     validate_status_address(address)?;
     let listener = tokio::net::TcpListener::bind(address).await?;
     let address = listener.local_addr()?;
-    println!("Live peer status available at http://{address}/status");
-    let app = Router::new().route("/status", get(peer_status));
+    println!("Live peer status available at http://{address}/status and /metrics");
+    let app = Router::new()
+        .route("/status", get(peer_status))
+        .route("/metrics", get(peer_metrics));
     Ok(tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app).await {
             tracing::error!(%error, "peer status listener stopped");
@@ -4830,7 +4842,13 @@ mod tests {
             .expect("bind status listener");
         let address = listener.local_addr().expect("status listener address");
         let server = tokio::spawn(async move {
-            axum::serve(listener, Router::new().route("/status", get(peer_status))).await
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/status", get(peer_status))
+                    .route("/metrics", get(peer_metrics)),
+            )
+            .await
         });
         let response = reqwest::get(format!("http://{address}/status"))
             .await
@@ -4854,6 +4872,23 @@ mod tests {
         );
         assert!(!body.contains("credential"));
         assert!(!body.contains("candidate"));
+
+        let metrics_response = reqwest::get(format!("http://{address}/metrics"))
+            .await
+            .expect("query aggregate peer metrics")
+            .error_for_status()
+            .expect("metrics response");
+        assert_eq!(
+            metrics_response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain; version=0.0.4; charset=utf-8")
+        );
+        let metrics = metrics_response.text().await.expect("metrics body");
+        assert!(metrics.contains("mini_tunnel_peer_online_count"));
+        assert!(metrics.contains("mini_tunnel_peer_rtt_ms_max"));
+        assert!(!metrics.contains(&peer));
         server.abort();
     }
 
