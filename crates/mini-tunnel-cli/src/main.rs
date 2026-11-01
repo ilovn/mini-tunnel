@@ -1316,6 +1316,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         });
                     }
                     let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::channel(64);
+                    let require_ice_consent = endpoint.ice.is_some();
                     let allowed_members = peers
                         .iter()
                         .map(|peer| {
@@ -1418,6 +1419,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         mini_tunnel_agent::tunnel::PeerConnector,
                         mini_tunnel_agent::tunnel::PeerConnector,
                     )> = Vec::new();
+                    let mut pending_accepted_channels = std::collections::HashMap::new();
+                    let mut pending_ice_monitors = std::collections::HashMap::new();
                     let mut accept_finished = accept_tasks.is_empty();
                     let startup_deadline = tokio::time::Instant::now() + Duration::from_secs(45);
                     let mut first_peer_at = None;
@@ -1437,6 +1440,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     Some((peer, channel, remote)) => {
                                         if connected.iter().any(|known| known.0.device_id == peer.device_id) {
                                             channel.close();
+                                        } else if require_ice_consent && channel.transport_name() == "QUIC/UDP" {
+                                            if let Some(monitor) = pending_ice_monitors.remove(&peer.device_id) {
+                                                let mut channel = channel;
+                                                channel.set_ice_consent_monitor(monitor);
+                                                println!("Connected mesh peer {} at {remote}", peer.device_id);
+                                                let connector = peer_connectors.remove(&peer.device_id).expect("peer connector exists");
+                                                let probe = peer_probes.remove(&peer.device_id).expect("peer probe exists");
+                                                connected.push((peer, channel, remote, connector, probe));
+                                                first_peer_at.get_or_insert_with(tokio::time::Instant::now);
+                                            } else if let Some((_, duplicate, _)) = pending_accepted_channels.insert(peer.device_id.clone(), (peer, channel, remote)) {
+                                                duplicate.close();
+                                            }
                                         } else {
                                             println!("Connected mesh peer {} at {remote}", peer.device_id);
                                             let connector = peer_connectors.remove(&peer.device_id).expect("peer connector exists");
@@ -1452,8 +1467,27 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 let Some(result) = result else { continue; };
                                 let (peer, keep_outbound, result) = result?;
                                 match result {
-                                    Ok((channel, remote)) => {
-                                        if keep_outbound || channel.transport_name() == "Relay/TLS" {
+                                    Ok((mut channel, remote)) => {
+                                        if !keep_outbound && require_ice_consent && channel.transport_name() == "QUIC/UDP" {
+                                            if let Some((accepted_peer, mut accepted_channel, accepted_remote)) = pending_accepted_channels.remove(&peer.device_id) {
+                                                if transfer_peer_ice_consent_monitor(&mut channel, &mut accepted_channel) {
+                                                    println!("Connected mesh peer {} at {accepted_remote}", accepted_peer.device_id);
+                                                    let connector = peer_connectors.remove(&accepted_peer.device_id).expect("peer connector exists");
+                                                    let probe = peer_probes.remove(&accepted_peer.device_id).expect("peer probe exists");
+                                                    connected.push((accepted_peer, accepted_channel, accepted_remote, connector, probe));
+                                                    first_peer_at.get_or_insert_with(tokio::time::Instant::now);
+                                                } else {
+                                                    accepted_channel.close();
+                                                    eprintln!("Peer {} direct ICE session had no consent monitor; waiting for reliable fallback", peer.device_id);
+                                                }
+                                            } else if let Some(monitor) = channel.take_ice_consent_monitor() {
+                                                channel.close();
+                                                pending_ice_monitors.insert(peer.device_id.clone(), monitor);
+                                            } else {
+                                                channel.close();
+                                                eprintln!("Peer {} direct ICE session had no consent monitor; waiting for reliable fallback", peer.device_id);
+                                            }
+                                        } else if keep_outbound || channel.transport_name() == "Relay/TLS" {
                                             if connected.iter().any(|known| known.0.device_id == peer.device_id) {
                                                 channel.close();
                                             } else {
@@ -1475,6 +1509,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             _ = tokio::time::sleep_until(settle_deadline), if first_peer_at.is_some() => break,
                             _ = tokio::time::sleep_until(startup_deadline), if first_peer_at.is_none() => break,
                         }
+                    }
+                    for (_, (_, channel, _)) in pending_accepted_channels.drain() {
+                        channel.close();
+                    }
+                    for (_, monitor) in pending_ice_monitors.drain() {
+                        monitor.stop().await;
                     }
                     if connected.is_empty() {
                         println!(
@@ -2393,7 +2433,7 @@ async fn connect_mesh_peer(
         }
     }
     let candidates = candidates_for_path(&peer.candidates, reliable_only);
-    match mini_tunnel_agent::connect_peer_candidates(
+    let direct_result = mini_tunnel_agent::connect_peer_candidates(
         &endpoint.endpoint,
         &candidates,
         network_id,
@@ -2401,8 +2441,21 @@ async fn connect_mesh_peer(
         &peer.device_id,
         peer_key,
     )
-    .await
-    {
+    .await;
+    let direct_result = match direct_result {
+        Ok((channel, _remote))
+            if endpoint.ice.is_some()
+                && channel.transport_name() == "QUIC/UDP"
+                && !channel.has_ice_consent_monitor() =>
+        {
+            channel.close();
+            Err(mini_tunnel_agent::CandidateConnectError::Unreachable(
+                "ICE-enabled UDP candidate was not nominated and has no consent monitor".into(),
+            ))
+        }
+        result => result,
+    };
+    match direct_result {
         Ok(connection) => Ok(connection),
         Err(direct_error) => {
             if matches!(
@@ -2449,6 +2502,18 @@ async fn connect_mesh_peer(
             Ok((channel, remote))
         }
     }
+}
+
+fn transfer_peer_ice_consent_monitor(
+    probe_channel: &mut mini_tunnel_agent::PeerChannel,
+    accepted_channel: &mut mini_tunnel_agent::PeerChannel,
+) -> bool {
+    let Some(monitor) = probe_channel.take_ice_consent_monitor() else {
+        return false;
+    };
+    accepted_channel.set_ice_consent_monitor(monitor);
+    probe_channel.close();
+    true
 }
 
 fn build_mesh_peer_connectors(
@@ -4997,6 +5062,117 @@ mod tests {
         active_remote.close_async().await;
         endpoint_a.close(0_u32.into(), b"test complete");
         endpoint_b.close(0_u32.into(), b"test complete");
+        std::fs::remove_dir_all(temp).expect("remove test identities");
+    }
+
+    #[tokio::test]
+    async fn elected_inbound_channel_inherits_monitor_from_reverse_probe() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-ice-monitor-transfer-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let a = std::sync::Arc::new(
+            mini_tunnel_agent::Identity::load_or_create_at(temp.join("a/key"))
+                .expect("local identity"),
+        );
+        let b = std::sync::Arc::new(
+            mini_tunnel_agent::Identity::load_or_create_at(temp.join("b/key"))
+                .expect("peer identity"),
+        );
+        let local_endpoint =
+            mini_tunnel_agent::peer_endpoint(&a, "127.0.0.1:0".parse().expect("local address"))
+                .expect("local endpoint");
+        let peer_endpoint =
+            mini_tunnel_agent::peer_endpoint(&b, "127.0.0.1:0".parse().expect("peer address"))
+                .expect("peer endpoint");
+        let local_peer_id = a.device_id();
+        let local_peer_key = a.public_key();
+        let peer_id = b.device_id();
+        let peer_key = b.public_key();
+        let accept_probe = {
+            let endpoint = peer_endpoint.clone();
+            let identity = std::sync::Arc::clone(&b);
+            let expected_peer_id = local_peer_id.clone();
+            tokio::spawn(async move {
+                mini_tunnel_agent::accept_peer(
+                    &endpoint,
+                    "ice-monitor-transfer",
+                    &identity,
+                    &expected_peer_id,
+                    local_peer_key,
+                )
+                .await
+                .expect("accept reverse probe")
+            })
+        };
+        let mut probe = mini_tunnel_agent::connect_peer(
+            &local_endpoint,
+            peer_endpoint.local_addr().expect("peer socket"),
+            "ice-monitor-transfer",
+            &a,
+            &peer_id,
+            peer_key,
+        )
+        .await
+        .expect("connect reverse probe");
+        let probe_remote = accept_probe.await.expect("join probe accept task");
+        let accept_winner = {
+            let endpoint = peer_endpoint.clone();
+            let identity = std::sync::Arc::clone(&b);
+            let expected_peer_id = local_peer_id.clone();
+            tokio::spawn(async move {
+                mini_tunnel_agent::accept_peer(
+                    &endpoint,
+                    "ice-monitor-transfer",
+                    &identity,
+                    &expected_peer_id,
+                    local_peer_key,
+                )
+                .await
+                .expect("accept elected inbound channel")
+            })
+        };
+        let mut winner = mini_tunnel_agent::connect_peer(
+            &local_endpoint,
+            peer_endpoint.local_addr().expect("peer socket"),
+            "ice-monitor-transfer",
+            &a,
+            &peer_id,
+            peer_key,
+        )
+        .await
+        .expect("connect elected data path");
+        let winner_remote = accept_winner.await.expect("join winner accept task");
+
+        let (monitor, mut cancel, failure_sender) =
+            mini_tunnel_agent::ice::IceConsentMonitor::new();
+        monitor
+            .set_task(tokio::spawn(async move {
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_millis(100)) => {
+                        failure_sender.send_replace(true);
+                    }
+                    _ = cancel.changed() => {}
+                }
+            }))
+            .await;
+        probe.set_ice_consent_monitor(monitor);
+
+        assert!(transfer_peer_ice_consent_monitor(&mut probe, &mut winner));
+        assert!(!probe.has_ice_consent_monitor());
+        assert!(winner.has_ice_consent_monitor());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), winner.wait_ice_consent_failure())
+                .await
+                .is_ok()
+        );
+
+        winner.stop_ice_consent_monitor().await;
+        winner.close_async().await;
+        winner_remote.close_async().await;
+        probe_remote.close_async().await;
+        local_endpoint.close(0_u32.into(), b"test complete");
+        peer_endpoint.close(0_u32.into(), b"test complete");
         std::fs::remove_dir_all(temp).expect("remove test identities");
     }
 

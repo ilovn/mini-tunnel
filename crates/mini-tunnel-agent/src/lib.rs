@@ -502,6 +502,14 @@ impl PeerChannel {
         self.ice_consent.is_some()
     }
 
+    /// Move this channel's nominated ICE session to another channel for the same peer path.
+    ///
+    /// This is used when an authenticated simultaneous-connect probe owns the ICE driver but
+    /// loses the mesh connection election to the peer's accepted inbound channel.
+    pub fn take_ice_consent_monitor(&mut self) -> Option<ice::IceConsentMonitor> {
+        self.ice_consent.take()
+    }
+
     /// Resolve when ICE consent expires; channels without ICE consent remain pending.
     pub async fn wait_ice_consent_failure(&self) {
         let Some(monitor) = &self.ice_consent else {
