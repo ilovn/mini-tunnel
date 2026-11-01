@@ -350,6 +350,20 @@ fn new_mesh_peer_runtime(
 
 struct MeshReceiverTasks(HashMap<Ipv4Addr, tokio::task::JoinHandle<()>>);
 
+struct AbortOnDropTask(tokio::task::JoinHandle<()>);
+
+impl AbortOnDropTask {
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+impl Drop for AbortOnDropTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 impl Deref for MeshReceiverTasks {
     type Target = HashMap<Ipv4Addr, tokio::task::JoinHandle<()>>;
 
@@ -656,7 +670,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                             let connector = Arc::clone(connector);
                             let sender = fallback_tx.clone();
                             let peer_address = address;
-                            fallback_task = Some(tokio::spawn(async move {
+                            fallback_task = Some(AbortOnDropTask(tokio::spawn(async move {
                                 let mut attempt = 0_u32;
                                 loop {
                                     tokio::time::sleep(crate::reconnect_delay(attempt)).await;
@@ -680,7 +694,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                                         ),
                                     }
                                 }
-                            }));
+                            })));
                         }
                     }
                     if let Err(error) = active.send_keepalive().await {
@@ -756,11 +770,11 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         if let Some(task) = probe_task {
             task.abort();
         }
-        if let Some(task) = fallback_task {
-            task.abort();
-        }
         let failure = match outcome {
             Ok(()) => {
+                if let Some(task) = fallback_task.take() {
+                    task.abort();
+                }
                 active.stop_ice_consent_monitor().await;
                 continue;
             }
@@ -789,6 +803,38 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
             reliable_fallback = force_reliable,
             "peer path failed; reconnecting"
         );
+        if let Some(task) = fallback_task.take() {
+            let reconnected = match fallback_rx.recv().await {
+                Some(Ok(candidate)) => Some(candidate),
+                Some(Err(error)) => {
+                    task.abort();
+                    let _ = event_tx
+                        .send(MeshEvent {
+                            address,
+                            result: Err(error),
+                            pending: None,
+                        })
+                        .await;
+                    return;
+                }
+                None => {
+                    task.abort();
+                    None
+                }
+            };
+            if let Some(reconnected) = reconnected {
+                let to_path = reconnected.transport_name();
+                tracing::info!(
+                    peer_address = %address,
+                    from_path = active.transport_name(),
+                    to_path,
+                    reliable_fallback = force_reliable,
+                    "peer reconnected using pending reliable fallback"
+                );
+                *channel.write().await = Arc::new(reconnected);
+                continue;
+            }
+        }
         if connector.is_none() {
             let _ = event_tx
                 .send(MeshEvent {
@@ -2063,6 +2109,7 @@ mod tests {
             accept_tcp_peer_any(&tcp_listener, network, &accept_identity, &allowed).await
         });
         let requested_reliable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reliable_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (fallback_started_tx, mut fallback_started_rx) = mpsc::channel(1);
         let (fallback_release_tx, fallback_release_rx) = tokio::sync::oneshot::channel();
         let fallback_release = Arc::new(std::sync::Mutex::new(Some(fallback_release_rx)));
@@ -2071,12 +2118,14 @@ mod tests {
             let b_id = b.device_id();
             let b_key = b.public_key();
             let requested_reliable = Arc::clone(&requested_reliable);
+            let reliable_attempts = Arc::clone(&reliable_attempts);
             let fallback_started_tx = fallback_started_tx.clone();
             let fallback_release = Arc::clone(&fallback_release);
             Arc::new(move |force_reliable| -> PeerConnectFuture {
                 let a = Arc::clone(&a);
                 let b_id = b_id.clone();
                 let requested_reliable = Arc::clone(&requested_reliable);
+                let reliable_attempts = Arc::clone(&reliable_attempts);
                 let fallback_started_tx = fallback_started_tx.clone();
                 let release = if force_reliable {
                     fallback_release.lock().unwrap().take()
@@ -2086,6 +2135,7 @@ mod tests {
                 Box::pin(async move {
                     requested_reliable.store(force_reliable, Ordering::SeqCst);
                     if force_reliable {
+                        reliable_attempts.fetch_add(1, Ordering::SeqCst);
                         fallback_started_tx
                             .send(())
                             .await
@@ -2185,6 +2235,21 @@ mod tests {
                 .is_err(),
             "fallback must not be considered ready before authentication completes"
         );
+        remote_initial.close_async().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if crate::status::snapshot().into_iter().any(|status| {
+                    status.peer == peer_ip.to_string()
+                        && !status.online
+                        && status.active_path == "QUIC/UDP"
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("closed UDP path should enter reconnect while retaining fallback task");
         fallback_release_tx
             .send(())
             .expect("release reliable fallback connector");
@@ -2196,6 +2261,11 @@ mod tests {
             .unwrap()
             .1;
         assert!(requested_reliable.load(Ordering::SeqCst));
+        assert_eq!(
+            reliable_attempts.load(Ordering::SeqCst),
+            1,
+            "the pending authenticated fallback must survive loss of the old path"
+        );
         let fallback_status = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if let Some(status) = crate::status::snapshot().into_iter().find(|status| {
