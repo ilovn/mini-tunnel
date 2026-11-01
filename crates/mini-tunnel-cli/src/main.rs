@@ -26,6 +26,8 @@ use mini_tunnel_protocol::{
 };
 use serde::Deserialize;
 
+const PEER_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Parser)]
 #[command(name = "mini-tunnel", version, about = "A minimal peer-to-peer tunnel")]
 struct Cli {
@@ -1569,8 +1571,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     peer_key,
                 )
                 .await?;
-                let packet = channel.recv_packet().await?;
-                println!("Received authenticated datagram ({} bytes)", packet.len());
+                let packet =
+                    receive_and_echo_peer_diagnostic(&channel, PEER_DIAGNOSTIC_TIMEOUT).await?;
+                println!(
+                    "Received and echoed authenticated datagram ({} bytes)",
+                    packet.len()
+                );
             }
             PeerCommand::Send {
                 bind,
@@ -1592,8 +1598,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     peer_key,
                 )
                 .await?;
-                channel.send_packet(message.as_bytes()).await?;
-                println!("Sent authenticated datagram ({} bytes)", message.len());
+                send_peer_diagnostic_and_wait_for_echo(&channel, message.as_bytes()).await?;
+                println!(
+                    "Peer confirmed authenticated datagram ({} bytes)",
+                    message.len()
+                );
             }
         },
         Command::Network { command } => match command {
@@ -1777,6 +1786,35 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         },
     }
+    Ok(())
+}
+
+async fn receive_and_echo_peer_diagnostic(
+    channel: &mini_tunnel_agent::PeerChannel,
+    linger: Duration,
+) -> Result<Vec<u8>, mini_tunnel_agent::IdentityError> {
+    let packet = tokio::time::timeout(PEER_DIAGNOSTIC_TIMEOUT, channel.recv_packet())
+        .await
+        .map_err(|_| {
+            mini_tunnel_agent::IdentityError::Transport(
+                "peer diagnostic receive timed out".to_owned(),
+            )
+        })??;
+    channel.send_packet(&packet).await?;
+    tokio::time::sleep(linger).await;
+    Ok(packet)
+}
+
+async fn send_peer_diagnostic_and_wait_for_echo(
+    channel: &mini_tunnel_agent::PeerChannel,
+    message: &[u8],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    channel.send_packet(message).await?;
+    let echoed = tokio::time::timeout(PEER_DIAGNOSTIC_TIMEOUT, channel.recv_packet()).await??;
+    if echoed != message {
+        return Err("peer diagnostic echo did not match the sent message".into());
+    }
+    channel.close();
     Ok(())
 }
 
@@ -4143,6 +4181,75 @@ mod tests {
         let path = directory.join("ticket-key");
         std::fs::write(&path, contents).unwrap();
         (directory, path)
+    }
+
+    #[tokio::test]
+    async fn peer_diagnostic_waits_for_authenticated_echo_before_succeeding() {
+        let directory = std::env::temp_dir().join(format!(
+            "mini-tunnel-peer-diagnostic-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let identity_a =
+            mini_tunnel_agent::Identity::load_or_create_at(directory.join("a/device.key"))
+                .expect("create first identity");
+        let identity_b =
+            mini_tunnel_agent::Identity::load_or_create_at(directory.join("b/device.key"))
+                .expect("create second identity");
+        let endpoint_a = mini_tunnel_agent::peer_endpoint(
+            &identity_a,
+            "127.0.0.1:0".parse().expect("parse bind address"),
+        )
+        .expect("bind client endpoint");
+        let endpoint_b = mini_tunnel_agent::peer_endpoint(
+            &identity_b,
+            "127.0.0.1:0".parse().expect("parse bind address"),
+        )
+        .expect("bind server endpoint");
+        let address_b = endpoint_b.local_addr().expect("read server endpoint");
+        let network_id = format!("peer-diagnostic-{}", uuid::Uuid::new_v4());
+        let expected_client_id = identity_a.device_id();
+        let expected_client_key = identity_a.public_key();
+        let expected_server_id = identity_b.device_id();
+        let expected_server_key = identity_b.public_key();
+        let server_network_id = network_id.clone();
+        let server_task = tokio::spawn(async move {
+            let channel = mini_tunnel_agent::accept_peer(
+                &endpoint_b,
+                &server_network_id,
+                &identity_b,
+                &expected_client_id,
+                expected_client_key,
+            )
+            .await?;
+            receive_and_echo_peer_diagnostic(&channel, Duration::from_millis(100)).await
+        });
+
+        let channel = mini_tunnel_agent::connect_peer(
+            &endpoint_a,
+            address_b,
+            &network_id,
+            &identity_a,
+            &expected_server_id,
+            expected_server_key,
+        )
+        .await
+        .expect("connect authenticated peer");
+        let message = b"diagnostic echo confirms delivery";
+        send_peer_diagnostic_and_wait_for_echo(&channel, message)
+            .await
+            .expect("wait for peer echo");
+        assert_eq!(
+            server_task
+                .await
+                .expect("join server task")
+                .expect("receive and echo"),
+            message
+        );
+
+        channel.close();
+        endpoint_a.close(0_u32.into(), b"diagnostic complete");
+        std::fs::remove_dir_all(directory).expect("remove identities");
     }
 
     #[test]
