@@ -2,6 +2,10 @@
 
 Status: **not yet executed**. The loopback ICE mapping proxy verifies packet rewriting and session behavior, but it does not establish interoperability across public NATs. Do not mark this matrix complete until the evidence below is collected from two independent, real client networks.
 
+## Preliminary single-client observation (not matrix evidence)
+
+On 2026-11-01, one UDP socket on the development host sent STUN Binding requests to `stun.l.google.com:19302` and `global.stun.twilio.com:3478`. Both returned valid responses with the same XOR-MAPPED IPv4 address and port. The mapped endpoint is intentionally omitted. This only records the mapping seen by one client for those two STUN destinations at that time; it does not classify the NAT, establish behavior toward a peer destination, or prove ICE/direct tunnel connectivity. It does not satisfy any matrix case above, and the matrix remains unexecuted.
+
 ## Prerequisites
 
 - Two Linux devices, A and B, each behind a different physical NAT and public egress address. A cloud VM pair on the same virtual network does not count as two independent NATs.
