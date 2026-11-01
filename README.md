@@ -10,6 +10,19 @@ Still in progress: full public ICE interoperability, public NAT/QoS validation, 
 
 ## Quick start
 
+### Install a prebuilt Linux binary
+
+Linux x86_64 users do not need Rust or Cargo on the target machine. Download the `mini-tunnel-linux-x86_64-ubuntu20.04` artifact from a successful [GitHub Actions CI run](https://github.com/ilovn/mini-tunnel/actions/workflows/ci.yml), then verify and install it:
+
+```sh
+sha256sum --check mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz.sha256
+tar -xzf mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz
+sudo install -m 0755 mini-tunnel /usr/local/bin/mini-tunnel
+mini-tunnel --version
+```
+
+The binary is built in an Ubuntu 20.04 environment and targets glibc 2.31 or newer. The target needs `libc` and `libgcc` (normally already present on Ubuntu); it does not need a compiler or Rust toolchain. This artifact is for Linux x86_64 only. macOS and Windows users can build from source or use their platform-specific CI builds when available.
+
 Start the coordinator:
 
 ```sh

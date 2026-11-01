@@ -15,6 +15,56 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  linux-release:
+    name: Linux x86_64 release binary (Ubuntu 20.04 baseline)
+    runs-on: ubuntu-latest
+    container: ubuntu:20.04
+    timeout-minutes: 45
+    steps:
+      - name: Install build prerequisites
+        run: |
+          # Ubuntu 20.04 is past standard support; its archived package mirror
+          # keeps the reproducible glibc 2.31 build environment available.
+          sed -i 's|archive.ubuntu.com|old-releases.ubuntu.com|g; s|security.ubuntu.com|old-releases.ubuntu.com|g' /etc/apt/sources.list
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
+            build-essential ca-certificates curl pkg-config tar gzip
+
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install stable Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 --fail --location https://sh.rustup.rs -o /tmp/rustup-init.sh
+          sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build and package
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --bin mini-tunnel
+          mkdir -p dist
+          install -m 0755 target/release/mini-tunnel dist/mini-tunnel
+          dist/mini-tunnel --version
+          dist/mini-tunnel --help >/dev/null
+          ldd dist/mini-tunnel
+          if ldd dist/mini-tunnel | grep -q 'not found'; then
+            echo 'Unresolved runtime library dependency' >&2
+            exit 1
+          fi
+          tar -C dist -czf mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz mini-tunnel
+          sha256sum mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz > mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz.sha256
+
+      - name: Upload Linux x86_64 release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mini-tunnel-linux-x86_64-ubuntu20.04
+          path: |
+            mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz
+            mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
   postgres-integration:
     name: PostgreSQL integration
     runs-on: ubuntu-latest
