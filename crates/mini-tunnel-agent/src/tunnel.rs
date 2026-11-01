@@ -1763,11 +1763,19 @@ mod tests {
             .send(packet(local_ip, peer_ip, 28))
             .await
             .expect("queue overlay packet for recovered peer");
-        let forwarded =
-            tokio::time::timeout(Duration::from_secs(3), recovered_remote.recv_packet())
-                .await
-                .expect("recovered TCP path did not forward the packet")
-                .expect("receive forwarded overlay packet");
+        let forwarded = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let packet = recovered_remote
+                    .recv_packet()
+                    .await
+                    .expect("receive forwarded overlay packet");
+                if !packet.is_empty() {
+                    break packet;
+                }
+            }
+        })
+        .await
+        .expect("recovered TCP path did not forward the packet");
         assert_eq!(forwarded, packet(local_ip, peer_ip, 28));
 
         pump.abort();
