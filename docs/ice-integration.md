@@ -18,6 +18,8 @@ The ICE driver sends its outbound checks through the same underlying bound socke
 
 After nomination, consent checks use a 5-second base interval. The bundled `rtc-ice` agent independently randomizes each following interval between 0.8 and 1.2 times that base (4–6 seconds) using its cryptographic random provider, as required by RFC 7675. It marks the selected path disconnected after 15 seconds without a valid response and failed at the 30-second consent expiry. The monitor is owned by its `PeerChannel`; consent expiry enters the same path recovery loop as a QUIC transport failure, and stopping/replacing a channel cancels the monitor and unregisters its ufrag session. This is layered on top of authenticated QUIC keepalives, so overlay data still uses the existing encrypted transport.
 
+When upgrading a working TCP/relay mesh path to UDP with ICE enabled, the candidate must first pass authenticated QUIC health probes and then retain ICE consent for 31 seconds before replacing the current channel. This exceeds the agent's 30-second failed timeout; an expired or missing consent monitor rejects the candidate while the reliable channel remains active. Without ICE, the existing short health-probe promotion path is unchanged.
+
 The socket adapter must preserve Quinn's packet metadata and readiness behavior. Intercepting one packet in a batched receive must compact the remaining datagrams and metadata correctly. ICE queue saturation drops the check input and lets the agent retransmit according to its bounded timer schedule; it must never block Quinn's receive path.
 
 ## Signaling and compatibility

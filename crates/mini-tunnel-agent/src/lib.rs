@@ -496,6 +496,12 @@ impl PeerChannel {
         self.ice_consent = Some(monitor);
     }
 
+    /// Return whether this channel is protected by an active ICE consent monitor.
+    #[must_use]
+    pub fn has_ice_consent_monitor(&self) -> bool {
+        self.ice_consent.is_some()
+    }
+
     /// Resolve when ICE consent expires; channels without ICE consent remain pending.
     pub async fn wait_ice_consent_failure(&self) {
         let Some(monitor) = &self.ice_consent else {

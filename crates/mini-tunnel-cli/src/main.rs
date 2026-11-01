@@ -27,6 +27,7 @@ use mini_tunnel_protocol::{
 use serde::Deserialize;
 
 const PEER_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(5);
+const ICE_PATH_PROMOTION_PROBATION: Duration = Duration::from_secs(31);
 
 #[derive(Debug, Parser)]
 #[command(name = "mini-tunnel", version, about = "A minimal peer-to-peer tunnel")]
@@ -2462,6 +2463,7 @@ fn build_mesh_peer_connectors(
     tokio::sync::mpsc::Sender<mini_tunnel_agent::PeerChannel>,
 ) {
     let keep_outbound = identity.device_id() < peer.device_id;
+    let require_ice_consent = endpoint.ice.is_some();
     let (accepted_tx, accepted_rx) =
         tokio::sync::mpsc::channel::<mini_tunnel_agent::PeerChannel>(2);
     let receiver = std::sync::Arc::new(tokio::sync::Mutex::new(accepted_rx));
@@ -2616,7 +2618,7 @@ fn build_mesh_peer_connectors(
                     false,
                 )
                 .await?;
-                validate_udp_probe(channel).await
+                validate_udp_probe(channel, require_ice_consent).await
             })
         })
     } else {
@@ -2634,7 +2636,7 @@ fn build_mesh_peer_connectors(
             let network_id = network_id.clone();
             let peer = peer.clone();
             Box::pin(async move {
-                let monitor = select_current_ice_peer_address(
+                let mut monitor = select_current_ice_peer_address(
                     &endpoint,
                     &coordinator_url,
                     &network_id,
@@ -2644,28 +2646,23 @@ fn build_mesh_peer_connectors(
                 .await
                 .map(|(_, monitor)| monitor);
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
-                loop {
-                    let channel = tokio::time::timeout_at(deadline, async {
-                        receiver.lock().await.recv().await
-                    })
-                    .await
-                    .map_err(|_| {
-                        mini_tunnel_agent::IdentityError::Transport(
-                            "timed out waiting for direct probe".to_owned(),
-                        )
-                    })?
-                    .ok_or_else(|| {
-                        mini_tunnel_agent::IdentityError::Transport(
-                            "peer accept dispatcher stopped".to_owned(),
-                        )
-                    })?;
-                    if let Ok(mut channel) = validate_udp_probe(channel).await {
-                        if let Some(monitor) = monitor {
-                            channel.set_ice_consent_monitor(monitor);
-                        }
-                        return Ok(channel);
-                    }
+                let mut channel =
+                    tokio::time::timeout_at(deadline, async { receiver.lock().await.recv().await })
+                        .await
+                        .map_err(|_| {
+                            mini_tunnel_agent::IdentityError::Transport(
+                                "timed out waiting for direct probe".to_owned(),
+                            )
+                        })?
+                        .ok_or_else(|| {
+                            mini_tunnel_agent::IdentityError::Transport(
+                                "peer accept dispatcher stopped".to_owned(),
+                            )
+                        })?;
+                if let Some(monitor) = monitor.take() {
+                    channel.set_ice_consent_monitor(monitor);
                 }
+                validate_udp_probe(channel, require_ice_consent).await
             })
         })
     };
@@ -3025,12 +3022,36 @@ fn spawn_mesh_membership_refresh(config: MeshMembershipRefresh) -> tokio::task::
 
 async fn validate_udp_probe(
     channel: mini_tunnel_agent::PeerChannel,
+    require_ice_consent: bool,
+) -> Result<mini_tunnel_agent::PeerChannel, mini_tunnel_agent::IdentityError> {
+    validate_udp_probe_with_window(channel, require_ice_consent, ICE_PATH_PROMOTION_PROBATION).await
+}
+
+async fn validate_udp_probe_with_window(
+    channel: mini_tunnel_agent::PeerChannel,
+    require_ice_consent: bool,
+    consent_window: Duration,
 ) -> Result<mini_tunnel_agent::PeerChannel, mini_tunnel_agent::IdentityError> {
     let rtt = channel.probe_health(3, Duration::from_secs(2)).await?;
     if !mini_tunnel_agent::tunnel::path_quality_rtt_is_acceptable(rtt) {
         return Err(mini_tunnel_agent::IdentityError::Transport(
             "direct path probe exceeded RTT threshold".to_owned(),
         ));
+    }
+    if require_ice_consent {
+        if !channel.has_ice_consent_monitor() {
+            return Err(mini_tunnel_agent::IdentityError::Transport(
+                "direct candidate is missing ICE consent".to_owned(),
+            ));
+        }
+        if tokio::time::timeout(consent_window, channel.wait_ice_consent_failure())
+            .await
+            .is_ok()
+        {
+            return Err(mini_tunnel_agent::IdentityError::Transport(
+                "ICE consent expired during direct path probation".to_owned(),
+            ));
+        }
     }
     Ok(channel)
 }
@@ -4823,6 +4844,204 @@ mod tests {
                 command: PeerCommand::Status { .. }
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn expired_ice_candidate_is_rejected_while_reliable_channel_keeps_carrying_packets() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-ice-promotion-probation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let a = std::sync::Arc::new(
+            mini_tunnel_agent::Identity::load_or_create_at(temp.join("a/key"))
+                .expect("local identity"),
+        );
+        let b = std::sync::Arc::new(
+            mini_tunnel_agent::Identity::load_or_create_at(temp.join("b/key"))
+                .expect("peer identity"),
+        );
+
+        let listener = mini_tunnel_agent::peer_tcp_listener("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("bind reliable path");
+        let allowed = vec![(a.device_id(), a.public_key())];
+        let accepted = mini_tunnel_agent::accept_tcp_peer_any(
+            &listener,
+            "ice-promotion-probation",
+            &b,
+            &allowed,
+        );
+        let b_id = b.device_id();
+        let connected = mini_tunnel_agent::connect_tcp_peer(
+            listener.local_addr().unwrap(),
+            "ice-promotion-probation",
+            &a,
+            &b_id,
+            b.public_key(),
+        );
+        let (active_remote, active) = tokio::join!(accepted, connected);
+        let active_remote = active_remote.expect("accept reliable peer").1;
+        let active = active.expect("connect reliable peer");
+
+        let endpoint_a = mini_tunnel_agent::peer_endpoint(&a, "127.0.0.1:0".parse().unwrap())
+            .expect("bind candidate endpoint");
+        let endpoint_b = mini_tunnel_agent::peer_endpoint(&b, "127.0.0.1:0".parse().unwrap())
+            .expect("bind candidate accept endpoint");
+        let accepting = {
+            let endpoint = endpoint_b.clone();
+            let identity = std::sync::Arc::clone(&b);
+            let peer_id = a.device_id();
+            let peer_key = a.public_key();
+            tokio::spawn(async move {
+                mini_tunnel_agent::accept_peer(
+                    &endpoint,
+                    "ice-promotion-probation",
+                    &identity,
+                    &peer_id,
+                    peer_key,
+                )
+                .await
+                .expect("accept provisional UDP channel")
+            })
+        };
+        let mut candidate = mini_tunnel_agent::connect_peer(
+            &endpoint_a,
+            endpoint_b.local_addr().unwrap(),
+            "ice-promotion-probation",
+            &a,
+            &b.device_id(),
+            b.public_key(),
+        )
+        .await
+        .expect("connect provisional UDP channel");
+        let candidate_remote = accepting.await.expect("join accept task");
+        let candidate_responder =
+            tokio::spawn(async move { while candidate_remote.recv_packet().await.is_ok() {} });
+        let (monitor, mut cancel, failure_sender) =
+            mini_tunnel_agent::ice::IceConsentMonitor::new();
+        monitor
+            .set_task(tokio::spawn(async move {
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_millis(250)) => {
+                        failure_sender.send_replace(true);
+                    }
+                    _ = cancel.changed() => {}
+                }
+            }))
+            .await;
+        candidate.set_ice_consent_monitor(monitor);
+        let validation = tokio::spawn(validate_udp_probe_with_window(
+            candidate,
+            true,
+            Duration::from_secs(1),
+        ));
+
+        let before_expiry = vec![1, 2, 3, 4];
+        active
+            .send_packet(&before_expiry)
+            .await
+            .expect("incumbent path should remain active during probation");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), active_remote.recv_packet())
+                .await
+                .expect("reliable packet timeout")
+                .expect("receive over incumbent reliable path"),
+            before_expiry
+        );
+
+        let rejected = match validation.await.expect("join candidate validation") {
+            Ok(_) => panic!("expired consent must reject the UDP candidate"),
+            Err(error) => error,
+        };
+        assert!(rejected.to_string().contains("ICE consent expired"));
+
+        let after_expiry = vec![5, 6, 7, 8];
+        active
+            .send_packet(&after_expiry)
+            .await
+            .expect("incumbent path should survive rejected candidate");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), active_remote.recv_packet())
+                .await
+                .expect("post-expiry reliable packet timeout")
+                .expect("receive after candidate rejection"),
+            after_expiry
+        );
+        candidate_responder.abort();
+        active.close_async().await;
+        active_remote.close_async().await;
+        endpoint_a.close(0_u32.into(), b"test complete");
+        endpoint_b.close(0_u32.into(), b"test complete");
+        std::fs::remove_dir_all(temp).expect("remove test identities");
+    }
+
+    #[tokio::test]
+    async fn ice_candidate_promotes_only_after_consent_probation_window() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-ice-promotion-healthy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let a = std::sync::Arc::new(
+            mini_tunnel_agent::Identity::load_or_create_at(temp.join("a/key"))
+                .expect("local identity"),
+        );
+        let b = std::sync::Arc::new(
+            mini_tunnel_agent::Identity::load_or_create_at(temp.join("b/key"))
+                .expect("peer identity"),
+        );
+        let endpoint_a = mini_tunnel_agent::peer_endpoint(&a, "127.0.0.1:0".parse().unwrap())
+            .expect("bind candidate endpoint");
+        let endpoint_b = mini_tunnel_agent::peer_endpoint(&b, "127.0.0.1:0".parse().unwrap())
+            .expect("bind candidate accept endpoint");
+        let accepting = {
+            let endpoint = endpoint_b.clone();
+            let identity = std::sync::Arc::clone(&b);
+            let peer_id = a.device_id();
+            let peer_key = a.public_key();
+            tokio::spawn(async move {
+                mini_tunnel_agent::accept_peer(
+                    &endpoint,
+                    "ice-promotion-healthy",
+                    &identity,
+                    &peer_id,
+                    peer_key,
+                )
+                .await
+                .expect("accept provisional UDP channel")
+            })
+        };
+        let mut candidate = mini_tunnel_agent::connect_peer(
+            &endpoint_a,
+            endpoint_b.local_addr().unwrap(),
+            "ice-promotion-healthy",
+            &a,
+            &b.device_id(),
+            b.public_key(),
+        )
+        .await
+        .expect("connect provisional UDP channel");
+        let candidate_remote = accepting.await.expect("join accept task");
+        let candidate_responder =
+            tokio::spawn(async move { while candidate_remote.recv_packet().await.is_ok() {} });
+        let (monitor, mut cancel, _failure_sender) =
+            mini_tunnel_agent::ice::IceConsentMonitor::new();
+        monitor
+            .set_task(tokio::spawn(async move {
+                let _ = cancel.changed().await;
+            }))
+            .await;
+        candidate.set_ice_consent_monitor(monitor);
+        let started = tokio::time::Instant::now();
+        let candidate = validate_udp_probe_with_window(candidate, true, Duration::from_millis(50))
+            .await
+            .expect("candidate with live consent survives probation");
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert!(candidate.has_ice_consent_monitor());
+        candidate.stop_ice_consent_monitor().await;
+        candidate_responder.abort();
+        endpoint_a.close(0_u32.into(), b"test complete");
+        endpoint_b.close(0_u32.into(), b"test complete");
+        std::fs::remove_dir_all(temp).expect("remove test identities");
     }
 
     #[tokio::test]
