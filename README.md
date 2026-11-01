@@ -21,7 +21,7 @@ sudo install -m 0755 mini-tunnel /usr/local/bin/mini-tunnel
 mini-tunnel --version
 ```
 
-The binary is built in an Ubuntu 20.04 environment and targets glibc 2.31 or newer. The target needs `libc` and `libgcc` (normally already present on Ubuntu); it does not need a compiler or Rust toolchain. This artifact is for Linux x86_64 only. macOS and Windows users can build from source or use their platform-specific CI builds when available.
+The x86_64 binary is built in Ubuntu 20.04 and targets glibc 2.31 or newer. The ARM64 binary is built natively in Ubuntu 22.04 and targets glibc 2.35 or newer. Both target systems need `libc` and `libgcc` (normally already present on Ubuntu); neither needs a compiler or Rust toolchain. Download the matching `mini-tunnel-linux-aarch64-ubuntu22.04` artifact from the same successful CI run for ARM64 Linux. macOS and Windows users can build from source or use their platform-specific CI builds when available.
 
 Start the coordinator:
 
