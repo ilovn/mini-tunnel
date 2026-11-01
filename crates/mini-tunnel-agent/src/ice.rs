@@ -866,6 +866,8 @@ pub enum IceDriverError {
 pub struct IceAgentDriver {
     agent: Agent,
     local_addr: SocketAddr,
+    local_candidate_count: usize,
+    remote_candidate_count: usize,
 }
 
 /// Return whether a failed datagram send is specific to this candidate and should not stop the
@@ -931,7 +933,12 @@ impl Drop for IceConsentMonitor {
 impl IceAgentDriver {
     #[must_use]
     pub fn new(agent: Agent, local_addr: SocketAddr) -> Self {
-        Self { agent, local_addr }
+        Self {
+            agent,
+            local_addr,
+            local_candidate_count: 0,
+            remote_candidate_count: 0,
+        }
     }
 
     /// Build an ICE connectivity-check session for one peer.
@@ -1053,7 +1060,10 @@ impl IceAgentDriver {
                 remote_credentials.password.clone(),
             )
             .map_err(|error| IceDriverError::Agent(error.to_string()))?;
-        Ok(Self::new(agent, local_socket_addr))
+        let mut driver = Self::new(agent, local_socket_addr);
+        driver.local_candidate_count = local_candidates.len();
+        driver.remote_candidate_count = remote_candidates.len();
+        Ok(driver)
     }
 
     /// Feed one datagram to ICE. `false` means it was not STUN or rtc-ice rejected the message.
@@ -1144,10 +1154,15 @@ impl IceAgentDriver {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or(IceDriverError::Timeout)?;
+        let mut outbound_datagrams = 0_u64;
+        let mut candidate_send_errors = 0_u64;
+        let mut inbound_stun_datagrams = 0_u64;
+        let mut agent_accepted_datagrams = 0_u64;
         loop {
             let now = Instant::now();
             self.handle_timeout(now)?;
             for transmit in self.poll_transmits() {
+                outbound_datagrams = outbound_datagrams.saturating_add(1);
                 router
                     .register_ice_request(
                         local_ufrag,
@@ -1163,31 +1178,65 @@ impl IceAgentDriver {
                     if !is_candidate_send_error(&error) {
                         return Err(IceDriverError::Socket(error.to_string()));
                     }
+                    candidate_send_errors = candidate_send_errors.saturating_add(1);
                     // A candidate-specific routing error must not abort the checklist: another
                     // address family or server-reflexive candidate may still be reachable.
                     tracing::debug!(
-                        candidate = %transmit.transport.peer_addr,
                         %error,
                         "ICE candidate send failed; continuing connectivity checks"
                     );
                 }
             }
             if let Some(pair) = self.selected_pair() {
+                tracing::debug!(
+                    local_candidates = self.local_candidate_count,
+                    remote_candidates = self.remote_candidate_count,
+                    outbound_datagrams,
+                    candidate_send_errors,
+                    inbound_stun_datagrams,
+                    agent_accepted_datagrams,
+                    nominated = true,
+                    "ICE checklist summary"
+                );
                 return Ok(pair);
             }
             if now >= deadline {
+                tracing::debug!(
+                    local_candidates = self.local_candidate_count,
+                    remote_candidates = self.remote_candidate_count,
+                    outbound_datagrams,
+                    candidate_send_errors,
+                    inbound_stun_datagrams,
+                    agent_accepted_datagrams,
+                    nominated = false,
+                    "ICE checklist summary"
+                );
                 return Err(IceDriverError::Timeout);
             }
             let next_deadline = self.next_timeout().unwrap_or(deadline).min(deadline);
             tokio::select! {
                 datagram = datagrams.recv() => {
                     let datagram = datagram.ok_or_else(|| IceDriverError::Router("peer datagram queue closed".to_owned()))?;
-                    router
+                    inbound_stun_datagrams = inbound_stun_datagrams.saturating_add(1);
+                    let accepted = router
                         .handle_datagram(local_ufrag, remote_ufrag, self, datagram, Instant::now())
                         .map_err(|error| IceDriverError::Router(error.to_string()))?;
+                    if accepted {
+                        agent_accepted_datagrams = agent_accepted_datagrams.saturating_add(1);
+                    }
                 }
                 () = tokio::time::sleep_until(tokio::time::Instant::from_std(next_deadline)) => {
                     if Instant::now() >= deadline {
+                        tracing::debug!(
+                            local_candidates = self.local_candidate_count,
+                            remote_candidates = self.remote_candidate_count,
+                            outbound_datagrams,
+                            candidate_send_errors,
+                            inbound_stun_datagrams,
+                            agent_accepted_datagrams,
+                            nominated = false,
+                            "ICE checklist summary"
+                        );
                         return Err(IceDriverError::Timeout);
                     }
                 }
