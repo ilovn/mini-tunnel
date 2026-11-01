@@ -113,20 +113,20 @@ pub struct CoordinatorState {
 
 #[derive(Default)]
 struct RequestLatencyMetrics {
-    buckets: [AtomicU64; REQUEST_LATENCY_BUCKETS_MICROS.len()],
-    count: AtomicU64,
+    // Exclusive bucket counts; Prometheus cumulative buckets are derived at scrape time so a
+    // scrape cannot observe a request halfway through multiple bucket increments.
+    buckets: [AtomicU64; REQUEST_LATENCY_BUCKETS_MICROS.len() + 1],
     sum_micros: AtomicU64,
 }
 
 impl RequestLatencyMetrics {
     fn record(&self, elapsed: Duration) {
         let micros = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
-        for (bucket, bound) in self.buckets.iter().zip(REQUEST_LATENCY_BUCKETS_MICROS) {
-            if micros <= bound {
-                bucket.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        self.count.fetch_add(1, Ordering::Relaxed);
+        let bucket_index = REQUEST_LATENCY_BUCKETS_MICROS
+            .iter()
+            .position(|bound| micros <= *bound)
+            .unwrap_or(REQUEST_LATENCY_BUCKETS_MICROS.len());
+        self.buckets[bucket_index].fetch_add(1, Ordering::Relaxed);
         self.sum_micros.fetch_add(micros, Ordering::Relaxed);
     }
 
@@ -134,14 +134,23 @@ impl RequestLatencyMetrics {
         let mut output = String::from(
             "# HELP mini_tunnel_coordinator_request_duration_seconds Coordinator HTTP request latency.\n# TYPE mini_tunnel_coordinator_request_duration_seconds histogram\n",
         );
-        for (bucket, bound) in self.buckets.iter().zip(REQUEST_LATENCY_BUCKETS_MICROS) {
+        let mut cumulative = 0_u64;
+        for (bucket, bound) in self
+            .buckets
+            .iter()
+            .take(REQUEST_LATENCY_BUCKETS_MICROS.len())
+            .zip(REQUEST_LATENCY_BUCKETS_MICROS)
+        {
+            cumulative = cumulative.saturating_add(bucket.load(Ordering::Relaxed));
             output.push_str(&format!(
                 "mini_tunnel_coordinator_request_duration_seconds_bucket{{le=\"{:.3}\"}} {}\n",
                 bound as f64 / 1_000_000.0,
-                bucket.load(Ordering::Relaxed)
+                cumulative
             ));
         }
-        let count = self.count.load(Ordering::Relaxed);
+        let count = cumulative.saturating_add(
+            self.buckets[REQUEST_LATENCY_BUCKETS_MICROS.len()].load(Ordering::Relaxed),
+        );
         output.push_str(&format!(
             "mini_tunnel_coordinator_request_duration_seconds_bucket{{le=\"+Inf\"}} {count}\nmini_tunnel_coordinator_request_duration_seconds_sum {:.6}\nmini_tunnel_coordinator_request_duration_seconds_count {count}\n",
             self.sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0,
@@ -4327,35 +4336,88 @@ mod tests {
     fn request_latency_histogram_counts_cumulative_buckets_and_sum() {
         let metrics = RequestLatencyMetrics::default();
         metrics.record(Duration::from_millis(4));
+        metrics.record(Duration::from_millis(5));
         metrics.record(Duration::from_millis(6));
         metrics.record(Duration::from_millis(300));
+        metrics.record(Duration::from_millis(500));
         metrics.record(Duration::from_secs(10));
 
         let output = metrics.prometheus();
         assert!(
             output.contains(
-                "mini_tunnel_coordinator_request_duration_seconds_bucket{le=\"0.005\"} 1\n"
+                "mini_tunnel_coordinator_request_duration_seconds_bucket{le=\"0.005\"} 2\n"
             )
         );
         assert!(
             output.contains(
-                "mini_tunnel_coordinator_request_duration_seconds_bucket{le=\"0.010\"} 2\n"
+                "mini_tunnel_coordinator_request_duration_seconds_bucket{le=\"0.010\"} 3\n"
             )
         );
         assert!(
             output.contains(
-                "mini_tunnel_coordinator_request_duration_seconds_bucket{le=\"0.500\"} 3\n"
+                "mini_tunnel_coordinator_request_duration_seconds_bucket{le=\"0.500\"} 5\n"
             )
         );
         assert!(
             output.contains(
-                "mini_tunnel_coordinator_request_duration_seconds_bucket{le=\"+Inf\"} 4\n"
+                "mini_tunnel_coordinator_request_duration_seconds_bucket{le=\"+Inf\"} 6\n"
             )
         );
         assert!(
-            output.contains("mini_tunnel_coordinator_request_duration_seconds_sum 10.310000\n")
+            output.contains("mini_tunnel_coordinator_request_duration_seconds_sum 10.815000\n")
         );
-        assert!(output.contains("mini_tunnel_coordinator_request_duration_seconds_count 4\n"));
+        assert!(output.contains("mini_tunnel_coordinator_request_duration_seconds_count 6\n"));
+    }
+
+    #[test]
+    fn request_latency_histogram_scrapes_remain_monotonic_while_recording() {
+        const RECORDS: usize = 20_000;
+        let metrics = Arc::new(RequestLatencyMetrics::default());
+        let writer_metrics = Arc::clone(&metrics);
+        let writer = std::thread::spawn(move || {
+            for index in 0..RECORDS {
+                let elapsed = match index % 4 {
+                    0 => Duration::from_micros(4_999),
+                    1 => Duration::from_millis(5),
+                    2 => Duration::from_micros(5_001),
+                    _ => Duration::from_secs(6),
+                };
+                writer_metrics.record(elapsed);
+            }
+        });
+
+        while !writer.is_finished() {
+            let output = metrics.prometheus();
+            let buckets = output
+                .lines()
+                .filter(|line| line.contains("_bucket{"))
+                .map(|line| {
+                    line.rsplit_once(' ')
+                        .expect("bucket sample value")
+                        .1
+                        .parse::<u64>()
+                        .expect("numeric bucket sample")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(buckets.len(), REQUEST_LATENCY_BUCKETS_MICROS.len() + 1);
+            assert!(buckets.windows(2).all(|pair| pair[0] <= pair[1]));
+
+            let count = output
+                .lines()
+                .find(|line| line.contains("_count "))
+                .and_then(|line| line.rsplit_once(' '))
+                .expect("histogram count")
+                .1
+                .parse::<u64>()
+                .expect("numeric histogram count");
+            assert_eq!(buckets.last(), Some(&count));
+        }
+        writer.join().expect("latency writer thread");
+
+        let output = metrics.prometheus();
+        assert!(output.contains(&format!(
+            "mini_tunnel_coordinator_request_duration_seconds_count {RECORDS}\n"
+        )));
     }
 
     fn create_request(name: &str, cidr: &str) -> CreateNetworkRequest {
