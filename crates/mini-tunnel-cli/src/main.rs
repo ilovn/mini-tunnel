@@ -1160,8 +1160,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 if remote == nominated_remote
                                     && channel.transport_name() == "QUIC/UDP"
                                 {
+                                    tracing::debug!(
+                                        peer_id = %peer.device_id,
+                                        remote = %remote,
+                                        "attaching ICE consent monitor to accepted peer"
+                                    );
                                     channel.set_ice_consent_monitor(monitor);
                                 } else {
+                                    tracing::warn!(
+                                        peer_id = %peer.device_id,
+                                        nominated_remote = %nominated_remote,
+                                        quic_remote = %remote,
+                                        transport = channel.transport_name(),
+                                        "stopping ICE consent monitor because accepted path differs from nominated path"
+                                    );
                                     monitor.stop().await;
                                 }
                             }
@@ -2243,6 +2255,7 @@ async fn select_ice_peer_address(
             let (monitor, mut cancel, failure_sender) =
                 mini_tunnel_agent::ice::IceConsentMonitor::new();
             let task = tokio::spawn(async move {
+                tracing::debug!("ICE consent monitor started");
                 if let Err(error) = driver
                     .monitor_consent(
                         &socket,
@@ -2256,6 +2269,8 @@ async fn select_ice_peer_address(
                 {
                     tracing::warn!(%error, "nominated ICE consent expired");
                     failure_sender.send_replace(true);
+                } else {
+                    tracing::debug!("ICE consent monitor stopped");
                 }
                 let _ = router.unregister(&local_ufrag, &remote_ufrag);
             });
