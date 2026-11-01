@@ -2005,8 +2005,8 @@ mod tests {
             })
         };
 
-        let local_ip = Ipv4Addr::new(10, 0, 0, 1);
-        let peer_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let local_ip = Ipv4Addr::new(10, 254, 253, 1);
+        let peer_ip = Ipv4Addr::new(10, 254, 253, 2);
         let (outbound_tx, outbound_rx) = mpsc::channel(2);
         let (inbound_tx, _inbound_rx) = mpsc::channel(2);
         let io = MockPacketIo {

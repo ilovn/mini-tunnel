@@ -123,3 +123,32 @@ tests:
       - eval_time: 7m
         alertname: MiniTunnelCoordinatorConnectionRejected
         exp_alerts: []
+
+  - name: fires for sustained UDP Relay authentication rate limiting
+    interval: 1m
+    input_series:
+      - series: 'mini_tunnel_udp_relay_auth_rate_limited_total{job="mini-tunnel-relay",instance="relay.internal:42002"}'
+        values: '0 30 60 90 120 150 180 210 240 270 300'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: MiniTunnelUdpRelayAuthenticationRateLimited
+        exp_alerts:
+          - exp_labels:
+              job: mini-tunnel-relay
+              instance: relay.internal:42002
+              severity: warning
+              alertname: MiniTunnelUdpRelayAuthenticationRateLimited
+            exp_annotations:
+              summary: mini-tunnel UDP Relay is rate-limiting authentication traffic
+              description: More than 100 UDP authentication packets were rate-limited in five minutes for at least two minutes; inspect source churn and peer connection retries before adjusting limits.
+              runbook: deploy/systemd/README.md#monitoring-and-alerts
+
+  - name: stays quiet below UDP Relay authentication rate limit threshold
+    interval: 1m
+    input_series:
+      - series: 'mini_tunnel_udp_relay_auth_rate_limited_total{job="mini-tunnel-relay",instance="relay.internal:42002"}'
+        values: '0 5 10 15 20 25 30 35 40 45 50'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: MiniTunnelUdpRelayAuthenticationRateLimited
+        exp_alerts: []

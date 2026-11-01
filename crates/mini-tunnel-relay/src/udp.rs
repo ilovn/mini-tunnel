@@ -86,6 +86,7 @@ pub struct UdpRelayStats {
     pub pending_authentications: usize,
     pub forwarded_datagrams_total: u64,
     pub dropped_datagrams_total: u64,
+    pub auth_rate_limited_total: u64,
 }
 
 #[derive(Clone)]
@@ -98,6 +99,7 @@ struct Inner {
     state: Mutex<State>,
     forwarded: AtomicU64,
     dropped: AtomicU64,
+    auth_rate_limited: AtomicU64,
     shutdown: watch::Sender<bool>,
 }
 
@@ -147,6 +149,7 @@ impl UdpRelayServer {
                 state: Mutex::new(State::default()),
                 forwarded: AtomicU64::new(0),
                 dropped: AtomicU64::new(0),
+                auth_rate_limited: AtomicU64::new(0),
                 shutdown,
             }),
         }
@@ -159,6 +162,7 @@ impl UdpRelayServer {
             pending_authentications: state.pending.len(),
             forwarded_datagrams_total: self.inner.forwarded.load(Ordering::Relaxed),
             dropped_datagrams_total: self.inner.dropped.load(Ordering::Relaxed),
+            auth_rate_limited_total: self.inner.auth_rate_limited.load(Ordering::Relaxed),
         }
     }
 
@@ -251,13 +255,17 @@ impl UdpRelayServer {
 
     async fn admit_auth_attempt(&self, source_ip: IpAddr) -> bool {
         let mut state = self.inner.state.lock().await;
-        allow_auth_attempt_with_rate(
+        let allowed = allow_auth_attempt_with_rate(
             &mut state,
             source_ip,
             tokio::time::Instant::now(),
             self.inner.config.auth_burst,
             self.inner.config.auth_per_second,
-        )
+        );
+        if !allowed {
+            self.inner.auth_rate_limited.fetch_add(1, Ordering::Relaxed);
+        }
+        allowed
     }
 
     async fn handle_hello(

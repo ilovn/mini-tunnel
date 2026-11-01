@@ -89,6 +89,24 @@ jobs:
           # rsa is an unbuilt optional dependency of SQLx's disabled MySQL driver; the advisory has no fix.
           cargo audit --ignore RUSTSEC-2023-0071
 
+      - name: Validate Prometheus rules
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          prometheus_version=3.15.1
+          archive="$RUNNER_TEMP/prometheus-${prometheus_version}.linux-amd64.tar.gz"
+          checksums="$RUNNER_TEMP/prometheus-${prometheus_version}-sha256sums.txt"
+          release_url="https://github.com/prometheus/prometheus/releases/download/v${prometheus_version}"
+          curl --fail --location --retry 3 --output "$archive" \
+            "$release_url/prometheus-${prometheus_version}.linux-amd64.tar.gz"
+          curl --fail --location --retry 3 --output "$checksums" \
+            "$release_url/sha256sums.txt"
+          (cd "$RUNNER_TEMP" && grep "prometheus-${prometheus_version}.linux-amd64.tar.gz$" "$checksums" | sha256sum --check -)
+          tar -xzf "$archive" -C "$RUNNER_TEMP" --strip-components=1 \
+            "prometheus-${prometheus_version}.linux-amd64/promtool"
+          "$RUNNER_TEMP/promtool" check rules deploy/prometheus/mini-tunnel-alerts.yml
+          "$RUNNER_TEMP/promtool" test rules deploy/prometheus/mini-tunnel-alerts.test.yml
+
       - name: Run workspace tests
         run: cargo +stable test --workspace
 

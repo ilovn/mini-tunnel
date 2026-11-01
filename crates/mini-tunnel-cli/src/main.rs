@@ -640,6 +640,9 @@ async fn relay_metrics(State(relay): State<RelayMetricsState>) -> impl IntoRespo
          # HELP mini_tunnel_udp_relay_forwarded_datagrams_total Opaque datagrams forwarded by UDP relay.\n\
          # TYPE mini_tunnel_udp_relay_forwarded_datagrams_total counter\n\
          mini_tunnel_udp_relay_forwarded_datagrams_total {}\n\
+         # HELP mini_tunnel_udp_relay_auth_rate_limited_total UDP relay authentication packets rejected by per-source rate limits.\n\
+         # TYPE mini_tunnel_udp_relay_auth_rate_limited_total counter\n\
+         mini_tunnel_udp_relay_auth_rate_limited_total {}\n\
          # HELP mini_tunnel_udp_relay_dropped_datagrams_total Invalid or unauthorized UDP relay packets dropped.\n\
          # TYPE mini_tunnel_udp_relay_dropped_datagrams_total counter\n\
          mini_tunnel_udp_relay_dropped_datagrams_total {}\n",
@@ -654,6 +657,7 @@ async fn relay_metrics(State(relay): State<RelayMetricsState>) -> impl IntoRespo
         udp_stats.active_sessions,
         udp_stats.pending_authentications,
         udp_stats.forwarded_datagrams_total,
+        udp_stats.auth_rate_limited_total,
         udp_stats.dropped_datagrams_total,
     );
     (
@@ -5370,14 +5374,41 @@ mod tests {
         let relay =
             mini_tunnel_relay::RelayServer::new(mini_tunnel_relay::RelayConfig::new([21; 32]));
         let udp_relay = mini_tunnel_relay::UdpRelayServer::new(
-            mini_tunnel_relay::UdpRelayConfig::new([21; 32]),
+            mini_tunnel_relay::UdpRelayConfig::new([21; 32]).with_auth_rate(1, 1),
         );
+        let udp_listener = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind UDP relay listener");
+        let udp_address = udp_listener.local_addr().expect("UDP relay address");
+        let udp_server = {
+            let udp_relay = udp_relay.clone();
+            tokio::spawn(async move { udp_relay.run(udp_listener).await.expect("UDP relay") })
+        };
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind UDP client");
+        client
+            .send_to(b"MTUHELLO", udp_address)
+            .await
+            .expect("send first auth packet");
+        client
+            .send_to(b"MTUHELLO", udp_address)
+            .await
+            .expect("send rate-limited auth packet");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while udp_relay.stats().await.auth_rate_limited_total == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("rate-limit metric counter timeout");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind metrics listener");
         let address = listener.local_addr().expect("metrics address");
+        let metrics_udp_relay = udp_relay.clone();
         let server = tokio::spawn(async move {
-            axum::serve(listener, relay_metrics_router(relay, udp_relay)).await
+            axum::serve(listener, relay_metrics_router(relay, metrics_udp_relay)).await
         });
         let client = reqwest::Client::new();
         let health = client
@@ -5404,6 +5435,9 @@ mod tests {
         assert!(body.contains("mini_tunnel_relay_bytes_forwarded_total 0"));
         assert!(body.contains("mini_tunnel_udp_relay_active_sessions 0"));
         assert!(body.contains("mini_tunnel_udp_relay_forwarded_datagrams_total 0"));
+        assert!(body.contains("mini_tunnel_udp_relay_auth_rate_limited_total 1"));
+        udp_relay.shutdown();
+        udp_server.await.expect("UDP relay task");
         server.abort();
     }
 

@@ -92,3 +92,13 @@ groups:
           summary: mini-tunnel Relay is seeing repeated handshake failures
           description: More than 20 relay handshakes failed in five minutes for at least two minutes; inspect relay logs and source network activity.
           runbook: deploy/systemd/README.md#monitoring-and-alerts
+
+      - alert: MiniTunnelUdpRelayAuthenticationRateLimited
+        expr: increase(mini_tunnel_udp_relay_auth_rate_limited_total{job="mini-tunnel-relay"}[5m]) > 100
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: mini-tunnel UDP Relay is rate-limiting authentication traffic
+          description: More than 100 UDP authentication packets were rate-limited in five minutes for at least two minutes; inspect source churn and peer connection retries before adjusting limits.
+          runbook: deploy/systemd/README.md#monitoring-and-alerts
