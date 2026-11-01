@@ -5342,6 +5342,7 @@ mod tests {
         ];
         candidates.sort();
         let timestamp_ms = unix_time_ms().expect("clock");
+        let accepted_candidate_timestamp_ms = timestamp_ms;
         let signature = key_a.sign(&candidate_signing_bytes(
             &network_id.to_string(),
             &join_a.device_id,
@@ -5393,7 +5394,9 @@ mod tests {
             password: "abcdefghijklmnopqrstuvwxyzABCDEF".to_owned(),
             generation: 1,
         };
-        let timestamp_ms = unix_time_ms().expect("clock");
+        let timestamp_ms = unix_time_ms()
+            .expect("clock")
+            .max(accepted_candidate_timestamp_ms.saturating_add(1));
         let signature = key_a.sign(&candidate_signing_bytes_with_ice(
             &network_id.to_string(),
             &join_a.device_id,
