@@ -386,6 +386,7 @@ impl IceDatagramRouter {
         }
         let route = if let Some(username) = crate::stun::ice_username(&datagram.payload) {
             let Some(key) = ice_session_key(username) else {
+                tracing::debug!(peer = %datagram.peer_addr, "dropping ICE datagram with malformed username");
                 return false;
             };
             self.sessions.get(&key)
@@ -394,7 +395,21 @@ impl IceDatagramRouter {
                 .get(&datagram.peer_addr)
                 .and_then(|key| self.sessions.get(key))
         };
-        route.is_some_and(|route| route.sender.try_send(datagram).is_ok())
+        let Some(route) = route else {
+            tracing::debug!(peer = %datagram.peer_addr, "dropping ICE datagram without a registered session");
+            return false;
+        };
+        match route.sender.try_send(datagram) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(datagram)) => {
+                tracing::warn!(peer = %datagram.peer_addr, "dropping ICE datagram because the session queue is full");
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(datagram)) => {
+                tracing::debug!(peer = %datagram.peer_addr, "dropping ICE datagram because the session is closed");
+                false
+            }
+        }
     }
 }
 
