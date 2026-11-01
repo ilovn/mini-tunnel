@@ -170,6 +170,13 @@ enum RelayCommand {
             default_value = "0.0.0.0:42001"
         )]
         listen: SocketAddr,
+        /// UDP listener for ticket-authorized opaque QUIC datagrams.
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_UDP_RELAY_LISTEN",
+            default_value = "0.0.0.0:42003"
+        )]
+        udp_listen: SocketAddr,
         /// Loopback-only HTTP health and Prometheus metrics listener.
         #[arg(
             long,
@@ -551,19 +558,29 @@ fn validate_relay_metrics_address(address: SocketAddr) -> std::io::Result<()> {
     }
 }
 
-fn relay_metrics_router(relay: mini_tunnel_relay::RelayServer) -> Router {
+#[derive(Clone)]
+struct RelayMetricsState {
+    tcp: mini_tunnel_relay::RelayServer,
+    udp: mini_tunnel_relay::UdpRelayServer,
+}
+
+fn relay_metrics_router(
+    tcp: mini_tunnel_relay::RelayServer,
+    udp: mini_tunnel_relay::UdpRelayServer,
+) -> Router {
     Router::new()
         .route("/healthz", get(relay_health))
         .route("/metrics", get(relay_metrics))
-        .with_state(relay)
+        .with_state(RelayMetricsState { tcp, udp })
 }
 
 async fn relay_health() -> impl IntoResponse {
     (StatusCode::OK, "ok\n")
 }
 
-async fn relay_metrics(State(relay): State<mini_tunnel_relay::RelayServer>) -> impl IntoResponse {
-    let stats = relay.stats().await;
+async fn relay_metrics(State(relay): State<RelayMetricsState>) -> impl IntoResponse {
+    let stats = relay.tcp.stats().await;
+    let udp_stats = relay.udp.stats().await;
     let body = format!(
         "# HELP mini_tunnel_relay_active_connections Accepted relay connections, including pending and active sessions.\n\
          # TYPE mini_tunnel_relay_active_connections gauge\n\
@@ -588,7 +605,19 @@ async fn relay_metrics(State(relay): State<mini_tunnel_relay::RelayServer>) -> i
          mini_tunnel_relay_handshake_failures_total {}\n\
          # HELP mini_tunnel_relay_bytes_forwarded_total Bytes forwarded across all sessions.\n\
          # TYPE mini_tunnel_relay_bytes_forwarded_total counter\n\
-         mini_tunnel_relay_bytes_forwarded_total {}\n",
+         mini_tunnel_relay_bytes_forwarded_total {}\n\
+         # HELP mini_tunnel_udp_relay_active_sessions Paired UDP relay sessions.\n\
+         # TYPE mini_tunnel_udp_relay_active_sessions gauge\n\
+         mini_tunnel_udp_relay_active_sessions {}\n\
+         # HELP mini_tunnel_udp_relay_pending_authentications UDP relay challenges awaiting proof.\n\
+         # TYPE mini_tunnel_udp_relay_pending_authentications gauge\n\
+         mini_tunnel_udp_relay_pending_authentications {}\n\
+         # HELP mini_tunnel_udp_relay_forwarded_datagrams_total Opaque datagrams forwarded by UDP relay.\n\
+         # TYPE mini_tunnel_udp_relay_forwarded_datagrams_total counter\n\
+         mini_tunnel_udp_relay_forwarded_datagrams_total {}\n\
+         # HELP mini_tunnel_udp_relay_dropped_datagrams_total Invalid or unauthorized UDP relay packets dropped.\n\
+         # TYPE mini_tunnel_udp_relay_dropped_datagrams_total counter\n\
+         mini_tunnel_udp_relay_dropped_datagrams_total {}\n",
         stats.active_connections,
         stats.max_connections,
         stats.max_connections_per_source_ip,
@@ -597,6 +626,10 @@ async fn relay_metrics(State(relay): State<mini_tunnel_relay::RelayServer>) -> i
         stats.capacity_rejections_total,
         stats.handshake_failures_total,
         stats.bytes_forwarded_total,
+        udp_stats.active_sessions,
+        udp_stats.pending_authentications,
+        udp_stats.forwarded_datagrams_total,
+        udp_stats.dropped_datagrams_total,
     );
     (
         [(
@@ -771,6 +804,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Relay { command } => match command {
             RelayCommand::Serve {
                 listen,
+                udp_listen,
                 metrics_listen,
                 max_connections,
                 max_connections_per_source_ip,
@@ -784,25 +818,36 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let key: [u8; 32] = key
                     .try_into()
                     .map_err(|_| "relay ticket key must decode to exactly 32 bytes")?;
+                let previous_key =
+                    if let Some(previous) = previous_ticket_key {
+                        let previous = URL_SAFE_NO_PAD.decode(previous)?;
+                        Some(<[u8; 32]>::try_from(previous).map_err(
+                            |_| "previous relay ticket key must decode to exactly 32 bytes",
+                        )?)
+                    } else {
+                        None
+                    };
                 let mut config = mini_tunnel_relay::RelayConfig::new(key)
                     .with_max_session_bytes(max_session_bytes)
                     .with_max_connections(max_connections)
                     .with_max_connections_per_source_ip(max_connections_per_source_ip);
                 config.shutdown_grace = Duration::from_secs(shutdown_grace_seconds);
-                if let Some(previous) = previous_ticket_key {
-                    let previous = URL_SAFE_NO_PAD.decode(previous)?;
-                    let previous: [u8; 32] = previous
-                        .try_into()
-                        .map_err(|_| "previous relay ticket key must decode to exactly 32 bytes")?;
+                if let Some(previous) = previous_key {
                     config = config.with_previous_ticket_key(previous);
                 }
                 validate_relay_metrics_address(metrics_listen)?;
                 let listener = tokio::net::TcpListener::bind(listen).await?;
                 eprintln!("relay listening on {}", listener.local_addr()?);
+                let udp_socket = tokio::net::UdpSocket::bind(udp_listen).await?;
+                eprintln!("UDP relay listening on {}", udp_socket.local_addr()?);
                 let metrics_listener = tokio::net::TcpListener::bind(metrics_listen).await?;
                 let relay = mini_tunnel_relay::RelayServer::new(config);
-                let metrics_relay = relay.clone();
-                let metrics_router = relay_metrics_router(metrics_relay);
+                let mut udp_config = mini_tunnel_relay::UdpRelayConfig::new(key);
+                if let Some(previous) = previous_key {
+                    udp_config = udp_config.with_previous_ticket_key(previous);
+                }
+                let udp_relay = mini_tunnel_relay::UdpRelayServer::new(udp_config);
+                let metrics_router = relay_metrics_router(relay.clone(), udp_relay.clone());
                 let (metrics_shutdown_tx, mut metrics_shutdown_rx) =
                     tokio::sync::watch::channel(false);
                 let metrics_task = tokio::spawn(async move {
@@ -817,16 +862,34 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         .await
                 });
                 eprintln!("relay metrics listening on {metrics_listen}");
+                let udp_server = udp_relay.clone();
+                let udp_task = tokio::spawn(async move { udp_server.run(udp_socket).await });
+                let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+                let signal_tx = shutdown_tx.clone();
+                let signal_udp_relay = udp_relay.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = shutdown_signal().await {
+                        eprintln!("could not listen for shutdown signal: {error}");
+                    }
+                    signal_tx.send_replace(true);
+                    signal_udp_relay.shutdown();
+                });
+                let mut shutdown_rx = shutdown_tx.subscribe();
                 let result = relay
                     .run_until(listener, async {
-                        if let Err(error) = shutdown_signal().await {
-                            eprintln!("could not listen for shutdown signal: {error}");
+                        while !*shutdown_rx.borrow() {
+                            if shutdown_rx.changed().await.is_err() {
+                                break;
+                            }
                         }
                     })
                     .await;
+                udp_relay.shutdown();
+                let udp_result = udp_task.await?;
                 metrics_shutdown_tx.send_replace(true);
                 let metrics_result = metrics_task.await?;
                 result?;
+                udp_result?;
                 metrics_result?;
             }
         },
@@ -5076,12 +5139,16 @@ mod tests {
     async fn relay_metrics_http_endpoint_reports_health_and_counters() {
         let relay =
             mini_tunnel_relay::RelayServer::new(mini_tunnel_relay::RelayConfig::new([21; 32]));
+        let udp_relay = mini_tunnel_relay::UdpRelayServer::new(
+            mini_tunnel_relay::UdpRelayConfig::new([21; 32]),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind metrics listener");
         let address = listener.local_addr().expect("metrics address");
-        let server =
-            tokio::spawn(async move { axum::serve(listener, relay_metrics_router(relay)).await });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, relay_metrics_router(relay, udp_relay)).await
+        });
         let client = reqwest::Client::new();
         let health = client
             .get(format!("http://{address}/healthz"))
@@ -5105,6 +5172,8 @@ mod tests {
         assert!(body.contains("mini_tunnel_relay_active_connections 0"));
         assert!(body.contains("mini_tunnel_relay_active_sessions 0"));
         assert!(body.contains("mini_tunnel_relay_bytes_forwarded_total 0"));
+        assert!(body.contains("mini_tunnel_udp_relay_active_sessions 0"));
+        assert!(body.contains("mini_tunnel_udp_relay_forwarded_datagrams_total 0"));
         server.abort();
     }
 

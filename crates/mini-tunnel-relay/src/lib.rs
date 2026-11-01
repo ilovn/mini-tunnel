@@ -1,5 +1,12 @@
 //! Ticket-authorized opaque TCP relay for end-to-end TLS peer streams.
 
+mod udp;
+
+pub use udp::{
+    UdpRelayConfig, UdpRelayServer, UdpRelayStats, is_udp_relay_datagram, udp_relay_hello,
+    udp_relay_proof,
+};
+
 use std::{
     collections::HashMap,
     future::Future,
