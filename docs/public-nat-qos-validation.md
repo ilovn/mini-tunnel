@@ -35,6 +35,7 @@ RUST_LOG=mini_tunnel_agent=debug \
     --network-id '<network-id>' \
     --bind '0.0.0.0:42000' \
     --stun-server '<stun-ip>:3478' \
+    --stun-server '<independent-stun-ip>:3478' \
     --manage-route \
     --ice
 ```
@@ -55,7 +56,7 @@ Run each topology from a clean peer start, then repeat with A and B roles revers
 | UDP blocked after connection | Block only peer UDP at one router after direct path is established; preserve HTTPS and Relay TCP | ICE/QUIC path fails closed, the session recovers over TCP/Relay, and overlay probes resume without restarting the mesh process |
 | NAT rebinding | Change the client uplink or force its UDP mapping to expire while the process remains alive | Old path is abandoned; a newly authenticated path is selected or authorized fallback is used; stale candidates do not receive overlay payload |
 
-For NAT behavior, capture the same bound UDP socket's STUN mapping against at least two independently operated STUN destinations where available. Use the router mapping/filter observations and packet captures as evidence. This remains an observed network behavior, not a guaranteed portable label.
+For NAT behavior, configure at least two independently operated STUN destinations where available and record each mapping returned for the same bound UDP socket. Use the router mapping/filter observations and packet captures as evidence. Multiple STUN results help expose destination-dependent mapping but cannot establish mapping behavior for every peer destination; this remains an observed network behavior, not a guaranteed portable label.
 
 ## QoS cases
 

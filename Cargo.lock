@@ -1837,6 +1837,7 @@ dependencies = [
  "base64 0.23.1",
  "clap",
  "directories",
+ "futures-util",
  "if-addrs",
  "ipnet",
  "mini-tunnel-agent",

@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 axum.workspace = true
 clap.workspace = true
+futures-util.workspace = true
 base64.workspace = true
 directories.workspace = true
 mini-tunnel-coordinator = { path = "../mini-tunnel-coordinator" }
