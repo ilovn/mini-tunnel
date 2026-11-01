@@ -4245,7 +4245,50 @@ fn create_tun(
     let mut config = mini_tunnel_agent::tun_device::TunConfig::ipv4(local_ipv4, prefix_len);
     config = config.with_ipv6(local_ipv6, 64);
     config.mtu = mtu;
-    Ok(mini_tunnel_agent::tun_device::TunDevice::create(config)?)
+    let (device, ipv6_enabled, ipv6_error) = create_tun_with_ipv6_fallback(config, |config| {
+        mini_tunnel_agent::tun_device::TunDevice::create(config)
+    })?;
+    if !ipv6_enabled {
+        tracing::warn!(
+            error = %ipv6_error.expect("IPv4-only fallback retains the IPv6 setup error"),
+            "IPv6 overlay setup is unavailable; continuing with IPv4-only TUN"
+        );
+    }
+    Ok(device)
+}
+
+fn create_tun_with_ipv6_fallback<T>(
+    mut config: mini_tunnel_agent::tun_device::TunConfig,
+    mut create: impl FnMut(mini_tunnel_agent::tun_device::TunConfig) -> std::io::Result<T>,
+) -> std::io::Result<(T, bool, Option<std::io::Error>)> {
+    if config.local_ipv6.is_none() {
+        return create(config).map(|device| (device, false, None));
+    }
+    match create(config.clone()) {
+        Ok(device) => Ok((device, true, None)),
+        Err(ipv6_error) if ipv6_tun_setup_may_be_unsupported(&ipv6_error) => {
+            config.local_ipv6 = None;
+            match create(config) {
+                Ok(device) => Ok((device, false, Some(ipv6_error))),
+                Err(ipv4_error) => Err(std::io::Error::new(
+                    ipv4_error.kind(),
+                    format!(
+                        "IPv6 TUN setup failed ({ipv6_error}); IPv4-only TUN fallback also failed ({ipv4_error})"
+                    ),
+                )),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn ipv6_tun_setup_may_be_unsupported(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::Unsupported
+            | std::io::ErrorKind::AddrNotAvailable
+    )
 }
 
 fn resolve_tun_parameters(
@@ -4404,6 +4447,100 @@ fn print_tunnel_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tun_uses_ipv4_only_when_optional_ipv6_setup_is_denied() {
+        let config =
+            mini_tunnel_agent::tun_device::TunConfig::ipv4(Ipv4Addr::new(10, 77, 0, 2), 24)
+                .with_ipv6("fd00::2".parse().unwrap(), 64);
+        let mut attempts = 0;
+        let (device, ipv6_enabled, ipv6_error) = create_tun_with_ipv6_fallback(config, |config| {
+            attempts += 1;
+            if config.local_ipv6.is_some() {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "IPv6 disabled by host",
+                ))
+            } else {
+                Ok(config.local_ipv4)
+            }
+        })
+        .expect("IPv4-only fallback succeeds");
+
+        assert_eq!(attempts, 2);
+        assert_eq!(device, Ipv4Addr::new(10, 77, 0, 2));
+        assert!(!ipv6_enabled);
+        assert_eq!(
+            ipv6_error.expect("fallback records the IPv6 error").kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn tun_does_not_fallback_for_unrelated_creation_errors() {
+        let config =
+            mini_tunnel_agent::tun_device::TunConfig::ipv4(Ipv4Addr::new(10, 77, 0, 2), 24)
+                .with_ipv6("fd00::2".parse().unwrap(), 64);
+        let mut attempts = 0;
+        let error = create_tun_with_ipv6_fallback(config, |_| {
+            attempts += 1;
+            Err::<(), _>(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "TUN device is unavailable",
+            ))
+        })
+        .expect_err("unrelated TUN error remains fatal");
+
+        assert_eq!(attempts, 1);
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn tun_reports_both_errors_when_ipv4_fallback_also_fails() {
+        let config =
+            mini_tunnel_agent::tun_device::TunConfig::ipv4(Ipv4Addr::new(10, 77, 0, 2), 24)
+                .with_ipv6("fd00::2".parse().unwrap(), 64);
+        let mut attempts = 0;
+        let error = create_tun_with_ipv6_fallback(config, |_| {
+            attempts += 1;
+            let message = if attempts == 1 {
+                "IPv6 disabled"
+            } else {
+                "TUN permission denied"
+            };
+            Err::<(), _>(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                message,
+            ))
+        })
+        .expect_err("failed fallback is returned");
+
+        assert_eq!(attempts, 2);
+        assert!(error.to_string().contains("IPv6 disabled"));
+        assert!(error.to_string().contains("TUN permission denied"));
+    }
+
+    #[test]
+    fn ipv6_fallback_error_classifier_is_limited_to_host_capability_errors() {
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Unsupported,
+            std::io::ErrorKind::AddrNotAvailable,
+        ] {
+            assert!(ipv6_tun_setup_may_be_unsupported(&std::io::Error::from(
+                kind
+            )));
+        }
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::ConnectionRefused,
+        ] {
+            assert!(!ipv6_tun_setup_may_be_unsupported(&std::io::Error::from(
+                kind
+            )));
+        }
+    }
 
     #[test]
     fn candidate_update_signatures_use_coordinator_canonical_order() {
