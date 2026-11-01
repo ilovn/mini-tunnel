@@ -65,3 +65,61 @@ tests:
       - eval_time: 7m
         alertname: MiniTunnelRelayHandshakeFailures
         exp_alerts: []
+
+  - name: fires for sustained coordinator rate limiting
+    interval: 1m
+    input_series:
+      - series: 'mini_tunnel_coordinator_rate_limited_total{job="mini-tunnel-coordinator",instance="coordinator.internal:8443"}'
+        values: '0 30 60 90 120 150 180 210 240 270 300'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: MiniTunnelCoordinatorRateLimited
+        exp_alerts:
+          - exp_labels:
+              job: mini-tunnel-coordinator
+              instance: coordinator.internal:8443
+              severity: warning
+              alertname: MiniTunnelCoordinatorRateLimited
+            exp_annotations:
+              summary: mini-tunnel Coordinator is repeatedly rate-limiting requests
+              description: More than 100 requests were rate-limited in five minutes for at least two minutes; inspect client traffic and proxy address attribution.
+              runbook: deploy/systemd/README.md#monitoring-and-alerts
+
+  - name: stays quiet for occasional coordinator rate limiting
+    interval: 1m
+    input_series:
+      - series: 'mini_tunnel_coordinator_rate_limited_total{job="mini-tunnel-coordinator",instance="coordinator.internal:8443"}'
+        values: '0 5 10 15 20 25 30 35 40 45 50'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: MiniTunnelCoordinatorRateLimited
+        exp_alerts: []
+
+  - name: fires for sustained coordinator connection capacity rejection
+    interval: 1m
+    input_series:
+      - series: 'mini_tunnel_coordinator_connection_rejected_total{job="mini-tunnel-coordinator",instance="coordinator.internal:8443"}'
+        values: '0 3 6 9 12 15 18 21 24 27 30'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: MiniTunnelCoordinatorConnectionRejected
+        exp_alerts:
+          - exp_labels:
+              job: mini-tunnel-coordinator
+              instance: coordinator.internal:8443
+              severity: warning
+              alertname: MiniTunnelCoordinatorConnectionRejected
+            exp_annotations:
+              summary: mini-tunnel Coordinator HTTP connection capacity was exhausted
+              description: More than 10 HTTP connections were rejected in five minutes for at least two minutes; inspect connection churn and host capacity.
+              runbook: deploy/systemd/README.md#monitoring-and-alerts
+
+  - name: stays quiet below coordinator connection rejection threshold
+    interval: 1m
+    input_series:
+      - series: 'mini_tunnel_coordinator_connection_rejected_total{job="mini-tunnel-coordinator",instance="coordinator.internal:8443"}'
+        values: '0 1 2 3 4 5 6 7 8 9 10'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: MiniTunnelCoordinatorConnectionRejected
+        exp_alerts: []
