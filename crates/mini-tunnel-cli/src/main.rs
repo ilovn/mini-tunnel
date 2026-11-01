@@ -2312,8 +2312,11 @@ async fn select_ice_peer_address(
             let router = local.router.clone();
             let local_ufrag = local_ufrag.clone();
             let remote_ufrag = remote.ufrag.clone();
-            let (monitor, mut cancel, failure_sender) =
+            let (monitor, cancel, failure_sender) =
                 mini_tunnel_agent::ice::IceConsentMonitor::new();
+            let degraded_sender = monitor.degraded_sender();
+            let mut signals =
+                mini_tunnel_agent::ice::IceConsentSignals::new(cancel, degraded_sender);
             let task = tokio::spawn(async move {
                 tracing::debug!("ICE consent monitor started");
                 if let Err(error) = driver
@@ -2323,7 +2326,7 @@ async fn select_ice_peer_address(
                         &local_ufrag,
                         &remote_ufrag,
                         &mut datagrams,
-                        &mut cancel,
+                        &mut signals,
                     )
                     .await
                 {

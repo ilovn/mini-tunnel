@@ -527,6 +527,14 @@ impl PeerChannel {
         }
     }
 
+    pub(crate) fn ice_consent_degraded_receiver(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.ice_consent
+            .as_ref()
+            .map(ice::IceConsentMonitor::degraded_receiver)
+    }
+
     /// Stop this channel's ICE driver and wait for its router registration to be released.
     pub async fn stop_ice_consent_monitor(&self) {
         if let Some(monitor) = &self.ice_consent {

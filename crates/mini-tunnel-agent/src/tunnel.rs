@@ -425,6 +425,27 @@ async fn cancel_prepared_fallback(
     }
 }
 
+async fn wait_for_ice_consent_state_change(
+    receiver: &mut Option<tokio::sync::watch::Receiver<bool>>,
+    last_state: &mut bool,
+) -> bool {
+    let Some(receiver) = receiver.as_mut() else {
+        std::future::pending::<()>().await;
+        unreachable!();
+    };
+    let current = *receiver.borrow();
+    if current != *last_state {
+        *last_state = current;
+        return current;
+    }
+    if receiver.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+    let current = *receiver.borrow();
+    *last_state = current;
+    current
+}
+
 impl Deref for MeshReceiverTasks {
     type Target = HashMap<Ipv4Addr, tokio::task::JoinHandle<()>>;
 
@@ -629,6 +650,8 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         keepalive.tick().await;
         let mut last_received = tokio::time::Instant::now();
         let mut inbound = Box::pin(active.recv_packet());
+        let mut ice_consent_degraded = active.ice_consent_degraded_receiver();
+        let mut last_ice_consent_degraded = false;
         let mut quality = PathQualityTracker::default();
         let mut health_status_windows = 0_u8;
         let initial_health = active.health_snapshot();
@@ -677,6 +700,36 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                 }
                 _ = active.wait_ice_consent_failure() => {
                     break Err(IdentityError::Transport("ICE consent expired".to_owned()));
+                }
+                degraded = wait_for_ice_consent_state_change(
+                    &mut ice_consent_degraded,
+                    &mut last_ice_consent_degraded,
+                ), if ice_consent_degraded.is_some() && !force_reliable => {
+                    if degraded {
+                        if fallback_task.is_none()
+                            && ready_fallback.is_none()
+                            && let Some(connector) = connector.as_ref()
+                        {
+                            tracing::warn!(
+                                peer_address = %address,
+                                path = active.transport_name(),
+                                reason = "ice_consent_disconnected",
+                                "preparing reliable fallback while ICE consent is in its disconnected grace period"
+                            );
+                            fallback_task = Some(spawn_reliable_fallback_task(
+                                connector,
+                                address,
+                                fallback_tx.clone(),
+                            ));
+                        }
+                    } else if fallback_task.is_some() || ready_fallback.is_some() {
+                        cancel_prepared_fallback(
+                            &mut fallback_task,
+                            &mut fallback_rx,
+                            &mut ready_fallback,
+                        )
+                        .await;
+                    }
                 }
                 outbound = outbound_rx.recv() => {
                     let Some(packet) = outbound else { return };
@@ -2724,6 +2777,7 @@ mod tests {
         .unwrap();
         let _remote_initial = accept.await.unwrap().unwrap();
         let (monitor, mut cancel, consent_failed) = crate::ice::IceConsentMonitor::new();
+        let degraded_sender = monitor.degraded_sender();
         monitor
             .set_task(tokio::spawn(async move {
                 let _ = cancel.changed().await;
@@ -2733,20 +2787,24 @@ mod tests {
 
         let reliable_requested = Arc::new(Mutex::new(None));
         let reliable_notify = Arc::new(tokio::sync::Notify::new());
+        let reliable_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let remote_channel = Arc::new(Mutex::new(None));
         let connector: PeerConnector = {
             let a = Arc::clone(&a);
             let b = Arc::clone(&b);
             let reliable_requested = Arc::clone(&reliable_requested);
             let reliable_notify = Arc::clone(&reliable_notify);
+            let reliable_calls = Arc::clone(&reliable_calls);
             let remote_channel = Arc::clone(&remote_channel);
             Arc::new(move |force_reliable| -> PeerConnectFuture {
                 let a = Arc::clone(&a);
                 let b = Arc::clone(&b);
                 let reliable_requested = Arc::clone(&reliable_requested);
                 let reliable_notify = Arc::clone(&reliable_notify);
+                let reliable_calls = Arc::clone(&reliable_calls);
                 let remote_channel = Arc::clone(&remote_channel);
                 Box::pin(async move {
+                    reliable_calls.fetch_add(1, Ordering::Relaxed);
                     *reliable_requested.lock().await = Some(force_reliable);
                     reliable_notify.notify_one();
                     let (local, remote) = tcp_pair(a, b).await;
@@ -2781,11 +2839,28 @@ mod tests {
             )
             .await
         });
-        consent_failed.send_replace(true);
+        degraded_sender.send_replace(true);
         tokio::time::timeout(Duration::from_secs(3), reliable_notify.notified())
             .await
-            .expect("reconnect requested");
+            .expect("reliable fallback prepared after ICE reports disconnection");
         assert_eq!(*reliable_requested.lock().await, Some(true));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if remote_channel.lock().await.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("authenticated fallback channel is prepared before ICE failure");
+        let prepared_status = crate::status::snapshot()
+            .into_iter()
+            .find(|status| status.peer == peer_ip.to_string())
+            .expect("peer status available before ICE failure");
+        assert!(prepared_status.online);
+        assert_eq!(prepared_status.active_path, "QUIC/UDP");
+        consent_failed.send_replace(true);
 
         let recovered = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
@@ -2798,18 +2873,36 @@ mod tests {
         .await
         .expect("reliable peer channel established");
         assert_eq!(recovered.transport_name(), "TLS/TCP");
+        assert_eq!(reliable_calls.load(Ordering::Relaxed), 1);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if crate::status::snapshot().into_iter().any(|status| {
+                    status.peer == peer_ip.to_string()
+                        && status.online
+                        && status.active_path == "TLS/TCP"
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("mesh promoted the prepared reliable channel");
         outbound_tx
             .send(packet(local_ip, peer_ip, 28))
             .await
             .unwrap();
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(3), recovered.recv_packet())
-                .await
-                .unwrap()
-                .unwrap()
-                .len(),
-            28
-        );
+        let delivered = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let packet = recovered.recv_packet().await.unwrap();
+                if !packet.is_empty() {
+                    break packet;
+                }
+            }
+        })
+        .await
+        .expect("overlay packet delivered after fallback");
+        assert_eq!(delivered.len(), 28);
 
         pump.abort();
         recovered.close_async().await;

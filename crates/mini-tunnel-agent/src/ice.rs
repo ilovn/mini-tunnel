@@ -39,6 +39,7 @@ const ICE_TRANSACTION_TTL: Duration = Duration::from_secs(30);
 const ICE_CONSENT_INTERVAL: Duration = Duration::from_secs(5);
 const ICE_DISCONNECTED_TIMEOUT: Duration = Duration::from_secs(15);
 const ICE_FAILED_TIMEOUT: Duration = Duration::from_secs(30);
+const ICE_DISCONNECTED_RECOVERY_GRACE: Duration = Duration::from_secs(5);
 
 /// Generate an ephemeral ICE credential pair suitable for both rtc-ice and coordinator signaling.
 /// The coordinator accepts the RFC 8445 alphanumeric, `+`, and `/` alphabet; credentials are
@@ -888,18 +889,34 @@ pub(crate) fn is_candidate_send_error(error: &io::Error) -> bool {
 /// Channel-owned cancellation and failure signal for a nominated ICE consent session.
 pub struct IceConsentMonitor {
     cancel: watch::Sender<bool>,
+    degraded: watch::Sender<bool>,
     failed: watch::Receiver<bool>,
     task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+/// Driver-side signals that track the nominated pair's consent and shutdown lifecycle.
+pub struct IceConsentSignals {
+    cancel: watch::Receiver<bool>,
+    degraded: watch::Sender<bool>,
+}
+
+impl IceConsentSignals {
+    #[must_use]
+    pub fn new(cancel: watch::Receiver<bool>, degraded: watch::Sender<bool>) -> Self {
+        Self { cancel, degraded }
+    }
 }
 
 impl IceConsentMonitor {
     /// Create a monitor handle and the receivers/sender consumed by its driver task.
     pub fn new() -> (Self, watch::Receiver<bool>, watch::Sender<bool>) {
         let (cancel, cancel_receiver) = watch::channel(false);
+        let (degraded, _) = watch::channel(false);
         let (failure_sender, failed) = watch::channel(false);
         (
             Self {
                 cancel,
+                degraded,
                 failed,
                 task: tokio::sync::Mutex::new(None),
             },
@@ -910,6 +927,16 @@ impl IceConsentMonitor {
 
     pub(crate) fn failure_receiver(&self) -> watch::Receiver<bool> {
         self.failed.clone()
+    }
+
+    pub(crate) fn degraded_receiver(&self) -> watch::Receiver<bool> {
+        self.degraded.subscribe()
+    }
+
+    /// Signal early that the nominated pair has lost consent but is still within ICE's
+    /// disconnected grace period. The owner can prepare a reliable fallback before failure.
+    pub fn degraded_sender(&self) -> watch::Sender<bool> {
+        self.degraded.clone()
     }
 
     pub async fn set_task(&self, task: tokio::task::JoinHandle<()>) {
@@ -1252,10 +1279,11 @@ impl IceAgentDriver {
         local_ufrag: &str,
         remote_ufrag: &str,
         datagrams: &mut mpsc::Receiver<IceDatagram>,
-        cancel: &mut watch::Receiver<bool>,
+        signals: &mut IceConsentSignals,
     ) -> Result<(), IceDriverError> {
+        let mut disconnected_since = None;
         loop {
-            if *cancel.borrow() {
+            if *signals.cancel.borrow() {
                 return Ok(());
             }
             let now = Instant::now();
@@ -1275,27 +1303,44 @@ impl IceAgentDriver {
                     .map_err(|error| IceDriverError::Socket(error.to_string()))?;
             }
             let mut disconnected = false;
+            let mut failed = false;
             for event in self.poll_events() {
-                if let rtc_ice::Event::ConnectionStateChange(state) = event
-                    && matches!(
-                        state,
-                        rtc_ice::state::ConnectionState::Disconnected
-                            | rtc_ice::state::ConnectionState::Failed
-                            | rtc_ice::state::ConnectionState::Closed
-                    )
-                {
-                    disconnected = true;
+                if let rtc_ice::Event::ConnectionStateChange(state) = event {
+                    match state {
+                        rtc_ice::state::ConnectionState::Disconnected => disconnected = true,
+                        rtc_ice::state::ConnectionState::Failed
+                        | rtc_ice::state::ConnectionState::Closed => failed = true,
+                        rtc_ice::state::ConnectionState::Connected => {
+                            disconnected_since = None;
+                            signals.degraded.send_replace(false);
+                        }
+                        _ => {}
+                    }
                 }
             }
-            if disconnected || self.selected_pair().is_none() {
+            if disconnected {
+                signals.degraded.send_replace(true);
+                disconnected_since.get_or_insert(now);
+            }
+            if failed || (self.selected_pair().is_none() && disconnected_since.is_none()) {
+                return Err(IceDriverError::Timeout);
+            }
+            if disconnected_since.is_some_and(|since| {
+                now.saturating_duration_since(since) >= ICE_DISCONNECTED_RECOVERY_GRACE
+            }) {
                 return Err(IceDriverError::Timeout);
             }
             let next_deadline = self
                 .next_timeout()
-                .unwrap_or_else(|| now + Duration::from_secs(1));
+                .unwrap_or_else(|| now + Duration::from_secs(1))
+                .min(
+                    disconnected_since
+                        .map(|since| since + ICE_DISCONNECTED_RECOVERY_GRACE)
+                        .unwrap_or_else(|| now + Duration::from_secs(1)),
+                );
             tokio::select! {
-                changed = cancel.changed() => {
-                    if changed.is_err() || *cancel.borrow() {
+                changed = signals.cancel.changed() => {
+                    if changed.is_err() || *signals.cancel.borrow() {
                         return Ok(());
                     }
                 }
@@ -1996,7 +2041,9 @@ mod tests {
         assert_eq!(pair_a.expect("A nominates pair"), (address_a, address_b));
         assert_eq!(pair_b.expect("B nominates pair"), (address_b, address_a));
 
-        let (monitor, mut cancel, failure_sender) = IceConsentMonitor::new();
+        let (monitor, cancel, failure_sender) = IceConsentMonitor::new();
+        let degraded_sender = monitor.degraded_sender();
+        let mut signals = IceConsentSignals::new(cancel, degraded_sender);
         let router = endpoint_a.ice_router.clone();
         let socket = endpoint_a.socket.clone();
         let local_ufrag = credentials_a.ufrag.clone();
@@ -2009,7 +2056,7 @@ mod tests {
                     &local_ufrag,
                     &remote_ufrag,
                     &mut ice_messages_a,
-                    &mut cancel,
+                    &mut signals,
                 )
                 .await
                 .is_err()
@@ -2019,7 +2066,9 @@ mod tests {
             let _ = router.unregister(&local_ufrag, &remote_ufrag);
         });
         monitor.set_task(task).await;
-        let (monitor_b, mut cancel_b, failure_sender_b) = IceConsentMonitor::new();
+        let (monitor_b, cancel_b, failure_sender_b) = IceConsentMonitor::new();
+        let degraded_sender_b = monitor_b.degraded_sender();
+        let mut signals_b = IceConsentSignals::new(cancel_b, degraded_sender_b);
         let router_b = endpoint_b.ice_router.clone();
         let socket_b = endpoint_b.socket.clone();
         let local_ufrag_b = credentials_b.ufrag.clone();
@@ -2032,7 +2081,7 @@ mod tests {
                     &local_ufrag_b,
                     &remote_ufrag_b,
                     &mut ice_messages,
-                    &mut cancel_b,
+                    &mut signals_b,
                 )
                 .await
                 .is_err()
@@ -2050,6 +2099,21 @@ mod tests {
         );
 
         monitor_b.stop().await;
+        let mut degraded = monitor.degraded_receiver();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if *degraded.borrow() {
+                    break;
+                }
+                degraded.changed().await.expect("ICE degraded state sender");
+            }
+        })
+        .await
+        .expect("ICE disconnected state is reported before consent failure");
+        assert!(
+            !*monitor.failure_receiver().borrow(),
+            "the consent monitor must allow time to prepare fallback after disconnection"
+        );
         let mut failed = monitor.failure_receiver();
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
