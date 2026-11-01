@@ -129,6 +129,7 @@ TCP fallback 的帧格式：`u32_be frame_length | encrypted_packet`，最大 fr
 - 控制面 TLS；设备公钥注册；配置由服务端签名并绑定网络/设备/到期时间/版本。P2P 端到端加密、双向 peer 验证、域分离 session key、前向保密（使用成熟实现）。Relay 只转发不可解密内容。
 - 会话消息绑定 network ID、双方设备 ID、握手随机数和协议版本，防止跨网重放/混淆；数据包重放窗口与乱序检查。
 - Coordinator/relay 抵御 DoS：握手前 stateless cookie / address validation、响应放大限制、候选数和同时连接数上限、签名 relay ticket、速率配额；不接受用户指定任意 relay 目的地址以避免 SSRF。
+- UDP Relay 将 HELLO/PROOF 按规范化来源 IP 限速，默认突发 20、持续每秒 10 次；速率表限制为 4096 个活跃来源并在空闲 60 秒后清理。可通过 `--udp-auth-burst`、`--udp-auth-rate-per-second` 或 `MINI_TUNNEL_UDP_RELAY_AUTH_BURST`、`MINI_TUNNEL_UDP_RELAY_AUTH_RATE_PER_SECOND` 调整；状态表容量保持固定。
 - 管理员可移除成员，在线下发撤销；离线设备靠短租期凭证限制吊销延迟。密钥轮换/泄露处置包含重新入网和强制 session key 更新。
 - 记录审计事件但不记录流量 payload、token、私钥。更新包签名校验；版本回滚保护需纳入发布设计。
 

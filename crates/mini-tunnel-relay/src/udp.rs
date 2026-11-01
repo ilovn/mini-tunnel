@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     io,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -35,6 +35,11 @@ const MAX_TICKET_LIFETIME_MS: u64 = 120_000;
 const MAX_SESSION_BYTES: u64 = 1024 * 1024 * 1024;
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_UDP_PACKET: usize = 64 * 1024;
+const MAX_AUTH_RATE_SOURCES: usize = 4096;
+const AUTH_RATE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const AUTH_RATE_BURST: u32 = 20;
+const AUTH_RATE_PER_SECOND: u32 = 10;
+const AUTH_RATE_TOKEN_MILLI: u32 = 1000;
 
 #[derive(Debug, Clone)]
 pub struct UdpRelayConfig {
@@ -42,6 +47,8 @@ pub struct UdpRelayConfig {
     pub previous_ticket_key: Option<[u8; 32]>,
     pub max_sessions: usize,
     pub max_pending: usize,
+    pub auth_burst: u32,
+    pub auth_per_second: u32,
 }
 
 impl UdpRelayConfig {
@@ -52,6 +59,8 @@ impl UdpRelayConfig {
             previous_ticket_key: None,
             max_sessions: MAX_SESSIONS,
             max_pending: MAX_PENDING,
+            auth_burst: AUTH_RATE_BURST,
+            auth_per_second: AUTH_RATE_PER_SECOND,
         }
     }
 
@@ -60,6 +69,13 @@ impl UdpRelayConfig {
         if key != self.ticket_key {
             self.previous_ticket_key = Some(key);
         }
+        self
+    }
+
+    #[must_use]
+    pub fn with_auth_rate(mut self, burst: u32, per_second: u32) -> Self {
+        self.auth_burst = burst.clamp(1, 1_000_000);
+        self.auth_per_second = per_second.clamp(1, 1_000_000);
         self
     }
 }
@@ -91,6 +107,7 @@ struct State {
     used_tickets: HashMap<[u8; 16], u64>,
     accepted_proofs: HashMap<[u8; 16], AcceptedProof>,
     sessions: HashMap<[u8; 16], Session>,
+    auth_rate_limits: HashMap<IpAddr, AuthRateLimit>,
 }
 
 struct Pending {
@@ -103,6 +120,12 @@ struct Pending {
 struct AcceptedProof {
     expires_at_ms: u64,
     packet: Vec<u8>,
+}
+
+struct AuthRateLimit {
+    tokens_milli: u32,
+    last_refill: tokio::time::Instant,
+    last_seen: tokio::time::Instant,
 }
 
 #[derive(Clone)]
@@ -171,9 +194,15 @@ impl UdpRelayServer {
         packet: &[u8],
     ) -> io::Result<bool> {
         if packet.starts_with(HELLO) {
+            if !self.admit_auth_attempt(source.ip()).await {
+                return Ok(false);
+            }
             return self.handle_hello(socket, source, packet).await;
         }
         if packet.starts_with(PROOF) {
+            if !self.admit_auth_attempt(source.ip()).await {
+                return Ok(false);
+            }
             return self.handle_proof(socket, source, packet).await;
         }
         let Ok((session_id, _)) = decode_udp_relay_datagram(packet) else {
@@ -218,6 +247,17 @@ impl UdpRelayServer {
         socket.send_to(packet, target).await?;
         self.inner.forwarded.fetch_add(1, Ordering::Relaxed);
         Ok(true)
+    }
+
+    async fn admit_auth_attempt(&self, source_ip: IpAddr) -> bool {
+        let mut state = self.inner.state.lock().await;
+        allow_auth_attempt_with_rate(
+            &mut state,
+            source_ip,
+            tokio::time::Instant::now(),
+            self.inner.config.auth_burst,
+            self.inner.config.auth_per_second,
+        )
     }
 
     async fn handle_hello(
@@ -492,6 +532,63 @@ impl UdpRelayServer {
     }
 }
 
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(IpAddr::V6(ip), IpAddr::V4),
+        IpAddr::V4(ip) => IpAddr::V4(ip),
+    }
+}
+
+#[cfg(test)]
+fn allow_auth_attempt(state: &mut State, source_ip: IpAddr, now: tokio::time::Instant) -> bool {
+    allow_auth_attempt_with_rate(state, source_ip, now, AUTH_RATE_BURST, AUTH_RATE_PER_SECOND)
+}
+
+fn allow_auth_attempt_with_rate(
+    state: &mut State,
+    source_ip: IpAddr,
+    now: tokio::time::Instant,
+    burst: u32,
+    per_second: u32,
+) -> bool {
+    let burst = burst.clamp(1, 1_000_000);
+    let per_second = per_second.clamp(1, 1_000_000);
+    state
+        .auth_rate_limits
+        .retain(|_, bucket| now.duration_since(bucket.last_seen) < AUTH_RATE_IDLE_TIMEOUT);
+    let source_ip = normalize_ip(source_ip);
+    let capacity_milli = burst.saturating_mul(AUTH_RATE_TOKEN_MILLI);
+    if let Some(bucket) = state.auth_rate_limits.get_mut(&source_ip) {
+        let elapsed_ms = now.duration_since(bucket.last_refill).as_millis();
+        let refill_milli = elapsed_ms
+            .saturating_mul(u128::from(per_second))
+            .min(u128::from(capacity_milli)) as u32;
+        bucket.tokens_milli = bucket
+            .tokens_milli
+            .saturating_add(refill_milli)
+            .min(capacity_milli);
+        bucket.last_refill = now;
+        bucket.last_seen = now;
+        if bucket.tokens_milli < AUTH_RATE_TOKEN_MILLI {
+            return false;
+        }
+        bucket.tokens_milli -= AUTH_RATE_TOKEN_MILLI;
+        return true;
+    }
+    if state.auth_rate_limits.len() >= MAX_AUTH_RATE_SOURCES {
+        return false;
+    }
+    state.auth_rate_limits.insert(
+        source_ip,
+        AuthRateLimit {
+            tokens_milli: (burst - 1) * AUTH_RATE_TOKEN_MILLI,
+            last_refill: now,
+            last_seen: now,
+        },
+    );
+    true
+}
+
 fn unix_time_ms() -> Option<u64> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -564,6 +661,66 @@ mod tests {
 
     fn device_id(identity: &SigningKey) -> String {
         mini_tunnel_protocol::device_id_from_public_key(&identity.verifying_key().to_bytes())
+    }
+
+    #[test]
+    fn authentication_rate_limit_bounds_burst_and_refills() {
+        let mut state = State::default();
+        let source_ip = "192.0.2.10".parse().expect("source IP");
+        let now = tokio::time::Instant::now();
+        for _ in 0..AUTH_RATE_BURST {
+            assert!(allow_auth_attempt(&mut state, source_ip, now));
+        }
+        assert!(!allow_auth_attempt(&mut state, source_ip, now));
+        assert!(allow_auth_attempt(
+            &mut state,
+            source_ip,
+            now + Duration::from_millis(100)
+        ));
+    }
+
+    #[test]
+    fn auth_rate_configuration_is_bounded() {
+        let config = UdpRelayConfig::new([1; 32]).with_auth_rate(0, u32::MAX);
+        assert_eq!(config.auth_burst, 1);
+        assert_eq!(config.auth_per_second, 1_000_000);
+    }
+
+    #[test]
+    fn authentication_rate_limit_normalizes_mapped_ipv4() {
+        let mut state = State::default();
+        let now = tokio::time::Instant::now();
+        let ipv4 = "192.0.2.10".parse().expect("source IPv4");
+        let mapped_ipv6 = "::ffff:192.0.2.10".parse().expect("mapped source IPv6");
+        for _ in 0..AUTH_RATE_BURST {
+            assert!(allow_auth_attempt(&mut state, ipv4, now));
+        }
+        assert!(!allow_auth_attempt(&mut state, mapped_ipv6, now));
+        assert_eq!(state.auth_rate_limits.len(), 1);
+    }
+
+    #[test]
+    fn authentication_rate_limit_allows_udp_retry_load_and_caps_sources() {
+        let mut state = State::default();
+        let source_ip = "192.0.2.10".parse().expect("source IP");
+        let mut now = tokio::time::Instant::now();
+        for _ in 0..140 {
+            now += Duration::from_millis(250);
+            assert!(allow_auth_attempt(&mut state, source_ip, now));
+        }
+
+        for index in 0..MAX_AUTH_RATE_SOURCES - 1 {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(index as u32));
+            assert!(allow_auth_attempt(&mut state, ip, now));
+        }
+        assert_eq!(state.auth_rate_limits.len(), MAX_AUTH_RATE_SOURCES);
+        let new_ip = IpAddr::V4(std::net::Ipv4Addr::from(u32::MAX));
+        assert!(!allow_auth_attempt(&mut state, new_ip, now));
+        assert_eq!(state.auth_rate_limits.len(), MAX_AUTH_RATE_SOURCES);
+
+        now += AUTH_RATE_IDLE_TIMEOUT;
+        assert!(allow_auth_attempt(&mut state, new_ip, now));
+        assert_eq!(state.auth_rate_limits.len(), 1);
     }
 
     fn ticket(

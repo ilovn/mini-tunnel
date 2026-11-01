@@ -200,6 +200,22 @@ enum RelayCommand {
             value_parser = parse_positive_usize
         )]
         max_connections_per_source_ip: usize,
+        /// UDP authentication burst allowed from one source IP.
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_UDP_RELAY_AUTH_BURST",
+            default_value_t = 20,
+            value_parser = clap::value_parser!(u32).range(1..=1_000_000)
+        )]
+        udp_auth_burst: u32,
+        /// Sustained UDP authentication packets per second allowed from one source IP.
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_UDP_RELAY_AUTH_RATE_PER_SECOND",
+            default_value_t = 10,
+            value_parser = clap::value_parser!(u32).range(1..=1_000_000)
+        )]
+        udp_auth_rate_per_second: u32,
         /// Previous ticket key accepted during rotation. Tickets still expire normally.
         #[arg(long, env = "MINI_TUNNEL_RELAY_PREVIOUS_TICKET_KEY")]
         previous_ticket_key: Option<String>,
@@ -817,6 +833,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 metrics_listen,
                 max_connections,
                 max_connections_per_source_ip,
+                udp_auth_burst,
+                udp_auth_rate_per_second,
                 previous_ticket_key,
                 max_session_bytes,
                 shutdown_grace_seconds,
@@ -851,7 +869,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 eprintln!("UDP relay listening on {}", udp_socket.local_addr()?);
                 let metrics_listener = tokio::net::TcpListener::bind(metrics_listen).await?;
                 let relay = mini_tunnel_relay::RelayServer::new(config);
-                let mut udp_config = mini_tunnel_relay::UdpRelayConfig::new(key);
+                let mut udp_config = mini_tunnel_relay::UdpRelayConfig::new(key)
+                    .with_auth_rate(udp_auth_burst, udp_auth_rate_per_second);
                 if let Some(previous) = previous_key {
                     udp_config = udp_config.with_previous_ticket_key(previous);
                 }
@@ -4817,6 +4836,33 @@ mod tests {
                 _ => panic!("expected connect or listen command"),
             }
         }
+    }
+
+    #[test]
+    fn relay_command_accepts_udp_auth_rate_overrides() {
+        let cli = Cli::try_parse_from([
+            "mini-tunnel",
+            "relay",
+            "serve",
+            "--udp-auth-burst",
+            "32",
+            "--udp-auth-rate-per-second",
+            "16",
+        ])
+        .expect("UDP authentication rate options parse");
+        let Command::Relay {
+            command:
+                RelayCommand::Serve {
+                    udp_auth_burst,
+                    udp_auth_rate_per_second,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected relay serve command");
+        };
+        assert_eq!(udp_auth_burst, 32);
+        assert_eq!(udp_auth_rate_per_second, 16);
     }
 
     #[test]
