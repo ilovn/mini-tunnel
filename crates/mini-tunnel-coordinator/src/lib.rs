@@ -71,6 +71,9 @@ const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const ICE_CREDENTIAL_TTL_MS: u64 = 120_000;
 const MAX_EPHEMERAL_ICE_CREDENTIALS: usize = 8192;
+const REQUEST_LATENCY_BUCKETS_MICROS: [u64; 9] = [
+    5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 5_000_000,
+];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthResponse {
@@ -101,10 +104,50 @@ pub struct CoordinatorState {
     concurrency_rejections_total: Arc<AtomicU64>,
     connection_rejections_total: Arc<AtomicU64>,
     request_timeouts_total: Arc<AtomicU64>,
+    request_latency: Arc<RequestLatencyMetrics>,
     trusted_proxies: Arc<Vec<IpNet>>,
     relay_ticket_key: Option<Arc<[u8; 32]>>,
     relay_pairs: Arc<Mutex<RelayPairStore>>,
     ice_credentials: Arc<RwLock<HashMap<(Uuid, String), EphemeralIceCredentials>>>,
+}
+
+#[derive(Default)]
+struct RequestLatencyMetrics {
+    buckets: [AtomicU64; REQUEST_LATENCY_BUCKETS_MICROS.len()],
+    count: AtomicU64,
+    sum_micros: AtomicU64,
+}
+
+impl RequestLatencyMetrics {
+    fn record(&self, elapsed: Duration) {
+        let micros = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+        for (bucket, bound) in self.buckets.iter().zip(REQUEST_LATENCY_BUCKETS_MICROS) {
+            if micros <= bound {
+                bucket.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_micros.fetch_add(micros, Ordering::Relaxed);
+    }
+
+    fn prometheus(&self) -> String {
+        let mut output = String::from(
+            "# HELP mini_tunnel_coordinator_request_duration_seconds Coordinator HTTP request latency.\n# TYPE mini_tunnel_coordinator_request_duration_seconds histogram\n",
+        );
+        for (bucket, bound) in self.buckets.iter().zip(REQUEST_LATENCY_BUCKETS_MICROS) {
+            output.push_str(&format!(
+                "mini_tunnel_coordinator_request_duration_seconds_bucket{{le=\"{:.3}\"}} {}\n",
+                bound as f64 / 1_000_000.0,
+                bucket.load(Ordering::Relaxed)
+            ));
+        }
+        let count = self.count.load(Ordering::Relaxed);
+        output.push_str(&format!(
+            "mini_tunnel_coordinator_request_duration_seconds_bucket{{le=\"+Inf\"}} {count}\nmini_tunnel_coordinator_request_duration_seconds_sum {:.6}\nmini_tunnel_coordinator_request_duration_seconds_count {count}\n",
+            self.sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        ));
+        output
+    }
 }
 
 #[derive(Clone)]
@@ -2202,7 +2245,19 @@ pub fn router_with_state(state: CoordinatorState) -> Router {
         .route("/v1/networks/{network_id}/relay-ticket", post(relay_ticket))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(from_fn_with_state(state.clone(), limit_requests))
+        .layer(from_fn_with_state(state.clone(), record_request_latency))
         .with_state(state)
+}
+
+async fn record_request_latency(
+    State(state): State<CoordinatorState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let started = Instant::now();
+    let response = next.run(request).await;
+    state.request_latency.record(started.elapsed());
+    response
 }
 
 async fn limit_requests(
@@ -2455,13 +2510,14 @@ async fn metrics(State(state): State<CoordinatorState>, request: Request) -> Res
         .values()
         .map(|network| network.members.len())
         .sum();
-    let body = format!(
+    let mut body = format!(
         "# HELP mini_tunnel_coordinator_networks Configured overlay networks.\n# TYPE mini_tunnel_coordinator_networks gauge\nmini_tunnel_coordinator_networks {networks}\n# HELP mini_tunnel_coordinator_members Enrolled devices across all networks.\n# TYPE mini_tunnel_coordinator_members gauge\nmini_tunnel_coordinator_members {members}\n# HELP mini_tunnel_coordinator_rate_limited_total Requests rejected by the source IP rate limiter.\n# TYPE mini_tunnel_coordinator_rate_limited_total counter\nmini_tunnel_coordinator_rate_limited_total {}\n# HELP mini_tunnel_coordinator_concurrency_rejected_total API requests rejected because the global in-flight limit was reached.\n# TYPE mini_tunnel_coordinator_concurrency_rejected_total counter\nmini_tunnel_coordinator_concurrency_rejected_total {}\n# HELP mini_tunnel_coordinator_connection_rejected_total HTTP connections rejected because the active connection limit was reached.\n# TYPE mini_tunnel_coordinator_connection_rejected_total counter\nmini_tunnel_coordinator_connection_rejected_total {}\n# HELP mini_tunnel_coordinator_request_timeouts_total API requests that exceeded the processing time limit.\n# TYPE mini_tunnel_coordinator_request_timeouts_total counter\nmini_tunnel_coordinator_request_timeouts_total {}\n",
         state.request_limiter.rejected_total.load(Ordering::Relaxed),
         state.concurrency_rejections_total.load(Ordering::Relaxed),
         state.connection_rejections_total.load(Ordering::Relaxed),
         state.request_timeouts_total.load(Ordering::Relaxed),
     );
+    body.push_str(&state.request_latency.prometheus());
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -3053,6 +3109,7 @@ mod tests {
             .route("/healthz", get(health))
             .route("/metrics", get(metrics))
             .layer(from_fn_with_state(state.clone(), limit_requests))
+            .layer(from_fn_with_state(state.clone(), record_request_latency))
             .with_state(state.clone());
         let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 88)), 12345);
         let make_request = |path: &str, source: SocketAddr| {
@@ -4258,6 +4315,47 @@ mod tests {
         assert!(body.contains("mini_tunnel_coordinator_networks 1\n"));
         assert!(body.contains("mini_tunnel_coordinator_members 0\n"));
         assert!(body.contains("mini_tunnel_coordinator_rate_limited_total 1\n"));
+        assert!(
+            body.contains(
+                "mini_tunnel_coordinator_request_duration_seconds_bucket{le=\"+Inf\"} 3\n"
+            )
+        );
+        assert!(body.contains("mini_tunnel_coordinator_request_duration_seconds_count 3\n"));
+    }
+
+    #[test]
+    fn request_latency_histogram_counts_cumulative_buckets_and_sum() {
+        let metrics = RequestLatencyMetrics::default();
+        metrics.record(Duration::from_millis(4));
+        metrics.record(Duration::from_millis(6));
+        metrics.record(Duration::from_millis(300));
+        metrics.record(Duration::from_secs(10));
+
+        let output = metrics.prometheus();
+        assert!(
+            output.contains(
+                "mini_tunnel_coordinator_request_duration_seconds_bucket{le=\"0.005\"} 1\n"
+            )
+        );
+        assert!(
+            output.contains(
+                "mini_tunnel_coordinator_request_duration_seconds_bucket{le=\"0.010\"} 2\n"
+            )
+        );
+        assert!(
+            output.contains(
+                "mini_tunnel_coordinator_request_duration_seconds_bucket{le=\"0.500\"} 3\n"
+            )
+        );
+        assert!(
+            output.contains(
+                "mini_tunnel_coordinator_request_duration_seconds_bucket{le=\"+Inf\"} 4\n"
+            )
+        );
+        assert!(
+            output.contains("mini_tunnel_coordinator_request_duration_seconds_sum 10.310000\n")
+        );
+        assert!(output.contains("mini_tunnel_coordinator_request_duration_seconds_count 4\n"));
     }
 
     fn create_request(name: &str, cidr: &str) -> CreateNetworkRequest {
