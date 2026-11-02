@@ -2369,7 +2369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ice_and_quic_work_through_bidirectional_nat_mapping_proxies() {
+    async fn ice_and_quic_recover_from_nat_rebinding_through_mapping_proxies() {
         let temp =
             std::env::temp_dir().join(format!("mini-tunnel-ice-nat-{}", uuid::Uuid::new_v4()));
         let identity_a =
@@ -2388,17 +2388,34 @@ mod tests {
         // Each proxy exposes a different UDP port. Packets sent to B's mapping are forwarded to
         // B from A's mapping, and vice versa, so the endpoints see translated source addresses.
         let mapping_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("mapping A"));
+        let mapping_a_rebound = Arc::new(
+            UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("rebound mapping A"),
+        );
         let mapping_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("mapping B"));
         let drop_first_mapped_datagram = Arc::new(AtomicBool::new(true));
+        let use_rebound_mapping = Arc::new(AtomicBool::new(false));
         let mapped_a = mapping_a.local_addr().expect("mapped A address");
+        let mapped_a_rebound = mapping_a_rebound
+            .local_addr()
+            .expect("rebound mapped A address");
+        assert_ne!(
+            mapped_a_rebound, mapped_a,
+            "the test must change the NAT mapping"
+        );
         let mapped_b = mapping_b.local_addr().expect("mapped B address");
         let proxy_a = {
             let mapping_a = Arc::clone(&mapping_a);
             let mapping_b = Arc::clone(&mapping_b);
             let drop_first_mapped_datagram = Arc::clone(&drop_first_mapped_datagram);
+            let use_rebound_mapping = Arc::clone(&use_rebound_mapping);
             tokio::spawn(async move {
                 let mut packet = vec![0; 65_535];
                 while let Ok((length, _source)) = mapping_a.recv_from(&mut packet).await {
+                    if use_rebound_mapping.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     if drop_first_mapped_datagram.swap(false, Ordering::Relaxed) {
                         continue;
                     }
@@ -2412,13 +2429,38 @@ mod tests {
                 }
             })
         };
+        let proxy_a_rebound = {
+            let mapping_a_rebound = Arc::clone(&mapping_a_rebound);
+            let mapping_b = Arc::clone(&mapping_b);
+            let use_rebound_mapping = Arc::clone(&use_rebound_mapping);
+            tokio::spawn(async move {
+                let mut packet = vec![0; 65_535];
+                while let Ok((length, _source)) = mapping_a_rebound.recv_from(&mut packet).await {
+                    if use_rebound_mapping.load(Ordering::Relaxed)
+                        && mapping_b
+                            .send_to(&packet[..length], address_a)
+                            .await
+                            .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        };
         let proxy_b = {
             let mapping_a = Arc::clone(&mapping_a);
+            let mapping_a_rebound = Arc::clone(&mapping_a_rebound);
             let mapping_b = Arc::clone(&mapping_b);
+            let use_rebound_mapping = Arc::clone(&use_rebound_mapping);
             tokio::spawn(async move {
                 let mut packet = vec![0; 65_535];
                 while let Ok((length, _source)) = mapping_b.recv_from(&mut packet).await {
-                    if mapping_a
+                    let source_mapping = if use_rebound_mapping.load(Ordering::Relaxed) {
+                        &mapping_a_rebound
+                    } else {
+                        &mapping_a
+                    };
+                    if source_mapping
                         .send_to(&packet[..length], address_b)
                         .await
                         .is_err()
@@ -2517,13 +2559,98 @@ mod tests {
                 .expect("receive tunneled payload"),
             b"ice-over-mapped-udp"
         );
+
+        let (monitor_a, cancel_a, failure_sender_a) = IceConsentMonitor::new();
+        let mut signals_a = IceConsentSignals::new(cancel_a, monitor_a.degraded_sender());
+        let router_a = endpoint_a.ice_router.clone();
+        let socket_a = endpoint_a.socket.clone();
+        let local_ufrag_a = credentials_a.ufrag.clone();
+        let remote_ufrag_a = credentials_b.ufrag.clone();
+        monitor_a
+            .set_task(tokio::spawn(async move {
+                if driver_a
+                    .monitor_consent(
+                        &socket_a,
+                        &router_a,
+                        &local_ufrag_a,
+                        &remote_ufrag_a,
+                        &mut messages_a,
+                        &mut signals_a,
+                    )
+                    .await
+                    .is_err()
+                {
+                    failure_sender_a.send_replace(true);
+                }
+                let _ = router_a.unregister(&local_ufrag_a, &remote_ufrag_a);
+            }))
+            .await;
+        let (monitor_b, cancel_b, failure_sender_b) = IceConsentMonitor::new();
+        let mut signals_b = IceConsentSignals::new(cancel_b, monitor_b.degraded_sender());
+        let router_b = endpoint_b.ice_router.clone();
+        let socket_b = endpoint_b.socket.clone();
+        let local_ufrag_b = credentials_b.ufrag.clone();
+        let remote_ufrag_b = credentials_a.ufrag.clone();
+        monitor_b
+            .set_task(tokio::spawn(async move {
+                if driver_b
+                    .monitor_consent(
+                        &socket_b,
+                        &router_b,
+                        &local_ufrag_b,
+                        &remote_ufrag_b,
+                        &mut messages_b,
+                        &mut signals_b,
+                    )
+                    .await
+                    .is_err()
+                {
+                    failure_sender_b.send_replace(true);
+                }
+                let _ = router_b.unregister(&local_ufrag_b, &remote_ufrag_b);
+            }))
+            .await;
+        let mut degraded_b = monitor_b.degraded_receiver();
+        use_rebound_mapping.store(true, Ordering::Relaxed);
+        channel_a
+            .send_packet(b"ice-after-nat-rebinding")
+            .await
+            .expect("send QUIC payload after NAT source-port change");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), channel_b.recv_packet())
+                .await
+                .expect("receive payload after QUIC path migration")
+                .expect("receive QUIC data"),
+            b"ice-after-nat-rebinding"
+        );
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if *degraded_b.borrow() {
+                    break;
+                }
+                degraded_b
+                    .changed()
+                    .await
+                    .expect("ICE monitor reports authenticated rebinding");
+            }
+        })
+        .await
+        .expect("authenticated rebinding signals reliable fallback preparation");
+        assert!(
+            !*monitor_b.failure_receiver().borrow(),
+            "the old nominated ICE pair remains inside its consent grace period"
+        );
+        monitor_a.stop().await;
+        monitor_b.stop().await;
         channel_a.close();
         channel_b.close();
         endpoint_a.endpoint.close(0_u32.into(), b"test complete");
         endpoint_b.endpoint.close(0_u32.into(), b"test complete");
         proxy_a.abort();
+        proxy_a_rebound.abort();
         proxy_b.abort();
         drop(mapping_a);
+        drop(mapping_a_rebound);
         drop(mapping_b);
         let _ = fs::remove_dir_all(temp);
     }
