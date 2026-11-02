@@ -657,7 +657,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         let initial_health = active.health_snapshot();
         let mut last_health_successes = initial_health.probes_succeeded;
         let mut last_health_missed = initial_health.probes_missed;
-        let mut consecutive_health_misses = 0_u64;
+        let mut unresolved_health_misses = 0_u64;
         let mut fallback_cooldown_until = tokio::time::Instant::now();
         crate::status::update(
             address.to_string(),
@@ -748,10 +748,10 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                     let new_missed = health.probes_missed.saturating_sub(last_health_missed);
                     last_health_successes = health.probes_succeeded;
                     last_health_missed = health.probes_missed;
-                    if new_successes > 0 {
-                        consecutive_health_misses = 0;
-                    } else {
-                        consecutive_health_misses = consecutive_health_misses.saturating_add(new_missed);
+                    if new_missed > 0 {
+                        unresolved_health_misses = unresolved_health_misses.saturating_add(new_missed);
+                    } else if new_successes > 0 {
+                        unresolved_health_misses = 0;
                     }
                     crate::status::update(
                         address.to_string(), true, active.transport_name(),
@@ -779,7 +779,8 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                         && quality.bad_windows == 0;
                     if !force_reliable
                         && active.transport_name() == "QUIC/UDP"
-                        && consecutive_health_misses >= EARLY_FALLBACK_MISSES
+                        && unresolved_health_misses >= EARLY_FALLBACK_MISSES
+                        && !completed_healthy_window
                         && tokio::time::Instant::now() >= fallback_cooldown_until
                         && fallback_task.is_none()
                         && ready_fallback.is_none()
@@ -787,7 +788,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                     {
                         tracing::debug!(
                             peer_address = %address,
-                            consecutive_missed_probes = consecutive_health_misses,
+                            unresolved_missed_probes = unresolved_health_misses,
                             "preparing reliable fallback while UDP health is degraded"
                         );
                         fallback_task = Some(spawn_reliable_fallback_task(
@@ -2875,6 +2876,7 @@ mod tests {
         });
         if let Ok(mut health) = health_channel.health.lock() {
             health.probes_missed = health.probes_missed.saturating_add(1);
+            health.probes_succeeded = health.probes_succeeded.saturating_add(1);
         }
 
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -2886,7 +2888,7 @@ mod tests {
             }
         })
         .await
-        .expect("one missed health probe should prepare a reliable path without ICE");
+        .expect("a missed probe must prepare a reliable path even when another probe succeeds");
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
         assert!(crate::status::snapshot().into_iter().any(|status| {
             status.peer == peer_ip.to_string() && status.online && status.active_path == "QUIC/UDP"
