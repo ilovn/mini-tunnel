@@ -726,12 +726,28 @@ impl PeerChannel {
             let succeeded_before = self.health_snapshot().probes_succeeded;
             self.send_keepalive().await?;
             let deadline = tokio::time::Instant::now() + per_probe_timeout;
+            let retry_udp_probe = matches!(self.transport, PeerTransport::Quic(_));
+            let mut next_retry = tokio::time::Instant::now() + Duration::from_millis(250);
             loop {
-                let packet = tokio::time::timeout_at(deadline, self.recv_packet_from_transport())
-                    .await
-                    .map_err(|_| {
-                        IdentityError::Transport("candidate path probe timed out".to_owned())
-                    })??;
+                let packet = if retry_udp_probe {
+                    tokio::select! {
+                        packet = self.recv_packet_from_transport() => packet?,
+                        _ = tokio::time::sleep_until(next_retry), if next_retry < deadline => {
+                            self.send_keepalive().await?;
+                            next_retry = (tokio::time::Instant::now() + Duration::from_millis(250)).min(deadline);
+                            continue;
+                        }
+                        _ = tokio::time::sleep_until(deadline) => {
+                            return Err(IdentityError::Transport("candidate path probe timed out".to_owned()));
+                        }
+                    }
+                } else {
+                    tokio::time::timeout_at(deadline, self.recv_packet_from_transport())
+                        .await
+                        .map_err(|_| {
+                            IdentityError::Transport("candidate path probe timed out".to_owned())
+                        })??
+                };
                 if !packet.is_empty() {
                     self.pending_probe_packets
                         .lock()
