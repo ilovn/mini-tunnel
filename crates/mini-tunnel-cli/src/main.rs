@@ -3560,6 +3560,25 @@ struct StunMapping {
     related: SocketAddr,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StunMappingObservation {
+    Unavailable,
+    SingleDestination,
+    ConsistentSample,
+    VaryingSample,
+}
+
+fn observe_stun_mappings(mappings: &[StunMapping]) -> StunMappingObservation {
+    match mappings {
+        [] => StunMappingObservation::Unavailable,
+        [_] => StunMappingObservation::SingleDestination,
+        [first, rest @ ..] if rest.iter().all(|mapping| mapping.mapped == first.mapped) => {
+            StunMappingObservation::ConsistentSample
+        }
+        _ => StunMappingObservation::VaryingSample,
+    }
+}
+
 fn normalize_stun_servers(
     servers: Vec<SocketAddr>,
 ) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error + Send + Sync>> {
@@ -3670,6 +3689,15 @@ async fn peer_endpoint_with_optional_stun(
     let bound = endpoint.socket.local_addr()?;
     let mappings =
         gather_stun_mappings(&endpoint.ice_router, &endpoint.socket, stun_servers, bound).await;
+    if !stun_servers.is_empty() {
+        let observation = observe_stun_mappings(&mappings);
+        tracing::info!(
+            configured_servers = stun_servers.len(),
+            successful_servers = mappings.len(),
+            observation = ?observation,
+            "STUN mapping sample collected; this is not a NAT type determination"
+        );
+    }
     Ok((endpoint, mappings))
 }
 
@@ -4824,6 +4852,36 @@ mod tests {
         assert_eq!(
             load_ticket_key(None, None, "TICKET_KEY", "TICKET_KEY_FILE").unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn stun_mapping_observation_summarizes_only_the_sample() {
+        let server_a: SocketAddr = "192.0.2.10:3478".parse().unwrap();
+        let server_b: SocketAddr = "192.0.2.11:3478".parse().unwrap();
+        let mapped_a: SocketAddr = "198.51.100.20:50000".parse().unwrap();
+        let mapped_b: SocketAddr = "198.51.100.20:50001".parse().unwrap();
+        let mapping = |server, mapped| StunMapping {
+            server,
+            mapped,
+            related: "10.0.0.2:40000".parse().unwrap(),
+        };
+
+        assert_eq!(
+            observe_stun_mappings(&[]),
+            StunMappingObservation::Unavailable
+        );
+        assert_eq!(
+            observe_stun_mappings(&[mapping(server_a, mapped_a)]),
+            StunMappingObservation::SingleDestination
+        );
+        assert_eq!(
+            observe_stun_mappings(&[mapping(server_a, mapped_a), mapping(server_b, mapped_a),]),
+            StunMappingObservation::ConsistentSample
+        );
+        assert_eq!(
+            observe_stun_mappings(&[mapping(server_a, mapped_a), mapping(server_b, mapped_b),]),
+            StunMappingObservation::VaryingSample
         );
     }
 
