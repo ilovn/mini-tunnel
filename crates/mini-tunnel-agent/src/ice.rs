@@ -1,7 +1,7 @@
 //! Bounded adapter between the Sans-I/O ICE agent and the shared UDP socket driver.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, VecDeque},
     future::Future,
     io::{self, IoSliceMut},
     net::SocketAddr,
@@ -258,7 +258,7 @@ impl IceDatagramRouterHandle {
 
 struct IceRoute {
     sender: mpsc::Sender<IceDatagram>,
-    peer_addresses: HashSet<SocketAddr>,
+    peer_addresses: VecDeque<SocketAddr>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -337,7 +337,7 @@ impl IceDatagramRouter {
             key,
             IceRoute {
                 sender,
-                peer_addresses: HashSet::new(),
+                peer_addresses: VecDeque::new(),
             },
         );
         Ok(receiver)
@@ -358,26 +358,35 @@ impl IceDatagramRouter {
             local_ufrag: local_ufrag.to_owned(),
             remote_ufrag: remote_ufrag.to_owned(),
         };
-        let route = self
-            .sessions
-            .get(&key)
-            .ok_or(IceRouterError::UnknownUfrag)?;
-        if !route.peer_addresses.contains(&peer_addr)
-            && route.peer_addresses.len() >= MAX_SESSION_PEER_ADDRESSES
-        {
-            return Err(IceRouterError::PeerAddressLimit);
+        if !self.sessions.contains_key(&key) {
+            return Err(IceRouterError::UnknownUfrag);
         }
-        if let Some(previous) = self.peer_sessions.insert(peer_addr, key.clone())
+        if let Some(previous) = self.peer_sessions.get(&peer_addr).cloned()
             && previous != key
             && let Some(previous_route) = self.sessions.get_mut(&previous)
         {
-            previous_route.peer_addresses.remove(&peer_addr);
+            previous_route
+                .peer_addresses
+                .retain(|address| *address != peer_addr);
         }
-        self.sessions
+
+        let route = self
+            .sessions
             .get_mut(&key)
-            .ok_or(IceRouterError::UnknownUfrag)?
-            .peer_addresses
-            .insert(peer_addr);
+            .ok_or(IceRouterError::UnknownUfrag)?;
+        route.peer_addresses.retain(|address| *address != peer_addr);
+        let evicted = if route.peer_addresses.len() >= MAX_SESSION_PEER_ADDRESSES {
+            route.peer_addresses.pop_front()
+        } else {
+            None
+        };
+        if let Some(evicted) = evicted
+            && self.peer_sessions.get(&evicted) == Some(&key)
+        {
+            self.peer_sessions.remove(&evicted);
+        }
+        route.peer_addresses.push_back(peer_addr);
+        self.peer_sessions.insert(peer_addr, key);
         Ok(())
     }
 
@@ -2065,6 +2074,115 @@ mod tests {
         assert!(!router.route(ice_packet("localB:unknownR", peer_a)));
         assert!(router.unregister("localA", "remoteA"));
         assert!(!router.route(ice_packet_without_username(peer_a)));
+    }
+
+    #[tokio::test]
+    async fn ice_router_evicts_old_authenticated_addresses_after_repeated_nat_rebinding() {
+        let mut router = IceDatagramRouter::default();
+        let credentials_a = generate_ice_credentials(1).unwrap();
+        let credentials_b = generate_ice_credentials(1).unwrap();
+        let mut session_a = router
+            .register(credentials_b.ufrag.clone(), credentials_a.ufrag.clone(), 4)
+            .unwrap();
+        let mut session_b = router
+            .register("localB".to_owned(), "remoteB".to_owned(), 4)
+            .unwrap();
+        let address_a: SocketAddr = "198.18.0.1:42000".parse().unwrap();
+        let address_b: SocketAddr = "198.18.0.2:42000".parse().unwrap();
+        let mut driver_b = IceAgentDriver::for_peer(
+            &credentials_b,
+            &credentials_a,
+            &[address_b],
+            &[address_a],
+            false,
+            Instant::now(),
+        )
+        .expect("construct the stable peer ICE session");
+        let addresses = (0..=MAX_SESSION_PEER_ADDRESSES)
+            .map(|offset| {
+                format!("198.51.100.10:{}", 42_000 + offset)
+                    .parse::<SocketAddr>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let authenticate_source = |router: &mut IceDatagramRouter,
+                                   driver_b: &mut IceAgentDriver,
+                                   source: SocketAddr| {
+            let now = Instant::now();
+            let mut driver_a = IceAgentDriver::for_peer(
+                &credentials_a,
+                &credentials_b,
+                &[address_a],
+                &[address_b],
+                true,
+                now,
+            )
+            .expect("construct fresh check sender with stable ICE credentials");
+            driver_a
+                .handle_timeout(now)
+                .expect("start connectivity check");
+            let check = driver_a
+                .poll_transmits()
+                .into_iter()
+                .find(|transmit| transmit.transport.peer_addr == address_b)
+                .expect("ICE check to the stable peer");
+            assert!(
+                driver_b
+                    .handle_datagram(now, source, check.transport.ecn, &check.message)
+                    .expect("authenticated checks from successive NAT mappings are accepted")
+            );
+            router
+                .associate_authenticated_peer(&credentials_b.ufrag, &credentials_a.ufrag, source)
+                .expect("associate only after ICE authentication");
+        };
+        for address in &addresses[..MAX_SESSION_PEER_ADDRESSES] {
+            authenticate_source(&mut router, &mut driver_b, *address);
+        }
+        // Re-authentication refreshes a live address so the LRU evicts the next oldest entry.
+        authenticate_source(&mut router, &mut driver_b, addresses[0]);
+        authenticate_source(
+            &mut router,
+            &mut driver_b,
+            addresses[MAX_SESSION_PEER_ADDRESSES],
+        );
+
+        let key_a = IceSessionKey {
+            local_ufrag: credentials_b.ufrag.clone(),
+            remote_ufrag: credentials_a.ufrag.clone(),
+        };
+        assert_eq!(
+            router.sessions[&key_a].peer_addresses.len(),
+            MAX_SESSION_PEER_ADDRESSES
+        );
+        assert_eq!(router.peer_sessions.len(), MAX_SESSION_PEER_ADDRESSES);
+        assert!(!router.peer_sessions.contains_key(&addresses[1]));
+        assert!(router.peer_sessions.contains_key(&addresses[0]));
+        assert!(!router.route(ice_packet_without_username(addresses[1])));
+        assert!(router.route(ice_packet_without_username(addresses[0])));
+        assert_eq!(session_a.recv().await.unwrap().peer_addr, addresses[0]);
+        let newest = addresses[MAX_SESSION_PEER_ADDRESSES];
+        assert!(router.route(ice_packet_without_username(newest)));
+        assert_eq!(session_a.recv().await.unwrap().peer_addr, newest);
+
+        // A socket address reassigned to another authenticated peer must have exactly one owner.
+        router
+            .associate_authenticated_peer("localB", "remoteB", addresses[0])
+            .unwrap();
+        let key_b = IceSessionKey {
+            local_ufrag: "localB".to_owned(),
+            remote_ufrag: "remoteB".to_owned(),
+        };
+        assert!(
+            !router.sessions[&key_a]
+                .peer_addresses
+                .contains(&addresses[0])
+        );
+        assert_eq!(router.peer_sessions.get(&addresses[0]), Some(&key_b));
+        assert!(router.route(ice_packet_without_username(addresses[0])));
+        assert_eq!(session_b.recv().await.unwrap().peer_addr, addresses[0]);
+        assert!(router.unregister("localB", "remoteB"));
+        assert!(!router.route(ice_packet_without_username(addresses[0])));
     }
 
     #[tokio::test]
