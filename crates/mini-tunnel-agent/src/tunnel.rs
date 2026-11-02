@@ -778,7 +778,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                         >= 3
                         && quality.bad_windows == 0;
                     if !force_reliable
-                        && active.transport_name() == "QUIC/UDP"
+                        && is_udp_path(active.transport_name())
                         && unresolved_health_misses >= EARLY_FALLBACK_MISSES
                         && !completed_healthy_window
                         && tokio::time::Instant::now() >= fallback_cooldown_until
@@ -808,7 +808,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                         )
                         .await;
                     }
-                    if active.transport_name() == "QUIC/UDP" && quality_degraded && !force_reliable {
+                    if is_udp_path(active.transport_name()) && quality_degraded && !force_reliable {
                         tracing::warn!(
                             peer_address = %address,
                             path = active.transport_name(),
@@ -962,8 +962,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         };
         active.stop_ice_consent_monitor().await;
         let health = active.health_snapshot();
-        if active.transport_name() == "QUIC/UDP" && matches!(&failure, IdentityError::Transport(_))
-        {
+        if is_udp_path(active.transport_name()) && matches!(&failure, IdentityError::Transport(_)) {
             force_reliable = true;
         }
         if let Some(candidate) = ready_fallback.take() {
@@ -1108,10 +1107,15 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
 fn path_rank(transport: &str) -> u8 {
     match transport {
         "QUIC/UDP" => 0,
-        "TLS/TCP" => 1,
-        "Relay/TLS" => 2,
+        "Relay/QUIC/UDP" => 1,
+        "TLS/TCP" => 2,
+        "Relay/TLS" => 3,
         _ => u8::MAX,
     }
+}
+
+fn is_udp_path(transport: &str) -> bool {
+    matches!(transport, "QUIC/UDP" | "Relay/QUIC/UDP")
 }
 
 /// Route packets across one TUN and multiple independently authenticated peer channels.
@@ -2143,6 +2147,21 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn direct_and_relay_quic_paths_are_classified_as_udp() {
+        assert!(is_udp_path("QUIC/UDP"));
+        assert!(is_udp_path("Relay/QUIC/UDP"));
+        assert!(!is_udp_path("TLS/TCP"));
+        assert!(!is_udp_path("Relay/TLS"));
+    }
+
+    #[test]
+    fn path_rank_prefers_direct_udp_then_relay_udp_then_reliable_paths() {
+        assert!(path_rank("QUIC/UDP") < path_rank("Relay/QUIC/UDP"));
+        assert!(path_rank("Relay/QUIC/UDP") < path_rank("TLS/TCP"));
+        assert!(path_rank("TLS/TCP") < path_rank("Relay/TLS"));
+    }
+
     #[tokio::test]
     async fn path_failure_discards_already_queued_mesh_packets() {
         let address = Ipv4Addr::new(10, 77, 0, 2);
@@ -2301,7 +2320,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mesh_switches_to_tcp_after_sustained_udp_quality_degradation() {
+    async fn mesh_switches_udp_relay_to_tcp_after_sustained_quality_degradation() {
         let temp = std::env::temp_dir().join(format!(
             "mini-tunnel-quality-fallback-{}",
             uuid::Uuid::new_v4()
@@ -2323,11 +2342,13 @@ mod tests {
         let accept_udp = tokio::spawn(async move {
             accept_peer(&server_endpoint, network, &server_identity, &a_id, a_key).await
         });
-        let initial = Arc::new(
-            connect_peer(&endpoint_a, peer_socket, network, &a, &b_id, b_key)
-                .await
-                .unwrap(),
-        );
+        let mut initial = connect_peer(&endpoint_a, peer_socket, network, &a, &b_id, b_key)
+            .await
+            .unwrap();
+        // Exercise the same channel's Relay/QUIC/UDP transport classification while retaining
+        // this loopback fixture's deterministic QUIC connection and health counters.
+        initial.relay = true;
+        let initial = Arc::new(initial);
         let remote_initial = accept_udp.await.unwrap().unwrap();
         // Start with a high RTT and no completed probes; first inject one miss to prepare
         // fallback, then interleave successes with >20% loss to exercise the quality threshold.
@@ -2450,7 +2471,7 @@ mod tests {
                 if let Some(status) = crate::status::snapshot().into_iter().find(|status| {
                     status.peer == peer_ip.to_string()
                         && status.online
-                        && status.active_path == "QUIC/UDP"
+                        && status.active_path == "Relay/QUIC/UDP"
                 }) {
                     break status;
                 }
@@ -2459,7 +2480,7 @@ mod tests {
         })
         .await
         .expect("active UDP path must remain online while fallback is prepared");
-        assert_eq!(pending_fallback_status.active_path, "QUIC/UDP");
+        assert_eq!(pending_fallback_status.active_path, "Relay/QUIC/UDP");
         assert_ne!(
             pending_fallback_status.last_switch_reason.as_deref(),
             Some("quality_threshold"),
@@ -2483,7 +2504,9 @@ mod tests {
         .await
         .expect("healthy recovery should cancel the pending fallback connection");
         assert!(crate::status::snapshot().into_iter().any(|status| {
-            status.peer == peer_ip.to_string() && status.online && status.active_path == "QUIC/UDP"
+            status.peer == peer_ip.to_string()
+                && status.online
+                && status.active_path == "Relay/QUIC/UDP"
         }));
 
         if let Ok(mut health) = health_control.health.lock() {
