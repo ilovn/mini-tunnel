@@ -64,7 +64,7 @@ jobs:
           subject-path: mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz
 
       - name: Upload Linux x86_64 release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mini-tunnel-linux-x86_64-ubuntu20.04
           path: |
@@ -123,7 +123,7 @@ jobs:
           subject-path: mini-tunnel-linux-aarch64-ubuntu22.04.tar.gz
 
       - name: Upload Linux ARM64 release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mini-tunnel-linux-aarch64-ubuntu22.04
           path: |
