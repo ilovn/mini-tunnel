@@ -29,6 +29,7 @@ use serde::Deserialize;
 const PEER_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(5);
 const ICE_PATH_PROMOTION_PROBATION: Duration = Duration::from_secs(31);
 const ICE_PATH_PROBATION_HEALTH_INTERVAL: Duration = Duration::from_secs(10);
+const DIRECT_PATH_PROMOTION_PROBATION: Duration = Duration::from_secs(31);
 
 #[derive(Debug, Parser)]
 #[command(name = "mini-tunnel", version, about = "A minimal peer-to-peer tunnel")]
@@ -3099,9 +3100,21 @@ async fn validate_udp_probe(
     channel: mini_tunnel_agent::PeerChannel,
     require_ice_consent: bool,
 ) -> Result<mini_tunnel_agent::PeerChannel, mini_tunnel_agent::IdentityError> {
-    validate_udp_probe_with_window(channel, require_ice_consent, ICE_PATH_PROMOTION_PROBATION).await
+    let probation = if require_ice_consent {
+        ICE_PATH_PROMOTION_PROBATION
+    } else {
+        DIRECT_PATH_PROMOTION_PROBATION
+    };
+    validate_udp_probe_with_timing(
+        channel,
+        require_ice_consent,
+        probation,
+        ICE_PATH_PROBATION_HEALTH_INTERVAL,
+    )
+    .await
 }
 
+#[cfg(test)]
 async fn validate_udp_probe_with_window(
     channel: mini_tunnel_agent::PeerChannel,
     require_ice_consent: bool,
@@ -3122,7 +3135,13 @@ async fn validate_udp_probe_with_timing(
     consent_window: Duration,
     health_interval: Duration,
 ) -> Result<mini_tunnel_agent::PeerChannel, mini_tunnel_agent::IdentityError> {
-    let rtt = channel.probe_health(3, Duration::from_secs(2)).await?;
+    // Recovery from a reliable path needs more evidence than initial direct dialing:
+    // several clean probes plus a probation window prevent a lucky short burst from
+    // promoting a lossy UDP candidate.
+    let initial_probes = if require_ice_consent { 3 } else { 8 };
+    let rtt = channel
+        .probe_health(initial_probes, Duration::from_secs(2))
+        .await?;
     if !mini_tunnel_agent::tunnel::path_quality_rtt_is_acceptable(rtt) {
         return Err(mini_tunnel_agent::IdentityError::Transport(
             "direct path probe exceeded RTT threshold".to_owned(),
@@ -3147,7 +3166,30 @@ async fn validate_udp_probe_with_timing(
                 }
                 _ = tokio::time::sleep_until(deadline) => break,
                 _ = health_probes.tick() => {
-                    channel.probe_health(1, Duration::from_secs(2)).await?;
+                    let rtt = channel.probe_health(1, Duration::from_secs(2)).await?;
+                    if !mini_tunnel_agent::tunnel::path_quality_rtt_is_acceptable(rtt) {
+                        return Err(mini_tunnel_agent::IdentityError::Transport(
+                            "direct path RTT exceeded threshold during probation".to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+    } else {
+        let deadline = tokio::time::Instant::now() + consent_window;
+        let mut health_probes = tokio::time::interval(health_interval);
+        health_probes.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        health_probes.tick().await;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                _ = health_probes.tick() => {
+                    let rtt = channel.probe_health(1, Duration::from_secs(2)).await?;
+                    if !mini_tunnel_agent::tunnel::path_quality_rtt_is_acceptable(rtt) {
+                        return Err(mini_tunnel_agent::IdentityError::Transport(
+                            "direct path RTT exceeded threshold during probation".to_owned(),
+                        ));
+                    }
                 }
             }
         }
@@ -5433,6 +5475,182 @@ mod tests {
         probe_remote.close_async().await;
         local_endpoint.close(0_u32.into(), b"test complete");
         peer_endpoint.close(0_u32.into(), b"test complete");
+        std::fs::remove_dir_all(temp).expect("remove test identities");
+    }
+
+    #[tokio::test]
+    async fn non_ice_direct_candidate_requires_sustained_health_probation() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-direct-promotion-probation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let a = std::sync::Arc::new(
+            mini_tunnel_agent::Identity::load_or_create_at(temp.join("a/key"))
+                .expect("local identity"),
+        );
+        let b = std::sync::Arc::new(
+            mini_tunnel_agent::Identity::load_or_create_at(temp.join("b/key"))
+                .expect("peer identity"),
+        );
+        let endpoint_a = mini_tunnel_agent::peer_endpoint(&a, "127.0.0.1:0".parse().unwrap())
+            .expect("bind local UDP endpoint");
+        let endpoint_b = mini_tunnel_agent::peer_endpoint(&b, "127.0.0.1:0".parse().unwrap())
+            .expect("bind peer UDP endpoint");
+        let accepting = {
+            let endpoint = endpoint_b.clone();
+            let identity = std::sync::Arc::clone(&b);
+            let peer_id = a.device_id();
+            let peer_key = a.public_key();
+            tokio::spawn(async move {
+                mini_tunnel_agent::accept_peer(
+                    &endpoint,
+                    "direct-promotion-probation",
+                    &identity,
+                    &peer_id,
+                    peer_key,
+                )
+                .await
+                .expect("accept provisional UDP channel")
+            })
+        };
+        let candidate = mini_tunnel_agent::connect_peer(
+            &endpoint_a,
+            endpoint_b.local_addr().unwrap(),
+            "direct-promotion-probation",
+            &a,
+            &b.device_id(),
+            b.public_key(),
+        )
+        .await
+        .expect("connect provisional UDP channel");
+        let candidate_remote = accepting.await.expect("join accept task");
+        let responder =
+            tokio::spawn(async move { while candidate_remote.recv_packet().await.is_ok() {} });
+
+        let started = tokio::time::Instant::now();
+        let candidate = validate_udp_probe_with_timing(
+            candidate,
+            false,
+            Duration::from_millis(120),
+            Duration::from_millis(20),
+        )
+        .await
+        .expect("healthy non-ICE candidate survives probation");
+        assert!(started.elapsed() >= Duration::from_millis(120));
+        assert!(candidate.health_snapshot().probes_succeeded >= 12);
+
+        candidate.close_async().await;
+        responder.abort();
+        endpoint_a.close(0_u32.into(), b"test complete");
+        endpoint_b.close(0_u32.into(), b"test complete");
+        std::fs::remove_dir_all(temp).expect("remove test identities");
+    }
+
+    #[tokio::test]
+    async fn non_ice_candidate_failure_during_probation_leaves_reliable_path_usable() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-direct-promotion-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let a = std::sync::Arc::new(
+            mini_tunnel_agent::Identity::load_or_create_at(temp.join("a/key"))
+                .expect("local identity"),
+        );
+        let b = std::sync::Arc::new(
+            mini_tunnel_agent::Identity::load_or_create_at(temp.join("b/key"))
+                .expect("peer identity"),
+        );
+
+        let listener = mini_tunnel_agent::peer_tcp_listener("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("bind reliable path");
+        let allowed = [(a.device_id(), a.public_key())];
+        let b_id = b.device_id();
+        let accepted = mini_tunnel_agent::accept_tcp_peer_any(
+            &listener,
+            "direct-promotion-failure",
+            &b,
+            &allowed,
+        );
+        let connected = mini_tunnel_agent::connect_tcp_peer(
+            listener.local_addr().unwrap(),
+            "direct-promotion-failure",
+            &a,
+            &b_id,
+            b.public_key(),
+        );
+        let (active_remote, active) = tokio::join!(accepted, connected);
+        let active_remote = active_remote.expect("accept reliable peer").1;
+        let active = active.expect("connect reliable peer");
+
+        let endpoint_a = mini_tunnel_agent::peer_endpoint(&a, "127.0.0.1:0".parse().unwrap())
+            .expect("bind local UDP endpoint");
+        let endpoint_b = mini_tunnel_agent::peer_endpoint(&b, "127.0.0.1:0".parse().unwrap())
+            .expect("bind peer UDP endpoint");
+        let accepting = {
+            let endpoint = endpoint_b.clone();
+            let identity = std::sync::Arc::clone(&b);
+            let peer_id = a.device_id();
+            let peer_key = a.public_key();
+            tokio::spawn(async move {
+                mini_tunnel_agent::accept_peer(
+                    &endpoint,
+                    "direct-promotion-failure",
+                    &identity,
+                    &peer_id,
+                    peer_key,
+                )
+                .await
+                .expect("accept provisional UDP channel")
+            })
+        };
+        let candidate = mini_tunnel_agent::connect_peer(
+            &endpoint_a,
+            endpoint_b.local_addr().unwrap(),
+            "direct-promotion-failure",
+            &a,
+            &b.device_id(),
+            b.public_key(),
+        )
+        .await
+        .expect("connect provisional UDP channel");
+        let candidate_remote = accepting.await.expect("join accept task");
+        let responder =
+            tokio::spawn(async move { while candidate_remote.recv_packet().await.is_ok() {} });
+        let failed_endpoint = endpoint_b.clone();
+        let close_candidate = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            failed_endpoint.close(0_u32.into(), b"simulated UDP path loss");
+        });
+
+        let result = validate_udp_probe_with_timing(
+            candidate,
+            false,
+            Duration::from_millis(500),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(result.is_err(), "failed candidate must not pass probation");
+        close_candidate.await.expect("close direct candidate");
+
+        let packet = vec![1, 2, 3, 4];
+        active
+            .send_packet(&packet)
+            .await
+            .expect("reliable path remains active after candidate rejection");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), active_remote.recv_packet())
+                .await
+                .expect("reliable packet timeout")
+                .expect("receive on reliable path"),
+            packet
+        );
+
+        responder.abort();
+        active.close_async().await;
+        active_remote.close_async().await;
+        endpoint_a.close(0_u32.into(), b"test complete");
+        endpoint_b.close(0_u32.into(), b"test complete");
         std::fs::remove_dir_all(temp).expect("remove test identities");
     }
 
