@@ -37,6 +37,8 @@ const MAX_PENDING_STUN_QUERIES: usize = 8;
 const MAX_PENDING_ICE_TRANSACTIONS: usize = 4096;
 const ICE_TRANSACTION_TTL: Duration = Duration::from_secs(30);
 const ICE_CONSENT_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(test)]
+pub(crate) const ICE_CONSENT_MAX_INTERVAL: Duration = Duration::from_secs(6);
 pub(crate) const ICE_DISCONNECTED_TIMEOUT: Duration = Duration::from_secs(15);
 const ICE_FAILED_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const ICE_DISCONNECTED_RECOVERY_GRACE: Duration = Duration::from_secs(5);

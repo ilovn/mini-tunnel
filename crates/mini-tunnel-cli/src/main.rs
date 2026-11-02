@@ -2216,8 +2216,8 @@ fn mesh_reconnect_direct_wait(relay_endpoints: RelayEndpoints, force_reliable: b
     if force_reliable && relay_endpoints.tcp.is_some() {
         // Both peers commonly request fallback together. Keep this accept grace
         // short so they do not wait in lockstep before pairing their relay tickets.
-        Duration::from_secs(1)
-            .min(mini_tunnel_relay::DEFAULT_PAIR_TIMEOUT.saturating_sub(Duration::from_secs(1)))
+        Duration::from_millis(250)
+            .min(mini_tunnel_relay::DEFAULT_PAIR_TIMEOUT.saturating_sub(Duration::from_millis(250)))
     } else if !force_reliable && relay_endpoints.udp.is_some() {
         Duration::from_secs(10)
     } else if force_reliable {
@@ -4719,7 +4719,7 @@ mod tests {
             udp: None,
         };
         let wait = mesh_reconnect_direct_wait(tcp_relay, true);
-        assert_eq!(wait, Duration::from_secs(1));
+        assert_eq!(wait, Duration::from_millis(250));
         assert!(wait < mini_tunnel_relay::DEFAULT_PAIR_TIMEOUT);
 
         let both_relays = RelayEndpoints {
@@ -4728,7 +4728,7 @@ mod tests {
         };
         assert_eq!(
             mesh_reconnect_direct_wait(both_relays, true),
-            Duration::from_secs(1),
+            Duration::from_millis(250),
             "reliable fallback must not wait for UDP relay candidates"
         );
         assert_eq!(
