@@ -63,6 +63,16 @@ groups:
           description: More than 100 requests were rate-limited in five minutes for at least two minutes; inspect client traffic and proxy address attribution.
           runbook: deploy/systemd/README.md#monitoring-and-alerts
 
+      - alert: MiniTunnelCoordinatorAdminAuthorizationFailures
+        expr: increase(mini_tunnel_coordinator_admin_auth_failures_total{job="mini-tunnel-coordinator"}[5m]) > 10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: mini-tunnel Coordinator is seeing repeated failed administrator authentication
+          description: More than 10 invalid administrator-token checks occurred in five minutes for at least two minutes; inspect Coordinator audit records and source access logs without exposing submitted credentials.
+          runbook: deploy/systemd/README.md#monitoring-and-alerts
+
       - alert: MiniTunnelCoordinatorConnectionRejected
         expr: increase(mini_tunnel_coordinator_connection_rejected_total[5m]) > 10
         for: 2m

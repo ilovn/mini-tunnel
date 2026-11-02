@@ -95,6 +95,35 @@ tests:
         alertname: MiniTunnelCoordinatorRateLimited
         exp_alerts: []
 
+  - name: fires for repeated administrator authorization failures
+    interval: 1m
+    input_series:
+      - series: 'mini_tunnel_coordinator_admin_auth_failures_total{job="mini-tunnel-coordinator",instance="coordinator.internal:8443"}'
+        values: '0 5 10 15 20 25 30 35 40 45 50'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: MiniTunnelCoordinatorAdminAuthorizationFailures
+        exp_alerts:
+          - exp_labels:
+              job: mini-tunnel-coordinator
+              instance: coordinator.internal:8443
+              severity: warning
+              alertname: MiniTunnelCoordinatorAdminAuthorizationFailures
+            exp_annotations:
+              summary: mini-tunnel Coordinator is seeing repeated failed administrator authentication
+              description: More than 10 invalid administrator-token checks occurred in five minutes for at least two minutes; inspect Coordinator audit records and source access logs without exposing submitted credentials.
+              runbook: deploy/systemd/README.md#monitoring-and-alerts
+
+  - name: stays quiet below administrator authorization failure threshold
+    interval: 1m
+    input_series:
+      - series: 'mini_tunnel_coordinator_admin_auth_failures_total{job="mini-tunnel-coordinator",instance="coordinator.internal:8443"}'
+        values: '0 2 4 6 8 10 12 14 16 18 20'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: MiniTunnelCoordinatorAdminAuthorizationFailures
+        exp_alerts: []
+
   - name: fires for sustained coordinator connection capacity rejection
     interval: 1m
     input_series:

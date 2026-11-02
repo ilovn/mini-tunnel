@@ -107,6 +107,7 @@ pub struct CoordinatorState {
     concurrency_rejections_total: Arc<AtomicU64>,
     connection_rejections_total: Arc<AtomicU64>,
     request_timeouts_total: Arc<AtomicU64>,
+    admin_auth_failures_total: Arc<AtomicU64>,
     request_latency: Arc<RequestLatencyMetrics>,
     trusted_proxies: Arc<Vec<IpNet>>,
     relay_ticket_key: Option<Arc<[u8; 32]>>,
@@ -892,6 +893,18 @@ impl CoordinatorState {
         lock_recover(&self.pending_audit_events).clear();
     }
 
+    fn record_admin_auth_failure(&self, event: &'static str, network_id: Uuid) {
+        self.admin_auth_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            target: "mini_tunnel::audit",
+            audit_event = event,
+            network_id = %network_id,
+            outcome = "denied",
+            "coordinator audit event"
+        );
+    }
+
     async fn create_network(
         &self,
         request: CreateNetworkRequest,
@@ -968,6 +981,7 @@ impl CoordinatorState {
             .get_mut(&network_id)
             .ok_or(ApiError::NotFound)?;
         if !constant_time_equal(&network.admin_token_hash, &token_hash(&request.admin_token)) {
+            self.record_admin_auth_failure("invite_issue_denied", network_id);
             return Err(ApiError::Unauthorized);
         }
         let now_ms = unix_time_ms().ok_or(ApiError::Internal)?;
@@ -1013,6 +1027,7 @@ impl CoordinatorState {
             .get_mut(&network_id)
             .ok_or(ApiError::NotFound)?;
         if !constant_time_equal(&network.admin_token_hash, &token_hash(&request.admin_token)) {
+            self.record_admin_auth_failure("member_revoke_denied", network_id);
             return Err(ApiError::Unauthorized);
         }
         let member = network
@@ -2593,11 +2608,12 @@ async fn metrics(State(state): State<CoordinatorState>, request: Request) -> Res
         .map(|network| network.members.len())
         .sum();
     let mut body = format!(
-        "# HELP mini_tunnel_coordinator_networks Configured overlay networks.\n# TYPE mini_tunnel_coordinator_networks gauge\nmini_tunnel_coordinator_networks {networks}\n# HELP mini_tunnel_coordinator_members Enrolled devices across all networks.\n# TYPE mini_tunnel_coordinator_members gauge\nmini_tunnel_coordinator_members {members}\n# HELP mini_tunnel_coordinator_rate_limited_total Requests rejected by the source IP rate limiter.\n# TYPE mini_tunnel_coordinator_rate_limited_total counter\nmini_tunnel_coordinator_rate_limited_total {}\n# HELP mini_tunnel_coordinator_concurrency_rejected_total API requests rejected because the global in-flight limit was reached.\n# TYPE mini_tunnel_coordinator_concurrency_rejected_total counter\nmini_tunnel_coordinator_concurrency_rejected_total {}\n# HELP mini_tunnel_coordinator_connection_rejected_total HTTP connections rejected because the active connection limit was reached.\n# TYPE mini_tunnel_coordinator_connection_rejected_total counter\nmini_tunnel_coordinator_connection_rejected_total {}\n# HELP mini_tunnel_coordinator_request_timeouts_total API requests that exceeded the processing time limit.\n# TYPE mini_tunnel_coordinator_request_timeouts_total counter\nmini_tunnel_coordinator_request_timeouts_total {}\n",
+        "# HELP mini_tunnel_coordinator_networks Configured overlay networks.\n# TYPE mini_tunnel_coordinator_networks gauge\nmini_tunnel_coordinator_networks {networks}\n# HELP mini_tunnel_coordinator_members Enrolled devices across all networks.\n# TYPE mini_tunnel_coordinator_members gauge\nmini_tunnel_coordinator_members {members}\n# HELP mini_tunnel_coordinator_rate_limited_total Requests rejected by the source IP rate limiter.\n# TYPE mini_tunnel_coordinator_rate_limited_total counter\nmini_tunnel_coordinator_rate_limited_total {}\n# HELP mini_tunnel_coordinator_concurrency_rejected_total API requests rejected because the global in-flight limit was reached.\n# TYPE mini_tunnel_coordinator_concurrency_rejected_total counter\nmini_tunnel_coordinator_concurrency_rejected_total {}\n# HELP mini_tunnel_coordinator_connection_rejected_total HTTP connections rejected because the active connection limit was reached.\n# TYPE mini_tunnel_coordinator_connection_rejected_total counter\nmini_tunnel_coordinator_connection_rejected_total {}\n# HELP mini_tunnel_coordinator_request_timeouts_total API requests that exceeded the processing time limit.\n# TYPE mini_tunnel_coordinator_request_timeouts_total counter\nmini_tunnel_coordinator_request_timeouts_total {}\n# HELP mini_tunnel_coordinator_admin_auth_failures_total Requests rejected because the administrator token did not match.\n# TYPE mini_tunnel_coordinator_admin_auth_failures_total counter\nmini_tunnel_coordinator_admin_auth_failures_total {}\n",
         state.request_limiter.rejected_total.load(Ordering::Relaxed),
         state.concurrency_rejections_total.load(Ordering::Relaxed),
         state.connection_rejections_total.load(Ordering::Relaxed),
         state.request_timeouts_total.load(Ordering::Relaxed),
+        state.admin_auth_failures_total.load(Ordering::Relaxed),
     );
     body.push_str(&state.request_latency.prometheus());
     (
@@ -4432,6 +4448,7 @@ mod tests {
     async fn metrics_are_loopback_only_and_report_basic_service_totals() {
         let state = CoordinatorState {
             request_limiter: RequestRateLimiter::new(1, Duration::from_secs(60)),
+            admin_auth_failures_total: Arc::new(AtomicU64::new(2)),
             ..CoordinatorState::default()
         };
         state
@@ -4492,6 +4509,7 @@ mod tests {
         assert!(body.contains("mini_tunnel_coordinator_networks 1\n"));
         assert!(body.contains("mini_tunnel_coordinator_members 0\n"));
         assert!(body.contains("mini_tunnel_coordinator_rate_limited_total 1\n"));
+        assert!(body.contains("mini_tunnel_coordinator_admin_auth_failures_total 2\n"));
         assert!(
             body.contains(
                 "mini_tunnel_coordinator_request_duration_seconds_bucket{le=\"+Inf\"} 3\n"
@@ -4618,7 +4636,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn administrative_audit_events_include_actions_without_credentials() {
+    async fn administrative_audit_events_include_success_and_denials_without_credentials() {
         let output = Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -4661,6 +4679,33 @@ mod tests {
                 )
                 .await
                 .expect("revoke member");
+            let invalid_invite_token = "submitted-admin-token-must-not-be-logged";
+            assert!(matches!(
+                state
+                    .create_invite(
+                        network_id,
+                        CreateInviteRequest {
+                            admin_token: invalid_invite_token.to_owned(),
+                        },
+                    )
+                    .await,
+                Err(ApiError::Unauthorized)
+            ));
+            let invalid_revoke_token = "submitted-revoke-token-must-not-be-logged";
+            let attempted_device_id = "untrusted-device-field-must-not-be-logged";
+            assert!(matches!(
+                state
+                    .revoke_member(
+                        network_id,
+                        RevokeMemberRequest {
+                            admin_token: invalid_revoke_token.to_owned(),
+                            device_id: attempted_device_id.to_owned(),
+                        },
+                    )
+                    .await,
+                Err(ApiError::Unauthorized)
+            ));
+            assert_eq!(state.admin_auth_failures_total.load(Ordering::Relaxed), 2);
             (
                 created.network_id,
                 enrolled.device_id,
@@ -4669,6 +4714,9 @@ mod tests {
                     invite.invite_token,
                     public_key,
                     signature,
+                    invalid_invite_token.to_owned(),
+                    invalid_revoke_token.to_owned(),
+                    attempted_device_id.to_owned(),
                 ],
             )
         }
@@ -4698,6 +4746,8 @@ mod tests {
             "invite_issued",
             "member_enrolled",
             "member_revoked",
+            "invite_issue_denied",
+            "member_revoke_denied",
         ] {
             assert!(
                 records.contains(event),
@@ -4707,6 +4757,7 @@ mod tests {
         assert!(records.contains(&network_id.to_string()));
         assert!(records.contains(&device_id));
         assert!(records.contains("outcome=\"success\""));
+        assert!(records.contains("outcome=\"denied\""));
         for secret in secrets {
             assert!(
                 !records.contains(&secret),

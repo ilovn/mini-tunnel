@@ -131,7 +131,7 @@ TCP fallback 的帧格式：`u32_be frame_length | encrypted_packet`，最大 fr
 - Coordinator/relay 抵御 DoS：握手前 stateless cookie / address validation、响应放大限制、候选数和同时连接数上限、签名 relay ticket、速率配额；不接受用户指定任意 relay 目的地址以避免 SSRF。
 - UDP Relay 将 HELLO/PROOF 按规范化来源 IP 限速，默认突发 20、持续每秒 10 次；速率表限制为 4096 个活跃来源并在空闲 60 秒后清理。可通过 `--udp-auth-burst`、`--udp-auth-rate-per-second` 或 `MINI_TUNNEL_UDP_RELAY_AUTH_BURST`、`MINI_TUNNEL_UDP_RELAY_AUTH_RATE_PER_SECOND` 调整；状态表容量保持固定。
 - 管理员可移除成员，在线下发撤销；离线设备靠短租期凭证限制吊销延迟。密钥轮换/泄露处置包含重新入网和强制 session key 更新。
-- Coordinator 对成功的网络创建、邀请签发、成员加入和成员撤销写结构化审计事件；不记录流量 payload、token、签名、公钥或候选地址。部署侧需配置日志保留/转发；这些运行日志不是防篡改审计账本。更新包签名校验；版本回滚保护需纳入发布设计。
+- Coordinator 对成功的网络创建、邀请签发、成员加入和成员撤销，以及邀请/撤销接口的无效管理员凭证写结构化审计事件；失败鉴权计入无标签 Prometheus 计数并可配置阈值告警。日志不记录流量 payload、token、签名、公钥或候选地址；失败事件也不记录客户端提交的设备 ID。部署侧需配置日志保留/转发；这些运行日志不是防篡改审计账本。更新包签名校验；版本回滚保护需纳入发布设计。
 
 ## 9. 部署和可用性
 
