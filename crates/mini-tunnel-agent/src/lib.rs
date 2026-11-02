@@ -342,6 +342,7 @@ pub struct PeerChannel {
 
 const HEALTH_PING: u8 = 0xf0;
 const HEALTH_PONG: u8 = 0xf1;
+pub(crate) const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PeerHealthSnapshot {
@@ -667,7 +668,7 @@ impl PeerChannel {
             let expired = health
                 .outstanding
                 .iter()
-                .filter(|(_, sent_at)| sent_at.elapsed() >= Duration::from_secs(20))
+                .filter(|(_, sent_at)| sent_at.elapsed() >= HEALTH_PROBE_TIMEOUT)
                 .map(|(nonce, _)| *nonce)
                 .collect::<Vec<_>>();
             for expired_nonce in expired {

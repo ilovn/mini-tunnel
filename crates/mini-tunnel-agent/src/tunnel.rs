@@ -23,6 +23,8 @@ const MAX_MESH_EVENT_QUEUE_CAPACITY: usize = 1024;
 const MESH_OUTBOUND_QUEUE_PER_PEER: usize = 1;
 const MESH_OUTBOUND_PACKET_TTL: Duration = Duration::from_secs(5);
 const EARLY_FALLBACK_MISSES: u64 = 1;
+const HEALTH_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn mesh_event_queue_capacity(peer_count: usize) -> usize {
     peer_count
@@ -232,6 +234,10 @@ static PATH_QUALITY_POLICY: OnceLock<PathQualityPolicy> = OnceLock::new();
 
 fn path_quality_policy() -> &'static PathQualityPolicy {
     PATH_QUALITY_POLICY.get_or_init(PathQualityPolicy::from_environment)
+}
+
+fn effective_health_probe_interval(configured_interval: Duration) -> Duration {
+    configured_interval.min(HEALTH_PROBE_INTERVAL)
 }
 
 /// Whether an authenticated direct UDP recovery probe meets the configured RTT limit.
@@ -645,7 +651,10 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
     } = receiver;
     loop {
         let active = Arc::clone(&*channel.read().await);
-        let mut keepalive = tokio::time::interval(quality_interval);
+        // Probe often enough to observe a sustained UDP loss window before the QUIC idle timeout.
+        // User-configured shorter intervals remain respected for tests and constrained deployments.
+        let mut keepalive =
+            tokio::time::interval(effective_health_probe_interval(quality_interval));
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         keepalive.tick().await;
         let mut last_received = tokio::time::Instant::now();
@@ -679,7 +688,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         let mut ready_fallback = None;
         let outcome = loop {
             tokio::select! {
-                result = tokio::time::timeout_at(last_received + Duration::from_secs(30), &mut inbound) => {
+                result = tokio::time::timeout_at(last_received + PEER_IDLE_TIMEOUT, &mut inbound) => {
                     let result = match result {
                         Ok(result) => result,
                         Err(_) => Err(IdentityError::Transport("peer keepalive timed out".to_owned())),
@@ -2321,6 +2330,27 @@ mod tests {
         assert!(path_rank("QUIC/UDP") < path_rank("Relay/QUIC/UDP"));
         assert!(path_rank("Relay/QUIC/UDP") < path_rank("TLS/TCP"));
         assert!(path_rank("TLS/TCP") < path_rank("Relay/TLS"));
+    }
+
+    #[test]
+    fn production_health_cadence_can_measure_default_quality_windows_before_idle_timeout() {
+        assert_eq!(
+            effective_health_probe_interval(Duration::from_secs(10)),
+            HEALTH_PROBE_INTERVAL
+        );
+        assert_eq!(
+            effective_health_probe_interval(Duration::from_millis(100)),
+            Duration::from_millis(100)
+        );
+
+        let default_policy = PathQualityPolicy::default();
+        let misses_to_degrade = u32::from(default_policy.bad_windows) * 3;
+        let earliest_complete_windows = crate::HEALTH_PROBE_TIMEOUT
+            + HEALTH_PROBE_INTERVAL * (misses_to_degrade.saturating_sub(1));
+        assert!(
+            earliest_complete_windows < PEER_IDLE_TIMEOUT,
+            "default loss windows should be observable before the peer idle timeout"
+        );
     }
 
     #[tokio::test]
