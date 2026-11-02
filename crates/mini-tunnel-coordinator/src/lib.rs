@@ -38,7 +38,10 @@ use mini_tunnel_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+use sqlx::{
+    PgPool, Row,
+    postgres::{PgConnectOptions, PgPoolOptions, PgSslMode},
+};
 use subtle::ConstantTimeEq;
 use tokio::{
     io::AsyncReadExt,
@@ -520,6 +523,7 @@ impl IntoResponse for ApiError {
 impl CoordinatorState {
     /// Apply additive PostgreSQL schema migrations using a database-owner role.
     pub async fn migrate_postgres_database(database_url: &str) -> io::Result<()> {
+        validate_postgres_transport(database_url)?;
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(5))
@@ -533,6 +537,7 @@ impl CoordinatorState {
 
     /// Connect to the authoritative PostgreSQL store and apply compatible schema migrations.
     pub async fn connect_postgres(database_url: &str) -> io::Result<Self> {
+        validate_postgres_transport(database_url)?;
         let pool = PgPoolOptions::new()
             .max_connections(32)
             .acquire_timeout(Duration::from_secs(5))
@@ -2077,6 +2082,33 @@ fn database_connection_error() -> io::Error {
     )
 }
 
+fn validate_postgres_transport(database_url: &str) -> io::Result<()> {
+    let options = database_url.parse::<PgConnectOptions>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid coordinator PostgreSQL connection URL",
+        )
+    })?;
+    let raw_host = options.get_host();
+    let host = raw_host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(raw_host);
+    let is_loopback = options.get_socket().is_some()
+        || host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if !is_loopback && !matches!(options.get_ssl_mode(), PgSslMode::VerifyFull) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "remote coordinator PostgreSQL connections require sslmode=verify-full",
+        ));
+    }
+    Ok(())
+}
+
 fn state_summary(store: &Store) -> StateSnapshotSummary {
     StateSnapshotSummary {
         networks: store.networks.len(),
@@ -3063,6 +3095,51 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::net::{TcpListener, TcpStream};
     use tower::ServiceExt;
+
+    #[test]
+    fn postgres_transport_requires_verified_tls_for_remote_hosts() {
+        for url in [
+            "postgres://user:pass@db.example.com/tunnel",
+            "postgres://user:pass@db.example.com/tunnel?sslmode=prefer",
+            "postgres://user:pass@db.example.com/tunnel?sslmode=disable",
+            "postgres://user:pass@db.example.com/tunnel?sslmode=require",
+            "postgres://user:pass@db.example.com/tunnel?sslmode=verify-ca",
+        ] {
+            let error = validate_postgres_transport(url).expect_err("remote URL must be rejected");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("sslmode=verify-full"));
+        }
+
+        validate_postgres_transport(
+            "postgres://user:pass@db.example.com/tunnel?sslmode=verify-full",
+        )
+        .expect("verified TLS is accepted for remote PostgreSQL");
+    }
+
+    #[test]
+    fn postgres_transport_keeps_loopback_development_urls_usable() {
+        for url in [
+            "postgres://user:pass@localhost/tunnel",
+            "postgres://user:pass@ci.localhost/tunnel?sslmode=disable",
+            "postgres://user:pass@127.0.0.1/tunnel?sslmode=prefer",
+            "postgres://user:pass@[::1]/tunnel?sslmode=disable",
+            "postgres://user:pass@localhost/tunnel?host=%2Fvar%2Frun%2Fpostgresql&sslmode=disable",
+        ] {
+            validate_postgres_transport(url)
+                .unwrap_or_else(|error| panic!("loopback URL {url:?} rejected: {error}"));
+        }
+    }
+
+    #[test]
+    fn postgres_transport_rejects_malformed_urls_without_exposing_credentials() {
+        let error = validate_postgres_transport("not a database URL")
+            .expect_err("malformed URL must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "invalid coordinator PostgreSQL connection URL"
+        );
+    }
 
     async fn block_until_released(
         State((entered, release)): State<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
