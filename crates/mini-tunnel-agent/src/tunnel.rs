@@ -2116,10 +2116,8 @@ mod tests {
         let responder = Arc::clone(&channel_b);
         let responder_task = tokio::spawn(async move {
             while let Ok(payload) = responder.recv_packet().await {
-                if !payload.is_empty() {
-                    if responder.send_packet(&payload).await.is_err() {
-                        break;
-                    }
+                if !payload.is_empty() && responder.send_packet(&payload).await.is_err() {
+                    break;
                 }
             }
         });
