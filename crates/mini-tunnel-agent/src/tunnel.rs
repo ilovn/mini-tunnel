@@ -257,6 +257,8 @@ pub struct PathQualityTracker {
     window_probes: u64,
     window_missed: u64,
     bad_windows: u8,
+    healthy_windows: u8,
+    last_window_healthy: bool,
     degraded: bool,
     policy: Option<PathQualityPolicy>,
 }
@@ -264,6 +266,7 @@ pub struct PathQualityTracker {
 impl PathQualityTracker {
     /// Require three probes per window and three consecutive bad windows before degrading.
     pub fn observe(&mut self, snapshot: crate::PeerHealthSnapshot) -> bool {
+        self.last_window_healthy = false;
         let successes = snapshot
             .probes_succeeded
             .saturating_sub(self.last_successes);
@@ -279,15 +282,23 @@ impl PathQualityTracker {
         let bad = u128::from(self.window_missed) * 100
             > u128::from(policy.max_loss_percent) * u128::from(self.window_probes)
             || snapshot.rtt.is_some_and(|rtt| rtt > policy.max_rtt);
-        self.bad_windows = if bad {
-            self.bad_windows.saturating_add(1)
+        if bad {
+            self.bad_windows = self.bad_windows.saturating_add(1);
+            self.healthy_windows = 0;
         } else {
-            0
-        };
+            self.bad_windows = 0;
+            self.healthy_windows = self.healthy_windows.saturating_add(1);
+            self.last_window_healthy = true;
+        }
         self.window_probes = 0;
         self.window_missed = 0;
         self.degraded = self.bad_windows >= policy.bad_windows;
         self.degraded
+    }
+
+    fn healthy_recovery_ready(&self) -> bool {
+        let policy = self.policy.unwrap_or_else(|| *path_quality_policy());
+        self.healthy_windows >= policy.bad_windows
     }
 }
 
@@ -779,13 +790,8 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                             "peer path health snapshot"
                         );
                     }
-                    let previous_window_probes = quality.window_probes;
                     let quality_degraded = quality.observe(health);
-                    let completed_healthy_window = previous_window_probes
-                        + new_successes
-                        + new_missed
-                        >= 3
-                        && quality.bad_windows == 0;
+                    let completed_healthy_window = quality.last_window_healthy;
                     if !force_reliable
                         && is_udp_path(active.transport_name())
                         && unresolved_health_misses >= EARLY_FALLBACK_MISSES
@@ -806,7 +812,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                             fallback_tx.clone(),
                         ));
                     }
-                    if completed_healthy_window
+                    if quality.healthy_recovery_ready()
                         && !force_reliable
                         && (fallback_task.is_some() || ready_fallback.is_some())
                     {
@@ -2398,6 +2404,43 @@ mod tests {
     }
 
     #[test]
+    fn fallback_recovery_requires_the_configured_number_of_healthy_windows() {
+        let mut tracker = PathQualityTracker::default();
+        let mut snapshot = crate::PeerHealthSnapshot {
+            rtt: Some(Duration::from_millis(50)),
+            probes_succeeded: 0,
+            probes_missed: 0,
+        };
+
+        for window in 0..2 {
+            snapshot.probes_succeeded += 3;
+            assert!(!tracker.observe(snapshot));
+            assert!(!tracker.healthy_recovery_ready());
+            assert!(tracker.last_window_healthy);
+            assert_eq!(tracker.healthy_windows, window + 1);
+        }
+
+        snapshot.probes_missed += 1;
+        snapshot.probes_succeeded += 2;
+        assert!(!tracker.observe(snapshot));
+        assert_eq!(
+            tracker.healthy_windows, 0,
+            "a bad window resets recovery hysteresis"
+        );
+        assert!(!tracker.healthy_recovery_ready());
+
+        for window in 0..3 {
+            snapshot.probes_succeeded += 3;
+            assert!(!tracker.observe(snapshot));
+            assert_eq!(
+                tracker.healthy_recovery_ready(),
+                window == 2,
+                "fallback cancellation requires three consecutive clean windows"
+            );
+        }
+    }
+
+    #[test]
     fn path_quality_uses_packet_loss_threshold_with_three_window_hysteresis() {
         let mut tracker = PathQualityTracker::default();
         let mut snapshot = crate::PeerHealthSnapshot {
@@ -2510,7 +2553,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn mesh_switches_udp_relay_to_tcp_after_sustained_quality_degradation() {
         let temp = std::env::temp_dir().join(format!(
             "mini-tunnel-quality-fallback-{}",
@@ -2541,12 +2584,9 @@ mod tests {
         initial.relay = true;
         let initial = Arc::new(initial);
         let remote_initial = accept_udp.await.unwrap().unwrap();
-        // Start with a high RTT and no completed probes; first inject one miss to prepare
-        // fallback, then interleave successes with >20% loss to exercise the quality threshold.
-        {
-            let mut health = initial.health.lock().unwrap();
-            health.rtt = Some(Duration::from_millis(500));
-        }
+        // One missed probe prepares fallback; later interleave successes with >20% loss to
+        // exercise the quality threshold without making the initial RTT itself degraded.
+        initial.health.lock().unwrap().rtt = Some(Duration::from_millis(50));
 
         let tcp_listener = peer_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
             .await
@@ -2610,20 +2650,12 @@ mod tests {
             mtu: 1500,
         };
         let health_channel = Arc::clone(&initial);
-        let health_control = Arc::clone(&health_channel);
-        let (recover_health_tx, recover_health_rx) = tokio::sync::oneshot::channel();
         let (continue_quality_tx, continue_quality_rx) = tokio::sync::oneshot::channel();
         let health_driver = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(150)).await;
             if let Ok(mut health) = health_channel.health.lock() {
                 health.rtt = Some(Duration::from_millis(50));
                 health.probes_missed = health.probes_missed.saturating_add(1);
-            }
-            recover_health_rx
-                .await
-                .expect("test releases a healthy recovery window");
-            if let Ok(mut health) = health_channel.health.lock() {
-                health.probes_succeeded = health.probes_succeeded.saturating_add(4);
             }
             continue_quality_rx
                 .await
@@ -2684,35 +2716,20 @@ mod tests {
             "fallback must not be considered ready before authentication completes"
         );
 
-        recover_health_tx
+        fallback_release_tx
             .send(())
-            .expect("simulate recovery before the sustained loss phase");
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !fallback_release_tx.is_closed() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("healthy recovery should cancel the pending fallback connection");
+            .expect("allow the reliable fallback to authenticate");
+        let recovered_remote = tokio::time::timeout(Duration::from_secs(3), &mut accept_tcp)
+            .await
+            .expect("prepared reliable fallback did not authenticate")
+            .unwrap()
+            .unwrap()
+            .1;
         assert!(crate::status::snapshot().into_iter().any(|status| {
             status.peer == peer_ip.to_string()
                 && status.online
                 && status.active_path == "Relay/QUIC/UDP"
         }));
-
-        if let Ok(mut health) = health_control.health.lock() {
-            health.probes_missed = health.probes_missed.saturating_add(1);
-        }
-        tokio::time::timeout(Duration::from_secs(2), fallback_started_rx.recv())
-            .await
-            .expect("a new miss should prepare fallback again")
-            .expect("reliable fallback connector stopped before retry");
-        let recovered_remote = tokio::time::timeout(Duration::from_secs(3), &mut accept_tcp)
-            .await
-            .expect("reprepared reliable fallback did not authenticate")
-            .unwrap()
-            .unwrap()
-            .1;
 
         continue_quality_tx
             .send(())
@@ -2734,14 +2751,14 @@ mod tests {
         .expect("intermittent probe successes must not cancel fallback while quality degrades");
         assert_eq!(
             reliable_attempts.load(Ordering::SeqCst),
-            2,
-            "one fallback attempt is cancelled after recovery, then one is reused for degradation"
+            1,
+            "the fallback candidate prepared during UDP health loss should be reused"
         );
         assert!(requested_reliable.load(Ordering::SeqCst));
         assert_eq!(
             reliable_attempts.load(Ordering::SeqCst),
-            2,
-            "the quality switch must reuse the candidate prepared after the second miss"
+            1,
+            "the quality switch must reuse the candidate prepared after the first missed probe"
         );
         let fallback_status = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
