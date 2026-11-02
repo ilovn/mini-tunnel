@@ -25,6 +25,7 @@ const MESH_OUTBOUND_PACKET_TTL: Duration = Duration::from_secs(5);
 const EARLY_FALLBACK_MISSES: u64 = 1;
 const HEALTH_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const DIRECT_PROBE_HANDOFF_GRACE: Duration = Duration::from_secs(2);
 
 fn mesh_event_queue_capacity(peer_count: usize) -> usize {
     peer_count
@@ -962,9 +963,33 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                 }
             }
         };
-        if let Some(task) = probe_task {
-            task.abort();
-        }
+        let pending_direct_probe = if matches!(&outcome, Err(IdentityError::Transport(_)))
+            && active.transport_name() != "QUIC/UDP"
+        {
+            if let Some(task) = probe_task.take() {
+                let result = tokio::time::timeout(DIRECT_PROBE_HANDOFF_GRACE, probe_rx.recv())
+                    .await
+                    .ok()
+                    .flatten();
+                if result.is_some() {
+                    let _ = task.await;
+                } else {
+                    task.abort();
+                    let _ = task.await;
+                    if let Ok(Ok(candidate)) = probe_rx.try_recv() {
+                        candidate.close_async().await;
+                    }
+                }
+                result
+            } else {
+                None
+            }
+        } else {
+            if let Some(task) = probe_task.take() {
+                task.abort();
+            }
+            None
+        };
         let failure = match outcome {
             Ok(()) => {
                 if let Some(task) = fallback_task.take() {
@@ -975,6 +1000,32 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
             }
             Err(failure) => failure,
         };
+        if let Some(Ok(candidate)) = pending_direct_probe {
+            if path_rank(candidate.transport_name()) < path_rank(active.transport_name()) {
+                let promoted_path = candidate.transport_name();
+                tracing::info!(
+                    peer_address = %address,
+                    from_path = active.transport_name(),
+                    to_path = promoted_path,
+                    reason = "healthy_direct_probe",
+                    "peer path promoted after active path closed during direct probe handoff"
+                );
+                active.stop_ice_consent_monitor().await;
+                *channel.write().await = Arc::new(candidate);
+                let health = channel.read().await.health_snapshot();
+                crate::status::update(
+                    address.to_string(),
+                    true,
+                    promoted_path,
+                    health.rtt.map(|rtt| rtt.as_millis() as u64),
+                    health.probes_succeeded,
+                    health.probes_missed,
+                    Some("healthy_direct_probe"),
+                );
+                continue;
+            }
+            candidate.close_async().await;
+        }
         active.stop_ice_consent_monitor().await;
         let health = active.health_snapshot();
         if is_udp_path(active.transport_name()) && matches!(&failure, IdentityError::Transport(_)) {
@@ -3535,6 +3586,226 @@ mod tests {
         endpoint_a.close(0_u32.into(), b"test complete");
         endpoint_b.close(0_u32.into(), b"test complete");
         fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn mesh_keeps_inflight_direct_probe_when_reliable_path_closes() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-mesh-probe-handoff-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let a = Arc::new(Identity::load_or_create_at(temp.join("a/key")).unwrap());
+        let b = Arc::new(Identity::load_or_create_at(temp.join("b/key")).unwrap());
+        let b_id = b.device_id();
+
+        let relay_listener = peer_tcp_listener("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let allowed = [(a.device_id(), a.public_key())];
+        let accept_relay = accept_tcp_peer_any(&relay_listener, "mesh-probe-handoff", &b, &allowed);
+        let connect_relay = connect_tcp_peer(
+            relay_listener.local_addr().unwrap(),
+            "mesh-probe-handoff",
+            &a,
+            &b_id,
+            b.public_key(),
+        );
+        let (accepted_relay, initial) = tokio::join!(accept_relay, connect_relay);
+        let remote_initial = accepted_relay.unwrap().1;
+        let initial = initial.unwrap();
+
+        let endpoint_a = peer_endpoint(&a, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let endpoint_b = peer_endpoint(&b, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let (direct_tx, mut direct_rx) = mpsc::channel(1);
+        let accept_direct = {
+            let endpoint = endpoint_b.clone();
+            let identity = Arc::clone(&b);
+            let peer_id = a.device_id();
+            let peer_key = a.public_key();
+            tokio::spawn(async move {
+                let channel = accept_peer(
+                    &endpoint,
+                    "mesh-probe-handoff",
+                    &identity,
+                    &peer_id,
+                    peer_key,
+                )
+                .await
+                .unwrap();
+                direct_tx.send(channel).await.unwrap();
+            })
+        };
+        let direct_candidate = connect_peer(
+            &endpoint_a,
+            endpoint_b.local_addr().unwrap(),
+            "mesh-probe-handoff",
+            &a,
+            &b_id,
+            b.public_key(),
+        )
+        .await
+        .unwrap();
+        let direct_remote = tokio::time::timeout(Duration::from_secs(2), direct_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        accept_direct.await.unwrap();
+        let direct_remote = Arc::new(direct_remote);
+        let (direct_packet_tx, mut direct_packet_rx) = mpsc::channel(1);
+        let direct_responder = {
+            let direct_remote = Arc::clone(&direct_remote);
+            tokio::spawn(async move {
+                while let Ok(packet) = direct_remote.recv_packet().await {
+                    if !packet.is_empty() && direct_packet_tx.send(packet).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+
+        let candidate = Arc::new(Mutex::new(Some(direct_candidate)));
+        let probe_started = Arc::new(tokio::sync::Notify::new());
+        let probe: PeerConnector = {
+            let candidate = Arc::clone(&candidate);
+            let probe_started = Arc::clone(&probe_started);
+            Arc::new(move |_| -> PeerConnectFuture {
+                let candidate = Arc::clone(&candidate);
+                let probe_started = Arc::clone(&probe_started);
+                Box::pin(async move {
+                    probe_started.notify_one();
+                    let candidate = candidate.lock().await.take().ok_or_else(|| {
+                        IdentityError::Transport("direct probe candidate already consumed".into())
+                    })?;
+                    candidate.probe_health(3, Duration::from_secs(2)).await?;
+                    // Model the remote endpoint finishing its validated direct
+                    // probe just after it closes its old reliable channel.
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    Ok(candidate)
+                })
+            })
+        };
+        let reconnect_attempts = Arc::new(AtomicUsize::new(0));
+        let connector: PeerConnector = {
+            let reconnect_attempts = Arc::clone(&reconnect_attempts);
+            Arc::new(move |_| -> PeerConnectFuture {
+                let reconnect_attempts = Arc::clone(&reconnect_attempts);
+                Box::pin(async move {
+                    reconnect_attempts.fetch_add(1, Ordering::SeqCst);
+                    Err(IdentityError::Transport(
+                        "unexpected reconnect after direct candidate was ready".into(),
+                    ))
+                })
+            })
+        };
+
+        let local_ip = Ipv4Addr::new(10, 254, 250, 1);
+        let peer_ip = Ipv4Addr::new(10, 254, 250, 2);
+        let (outbound_tx, outbound_rx) = mpsc::channel(4);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(4);
+        let io = Arc::new(MockPacketIo {
+            outbound: Mutex::new(outbound_rx),
+            inbound: inbound_tx,
+            local_ipv4: local_ip,
+            local_ipv6: None,
+            mtu: 1500,
+        });
+        let pump_io = Arc::clone(&io);
+        let pump = tokio::spawn(async move {
+            pump_peer_mesh_reconnecting(
+                &*pump_io,
+                vec![ReconnectingPeer {
+                    address: peer_ip,
+                    ipv6_address: None,
+                    channel: Arc::new(initial),
+                    connector,
+                    probe: Some(probe),
+                    probe_cooldown: Duration::from_millis(10),
+                }],
+            )
+            .await
+        });
+        let stop_status_watcher = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let offline_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let status_watcher = {
+            let stop = Arc::clone(&stop_status_watcher);
+            let offline_seen = Arc::clone(&offline_seen);
+            tokio::spawn(async move {
+                while !stop.load(Ordering::SeqCst) {
+                    if crate::status::snapshot()
+                        .into_iter()
+                        .any(|status| status.peer == peer_ip.to_string() && !status.online)
+                    {
+                        offline_seen.store(true, Ordering::SeqCst);
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                offline_seen.load(Ordering::SeqCst)
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(2), probe_started.notified())
+            .await
+            .expect("direct recovery probe did not start");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(remote_initial);
+
+        let direct_status = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(status) = crate::status::snapshot().into_iter().find(|status| {
+                    status.peer == peer_ip.to_string()
+                        && status.online
+                        && status.active_path == "QUIC/UDP"
+                }) {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .ok();
+
+        if direct_status.is_some() {
+            outbound_tx
+                .send(packet(local_ip, peer_ip, 28))
+                .await
+                .unwrap();
+        }
+        let delivered = if direct_status.is_some() {
+            tokio::time::timeout(Duration::from_secs(2), direct_packet_rx.recv())
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let attempts = reconnect_attempts.load(Ordering::SeqCst);
+        stop_status_watcher.store(true, Ordering::SeqCst);
+        let offline_was_reported = status_watcher.await.unwrap();
+
+        pump.abort();
+        direct_responder.abort();
+        drop(direct_remote);
+        if let Some(candidate) = candidate.lock().await.take() {
+            candidate.close_async().await;
+        }
+        endpoint_a.close(0_u32.into(), b"test complete");
+        endpoint_b.close(0_u32.into(), b"test complete");
+        fs::remove_dir_all(temp).unwrap();
+
+        assert!(
+            direct_status.is_some(),
+            "a direct candidate completing during the reliable-path handoff must be promoted"
+        );
+        assert_eq!(attempts, 0, "do not reconnect after direct promotion");
+        assert!(
+            !offline_was_reported,
+            "keep the peer online while the direct candidate completes its handoff"
+        );
+        assert_eq!(
+            delivered,
+            Some(packet(local_ip, peer_ip, 28)),
+            "the promoted direct path must carry overlay packets"
+        );
     }
 
     #[cfg(target_os = "linux")]
