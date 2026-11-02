@@ -1575,6 +1575,50 @@ mod tests {
             self.loss_active = true;
         }
 
+        fn reorder_both_egress(&mut self) {
+            for (namespace, device) in [
+                (&self.left_namespace, &self.left),
+                (&self.right_namespace, &self.right),
+            ] {
+                let output = Self::run_in_namespace(
+                    namespace,
+                    "tc",
+                    &[
+                        "qdisc", "replace", "dev", device, "root", "netem", "delay", "50ms",
+                        "20ms", "reorder", "5%", "loss", "2%",
+                    ],
+                );
+                assert!(
+                    output.status.success(),
+                    "tc packet-reordering profile on {device} failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            self.loss_active = true;
+        }
+
+        fn restore_both_egress(&mut self) {
+            if !self.loss_active {
+                return;
+            }
+            for (namespace, device) in [
+                (&self.left_namespace, &self.left),
+                (&self.right_namespace, &self.right),
+            ] {
+                let output = Self::run_in_namespace(
+                    namespace,
+                    "tc",
+                    &["qdisc", "del", "dev", device, "root"],
+                );
+                assert!(
+                    output.status.success(),
+                    "could not remove test qdisc from {device}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            self.loss_active = false;
+        }
+
         fn set_egress_loss(namespace: &str, device: &str) {
             let output = Self::run_in_namespace(
                 namespace,
@@ -2016,6 +2060,117 @@ mod tests {
         responder_task.abort();
         endpoint_a.close(0_u32.into(), b"veth fallback test complete");
         endpoint_b.close(0_u32.into(), b"veth fallback test complete");
+        drop(link);
+        fs::remove_dir_all(temp).expect("remove test identities");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires root privileges, iproute2, and tc netem"]
+    async fn privileged_linux_veth_quic_survives_packet_reordering_and_recovers() {
+        let (mut link, local_address, remote_address) = TestVethPair::create();
+        let temp =
+            std::env::temp_dir().join(format!("mini-tunnel-veth-reorder-{}", uuid::Uuid::new_v4()));
+        let identity_a = Arc::new(Identity::load_or_create_at(temp.join("a/device.key")).unwrap());
+        let identity_b = Arc::new(Identity::load_or_create_at(temp.join("b/device.key")).unwrap());
+        let endpoint_a =
+            peer_endpoint_in_namespace(&identity_a, local_address, &link.left_namespace)
+                .expect("endpoint A");
+        let endpoint_b =
+            peer_endpoint_in_namespace(&identity_b, remote_address, &link.right_namespace)
+                .expect("endpoint B");
+        let peer_id = identity_a.device_id();
+        let peer_key = identity_a.public_key();
+        let accept_endpoint = endpoint_b.clone();
+        let accept_identity = Arc::clone(&identity_b);
+        let accept = tokio::spawn(async move {
+            accept_peer(
+                &accept_endpoint,
+                "veth-reorder-test",
+                &accept_identity,
+                &peer_id,
+                peer_key,
+            )
+            .await
+        });
+        let channel_a = Arc::new(
+            connect_peer(
+                &endpoint_a,
+                endpoint_b.local_addr().expect("endpoint B address"),
+                "veth-reorder-test",
+                &identity_a,
+                &identity_b.device_id(),
+                identity_b.public_key(),
+            )
+            .await
+            .expect("establish authenticated QUIC over veth"),
+        );
+        let channel_b = Arc::new(
+            accept
+                .await
+                .expect("join accept task")
+                .expect("accept authenticated peer"),
+        );
+        assert_eq!(channel_a.transport_name(), "QUIC/UDP");
+
+        let responder = Arc::clone(&channel_b);
+        let responder_task = tokio::spawn(async move {
+            while let Ok(payload) = responder.recv_packet().await {
+                if !payload.is_empty() {
+                    if responder.send_packet(&payload).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        link.reorder_both_egress();
+        assert!(
+            link.qdisc_stats().contains("netem"),
+            "the isolated veth interfaces must carry the netem profile"
+        );
+        let impaired_qdisc = link.qdisc_stats();
+        let impaired_rtt = channel_a
+            .probe_health(3, Duration::from_secs(3))
+            .await
+            .expect("authenticated QUIC health probes survive reordering");
+        assert_eq!(channel_a.transport_name(), "QUIC/UDP");
+
+        let payload = vec![0x5a; 512];
+        channel_a
+            .send_packet(&payload)
+            .await
+            .expect("send overlay payload while packets are reordered");
+        let echoed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let packet = channel_a.recv_packet().await.expect("receive peer payload");
+                if packet == payload {
+                    break packet;
+                }
+            }
+        })
+        .await
+        .expect("peer payload did not survive the reordering profile");
+        assert_eq!(echoed, payload);
+
+        link.restore_both_egress();
+        let recovered_rtt = channel_a
+            .probe_health(3, Duration::from_secs(3))
+            .await
+            .expect("authenticated probes recover after removing netem");
+        assert_eq!(channel_a.transport_name(), "QUIC/UDP");
+        tracing::info!(
+            impaired_rtt_ms = impaired_rtt.as_millis() as u64,
+            recovered_rtt_ms = recovered_rtt.as_millis() as u64,
+            impaired_qdisc,
+            "isolated QUIC reordering validation completed"
+        );
+
+        responder_task.abort();
+        endpoint_a.close(0_u32.into(), b"veth reorder test complete");
+        endpoint_b.close(0_u32.into(), b"veth reorder test complete");
+        drop(channel_a);
+        drop(channel_b);
         drop(link);
         fs::remove_dir_all(temp).expect("remove test identities");
     }
