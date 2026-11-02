@@ -23,7 +23,7 @@ const MAX_MESH_EVENT_QUEUE_CAPACITY: usize = 1024;
 const MESH_OUTBOUND_QUEUE_PER_PEER: usize = 1;
 const MESH_OUTBOUND_PACKET_TTL: Duration = Duration::from_secs(5);
 const EARLY_FALLBACK_MISSES: u64 = 1;
-const HEALTH_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+const HEALTH_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn mesh_event_queue_capacity(peer_count: usize) -> usize {
@@ -2354,11 +2354,10 @@ mod tests {
         let misses_to_degrade = u32::from(default_policy.bad_windows) * 3;
         let earliest_complete_windows = crate::HEALTH_PROBE_TIMEOUT
             + HEALTH_PROBE_INTERVAL * (misses_to_degrade.saturating_sub(1));
-        let ice_fallback_deadline =
-            crate::ice::ICE_DISCONNECTED_TIMEOUT + crate::ice::ICE_DISCONNECTED_RECOVERY_GRACE;
+        let ice_fallback_deadline = crate::ice::ICE_DISCONNECTED_TIMEOUT;
         assert!(
             earliest_complete_windows + Duration::from_secs(5) <= ice_fallback_deadline,
-            "quality detection must have at least five seconds before ICE consent recovery failure"
+            "quality detection must have at least five seconds before ICE enters Disconnected"
         );
         assert!(
             earliest_complete_windows < PEER_IDLE_TIMEOUT,
