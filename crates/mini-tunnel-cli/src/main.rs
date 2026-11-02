@@ -2212,6 +2212,22 @@ struct RelayEndpoints {
     udp: Option<SocketAddr>,
 }
 
+fn mesh_reconnect_direct_wait(relay_endpoints: RelayEndpoints, force_reliable: bool) -> Duration {
+    if relay_endpoints.udp.is_some() {
+        Duration::from_secs(10)
+    } else if force_reliable && relay_endpoints.tcp.is_some() {
+        // The TCP relay drops an unpaired session after DEFAULT_PAIR_TIMEOUT. Keep
+        // the accepted peer's inbound-direct grace below that deadline so both
+        // peers can still request matching relay tickets in time.
+        Duration::from_secs(10)
+            .min(mini_tunnel_relay::DEFAULT_PAIR_TIMEOUT.saturating_sub(Duration::from_secs(10)))
+    } else if force_reliable {
+        Duration::from_secs(35)
+    } else {
+        Duration::from_secs(65)
+    }
+}
+
 async fn connect_tunnel_peer(
     endpoint: &TunnelEndpoint,
     peer: &PeerInfo,
@@ -2728,17 +2744,10 @@ fn build_mesh_peer_connectors(
                     } else {
                         None
                     };
-                    let direct_wait = if relay_endpoints.udp.is_some() {
-                        10
-                    } else if force_reliable {
-                        35
-                    } else {
-                        65
-                    };
                     if let Some(mut channel) = receive_reconnect_channel(
                         receiver,
                         force_reliable,
-                        Duration::from_secs(direct_wait),
+                        mesh_reconnect_direct_wait(relay_endpoints, force_reliable),
                         |channel: &mini_tunnel_agent::PeerChannel| {
                             matches!(channel.transport_name(), "TLS/TCP" | "Relay/TLS")
                         },
@@ -4702,6 +4711,28 @@ mod tests {
         assert!(mesh_channel_is_elected(false, "Relay/TLS"));
         assert!(!mesh_channel_is_elected(false, "QUIC/UDP"));
         assert!(mesh_channel_is_elected(true, "QUIC/UDP"));
+    }
+
+    #[test]
+    fn reliable_mesh_reconnect_starts_tcp_relay_before_pair_timeout() {
+        let tcp_relay = RelayEndpoints {
+            tcp: Some("127.0.0.1:45573".parse().unwrap()),
+            udp: None,
+        };
+        let wait = mesh_reconnect_direct_wait(tcp_relay, true);
+        assert_eq!(wait, Duration::from_secs(10));
+        assert!(wait < mini_tunnel_relay::DEFAULT_PAIR_TIMEOUT);
+
+        assert_eq!(
+            mesh_reconnect_direct_wait(RelayEndpoints::default(), true),
+            Duration::from_secs(35),
+            "without a relay, retain the longer direct TCP accept window"
+        );
+        assert_eq!(
+            mesh_reconnect_direct_wait(tcp_relay, false),
+            Duration::from_secs(65),
+            "normal reconnect retains its direct-path grace"
+        );
     }
 
     #[test]

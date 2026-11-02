@@ -41,7 +41,7 @@ const MAX_PENDING_SESSIONS: usize = 128;
 const MAX_USED_TICKETS: usize = 16_384;
 const MAX_SESSION_BYTES: u64 = 1024 * 1024 * 1024;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
-const PAIR_TIMEOUT: Duration = Duration::from_secs(25);
+pub const DEFAULT_PAIR_TIMEOUT: Duration = Duration::from_secs(25);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
 const MAX_TICKET_LIFETIME_MS: u64 = 120_000;
 const COPY_BUFFER_SIZE: usize = 16 * 1024;
@@ -83,7 +83,7 @@ impl RelayConfig {
             max_connections: MAX_CONNECTIONS,
             max_connections_per_source_ip: MAX_CONNECTIONS_PER_SOURCE_IP,
             max_pending_sessions: MAX_PENDING_SESSIONS,
-            pair_timeout: PAIR_TIMEOUT,
+            pair_timeout: DEFAULT_PAIR_TIMEOUT,
             max_session_bytes: MAX_SESSION_BYTES,
             shutdown_grace: SHUTDOWN_GRACE,
         }
