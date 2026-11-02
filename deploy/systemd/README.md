@@ -85,6 +85,17 @@ The coordinator template binds HTTPS to loopback for a local reverse proxy and t
 
 UDP Relay authentication control packets are limited per normalized source IP with a default burst of 20 and sustained rate of 10 packets/second. For high-churn deployments, tune `MINI_TUNNEL_UDP_RELAY_AUTH_BURST` and `MINI_TUNNEL_UDP_RELAY_AUTH_RATE_PER_SECOND` in `relay.env`; the limiter retains at most 4096 source entries and removes entries idle for 60 seconds. Keep rate overrides finite and monitor aggregate dropped datagrams when changing them.
 
+## Administrative audit events
+
+The Coordinator writes structured `INFO` audit records after successful network creation, invite issuance, member enrollment, and member revocation. Each record includes an `audit_event`, `network_id`, and `outcome`; enrollment and revocation also include the affected `device_id`. Admin/invite tokens, signatures, public keys, and candidate addresses are excluded. On systemd deployments, inspect or forward these records through the journal:
+
+```sh
+sudo journalctl -u mini-tunnel-coordinator.service -u mini-tunnel-coordinator-postgres.service \
+  -g 'coordinator audit event'
+```
+
+Configure journald retention or authenticated log forwarding to match the deployment's incident-response and privacy requirements. These application records cover successful state-changing operations; they are not a tamper-evident ledger and do not record failed authorization attempts.
+
 ## Certificate renewal
 
 The Coordinator checks its configured certificate and key every 30 seconds and reloads a valid matching pair without restarting. Renew the backend certificate and key at the configured paths, preserve the `coordinator.internal` DNS SAN used by Nginx, and ensure the service account can read the files but cannot modify them. Write renewed files to temporary paths, set ownership/mode, then atomically rename them into place so the watcher never sees a half-written pair. A mismatched or invalid pair leaves the current certificate active; inspect the Coordinator journal for reload errors and correct the files before the next poll. For a custom interval, set `MINI_TUNNEL_COORDINATOR_TLS_RELOAD_INTERVAL_SECONDS` in `coordinator.env` and restart the service once to apply it.

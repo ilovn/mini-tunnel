@@ -112,6 +112,14 @@ pub struct CoordinatorState {
     relay_ticket_key: Option<Arc<[u8; 32]>>,
     relay_pairs: Arc<Mutex<RelayPairStore>>,
     ice_credentials: Arc<RwLock<HashMap<(Uuid, String), EphemeralIceCredentials>>>,
+    pending_audit_events: Arc<Mutex<Vec<AuditEvent>>>,
+}
+
+#[derive(Debug, Clone)]
+struct AuditEvent {
+    event: &'static str,
+    network_id: Uuid,
+    device_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -861,6 +869,29 @@ impl CoordinatorState {
         Ok(())
     }
 
+    fn audit_success(&self, event: &'static str, network_id: Uuid, device_id: Option<&str>) {
+        if self.postgres.is_some() {
+            lock_recover(&self.pending_audit_events).push(AuditEvent {
+                event,
+                network_id,
+                device_id: device_id.map(str::to_owned),
+            });
+        } else {
+            record_audit_event(event, network_id, device_id);
+        }
+    }
+
+    fn flush_pending_audit_events(&self) {
+        let events = std::mem::take(&mut *lock_recover(&self.pending_audit_events));
+        for event in events {
+            record_audit_event(event.event, event.network_id, event.device_id.as_deref());
+        }
+    }
+
+    fn discard_pending_audit_events(&self) {
+        lock_recover(&self.pending_audit_events).clear();
+    }
+
     async fn create_network(
         &self,
         request: CreateNetworkRequest,
@@ -915,6 +946,7 @@ impl CoordinatorState {
             },
         );
         self.persist_or_restore(&mut store, previous)?;
+        self.audit_success("network_created", network_id, None);
 
         Ok(CreateNetworkResponse {
             network_id: network_id.to_string(),
@@ -954,6 +986,7 @@ impl CoordinatorState {
             },
         );
         self.persist_or_restore(&mut store, previous)?;
+        self.audit_success("invite_issued", network_id, None);
         Ok(CreateInviteResponse {
             invite_token,
             expires_in_seconds: INVITE_TTL.as_secs(),
@@ -992,6 +1025,7 @@ impl CoordinatorState {
             .invites
             .retain(|_, invite| invite.consumed_by.as_deref() != Some(request.device_id.as_str()));
         self.persist_or_restore(&mut store, previous)?;
+        self.audit_success("member_revoked", network_id, Some(&request.device_id));
         drop(store);
         self.ice_credentials
             .write()
@@ -1103,6 +1137,7 @@ impl CoordinatorState {
             .ok_or(ApiError::Unauthorized)?
             .consumed_by = Some(request.device_id.clone());
         self.persist_or_restore(&mut store, previous)?;
+        self.audit_success("member_enrolled", network_id, Some(&request.device_id));
 
         Ok(JoinNetworkResponse {
             network_id: network_id.to_string(),
@@ -2409,6 +2444,7 @@ async fn run_postgres_request(state: CoordinatorState, request: Request, next: N
     };
     let is_write = !request.method().is_safe();
     let _local_request_guard = state.postgres_request_lock.lock().await;
+    state.discard_pending_audit_events();
     let mut transaction = match pool.begin().await {
         Ok(transaction) => transaction,
         Err(error) => {
@@ -2477,6 +2513,7 @@ async fn run_postgres_request(state: CoordinatorState, request: Request, next: N
             *state.ice_credentials.write().await = latest_ice_credentials;
             *lock_recover(&state.relay_pairs) = latest_relay_pairs;
             let _ = transaction.rollback().await;
+            state.discard_pending_audit_events();
             return database_unavailable_response();
         }
         drop(current);
@@ -2484,11 +2521,14 @@ async fn run_postgres_request(state: CoordinatorState, request: Request, next: N
             *state.inner.write().await = latest_store;
             *state.ice_credentials.write().await = latest_ice_credentials;
             *lock_recover(&state.relay_pairs) = latest_relay_pairs;
+            state.discard_pending_audit_events();
             return database_unavailable_response();
         }
+        state.flush_pending_audit_events();
     } else {
         *state.inner.write().await = latest_store;
         let _ = transaction.rollback().await;
+        state.discard_pending_audit_events();
     }
     response
 }
@@ -3033,6 +3073,27 @@ fn token_hash(token: &str) -> [u8; 32] {
     Sha256::digest(token.as_bytes()).into()
 }
 
+fn record_audit_event(event: &'static str, network_id: Uuid, device_id: Option<&str>) {
+    if let Some(device_id) = device_id {
+        tracing::info!(
+            target: "mini_tunnel::audit",
+            audit_event = event,
+            network_id = %network_id,
+            device_id,
+            outcome = "success",
+            "coordinator audit event"
+        );
+    } else {
+        tracing::info!(
+            target: "mini_tunnel::audit",
+            audit_event = event,
+            network_id = %network_id,
+            outcome = "success",
+            "coordinator audit event"
+        );
+    }
+}
+
 fn constant_time_equal(left: &[u8; 32], right: &[u8; 32]) -> bool {
     bool::from(left.ct_eq(right))
 }
@@ -3095,6 +3156,35 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::net::{TcpListener, TcpStream};
     use tower::ServiceExt;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct AuditBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct AuditBufferWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for AuditBufferWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let mut buffer = self
+                .0
+                .lock()
+                .map_err(|_| io::Error::other("audit test buffer lock poisoned"))?;
+            buffer.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for AuditBuffer {
+        type Writer = AuditBufferWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            AuditBufferWriter(Arc::clone(&self.0))
+        }
+    }
 
     #[test]
     fn postgres_transport_requires_verified_tls_for_remote_hosts() {
@@ -4524,6 +4614,104 @@ mod tests {
             device_id,
             public_key: URL_SAFE_NO_PAD.encode(public_key),
             signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+        }
+    }
+
+    #[tokio::test]
+    async fn administrative_audit_events_include_actions_without_credentials() {
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                "mini_tunnel::audit=info",
+            ))
+            .with_writer(AuditBuffer(Arc::clone(&output)))
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("install audit test subscriber");
+        let (network_id, device_id, secrets) = async {
+            let state = CoordinatorState::default();
+            let created = state
+                .create_network(create_request("audit-test", "10.82.0.0/24"))
+                .await
+                .expect("create network");
+            let network_id = network_uuid(&created);
+            let invite = state
+                .create_invite(
+                    network_id,
+                    CreateInviteRequest {
+                        admin_token: created.admin_token.clone(),
+                    },
+                )
+                .await
+                .expect("issue invite");
+            let enrollment = signed_join(network_id, invite.invite_token.clone(), 240);
+            let public_key = enrollment.public_key.clone();
+            let signature = enrollment.signature.clone();
+            let enrolled = state
+                .join_network(network_id, enrollment)
+                .await
+                .expect("enroll member");
+            state
+                .revoke_member(
+                    network_id,
+                    RevokeMemberRequest {
+                        admin_token: created.admin_token.clone(),
+                        device_id: enrolled.device_id.clone(),
+                    },
+                )
+                .await
+                .expect("revoke member");
+            (
+                created.network_id,
+                enrolled.device_id,
+                vec![
+                    created.admin_token,
+                    invite.invite_token,
+                    public_key,
+                    signature,
+                ],
+            )
+        }
+        .await;
+
+        let postgres_state = CoordinatorState {
+            postgres: Some(Arc::new(
+                PgPoolOptions::new()
+                    .connect_lazy("postgres://localhost/mini_tunnel_audit_test")
+                    .expect("lazy PostgreSQL pool"),
+            )),
+            ..CoordinatorState::default()
+        };
+        let network_id = Uuid::parse_str(&network_id).expect("network UUID");
+        let output_length = output.lock().expect("audit buffer").len();
+        postgres_state.audit_success("network_created", network_id, None);
+        assert_eq!(output.lock().expect("audit buffer").len(), output_length);
+        postgres_state.discard_pending_audit_events();
+        assert_eq!(output.lock().expect("audit buffer").len(), output_length);
+        postgres_state.audit_success("network_created", network_id, None);
+        postgres_state.flush_pending_audit_events();
+
+        let records = String::from_utf8(output.lock().expect("audit buffer").clone())
+            .expect("valid UTF-8 audit records");
+        for event in [
+            "network_created",
+            "invite_issued",
+            "member_enrolled",
+            "member_revoked",
+        ] {
+            assert!(
+                records.contains(event),
+                "missing audit event {event}: {records}"
+            );
+        }
+        assert!(records.contains(&network_id.to_string()));
+        assert!(records.contains(&device_id));
+        assert!(records.contains("outcome=\"success\""));
+        for secret in secrets {
+            assert!(
+                !records.contains(&secret),
+                "audit record leaked a credential"
+            );
         }
     }
 
