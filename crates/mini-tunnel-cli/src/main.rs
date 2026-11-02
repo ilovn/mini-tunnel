@@ -1437,9 +1437,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         if attempts.is_empty() && accept_finished {
                             break;
                         }
-                        let settle_deadline = first_peer_at
-                            .map(|at| at + Duration::from_secs(1))
-                            .unwrap_or(startup_deadline);
+                        let settle_deadline = mesh_startup_settle_deadline(
+                            first_peer_at,
+                            !attempts.is_empty(),
+                            startup_deadline,
+                            Duration::from_secs(1),
+                        );
                         tokio::select! {
                             accepted = accepted_rx.recv(), if !accept_finished => {
                                 match accepted {
@@ -3644,6 +3647,21 @@ fn mesh_address_family_label(ipv6_enabled: bool) -> &'static str {
         "IPv4/IPv6"
     } else {
         "IPv4 only"
+    }
+}
+
+fn mesh_startup_settle_deadline(
+    first_peer_at: Option<tokio::time::Instant>,
+    attempts_pending: bool,
+    startup_deadline: tokio::time::Instant,
+    settle_window: Duration,
+) -> tokio::time::Instant {
+    if attempts_pending {
+        startup_deadline
+    } else {
+        first_peer_at
+            .map(|at| at + settle_window)
+            .unwrap_or(startup_deadline)
     }
 }
 
@@ -7079,6 +7097,39 @@ mod tests {
             ]
         );
         assert_eq!(added, vec![replacement, newcomer]);
+    }
+
+    #[test]
+    fn mesh_startup_keeps_collecting_until_pending_peer_attempts_finish() {
+        let started = tokio::time::Instant::now();
+        let startup_deadline = started + Duration::from_secs(45);
+        let first_peer_at = started + Duration::from_millis(250);
+
+        assert_eq!(
+            mesh_startup_settle_deadline(
+                Some(first_peer_at),
+                true,
+                startup_deadline,
+                Duration::from_secs(1),
+            ),
+            startup_deadline,
+            "a connected peer must not cancel other in-flight peer attempts"
+        );
+        assert_eq!(
+            mesh_startup_settle_deadline(
+                Some(first_peer_at),
+                false,
+                startup_deadline,
+                Duration::from_secs(1),
+            ),
+            first_peer_at + Duration::from_secs(1),
+            "once attempts finish, allow a short window to collect simultaneous accepts"
+        );
+        assert_eq!(
+            mesh_startup_settle_deadline(None, false, startup_deadline, Duration::from_secs(1),),
+            startup_deadline,
+            "when no peer connects, preserve the bounded startup deadline"
+        );
     }
 
     #[test]
