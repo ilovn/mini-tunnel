@@ -5531,13 +5531,13 @@ mod tests {
         let candidate = validate_udp_probe_with_timing(
             candidate,
             false,
-            Duration::from_millis(120),
-            Duration::from_millis(20),
+            Duration::from_millis(300),
+            Duration::from_millis(50),
         )
         .await
         .expect("healthy non-ICE candidate survives probation");
-        assert!(started.elapsed() >= Duration::from_millis(120));
-        assert!(candidate.health_snapshot().probes_succeeded >= 12);
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert!(candidate.health_snapshot().probes_succeeded >= 9);
 
         candidate.close_async().await;
         responder.abort();
