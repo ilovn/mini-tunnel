@@ -37,9 +37,9 @@ const MAX_PENDING_STUN_QUERIES: usize = 8;
 const MAX_PENDING_ICE_TRANSACTIONS: usize = 4096;
 const ICE_TRANSACTION_TTL: Duration = Duration::from_secs(30);
 const ICE_CONSENT_INTERVAL: Duration = Duration::from_secs(5);
-const ICE_DISCONNECTED_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const ICE_DISCONNECTED_TIMEOUT: Duration = Duration::from_secs(15);
 const ICE_FAILED_TIMEOUT: Duration = Duration::from_secs(30);
-const ICE_DISCONNECTED_RECOVERY_GRACE: Duration = Duration::from_secs(5);
+pub(crate) const ICE_DISCONNECTED_RECOVERY_GRACE: Duration = Duration::from_secs(5);
 
 /// Generate an ephemeral ICE credential pair suitable for both rtc-ice and coordinator signaling.
 /// The coordinator accepts the RFC 8445 alphanumeric, `+`, and `/` alphabet; credentials are

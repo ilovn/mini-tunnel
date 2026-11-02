@@ -165,7 +165,7 @@ impl Default for PathQualityPolicy {
         Self {
             max_rtt: Duration::from_millis(350),
             max_loss_percent: 20,
-            bad_windows: 3,
+            bad_windows: 2,
         }
     }
 }
@@ -264,7 +264,7 @@ pub struct PathQualityTracker {
 }
 
 impl PathQualityTracker {
-    /// Require three probes per window and three consecutive bad windows before degrading.
+    /// Require three probes per window and the configured consecutive bad windows before degrading.
     pub fn observe(&mut self, snapshot: crate::PeerHealthSnapshot) -> bool {
         self.last_window_healthy = false;
         let successes = snapshot
@@ -2339,7 +2339,7 @@ mod tests {
     }
 
     #[test]
-    fn production_health_cadence_can_measure_default_quality_windows_before_idle_timeout() {
+    fn production_health_cadence_precedes_ice_consent_failure_with_margin() {
         assert_eq!(
             effective_health_probe_interval(Duration::from_secs(10)),
             HEALTH_PROBE_INTERVAL
@@ -2350,9 +2350,16 @@ mod tests {
         );
 
         let default_policy = PathQualityPolicy::default();
+        assert_eq!(default_policy.bad_windows, 2);
         let misses_to_degrade = u32::from(default_policy.bad_windows) * 3;
         let earliest_complete_windows = crate::HEALTH_PROBE_TIMEOUT
             + HEALTH_PROBE_INTERVAL * (misses_to_degrade.saturating_sub(1));
+        let ice_fallback_deadline =
+            crate::ice::ICE_DISCONNECTED_TIMEOUT + crate::ice::ICE_DISCONNECTED_RECOVERY_GRACE;
+        assert!(
+            earliest_complete_windows + Duration::from_secs(5) <= ice_fallback_deadline,
+            "quality detection must have at least five seconds before ICE consent recovery failure"
+        );
         assert!(
             earliest_complete_windows < PEER_IDLE_TIMEOUT,
             "default loss windows should be observable before the peer idle timeout"
@@ -2374,8 +2381,15 @@ mod tests {
     }
 
     #[test]
-    fn path_quality_requires_three_bad_windows_and_resets_after_a_healthy_window() {
-        let mut tracker = PathQualityTracker::default();
+    fn path_quality_requires_configured_bad_windows_and_resets_after_a_healthy_window() {
+        let mut tracker = PathQualityTracker {
+            policy: Some(PathQualityPolicy {
+                max_rtt: Duration::from_millis(350),
+                max_loss_percent: 20,
+                bad_windows: 3,
+            }),
+            ..PathQualityTracker::default()
+        };
         let mut snapshot = crate::PeerHealthSnapshot {
             rtt: Some(Duration::from_millis(500)),
             probes_succeeded: 0,
@@ -2412,7 +2426,7 @@ mod tests {
             probes_missed: 0,
         };
 
-        for window in 0..2 {
+        for window in 0..1 {
             snapshot.probes_succeeded += 3;
             assert!(!tracker.observe(snapshot));
             assert!(!tracker.healthy_recovery_ready());
@@ -2429,20 +2443,27 @@ mod tests {
         );
         assert!(!tracker.healthy_recovery_ready());
 
-        for window in 0..3 {
+        for window in 0..usize::from(PathQualityPolicy::default().bad_windows) {
             snapshot.probes_succeeded += 3;
             assert!(!tracker.observe(snapshot));
             assert_eq!(
                 tracker.healthy_recovery_ready(),
-                window == 2,
-                "fallback cancellation requires three consecutive clean windows"
+                window + 1 == usize::from(PathQualityPolicy::default().bad_windows),
+                "fallback cancellation requires the configured consecutive clean windows"
             );
         }
     }
 
     #[test]
     fn path_quality_uses_packet_loss_threshold_with_three_window_hysteresis() {
-        let mut tracker = PathQualityTracker::default();
+        let mut tracker = PathQualityTracker {
+            policy: Some(PathQualityPolicy {
+                max_rtt: Duration::from_millis(350),
+                max_loss_percent: 20,
+                bad_windows: 3,
+            }),
+            ..PathQualityTracker::default()
+        };
         let mut snapshot = crate::PeerHealthSnapshot {
             rtt: Some(Duration::from_millis(50)),
             probes_succeeded: 0,
@@ -3105,6 +3126,20 @@ mod tests {
             )
             .await
         });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if crate::status::snapshot().into_iter().any(|status| {
+                    status.peer == peer_ip.to_string()
+                        && status.online
+                        && status.active_path == "QUIC/UDP"
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("mesh pump must publish the initial UDP path before health changes");
         if let Ok(mut health) = health_channel.health.lock() {
             health.probes_missed = health.probes_missed.saturating_add(1);
             health.probes_succeeded = health.probes_succeeded.saturating_add(1);
