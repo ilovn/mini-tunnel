@@ -886,6 +886,27 @@ pub(crate) fn is_candidate_send_error(error: &io::Error) -> bool {
     )
 }
 
+fn is_authenticated_peer_rebound(
+    selected_pair: Option<(SocketAddr, SocketAddr)>,
+    observed_peer: SocketAddr,
+    authenticated: bool,
+) -> bool {
+    authenticated && selected_pair.is_some_and(|(_, selected_peer)| selected_peer != observed_peer)
+}
+
+fn signal_authenticated_peer_rebound(
+    degraded: &watch::Sender<bool>,
+    selected_pair: Option<(SocketAddr, SocketAddr)>,
+    observed_peer: SocketAddr,
+    authenticated: bool,
+) -> bool {
+    let rebound = is_authenticated_peer_rebound(selected_pair, observed_peer, authenticated);
+    if rebound {
+        degraded.send_replace(true);
+    }
+    rebound
+}
+
 /// Channel-owned cancellation and failure signal for a nominated ICE consent session.
 pub struct IceConsentMonitor {
     cancel: watch::Sender<bool>,
@@ -1346,9 +1367,21 @@ impl IceAgentDriver {
                 }
                 datagram = datagrams.recv() => {
                     let datagram = datagram.ok_or_else(|| IceDriverError::Router("peer datagram queue closed".to_owned()))?;
-                    router
+                    let observed_peer = datagram.peer_addr;
+                    let previous_pair = self.selected_pair();
+                    let accepted = router
                         .handle_datagram(local_ufrag, remote_ufrag, self, datagram, Instant::now())
                         .map_err(|error| IceDriverError::Router(error.to_string()))?;
+                    if signal_authenticated_peer_rebound(
+                        &signals.degraded,
+                        previous_pair,
+                        observed_peer,
+                        accepted,
+                    ) {
+                        tracing::warn!(
+                            "authenticated ICE peer address changed; preparing reliable fallback"
+                        );
+                    }
                 }
                 () = tokio::time::sleep_until(tokio::time::Instant::from_std(next_deadline)) => {}
             }
@@ -1647,6 +1680,40 @@ mod tests {
     }
 
     #[test]
+    fn only_authenticated_source_changes_on_a_nominated_pair_mark_path_degraded() {
+        let local: SocketAddr = "192.0.2.10:42000".parse().unwrap();
+        let old_peer: SocketAddr = "198.51.100.10:42000".parse().unwrap();
+        let rebound_peer: SocketAddr = "198.51.100.10:52000".parse().unwrap();
+        let pair = Some((local, old_peer));
+        let (degraded, receiver) = watch::channel(false);
+        assert!(signal_authenticated_peer_rebound(
+            &degraded,
+            pair,
+            rebound_peer,
+            true
+        ));
+        assert!(*receiver.borrow());
+
+        let (degraded, receiver) = watch::channel(false);
+        assert!(!signal_authenticated_peer_rebound(
+            &degraded,
+            pair,
+            rebound_peer,
+            false
+        ));
+        assert!(!*receiver.borrow());
+        assert!(!signal_authenticated_peer_rebound(
+            &degraded, pair, old_peer, true
+        ));
+        assert!(!signal_authenticated_peer_rebound(
+            &degraded,
+            None,
+            rebound_peer,
+            true
+        ));
+    }
+
+    #[test]
     fn two_sans_io_agents_authenticate_checks_and_nominate_a_candidate_pair() {
         let now = Instant::now();
         let address_a: SocketAddr = "127.0.0.1:41001".parse().unwrap();
@@ -1801,6 +1868,135 @@ mod tests {
         assert_eq!(
             learned.candidate_type(),
             rtc_ice::candidate::CandidateType::PeerReflexive
+        );
+    }
+
+    #[test]
+    fn learns_authenticated_peer_reflexive_candidate_after_nat_rebinding() {
+        let address_a: SocketAddr = "127.0.0.1:41401".parse().unwrap();
+        let address_b: SocketAddr = "127.0.0.1:41402".parse().unwrap();
+        let mapped_a_before: SocketAddr = "127.0.0.1:52401".parse().unwrap();
+        let mapped_a_after: SocketAddr = "127.0.0.1:52402".parse().unwrap();
+        let credentials_a = generate_ice_credentials(1).expect("A signaling credentials");
+        let credentials_b = generate_ice_credentials(1).expect("B signaling credentials");
+        let start = Instant::now();
+        let mut driver_a = IceAgentDriver::for_peer(
+            &credentials_a,
+            &credentials_b,
+            &[address_a],
+            &[address_b],
+            true,
+            start,
+        )
+        .expect("construct controlling peer session");
+        let mut driver_b = IceAgentDriver::for_peer(
+            &credentials_b,
+            &credentials_a,
+            &[address_b],
+            &[address_a],
+            false,
+            start,
+        )
+        .expect("construct controlled peer session");
+
+        // Model a stateful NAT: A's packets to B arrive from its current public mapping,
+        // while replies addressed to that mapping return to A's original UDP socket.
+        let exchange = |driver_a: &mut IceAgentDriver,
+                        driver_b: &mut IceAgentDriver,
+                        mapped_a: SocketAddr,
+                        start: Instant,
+                        ticks: u64| {
+            let mut rebound_authenticated = false;
+            for tick in 0..ticks {
+                let now = start + Duration::from_millis(tick * 20);
+                driver_a.handle_timeout(now).expect("tick A");
+                driver_b.handle_timeout(now).expect("tick B");
+                for transmit in driver_a.poll_transmits() {
+                    if transmit.transport.peer_addr == address_b {
+                        let previous_pair = driver_b.selected_pair();
+                        let accepted = driver_b
+                            .handle_datagram(
+                                now,
+                                mapped_a,
+                                transmit.transport.ecn,
+                                &transmit.message,
+                            )
+                            .expect("deliver A check through the current NAT mapping");
+                        rebound_authenticated |=
+                            is_authenticated_peer_rebound(previous_pair, mapped_a, accepted);
+                    }
+                }
+                for transmit in driver_b.poll_transmits() {
+                    if transmit.transport.peer_addr == mapped_a {
+                        driver_a
+                            .handle_datagram(
+                                now,
+                                address_b,
+                                transmit.transport.ecn,
+                                &transmit.message,
+                            )
+                            .expect("deliver response through the current NAT mapping");
+                    }
+                }
+            }
+            rebound_authenticated
+        };
+
+        assert!(!exchange(
+            &mut driver_a,
+            &mut driver_b,
+            mapped_a_before,
+            start,
+            500,
+        ));
+        assert!(
+            driver_a.selected_pair().is_some(),
+            "initial ICE path nominates"
+        );
+        assert!(
+            driver_b.selected_pair().is_some(),
+            "peer nominates initial mapping"
+        );
+        assert!(
+            driver_b
+                .agent
+                .get_remote_candidates()
+                .iter()
+                .any(|candidate| candidate.addr() == mapped_a_before)
+        );
+
+        // Keep both ICE generations and the local socket addresses unchanged; only the NAT's
+        // public source port changes before its next authenticated consent check.
+        let rebound_at = start + Duration::from_secs(11);
+        assert!(exchange(
+            &mut driver_a,
+            &mut driver_b,
+            mapped_a_after,
+            rebound_at,
+            500,
+        ));
+        assert!(
+            driver_a.selected_pair().is_some(),
+            "A retains an authenticated ICE path"
+        );
+        assert!(
+            driver_b.selected_pair().is_some(),
+            "B retains an authenticated ICE path"
+        );
+        assert!(
+            driver_b
+                .agent
+                .get_remote_candidates()
+                .iter()
+                .any(|candidate| candidate.addr() == mapped_a_after
+                    && candidate.candidate_type()
+                        == rtc_ice::candidate::CandidateType::PeerReflexive),
+            "the peer must learn the rebound mapping only from an authenticated ICE check"
+        );
+        assert_eq!(
+            driver_b.selected_pair(),
+            Some((address_b, mapped_a_before)),
+            "ICE keeps the old nomination while the rebound path is checked"
         );
     }
 
