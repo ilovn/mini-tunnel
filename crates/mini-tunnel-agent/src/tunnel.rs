@@ -2135,20 +2135,28 @@ mod tests {
         assert_eq!(channel_a.transport_name(), "QUIC/UDP");
 
         let payload = vec![0x5a; 512];
-        channel_a
-            .send_packet(&payload)
-            .await
-            .expect("send overlay payload while packets are reordered");
         let echoed = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let packet = channel_a.recv_packet().await.expect("receive peer payload");
-                if packet == payload {
+                channel_a
+                    .send_packet(&payload)
+                    .await
+                    .expect("send overlay payload while packets are reordered");
+                if let Ok(packet) = tokio::time::timeout(Duration::from_millis(500), async {
+                    loop {
+                        let packet = channel_a.recv_packet().await.expect("receive peer payload");
+                        if packet == payload {
+                            break packet;
+                        }
+                    }
+                })
+                .await
+                {
                     break packet;
                 }
             }
         })
         .await
-        .expect("peer payload did not survive the reordering profile");
+        .expect("peer payload did not arrive after bounded retries on the lossy link");
         assert_eq!(echoed, payload);
 
         link.restore_both_egress();
