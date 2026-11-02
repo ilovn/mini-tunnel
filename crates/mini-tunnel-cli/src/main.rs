@@ -2213,14 +2213,13 @@ struct RelayEndpoints {
 }
 
 fn mesh_reconnect_direct_wait(relay_endpoints: RelayEndpoints, force_reliable: bool) -> Duration {
-    if relay_endpoints.udp.is_some() {
+    if force_reliable && relay_endpoints.tcp.is_some() {
+        // Both peers commonly request fallback together. Keep this accept grace
+        // short so they do not wait in lockstep before pairing their relay tickets.
+        Duration::from_secs(1)
+            .min(mini_tunnel_relay::DEFAULT_PAIR_TIMEOUT.saturating_sub(Duration::from_secs(1)))
+    } else if !force_reliable && relay_endpoints.udp.is_some() {
         Duration::from_secs(10)
-    } else if force_reliable && relay_endpoints.tcp.is_some() {
-        // The TCP relay drops an unpaired session after DEFAULT_PAIR_TIMEOUT. Keep
-        // the accepted peer's inbound-direct grace below that deadline so both
-        // peers can still request matching relay tickets in time.
-        Duration::from_secs(10)
-            .min(mini_tunnel_relay::DEFAULT_PAIR_TIMEOUT.saturating_sub(Duration::from_secs(10)))
     } else if force_reliable {
         Duration::from_secs(35)
     } else {
@@ -4720,8 +4719,23 @@ mod tests {
             udp: None,
         };
         let wait = mesh_reconnect_direct_wait(tcp_relay, true);
-        assert_eq!(wait, Duration::from_secs(10));
+        assert_eq!(wait, Duration::from_secs(1));
         assert!(wait < mini_tunnel_relay::DEFAULT_PAIR_TIMEOUT);
+
+        let both_relays = RelayEndpoints {
+            tcp: tcp_relay.tcp,
+            udp: Some("127.0.0.1:45574".parse().unwrap()),
+        };
+        assert_eq!(
+            mesh_reconnect_direct_wait(both_relays, true),
+            Duration::from_secs(1),
+            "reliable fallback must not wait for UDP relay candidates"
+        );
+        assert_eq!(
+            mesh_reconnect_direct_wait(both_relays, false),
+            Duration::from_secs(10),
+            "normal recovery still allows the direct/UDP relay grace"
+        );
 
         assert_eq!(
             mesh_reconnect_direct_wait(RelayEndpoints::default(), true),
