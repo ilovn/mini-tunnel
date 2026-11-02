@@ -15,13 +15,14 @@ Still in progress: full public ICE interoperability, public NAT/QoS validation, 
 Linux x86_64 users do not need Rust or Cargo on the target machine. Download the `mini-tunnel-linux-x86_64-ubuntu20.04` artifact from a successful [GitHub Actions CI run](https://github.com/ilovn/mini-tunnel/actions/workflows/ci.yml), then verify and install it:
 
 ```sh
+gh attestation verify mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz --repo ilovn/mini-tunnel --signer-workflow .github/workflows/ci.yml
 sha256sum --check mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz.sha256
 tar -xzf mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz
 sudo install -m 0755 mini-tunnel /usr/local/bin/mini-tunnel
 mini-tunnel --version
 ```
 
-The x86_64 binary is built in Ubuntu 20.04 and targets glibc 2.31 or newer. The ARM64 binary is built natively in Ubuntu 22.04 and targets glibc 2.35 or newer. Both target systems need `libc` and `libgcc` (normally already present on Ubuntu); neither needs a compiler or Rust toolchain. Download the matching `mini-tunnel-linux-aarch64-ubuntu22.04` artifact from the same successful CI run for ARM64 Linux. macOS and Windows users can build from source or use their platform-specific CI builds when available.
+The provenance command requires a current GitHub CLI with network access; it confirms the archive was produced by this repository's CI workflow. The SHA256 check detects download corruption. Use successful `main` branch or manually dispatched CI runs; pull request artifacts are not attested. The x86_64 binary is built in Ubuntu 20.04 and targets glibc 2.31 or newer. The ARM64 binary is built natively in Ubuntu 22.04 and targets glibc 2.35 or newer. Both target systems need `libc` and `libgcc` (normally already present on Ubuntu); neither needs a compiler or Rust toolchain. For ARM64, download the matching `mini-tunnel-linux-aarch64-ubuntu22.04` artifact and verify it with `gh attestation verify mini-tunnel-linux-aarch64-ubuntu22.04.tar.gz --repo ilovn/mini-tunnel --signer-workflow .github/workflows/ci.yml` and its `.sha256` file. macOS and Windows users can build from source or use their platform-specific CI builds when available.
 
 Start the coordinator:
 

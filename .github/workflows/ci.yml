@@ -20,6 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     container: ubuntu:20.04
     timeout-minutes: 45
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
     steps:
       - name: Install build prerequisites
         run: |
@@ -53,6 +57,12 @@ jobs:
           tar -C dist -czf mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz mini-tunnel
           sha256sum mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz > mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz.sha256
 
+      - name: Attest Linux x86_64 release archive
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz
+
       - name: Upload Linux x86_64 release artifact
         uses: actions/upload-artifact@v4
         with:
@@ -68,6 +78,10 @@ jobs:
     runs-on: ubuntu-24.04-arm
     container: ubuntu:22.04
     timeout-minutes: 45
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
     steps:
       - name: Install build prerequisites
         run: |
@@ -101,6 +115,12 @@ jobs:
           fi
           tar -C dist -czf mini-tunnel-linux-aarch64-ubuntu22.04.tar.gz mini-tunnel
           sha256sum mini-tunnel-linux-aarch64-ubuntu22.04.tar.gz > mini-tunnel-linux-aarch64-ubuntu22.04.tar.gz.sha256
+
+      - name: Attest Linux ARM64 release archive
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: mini-tunnel-linux-aarch64-ubuntu22.04.tar.gz
 
       - name: Upload Linux ARM64 release artifact
         uses: actions/upload-artifact@v4
