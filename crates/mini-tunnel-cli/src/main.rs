@@ -2592,7 +2592,7 @@ async fn select_ice_peer_address_with_timeout(
     if remote_candidates.is_empty() || local_candidates.is_empty() {
         return None;
     }
-    let mut datagrams = match local.router.register(
+    let (mut datagrams, registration) = match local.router.register_guarded(
         local.credentials.ufrag.clone(),
         remote.ufrag.clone(),
         32,
@@ -2617,7 +2617,6 @@ async fn select_ice_peer_address_with_timeout(
         ) {
             Ok(driver) => driver,
             Err(error) => {
-                let _ = local.router.unregister(&local_ufrag, &remote.ufrag);
                 tracing::debug!(peer_id = %peer.device_id, %error, "could not initialize ICE checks");
                 return None;
             }
@@ -2646,6 +2645,7 @@ async fn select_ice_peer_address_with_timeout(
             let mut signals =
                 mini_tunnel_agent::ice::IceConsentSignals::new(cancel, degraded_sender);
             let task = tokio::spawn(async move {
+                let _registration = registration;
                 tracing::debug!("ICE consent monitor started");
                 if let Err(error) = driver
                     .monitor_consent(
@@ -2663,13 +2663,11 @@ async fn select_ice_peer_address_with_timeout(
                 } else {
                     tracing::debug!("ICE consent monitor stopped");
                 }
-                let _ = router.unregister(&local_ufrag, &remote_ufrag);
             });
             monitor.set_task(task).await;
             Some((remote_address, monitor))
         }
         Err(error) => {
-            let _ = local.router.unregister(&local_ufrag, &remote.ufrag);
             tracing::debug!(peer_id = %peer.device_id, %error, "ICE checks failed; using transport fallback");
             None
         }

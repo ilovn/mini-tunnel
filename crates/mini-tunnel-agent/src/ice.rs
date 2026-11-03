@@ -189,6 +189,32 @@ impl IceDatagramRouterHandle {
             .register(local_ufrag, remote_ufrag, queue_capacity)
     }
 
+    /// Register a peer session whose router state is removed when the owner is dropped.
+    ///
+    /// Use this for cancellable async operations: cancellation drops the guard and prevents a
+    /// stale ufrag pair from blocking a later reconnect.
+    pub fn register_guarded(
+        &self,
+        local_ufrag: String,
+        remote_ufrag: String,
+        queue_capacity: usize,
+    ) -> Result<(mpsc::Receiver<IceDatagram>, IceSessionRegistration), IceRouterError> {
+        let (receiver, registration_id) = self
+            .router
+            .lock()
+            .map_err(|_| IceRouterError::Poisoned)?
+            .register_with_id(local_ufrag.clone(), remote_ufrag.clone(), queue_capacity)?;
+        Ok((
+            receiver,
+            IceSessionRegistration {
+                router: self.clone(),
+                local_ufrag,
+                remote_ufrag,
+                registration_id,
+            },
+        ))
+    }
+
     pub fn associate_authenticated_peer(
         &self,
         local_ufrag: &str,
@@ -294,6 +320,19 @@ impl IceDatagramRouterHandle {
             .unregister(local_ufrag, remote_ufrag))
     }
 
+    fn unregister_registration(
+        &self,
+        local_ufrag: &str,
+        remote_ufrag: &str,
+        registration_id: u64,
+    ) -> Result<bool, IceRouterError> {
+        Ok(self
+            .router
+            .lock()
+            .map_err(|_| IceRouterError::Poisoned)?
+            .unregister_registration(local_ufrag, remote_ufrag, registration_id))
+    }
+
     fn route(&self, datagram: IceDatagram) {
         if let Ok(mut router) = self.router.lock() {
             let _ = router.route(datagram);
@@ -313,8 +352,29 @@ impl IceDatagramRouterHandle {
     }
 }
 
+/// RAII owner for one ICE datagram-router registration.
+pub struct IceSessionRegistration {
+    router: IceDatagramRouterHandle,
+    local_ufrag: String,
+    remote_ufrag: String,
+    registration_id: u64,
+}
+
+impl Drop for IceSessionRegistration {
+    fn drop(&mut self) {
+        if let Err(error) = self.router.unregister_registration(
+            &self.local_ufrag,
+            &self.remote_ufrag,
+            self.registration_id,
+        ) {
+            tracing::warn!(%error, "could not remove dropped ICE session registration");
+        }
+    }
+}
+
 struct IceRoute {
     sender: mpsc::Sender<IceDatagram>,
+    registration_id: u64,
     peer_addresses: VecDeque<SocketAddr>,
 }
 
@@ -343,6 +403,7 @@ struct PendingIceTransaction {
 #[derive(Default)]
 pub struct IceDatagramRouter {
     sessions: HashMap<IceSessionKey, IceRoute>,
+    next_registration_id: u64,
     peer_sessions: HashMap<SocketAddr, IceSessionKey>,
     pending_stun: HashMap<[u8; 12], PendingStunQuery>,
     pending_ice: HashMap<[u8; 12], PendingIceTransaction>,
@@ -387,6 +448,16 @@ impl IceDatagramRouter {
         remote_ufrag: String,
         queue_capacity: usize,
     ) -> Result<mpsc::Receiver<IceDatagram>, IceRouterError> {
+        self.register_with_id(local_ufrag, remote_ufrag, queue_capacity)
+            .map(|(receiver, _)| receiver)
+    }
+
+    fn register_with_id(
+        &mut self,
+        local_ufrag: String,
+        remote_ufrag: String,
+        queue_capacity: usize,
+    ) -> Result<(mpsc::Receiver<IceDatagram>, u64), IceRouterError> {
         if !valid_ice_ufrag(&local_ufrag)
             || !valid_ice_ufrag(&remote_ufrag)
             || !(1..=MAX_SOCKET_QUEUE_CAPACITY).contains(&queue_capacity)
@@ -403,15 +474,18 @@ impl IceDatagramRouter {
         if self.sessions.len() >= MAX_ICE_SESSIONS {
             return Err(IceRouterError::SessionLimit);
         }
+        let registration_id = self.next_registration_id;
+        self.next_registration_id = self.next_registration_id.wrapping_add(1);
         let (sender, receiver) = mpsc::channel(queue_capacity);
         self.sessions.insert(
             key,
             IceRoute {
                 sender,
+                registration_id,
                 peer_addresses: VecDeque::new(),
             },
         );
-        Ok(receiver)
+        Ok((receiver, registration_id))
     }
 
     /// Associate an address only after the ICE agent accepted an authenticated check from it.
@@ -514,6 +588,26 @@ impl IceDatagramRouter {
             }
         }
         true
+    }
+
+    fn unregister_registration(
+        &mut self,
+        local_ufrag: &str,
+        remote_ufrag: &str,
+        registration_id: u64,
+    ) -> bool {
+        let key = IceSessionKey {
+            local_ufrag: local_ufrag.to_owned(),
+            remote_ufrag: remote_ufrag.to_owned(),
+        };
+        if self
+            .sessions
+            .get(&key)
+            .is_none_or(|route| route.registration_id != registration_id)
+        {
+            return false;
+        }
+        self.unregister(local_ufrag, remote_ufrag)
     }
 
     /// Route one demultiplexed STUN datagram without blocking the shared UDP receive loop.
@@ -2423,6 +2517,64 @@ mod tests {
                 now,
             )
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_guarded_ice_session_releases_router_registration() {
+        let router = IceDatagramRouterHandle::default();
+        let (registered_tx, registered_rx) = oneshot::channel();
+        let task_router = router.clone();
+        let task = tokio::spawn(async move {
+            let (_datagrams, _registration) = task_router
+                .register_guarded("localCancel".to_owned(), "remoteCancel".to_owned(), 2)
+                .expect("register guarded ICE session");
+            registered_tx.send(()).expect("notify registration ready");
+            std::future::pending::<()>().await;
+        });
+
+        registered_rx
+            .await
+            .expect("guarded ICE session should register");
+        assert!(matches!(
+            router.register("localCancel".to_owned(), "remoteCancel".to_owned(), 2),
+            Err(IceRouterError::DuplicateSession)
+        ));
+
+        task.abort();
+        let _ = task.await;
+        let (_datagrams, registration) = router
+            .register_guarded("localCancel".to_owned(), "remoteCancel".to_owned(), 2)
+            .expect("cancelled task must release its router registration");
+        drop(registration);
+    }
+
+    #[test]
+    fn stale_ice_registration_guard_does_not_remove_a_newer_session() {
+        let router = IceDatagramRouterHandle::default();
+        let (_old_datagrams, old_registration) = router
+            .register_guarded("localReplace".to_owned(), "remoteReplace".to_owned(), 2)
+            .expect("register first session");
+        assert!(
+            router
+                .unregister("localReplace", "remoteReplace")
+                .expect("remove first session")
+        );
+        let (_new_datagrams, new_registration) = router
+            .register_guarded("localReplace".to_owned(), "remoteReplace".to_owned(), 2)
+            .expect("register replacement session");
+
+        drop(old_registration);
+        assert!(matches!(
+            router.register("localReplace".to_owned(), "remoteReplace".to_owned(), 2),
+            Err(IceRouterError::DuplicateSession)
+        ));
+
+        drop(new_registration);
+        assert!(
+            router
+                .register("localReplace".to_owned(), "remoteReplace".to_owned(), 2)
+                .is_ok()
         );
     }
 
