@@ -925,6 +925,19 @@ pub struct IceAgentDriver {
     local_addr: SocketAddr,
     local_candidate_count: usize,
     remote_candidate_count: usize,
+    local_host_candidate_count: usize,
+    local_srflx_candidate_count: usize,
+    remote_host_candidate_count: usize,
+    remote_srflx_candidate_count: usize,
+}
+
+fn candidate_type_counts(candidates: &[SignaledCandidate]) -> (usize, usize) {
+    candidates.iter().fold((0, 0), |(host, srflx), candidate| {
+        match candidate.candidate_type {
+            SignaledCandidateType::Host => (host + 1, srflx),
+            SignaledCandidateType::ServerReflexive { .. } => (host, srflx + 1),
+        }
+    })
 }
 
 /// Return whether a failed datagram send is specific to this candidate and should not stop the
@@ -1042,6 +1055,10 @@ impl IceAgentDriver {
             local_addr,
             local_candidate_count: 0,
             remote_candidate_count: 0,
+            local_host_candidate_count: 0,
+            local_srflx_candidate_count: 0,
+            remote_host_candidate_count: 0,
+            remote_srflx_candidate_count: 0,
         }
     }
 
@@ -1167,6 +1184,14 @@ impl IceAgentDriver {
         let mut driver = Self::new(agent, local_socket_addr);
         driver.local_candidate_count = local_candidates.len();
         driver.remote_candidate_count = remote_candidates.len();
+        (
+            driver.local_host_candidate_count,
+            driver.local_srflx_candidate_count,
+        ) = candidate_type_counts(local_candidates);
+        (
+            driver.remote_host_candidate_count,
+            driver.remote_srflx_candidate_count,
+        ) = candidate_type_counts(remote_candidates);
         Ok(driver)
     }
 
@@ -1318,6 +1343,10 @@ impl IceAgentDriver {
                 tracing::debug!(
                     local_candidates = self.local_candidate_count,
                     remote_candidates = self.remote_candidate_count,
+                    local_host_candidates = self.local_host_candidate_count,
+                    local_srflx_candidates = self.local_srflx_candidate_count,
+                    remote_host_candidates = self.remote_host_candidate_count,
+                    remote_srflx_candidates = self.remote_srflx_candidate_count,
                     outbound_datagrams,
                     candidate_send_errors,
                     inbound_stun_datagrams,
@@ -1331,6 +1360,10 @@ impl IceAgentDriver {
                 tracing::debug!(
                     local_candidates = self.local_candidate_count,
                     remote_candidates = self.remote_candidate_count,
+                    local_host_candidates = self.local_host_candidate_count,
+                    local_srflx_candidates = self.local_srflx_candidate_count,
+                    remote_host_candidates = self.remote_host_candidate_count,
+                    remote_srflx_candidates = self.remote_srflx_candidate_count,
                     outbound_datagrams,
                     candidate_send_errors,
                     inbound_stun_datagrams,
@@ -1358,6 +1391,10 @@ impl IceAgentDriver {
                         tracing::debug!(
                             local_candidates = self.local_candidate_count,
                             remote_candidates = self.remote_candidate_count,
+                            local_host_candidates = self.local_host_candidate_count,
+                            local_srflx_candidates = self.local_srflx_candidate_count,
+                            remote_host_candidates = self.remote_host_candidate_count,
+                            remote_srflx_candidates = self.remote_srflx_candidate_count,
                             outbound_datagrams,
                             candidate_send_errors,
                             inbound_stun_datagrams,
@@ -1686,6 +1723,25 @@ mod tests {
         let related = built.related_address().expect("related address");
         assert_eq!(related.address, "192.168.1.4");
         assert_eq!(related.port, 4000);
+    }
+
+    #[test]
+    fn candidate_type_diagnostics_distinguish_host_and_server_reflexive() {
+        let candidates = [
+            SignaledCandidate {
+                address: "192.0.2.10:4000".parse().unwrap(),
+                transport: crate::candidate::CandidateTransport::Udp,
+                candidate_type: SignaledCandidateType::Host,
+            },
+            SignaledCandidate {
+                address: "198.51.100.10:5000".parse().unwrap(),
+                transport: crate::candidate::CandidateTransport::Udp,
+                candidate_type: SignaledCandidateType::ServerReflexive {
+                    related_address: "192.0.2.10:4000".parse().unwrap(),
+                },
+            },
+        ];
+        assert_eq!(candidate_type_counts(&candidates), (1, 1));
     }
 
     #[test]
