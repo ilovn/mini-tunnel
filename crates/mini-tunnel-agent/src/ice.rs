@@ -294,6 +294,18 @@ pub struct IceDatagramRouter {
 }
 
 impl IceDatagramRouter {
+    fn ufrag_registration_presence(&self, key: &IceSessionKey) -> (bool, bool) {
+        let local_known = self
+            .sessions
+            .keys()
+            .any(|session| session.local_ufrag == key.local_ufrag);
+        let remote_known = self
+            .sessions
+            .keys()
+            .any(|session| session.remote_ufrag == key.remote_ufrag);
+        (local_known, remote_known)
+    }
+
     fn register_stun_query(
         &mut self,
         transaction_id: [u8; 12],
@@ -463,15 +475,37 @@ impl IceDatagramRouter {
         }
         let route = if let Some(username) = crate::stun::ice_username(&datagram.payload) {
             let Some(key) = ice_session_key(username) else {
-                tracing::debug!(peer = %datagram.peer_addr, "dropping ICE datagram with malformed username");
+                tracing::debug!(
+                    peer = %datagram.peer_addr,
+                    route_miss = "malformed_ice_username",
+                    "dropping STUN datagram with malformed ICE username"
+                );
                 return false;
             };
-            self.sessions.get(&key)
+            let route = self.sessions.get(&key);
+            if route.is_none() {
+                let (local_ufrag_known, remote_ufrag_known) =
+                    self.ufrag_registration_presence(&key);
+                tracing::debug!(
+                    peer = %datagram.peer_addr,
+                    route_miss = "unknown_ice_session",
+                    local_ufrag_known,
+                    remote_ufrag_known,
+                    active_ice_sessions = self.sessions.len(),
+                    "dropping STUN datagram because its ICE session is not registered"
+                );
+            }
+            route
         } else if let Some(transaction_id) =
             crate::stun::binding_response_transaction_id(&datagram.payload)
         {
             if let Some(pending) = self.pending_ice.get(&transaction_id) {
                 if pending.peer_addr != datagram.peer_addr || pending.expires_at <= Instant::now() {
+                    tracing::debug!(
+                        peer = %datagram.peer_addr,
+                        route_miss = "ice_response_peer_or_transaction_mismatch",
+                        "dropping STUN response that does not match a live ICE transaction"
+                    );
                     return false;
                 }
                 let key = pending.session.clone();
@@ -488,7 +522,19 @@ impl IceDatagramRouter {
                 .and_then(|key| self.sessions.get(key))
         };
         let Some(route) = route else {
-            tracing::debug!(peer = %datagram.peer_addr, "dropping ICE datagram without a registered session");
+            if !crate::stun::is_stun_datagram(&datagram.payload) {
+                tracing::trace!(
+                    peer = %datagram.peer_addr,
+                    route_miss = "unassociated_non_stun_datagram",
+                    "dropping non-STUN datagram without an authenticated peer binding"
+                );
+            } else {
+                tracing::debug!(
+                    peer = %datagram.peer_addr,
+                    route_miss = "unmatched_stun_response_or_peer",
+                    "dropping STUN datagram without a registered transaction or peer binding"
+                );
+            }
             return false;
         };
         match route.sender.try_send(datagram) {
@@ -2076,6 +2122,36 @@ mod tests {
         assert!(!router.route(ice_packet("localB:unknownR", peer_a)));
         assert!(router.unregister("localA", "remoteA"));
         assert!(!router.route(ice_packet_without_username(peer_a)));
+    }
+
+    #[test]
+    fn ice_route_diagnostics_report_ufrag_presence_without_values() {
+        let mut router = IceDatagramRouter::default();
+        router
+            .register("localA".to_owned(), "remoteA".to_owned(), 2)
+            .expect("register a peer ICE session");
+
+        assert_eq!(
+            router.ufrag_registration_presence(&IceSessionKey {
+                local_ufrag: "localA".to_owned(),
+                remote_ufrag: "unknownR".to_owned(),
+            }),
+            (true, false)
+        );
+        assert_eq!(
+            router.ufrag_registration_presence(&IceSessionKey {
+                local_ufrag: "unknownL".to_owned(),
+                remote_ufrag: "remoteA".to_owned(),
+            }),
+            (false, true)
+        );
+        assert_eq!(
+            router.ufrag_registration_presence(&IceSessionKey {
+                local_ufrag: "unknownL".to_owned(),
+                remote_ufrag: "unknownR".to_owned(),
+            }),
+            (false, false)
+        );
     }
 
     #[tokio::test]
