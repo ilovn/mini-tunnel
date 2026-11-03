@@ -1457,6 +1457,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                             known.0.device_id == peer.device_id
                                                 && known.1.transport_name() == "QUIC/UDP"
                                         }) {
+                                            tracing::debug!(
+                                                peer_id = %peer.device_id,
+                                                path = channel.transport_name(),
+                                                reason = "direct_path_already_connected",
+                                                "closing duplicate accepted mesh channel"
+                                            );
                                             channel.close();
                                         } else if require_ice_consent && channel.transport_name() == "QUIC/UDP" {
                                             if let Some((nominated_remote, monitor)) = pending_ice_monitors.remove(&peer.device_id) {
@@ -1476,10 +1482,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                                     first_peer_at.get_or_insert_with(tokio::time::Instant::now);
                                                 } else {
                                                     if let Some((_, duplicate, _)) = pending_accepted_channels.insert(peer.device_id.clone(), (peer, channel, remote)) {
+                                                        tracing::debug!(
+                                                            path = duplicate.transport_name(),
+                                                            reason = "superseded_pending_accepted_channel",
+                                                            "closing superseded pending mesh channel"
+                                                        );
                                                         duplicate.close();
                                                     }
                                                 }
                                             } else if let Some((_, duplicate, _)) = pending_accepted_channels.insert(peer.device_id.clone(), (peer, channel, remote)) {
+                                                tracing::debug!(
+                                                    path = duplicate.transport_name(),
+                                                    reason = "superseded_pending_accepted_channel",
+                                                    "closing superseded pending mesh channel"
+                                                );
                                                 duplicate.close();
                                             }
                                         } else {
@@ -1549,6 +1565,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                             channel.transport_name(),
                                         ) {
                                             if connected.iter().any(|known| known.0.device_id == peer.device_id) {
+                                                tracing::debug!(
+                                                    peer_id = %peer.device_id,
+                                                    path = channel.transport_name(),
+                                                    reason = "peer_path_already_connected",
+                                                    "closing duplicate outbound mesh channel"
+                                                );
                                                 channel.close();
                                             } else {
                                                 println!("Connected mesh peer {} at {remote}", peer.device_id);
@@ -1560,6 +1582,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                         } else {
                                             // This authenticated reverse connection opened the
                                             // NAT mapping; keep the elected inbound session instead.
+                                            tracing::debug!(
+                                                peer_id = %peer.device_id,
+                                                path = channel.transport_name(),
+                                                outbound_elected = keep_outbound,
+                                                reason = "outbound_path_lost_deterministic_election",
+                                                "closing non-elected outbound mesh channel"
+                                            );
                                             channel.close();
                                         }
                                     }
@@ -1612,10 +1641,31 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         while let Some((peer, channel, _remote)) = accepted_rx.recv().await {
                             let registry = accepted_registry.read().await;
                             if let Some(sender) = registry.get(&peer.device_id) {
+                                let path = channel.transport_name();
                                 if let Err(error) = sender.try_send(channel) {
+                                    let reason = if matches!(
+                                        &error,
+                                        tokio::sync::mpsc::error::TrySendError::Full(_)
+                                    ) {
+                                        "peer_accept_queue_full"
+                                    } else {
+                                        "peer_accept_queue_closed"
+                                    };
+                                    tracing::debug!(
+                                        peer_id = %peer.device_id,
+                                        path,
+                                        reason,
+                                        "closing accepted mesh channel that could not be dispatched"
+                                    );
                                     error.into_inner().close();
                                 }
                             } else {
+                                tracing::debug!(
+                                    peer_id = %peer.device_id,
+                                    path = channel.transport_name(),
+                                    reason = "peer_accept_queue_missing",
+                                    "closing accepted mesh channel without a peer dispatcher"
+                                );
                                 channel.close();
                             }
                         }
