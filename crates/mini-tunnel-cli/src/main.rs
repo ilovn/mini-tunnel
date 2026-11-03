@@ -2824,11 +2824,22 @@ async fn connect_mesh_peer(
         {
             Ok(mut channel) => {
                 channel.set_ice_consent_monitor(monitor);
-                return Ok(MeshPeerConnection {
-                    channel,
-                    remote,
-                    nominated_ice_monitor: None,
-                });
+                match validate_udp_probe(channel, true, &peer.device_id).await {
+                    Ok(channel) => {
+                        return Ok(MeshPeerConnection {
+                            channel,
+                            remote,
+                            nominated_ice_monitor: None,
+                        });
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            peer_id = %peer.device_id,
+                            %error,
+                            "ICE nominated path failed initial health probation; trying candidates"
+                        );
+                    }
+                }
             }
             Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer) => {
                 monitor.stop().await;
@@ -6946,10 +6957,12 @@ mod tests {
         let local_key = identity.public_key();
         let server_endpoint = peer_endpoint.endpoint.clone();
         let peer_identity_path = identity_paths.last().expect("peer identity path").clone();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel(1);
         let accept = tokio::spawn(async move {
             let peer_identity = mini_tunnel_agent::Identity::load_or_create_at(peer_identity_path)
                 .expect("reload peer identity");
-            mini_tunnel_agent::accept_peer(
+            let channel = mini_tunnel_agent::accept_peer(
                 &server_endpoint,
                 "restart-net",
                 &peer_identity,
@@ -6957,6 +6970,17 @@ mod tests {
                 local_key,
             )
             .await
+            .expect("accept recovered peer");
+            let channel = std::sync::Arc::new(channel);
+            let responder_channel = std::sync::Arc::clone(&channel);
+            tokio::spawn(async move {
+                while let Ok(packet) = responder_channel.recv_packet().await {
+                    if !packet.is_empty() && packet_tx.send(packet).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let _ = accepted_tx.send(channel);
         });
         let (peer_selected_address, recovered) = tokio::join!(
             select_ice_peer_address(&peer_endpoint, &local_peer, &peer_identity),
@@ -6971,20 +6995,21 @@ mod tests {
         );
         let channel_local =
             recovered.expect("mesh recovery connector reconnects from fresh snapshot");
-        let channel_peer = accept.await.expect("accept task").expect("accept peer");
+        let channel_peer = accepted_rx.await.expect("accepted peer channel");
         channel_local
             .send_packet(b"coordinator-refreshed-ice")
             .await
             .expect("send over recovered channel");
         assert_eq!(
-            channel_peer
-                .recv_packet()
+            packet_rx
+                .recv()
                 .await
                 .expect("receive over recovered channel"),
             b"coordinator-refreshed-ice"
         );
         channel_local.close();
         channel_peer.close();
+        accept.await.expect("join accept task");
 
         let mut changed_member = expected_peer.clone();
         changed_member.assigned_ipv4 = "10.77.0.9".to_owned();
