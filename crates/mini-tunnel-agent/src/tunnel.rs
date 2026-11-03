@@ -241,6 +241,17 @@ fn effective_health_probe_interval(configured_interval: Duration) -> Duration {
     configured_interval.min(HEALTH_PROBE_INTERVAL)
 }
 
+fn mesh_path_failure_reason(quality_degraded: bool, failure: &IdentityError) -> &'static str {
+    if quality_degraded {
+        "quality_threshold"
+    } else if matches!(failure, IdentityError::Transport(reason) if reason == "ICE consent expired")
+    {
+        "ice_consent_expired"
+    } else {
+        "transport_failure"
+    }
+}
+
 /// Whether an authenticated direct UDP recovery probe meets the configured RTT limit.
 #[must_use]
 pub fn path_quality_rtt_is_acceptable(rtt: Duration) -> bool {
@@ -1035,13 +1046,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
             if path_rank(candidate.transport_name()) > path_rank(active.transport_name()) {
                 discard_queued_mesh_packets(&mut outbound_rx, address);
                 let fallback_path = candidate.transport_name();
-                let switch_reason = if quality.degraded {
-                    "quality_threshold"
-                } else if active.has_ice_consent_monitor() {
-                    "ice_consent_expired"
-                } else {
-                    "transport_failure"
-                };
+                let switch_reason = mesh_path_failure_reason(quality.degraded, &failure);
                 tracing::info!(
                     peer_address = %address,
                     from_path = active.transport_name(),
@@ -2387,6 +2392,32 @@ mod tests {
         assert!(path_rank("QUIC/UDP") < path_rank("Relay/QUIC/UDP"));
         assert!(path_rank("Relay/QUIC/UDP") < path_rank("TLS/TCP"));
         assert!(path_rank("TLS/TCP") < path_rank("Relay/TLS"));
+    }
+
+    #[test]
+    fn mesh_path_failure_reason_distinguishes_consent_from_transport_close() {
+        assert_eq!(
+            mesh_path_failure_reason(
+                false,
+                &IdentityError::Transport("ICE consent expired".to_owned())
+            ),
+            "ice_consent_expired"
+        );
+        assert_eq!(
+            mesh_path_failure_reason(
+                false,
+                &IdentityError::Transport("peer transport failed: closed".to_owned())
+            ),
+            "transport_failure"
+        );
+        assert_eq!(
+            mesh_path_failure_reason(
+                true,
+                &IdentityError::Transport("ICE consent expired".to_owned())
+            ),
+            "quality_threshold",
+            "a quality decision remains the primary switch reason"
+        );
     }
 
     #[test]
