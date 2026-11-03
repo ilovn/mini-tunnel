@@ -28,6 +28,33 @@ const QUEUE_CAPACITY: usize = 256;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const PAIR_TIMEOUT: Duration = Duration::from_secs(35);
 const RETRY_INTERVAL: Duration = Duration::from_millis(500);
+const UDP_RECEIVE_RETRY_BASE: Duration = Duration::from_millis(100);
+const UDP_RECEIVE_RETRY_MAX_SHIFT: u32 = 6;
+
+fn udp_receive_retry_delay(kind: io::ErrorKind, consecutive_errors: u32) -> Option<Duration> {
+    matches!(
+        kind,
+        io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+    )
+    .then(|| {
+        let shift = consecutive_errors.min(UDP_RECEIVE_RETRY_MAX_SHIFT);
+        UDP_RECEIVE_RETRY_BASE * (1_u32 << shift)
+    })
+}
+
+async fn wait_for_receive_retry_or_receiver_close(
+    sender: &mpsc::Sender<RelayDatagram>,
+    retry_delay: Duration,
+) -> bool {
+    tokio::select! {
+        () = sender.closed() => false,
+        () = tokio::time::sleep(retry_delay) => true,
+    }
+}
 
 #[derive(Debug)]
 struct RelayDatagram {
@@ -86,9 +113,51 @@ impl quinn::Runtime for UdpRelayRuntime {
         let receive_socket = Arc::clone(&socket);
         tokio::spawn(async move {
             let mut buffer = vec![0; u16::MAX as usize];
+            let mut consecutive_receive_errors = 0_u32;
             loop {
-                let Ok(length) = receive_socket.recv(&mut buffer).await else {
-                    break;
+                let result = tokio::select! {
+                    () = sender.closed() => break,
+                    result = receive_socket.recv(&mut buffer) => result,
+                };
+                let length = match result {
+                    Ok(length) => {
+                        if consecutive_receive_errors > 0 {
+                            tracing::info!(
+                                consecutive_receive_errors,
+                                "UDP relay receive recovered"
+                            );
+                            consecutive_receive_errors = 0;
+                        }
+                        length
+                    }
+                    Err(error) => {
+                        let kind = error.kind();
+                        let Some(retry_delay) =
+                            udp_receive_retry_delay(kind, consecutive_receive_errors)
+                        else {
+                            tracing::error!(
+                                ?kind,
+                                raw_os_error = error.raw_os_error(),
+                                "UDP relay receive task stopped after a fatal error"
+                            );
+                            break;
+                        };
+                        consecutive_receive_errors = consecutive_receive_errors.saturating_add(1);
+                        if consecutive_receive_errors == 1
+                            || consecutive_receive_errors.is_power_of_two()
+                        {
+                            tracing::warn!(
+                                ?kind,
+                                consecutive_receive_errors,
+                                retry_delay_ms = retry_delay.as_millis(),
+                                "UDP relay receive failed transiently; retrying"
+                            );
+                        }
+                        if !wait_for_receive_retry_or_receiver_close(&sender, retry_delay).await {
+                            break;
+                        }
+                        continue;
+                    }
                 };
                 let Ok((received_session, payload)) =
                     mini_tunnel_protocol::decode_udp_relay_datagram(&buffer[..length])
@@ -390,6 +459,52 @@ mod tests {
     use super::*;
     use mini_tunnel_protocol::{RELAY_TICKET_VERSION, RelayTicketClaims, issue_relay_ticket};
     use tokio::time::timeout;
+
+    #[test]
+    fn transient_udp_receive_errors_use_bounded_backoff() {
+        for kind in [
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::ConnectionReset,
+        ] {
+            assert_eq!(
+                udp_receive_retry_delay(kind, 0),
+                Some(Duration::from_millis(100)),
+                "{kind:?} should be retried"
+            );
+        }
+        assert_eq!(
+            udp_receive_retry_delay(io::ErrorKind::ConnectionReset, 1),
+            Some(Duration::from_millis(200))
+        );
+        assert_eq!(
+            udp_receive_retry_delay(io::ErrorKind::ConnectionRefused, u32::MAX),
+            Some(Duration::from_millis(6_400)),
+            "retry delay must stay capped"
+        );
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::NotConnected,
+        ] {
+            assert_eq!(udp_receive_retry_delay(kind, 0), None, "{kind:?} is fatal");
+        }
+    }
+
+    #[tokio::test]
+    async fn receiver_close_interrupts_udp_receive_retry_backoff() {
+        let (sender, receiver) = mpsc::channel::<RelayDatagram>(1);
+        drop(receiver);
+        let should_retry = timeout(
+            Duration::from_millis(100),
+            wait_for_receive_retry_or_receiver_close(&sender, Duration::from_secs(60)),
+        )
+        .await
+        .expect("receiver close should interrupt retry backoff");
+        assert!(!should_retry);
+    }
 
     fn make_ticket(
         key: &[u8; 32],
