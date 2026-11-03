@@ -564,6 +564,11 @@ impl PeerChannel {
     /// Close this peer session, for example after a simultaneous-connect probe loses election.
     pub fn close(&self) {
         if let PeerTransport::Quic(connection) = &self.transport {
+            tracing::debug!(
+                remote = %connection.remote_address(),
+                close_class = "local_path_not_selected",
+                "closing QUIC peer channel locally"
+            );
             connection.close(0_u32.into(), b"peer path not selected");
         }
     }
@@ -781,11 +786,19 @@ impl PeerChannel {
     async fn recv_packet_from_transport(&self) -> Result<Vec<u8>, IdentityError> {
         loop {
             let frame = match &self.transport {
-                PeerTransport::Quic(connection) => connection
-                    .read_datagram()
-                    .await
-                    .map_err(|error| IdentityError::Transport(error.to_string()))?
-                    .to_vec(),
+                PeerTransport::Quic(connection) => match connection.read_datagram().await {
+                    Ok(frame) => frame.to_vec(),
+                    Err(error) => {
+                        let close_class = quic_connection_error_class(&error);
+                        tracing::warn!(
+                            remote = %connection.remote_address(),
+                            close_class,
+                            %error,
+                            "QUIC peer datagram receive failed"
+                        );
+                        return Err(IdentityError::Transport(error.to_string()));
+                    }
+                },
                 PeerTransport::Tcp(transport) => {
                     read_tcp_peer_frame(transport, TCP_PEER_FRAME_READ_TIMEOUT).await?
                 }
@@ -833,6 +846,19 @@ impl PeerChannel {
             }
             return Ok(payload);
         }
+    }
+}
+
+fn quic_connection_error_class(error: &quinn::ConnectionError) -> &'static str {
+    match error {
+        quinn::ConnectionError::VersionMismatch => "version_mismatch",
+        quinn::ConnectionError::TransportError(_) => "transport_error",
+        quinn::ConnectionError::ConnectionClosed(_) => "peer_transport_close",
+        quinn::ConnectionError::ApplicationClosed(_) => "peer_application_close",
+        quinn::ConnectionError::Reset => "peer_reset",
+        quinn::ConnectionError::TimedOut => "timeout",
+        quinn::ConnectionError::LocallyClosed => "local_close",
+        quinn::ConnectionError::CidsExhausted => "cid_exhaustion",
     }
 }
 
@@ -2325,6 +2351,26 @@ pub fn default_identity_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quic_connection_errors_have_distinct_diagnostic_classes() {
+        assert_eq!(
+            quic_connection_error_class(&quinn::ConnectionError::LocallyClosed),
+            "local_close"
+        );
+        assert_eq!(
+            quic_connection_error_class(&quinn::ConnectionError::TimedOut),
+            "timeout"
+        );
+        assert_eq!(
+            quic_connection_error_class(&quinn::ConnectionError::Reset),
+            "peer_reset"
+        );
+        assert_eq!(
+            quic_connection_error_class(&quinn::ConnectionError::VersionMismatch),
+            "version_mismatch"
+        );
+    }
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
