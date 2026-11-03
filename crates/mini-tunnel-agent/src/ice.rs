@@ -6,7 +6,10 @@ use std::{
     io::{self, IoSliceMut},
     net::SocketAddr,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -95,6 +98,40 @@ struct QuinnDatagram {
 #[derive(Debug, Default)]
 struct SharedSocket {
     socket: Mutex<Option<Arc<UdpSocket>>>,
+    diagnostics: SocketDiagnostics,
+}
+
+#[derive(Debug, Default)]
+struct SocketDiagnostics {
+    received_datagrams: AtomicU64,
+    received_stun_datagrams: AtomicU64,
+    received_other_datagrams: AtomicU64,
+    ice_queue_drops: AtomicU64,
+    quinn_queue_drops: AtomicU64,
+    receive_errors: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+struct SocketDiagnosticsSnapshot {
+    received_datagrams: u64,
+    received_stun_datagrams: u64,
+    received_other_datagrams: u64,
+    ice_queue_drops: u64,
+    quinn_queue_drops: u64,
+    receive_errors: u64,
+}
+
+impl SocketDiagnostics {
+    fn snapshot(&self) -> SocketDiagnosticsSnapshot {
+        SocketDiagnosticsSnapshot {
+            received_datagrams: self.received_datagrams.load(Ordering::Relaxed),
+            received_stun_datagrams: self.received_stun_datagrams.load(Ordering::Relaxed),
+            received_other_datagrams: self.received_other_datagrams.load(Ordering::Relaxed),
+            ice_queue_drops: self.ice_queue_drops.load(Ordering::Relaxed),
+            quinn_queue_drops: self.quinn_queue_drops.load(Ordering::Relaxed),
+            receive_errors: self.receive_errors.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// A handle to the UDP socket shared by Quinn and the ICE driver.
@@ -110,6 +147,10 @@ impl IceSocketHandle {
 
     pub async fn send_to(&self, payload: &[u8], peer: SocketAddr) -> io::Result<usize> {
         self.socket()?.send_to(payload, peer).await
+    }
+
+    fn diagnostics(&self) -> SocketDiagnosticsSnapshot {
+        self.shared.diagnostics.snapshot()
     }
 
     fn socket(&self) -> io::Result<Arc<UdpSocket>> {
@@ -258,6 +299,18 @@ impl IceDatagramRouterHandle {
             let _ = router.route(datagram);
         }
     }
+
+    fn queue_drop_counts(&self) -> Option<(u64, u64)> {
+        self.router
+            .lock()
+            .map(|router| {
+                (
+                    router.session_queue_full_drops,
+                    router.session_queue_closed_drops,
+                )
+            })
+            .ok()
+    }
 }
 
 struct IceRoute {
@@ -293,6 +346,8 @@ pub struct IceDatagramRouter {
     peer_sessions: HashMap<SocketAddr, IceSessionKey>,
     pending_stun: HashMap<[u8; 12], PendingStunQuery>,
     pending_ice: HashMap<[u8; 12], PendingIceTransaction>,
+    session_queue_full_drops: u64,
+    session_queue_closed_drops: u64,
 }
 
 impl IceDatagramRouter {
@@ -542,10 +597,12 @@ impl IceDatagramRouter {
         match route.sender.try_send(datagram) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(datagram)) => {
+                self.session_queue_full_drops = self.session_queue_full_drops.saturating_add(1);
                 tracing::warn!(peer = %datagram.peer_addr, "dropping ICE datagram because the session queue is full");
                 false
             }
             Err(mpsc::error::TrySendError::Closed(datagram)) => {
+                self.session_queue_closed_drops = self.session_queue_closed_drops.saturating_add(1);
                 tracing::debug!(peer = %datagram.peer_addr, "dropping ICE datagram because the session is closed");
                 false
             }
@@ -743,6 +800,7 @@ impl quinn::Runtime for IcedQuinnRuntime {
         // The socket task is the sole receiver. Each datagram occupies one queue entry, so GRO
         // segments never need to be compacted or reconstructed in Quinn's RecvMeta array.
         let receive_socket = Arc::clone(&socket);
+        let shared_socket = Arc::clone(&self.shared_socket.shared);
         let ice_tx = self.ice_tx.clone();
         let quinn_tx = self.quinn_tx.clone();
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -758,18 +816,45 @@ impl quinn::Runtime for IcedQuinnRuntime {
                     }
                     result = receive_socket.recv_from(&mut buffer) => match result {
                         Ok(result) => result,
-                        Err(_) => break,
+                        Err(error) => {
+                            let diagnostics = &shared_socket.diagnostics;
+                            diagnostics.receive_errors.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(%error, "shared UDP receive loop stopped");
+                            break;
+                        }
                     }
                 };
+                let diagnostics = &shared_socket.diagnostics;
+                diagnostics
+                    .received_datagrams
+                    .fetch_add(1, Ordering::Relaxed);
                 let payload = buffer[..length].to_vec();
                 if crate::stun::is_stun_datagram(&payload) {
-                    let _ = ice_tx.try_send(IceDatagram {
-                        local_addr,
-                        peer_addr,
-                        payload,
-                    });
+                    diagnostics
+                        .received_stun_datagrams
+                        .fetch_add(1, Ordering::Relaxed);
+                    if ice_tx
+                        .try_send(IceDatagram {
+                            local_addr,
+                            peer_addr,
+                            payload,
+                        })
+                        .is_err()
+                    {
+                        diagnostics.ice_queue_drops.fetch_add(1, Ordering::Relaxed);
+                    }
                 } else {
-                    let _ = quinn_tx.try_send(QuinnDatagram { peer_addr, payload });
+                    diagnostics
+                        .received_other_datagrams
+                        .fetch_add(1, Ordering::Relaxed);
+                    if quinn_tx
+                        .try_send(QuinnDatagram { peer_addr, payload })
+                        .is_err()
+                    {
+                        diagnostics
+                            .quinn_queue_drops
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         });
@@ -950,6 +1035,14 @@ struct IceCandidatePairSummary {
     requests_sent: u64,
     requests_received: u64,
     responses_received: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct IceChecklistRunSummary {
+    outbound_datagrams: u64,
+    candidate_send_errors: u64,
+    session_stun_datagrams_delivered: u64,
+    agent_accepted_datagrams: u64,
 }
 
 fn candidate_type_counts(candidates: &[SignaledCandidate]) -> (usize, usize) {
@@ -1371,10 +1464,9 @@ impl IceAgentDriver {
 
     fn log_checklist_summary(
         &self,
-        outbound_datagrams: u64,
-        candidate_send_errors: u64,
-        inbound_stun_datagrams: u64,
-        agent_accepted_datagrams: u64,
+        run: IceChecklistRunSummary,
+        socket_diagnostics: SocketDiagnosticsSnapshot,
+        router_queue_drops: Option<(u64, u64)>,
         nominated: bool,
     ) {
         let pairs = self.candidate_pair_summary();
@@ -1385,10 +1477,10 @@ impl IceAgentDriver {
             local_srflx_candidates = self.local_srflx_candidate_count,
             remote_host_candidates = self.remote_host_candidate_count,
             remote_srflx_candidates = self.remote_srflx_candidate_count,
-            outbound_datagrams,
-            candidate_send_errors,
-            inbound_stun_datagrams,
-            agent_accepted_datagrams,
+            outbound_datagrams = run.outbound_datagrams,
+            candidate_send_errors = run.candidate_send_errors,
+            session_stun_datagrams_delivered = run.session_stun_datagrams_delivered,
+            agent_accepted_datagrams = run.agent_accepted_datagrams,
             nominated,
             "ICE checklist summary"
         );
@@ -1410,6 +1502,18 @@ impl IceAgentDriver {
             nominated_pairs = pairs.nominated_pairs,
             "ICE candidate-pair summary"
         );
+        tracing::debug!(
+            rx_datagrams = socket_diagnostics.received_datagrams,
+            rx_stun = socket_diagnostics.received_stun_datagrams,
+            rx_other = socket_diagnostics.received_other_datagrams,
+            ice_dispatch_drops = socket_diagnostics.ice_queue_drops,
+            quinn_dispatch_drops = socket_diagnostics.quinn_queue_drops,
+            rx_errors = socket_diagnostics.receive_errors,
+            ice_session_queue_counts_available = router_queue_drops.is_some(),
+            ice_session_queue_full_drops = router_queue_drops.map_or(0, |counts| counts.0),
+            ice_session_queue_closed_drops = router_queue_drops.map_or(0, |counts| counts.1),
+            "ICE UDP socket summary"
+        );
     }
 
     /// Run checks over the endpoint's shared UDP socket until nomination or timeout.
@@ -1425,16 +1529,13 @@ impl IceAgentDriver {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or(IceDriverError::Timeout)?;
-        let mut outbound_datagrams = 0_u64;
-        let mut candidate_send_errors = 0_u64;
-        let mut inbound_stun_datagrams = 0_u64;
-        let mut agent_accepted_datagrams = 0_u64;
+        let mut run = IceChecklistRunSummary::default();
         loop {
             let now = Instant::now();
             self.handle_timeout(now)?;
             self.log_check_events();
             for transmit in self.poll_transmits() {
-                outbound_datagrams = outbound_datagrams.saturating_add(1);
+                run.outbound_datagrams = run.outbound_datagrams.saturating_add(1);
                 router
                     .register_ice_request(
                         local_ufrag,
@@ -1450,7 +1551,7 @@ impl IceAgentDriver {
                     if !is_candidate_send_error(&error) {
                         return Err(IceDriverError::Socket(error.to_string()));
                     }
-                    candidate_send_errors = candidate_send_errors.saturating_add(1);
+                    run.candidate_send_errors = run.candidate_send_errors.saturating_add(1);
                     // A candidate-specific routing error must not abort the checklist: another
                     // address family or server-reflexive candidate may still be reachable.
                     tracing::debug!(
@@ -1461,20 +1562,18 @@ impl IceAgentDriver {
             }
             if let Some(pair) = self.selected_pair() {
                 self.log_checklist_summary(
-                    outbound_datagrams,
-                    candidate_send_errors,
-                    inbound_stun_datagrams,
-                    agent_accepted_datagrams,
+                    run,
+                    socket.diagnostics(),
+                    router.queue_drop_counts(),
                     true,
                 );
                 return Ok(pair);
             }
             if now >= deadline {
                 self.log_checklist_summary(
-                    outbound_datagrams,
-                    candidate_send_errors,
-                    inbound_stun_datagrams,
-                    agent_accepted_datagrams,
+                    run,
+                    socket.diagnostics(),
+                    router.queue_drop_counts(),
                     false,
                 );
                 return Err(IceDriverError::Timeout);
@@ -1483,22 +1582,24 @@ impl IceAgentDriver {
             tokio::select! {
                 datagram = datagrams.recv() => {
                     let datagram = datagram.ok_or_else(|| IceDriverError::Router("peer datagram queue closed".to_owned()))?;
-                    inbound_stun_datagrams = inbound_stun_datagrams.saturating_add(1);
+                    run.session_stun_datagrams_delivered = run
+                        .session_stun_datagrams_delivered
+                        .saturating_add(1);
                     let accepted = router
                         .handle_datagram(local_ufrag, remote_ufrag, self, datagram, Instant::now())
                         .map_err(|error| IceDriverError::Router(error.to_string()))?;
                     if accepted {
-                        agent_accepted_datagrams = agent_accepted_datagrams.saturating_add(1);
+                        run.agent_accepted_datagrams =
+                            run.agent_accepted_datagrams.saturating_add(1);
                     }
                     self.log_check_events();
                 }
                 () = tokio::time::sleep_until(tokio::time::Instant::from_std(next_deadline)) => {
                     if Instant::now() >= deadline {
                         self.log_checklist_summary(
-                            outbound_datagrams,
-                            candidate_send_errors,
-                            inbound_stun_datagrams,
-                            agent_accepted_datagrams,
+                            run,
+                            socket.diagnostics(),
+                            router.queue_drop_counts(),
                             false,
                         );
                         return Err(IceDriverError::Timeout);
@@ -2795,6 +2896,14 @@ mod tests {
             b"quic-survives-demux"
         );
 
+        for endpoint in [&endpoint_a, &endpoint_b] {
+            let diagnostics = endpoint.socket.diagnostics();
+            assert!(diagnostics.received_stun_datagrams > 0);
+            assert!(diagnostics.received_other_datagrams > 0);
+            assert_eq!(diagnostics.receive_errors, 0);
+            assert_eq!(endpoint.ice_router.queue_drop_counts(), Some((0, 0)));
+        }
+
         endpoint_a.endpoint.close(0_u32.into(), b"test complete");
         endpoint_b.endpoint.close(0_u32.into(), b"test complete");
         let _ = fs::remove_dir_all(temp);
@@ -3267,6 +3376,21 @@ mod tests {
             .expect("first STUN datagram queued");
         assert_eq!(first.payload, first_request);
         assert!(ice_messages.try_recv().is_err());
+        let diagnostics = endpoint.socket.diagnostics();
+        assert_eq!(diagnostics.received_datagrams, 2);
+        assert_eq!(diagnostics.received_stun_datagrams, 2);
+        assert_eq!(diagnostics.received_other_datagrams, 0);
+        assert_eq!(diagnostics.receive_errors, 0);
+        let (session_queue_full_drops, session_queue_closed_drops) = endpoint
+            .ice_router
+            .queue_drop_counts()
+            .expect("router queue diagnostics");
+        assert_eq!(session_queue_closed_drops, 0);
+        assert_eq!(
+            diagnostics.ice_queue_drops + session_queue_full_drops,
+            1,
+            "the excess datagram must be attributed to one bounded ICE queue"
+        );
         endpoint.endpoint.close(0_u32.into(), b"test complete");
         let _ = fs::remove_dir_all(temp);
     }
