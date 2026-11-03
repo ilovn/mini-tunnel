@@ -23,7 +23,7 @@ const MAX_MESH_EVENT_QUEUE_CAPACITY: usize = 1024;
 const MESH_OUTBOUND_QUEUE_PER_PEER: usize = 1;
 const MESH_OUTBOUND_PACKET_TTL: Duration = Duration::from_secs(5);
 const EARLY_FALLBACK_MISSES: u64 = 1;
-const HEALTH_PROBE_INTERVAL: Duration = Duration::from_millis(500);
+const HEALTH_PROBE_INTERVAL: Duration = Duration::from_millis(400);
 const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DIRECT_PROBE_HANDOFF_GRACE: Duration = Duration::from_secs(2);
 
@@ -251,6 +251,17 @@ fn quality_detection_budget(
     // Probe misses are counted while sending the next keepalive, then observed by the
     // following health tick. Include that polling delay after the final missed probe.
     probe_timeout + probe_interval * required_probes
+}
+
+fn conservative_ice_disconnected_budget() -> Duration {
+    crate::ice::ICE_DISCONNECTED_TIMEOUT
+        .saturating_sub(crate::ice::ICE_CONSENT_MAX_INTERVAL)
+        .saturating_sub(crate::HEALTH_PROBE_TIMEOUT)
+        .saturating_sub(HEALTH_PROBE_INTERVAL)
+}
+
+fn conservative_ice_disconnected_remaining(degradation_age: Duration) -> Duration {
+    conservative_ice_disconnected_budget().saturating_sub(degradation_age)
 }
 
 fn mesh_path_failure_reason(quality_degraded: bool, failure: &IdentityError) -> &'static str {
@@ -702,6 +713,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         let mut last_health_successes = initial_health.probes_succeeded;
         let mut last_health_missed = initial_health.probes_missed;
         let mut unresolved_health_misses = 0_u64;
+        let mut udp_degradation_started_at: Option<Instant> = None;
         let mut fallback_cooldown_until = tokio::time::Instant::now();
         crate::status::update(
             address.to_string(),
@@ -794,8 +806,12 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                     last_health_missed = health.probes_missed;
                     if new_missed > 0 {
                         unresolved_health_misses = unresolved_health_misses.saturating_add(new_missed);
+                        if is_udp_path(active.transport_name()) {
+                            udp_degradation_started_at.get_or_insert_with(Instant::now);
+                        }
                     } else if new_successes > 0 {
                         unresolved_health_misses = 0;
+                        udp_degradation_started_at = None;
                     }
                     crate::status::update(
                         address.to_string(), true, active.transport_name(),
@@ -825,9 +841,14 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                         && ready_fallback.is_none()
                         && let Some(connector) = connector.as_ref()
                     {
+                        let degradation_age = udp_degradation_started_at.map(|started| started.elapsed());
+                        let disconnected_deadline_remaining = degradation_age
+                            .map(conservative_ice_disconnected_remaining);
                         tracing::debug!(
                             peer_address = %address,
                             unresolved_missed_probes = unresolved_health_misses,
+                            udp_degradation_age_ms = degradation_age.map(|age| age.as_millis() as u64),
+                            conservative_ice_disconnected_remaining_ms = disconnected_deadline_remaining.map(|remaining| remaining.as_millis() as u64),
                             "preparing reliable fallback while UDP health is degraded"
                         );
                         fallback_task = Some(spawn_reliable_fallback_task(
@@ -848,12 +869,17 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                         .await;
                     }
                     if is_udp_path(active.transport_name()) && quality_degraded && !force_reliable {
+                        let degradation_age = udp_degradation_started_at.map(|started| started.elapsed());
+                        let disconnected_deadline_remaining = degradation_age
+                            .map(conservative_ice_disconnected_remaining);
                         tracing::warn!(
                             peer_address = %address,
                             path = active.transport_name(),
                             rtt_ms = health.rtt.map(|rtt| rtt.as_millis() as u64),
                             probes_succeeded = health.probes_succeeded,
                             probes_missed = health.probes_missed,
+                            udp_degradation_age_ms = degradation_age.map(|age| age.as_millis() as u64),
+                            conservative_ice_disconnected_remaining_ms = disconnected_deadline_remaining.map(|remaining| remaining.as_millis() as u64),
                             reason = "quality_threshold",
                             "peer path quality degraded; switching to reliable fallback"
                         );
@@ -879,6 +905,8 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                                 from_path = previous_path,
                                 to_path = fallback_path,
                                 reason = "quality_threshold",
+                                udp_degradation_age_ms = udp_degradation_started_at.map(|started: Instant| started.elapsed().as_millis() as u64),
+                                conservative_ice_disconnected_remaining_ms = udp_degradation_started_at.map(|started: Instant| conservative_ice_disconnected_remaining(started.elapsed()).as_millis() as u64),
                                 "peer path switched to prepared reliable fallback"
                             );
                             *channel.write().await = Arc::new(candidate);
@@ -964,6 +992,8 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                                     from_path = previous_path,
                                     to_path = fallback_path,
                                     reason = "quality_threshold",
+                                    udp_degradation_age_ms = udp_degradation_started_at.map(|started: Instant| started.elapsed().as_millis() as u64),
+                                    conservative_ice_disconnected_remaining_ms = udp_degradation_started_at.map(|started: Instant| conservative_ice_disconnected_remaining(started.elapsed()).as_millis() as u64),
                                     "peer path switched to reliable fallback"
                                 );
                                 *channel.write().await = Arc::new(candidate);
@@ -979,6 +1009,8 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                             tracing::debug!(
                                 peer_address = %address,
                                 path = candidate.transport_name(),
+                                udp_degradation_age_ms = udp_degradation_started_at.map(|started: Instant| started.elapsed().as_millis() as u64),
+                                conservative_ice_disconnected_remaining_ms = udp_degradation_started_at.map(|started: Instant| conservative_ice_disconnected_remaining(started.elapsed()).as_millis() as u64),
                                 "reliable fallback is ready; retaining the active path until degradation"
                             );
                             ready_fallback = Some(candidate);
@@ -1079,6 +1111,8 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                     from_path = active.transport_name(),
                     to_path = fallback_path,
                     reason = switch_reason,
+                    udp_degradation_age_ms = udp_degradation_started_at.map(|started: Instant| started.elapsed().as_millis() as u64),
+                    conservative_ice_disconnected_remaining_ms = udp_degradation_started_at.map(|started: Instant| conservative_ice_disconnected_remaining(started.elapsed()).as_millis() as u64),
                     "peer path recovered immediately with a prepared reliable channel"
                 );
                 active.close_async().await;
@@ -2465,15 +2499,29 @@ mod tests {
             crate::HEALTH_PROBE_TIMEOUT,
             HEALTH_PROBE_INTERVAL,
         );
-        let conservative_ice_fallback_deadline = crate::ice::ICE_DISCONNECTED_TIMEOUT
-            .saturating_sub(crate::ice::ICE_CONSENT_MAX_INTERVAL);
+        let conservative_ice_fallback_deadline = conservative_ice_disconnected_budget();
         assert!(
-            quality_detection == Duration::from_millis(3_500),
-            "default quality timing must include the poll after the last missed probe"
+            quality_detection == Duration::from_millis(2_900),
+            "default quality timing must include the missed-probe deadline and poll after the last missed probe"
+        );
+        assert_eq!(
+            conservative_ice_disconnected_budget(),
+            Duration::from_millis(8_100),
+            "the estimate must account for maximum consent phase and first-miss observation delay"
         );
         assert!(
             quality_detection + Duration::from_secs(5) <= conservative_ice_fallback_deadline,
             "quality detection must leave five seconds before ICE Disconnected after consent-interval phase"
+        );
+        assert_eq!(
+            conservative_ice_disconnected_remaining(quality_detection),
+            Duration::from_millis(5_200),
+            "the logged conservative estimate must retain at least five seconds after default quality detection"
+        );
+        assert_eq!(
+            conservative_ice_disconnected_remaining(Duration::from_secs(10)),
+            Duration::ZERO,
+            "the estimate must saturate after the conservative ICE deadline"
         );
         assert!(
             quality_detection < PEER_IDLE_TIMEOUT,
