@@ -29,6 +29,7 @@ use mini_tunnel_protocol::{
 use serde::Deserialize;
 
 const PEER_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(5);
+const COORDINATOR_HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
 const ICE_PATH_PROMOTION_PROBATION: Duration = Duration::from_secs(31);
 const COORDINATOR_CA_CERT_FILE_ENV: &str = "MINI_TUNNEL_COORDINATOR_CA_CERT_FILE";
 const MAX_COORDINATOR_CA_BUNDLE_BYTES: u64 = 1024 * 1024;
@@ -863,7 +864,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             CoordinatorCommand::Health { url } => {
                 let endpoint = format!("{}/healthz", url.trim_end_matches('/'));
-                let response = coordinator_http_client(Duration::from_secs(3))?
+                let response = coordinator_http_client(COORDINATOR_HEALTH_TIMEOUT)?
                     .get(endpoint)
                     .send()
                     .await?
@@ -5115,6 +5116,11 @@ fn print_tunnel_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coordinator_health_timeout_allows_slow_proxied_networks() {
+        assert_eq!(COORDINATOR_HEALTH_TIMEOUT, Duration::from_secs(10));
+    }
 
     #[test]
     fn coordinator_ca_bundle_rejects_empty_non_pem_and_oversized_files_safely() {
