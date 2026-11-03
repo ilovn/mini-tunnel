@@ -14,6 +14,9 @@ use std::{
 use thiserror::Error;
 
 const ROUTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+// Windows route changes can take longer while the IP Helper service reconciles a newly
+// created Wintun interface. Keep that wait bounded, but give it enough room for slow runners.
+const WINDOWS_ROUTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutingPlatform {
@@ -276,7 +279,15 @@ async fn execute(
     command: &RouteCommand,
     operation: &'static str,
 ) -> Result<(), RouteError> {
-    execute_with_timeout(runner, command, operation, ROUTE_COMMAND_TIMEOUT).await
+    execute_with_timeout(runner, command, operation, route_command_timeout(command)).await
+}
+
+fn route_command_timeout(command: &RouteCommand) -> Duration {
+    if command.program.as_os_str() == "netsh" {
+        WINDOWS_ROUTE_COMMAND_TIMEOUT
+    } else {
+        ROUTE_COMMAND_TIMEOUT
+    }
 }
 
 async fn execute_with_timeout(
@@ -481,6 +492,10 @@ mod tests {
                 command("ipv6", "delete", "fd12:3456::3/128"),
             ]
         );
+        assert_eq!(
+            route_command_timeout(&command("ipv4", "add", "10.77.0.3/32")),
+            WINDOWS_ROUTE_COMMAND_TIMEOUT
+        );
     }
 
     #[tokio::test]
@@ -599,6 +614,27 @@ mod tests {
                 timeout
             } if timeout == Duration::from_millis(10)
         ));
+    }
+
+    #[test]
+    fn non_windows_route_commands_keep_the_short_timeout() {
+        let linux = build_command(
+            RoutingPlatform::Linux,
+            RouteAction::Add,
+            "tun7",
+            Ipv4Addr::new(10, 77, 0, 3),
+        )
+        .expect("Linux route command");
+        let macos = build_command(
+            RoutingPlatform::MacOs,
+            RouteAction::Add,
+            "utun8",
+            Ipv4Addr::new(10, 77, 0, 3),
+        )
+        .expect("macOS route command");
+
+        assert_eq!(route_command_timeout(&linux), ROUTE_COMMAND_TIMEOUT);
+        assert_eq!(route_command_timeout(&macos), ROUTE_COMMAND_TIMEOUT);
     }
 
     #[tokio::test]
