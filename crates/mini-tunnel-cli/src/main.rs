@@ -2467,10 +2467,24 @@ async fn run_peer_tunnel(
     tunnel_result
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct RelayEndpoints {
     tcp: Option<SocketAddr>,
     udp: Option<SocketAddr>,
+}
+
+fn udp_recovery_probe_endpoints(
+    relay_endpoints: RelayEndpoints,
+    try_udp_relay: bool,
+) -> RelayEndpoints {
+    RelayEndpoints {
+        tcp: None,
+        udp: try_udp_relay.then_some(relay_endpoints.udp).flatten(),
+    }
+}
+
+fn udp_candidate_requires_ice_consent(ice_enabled: bool, transport: &str) -> bool {
+    ice_enabled && transport == "QUIC/UDP"
 }
 
 fn mesh_reconnect_direct_wait(relay_endpoints: RelayEndpoints, force_reliable: bool) -> Duration {
@@ -3135,44 +3149,48 @@ fn build_mesh_peer_connectors(
         let network_id = network_id.clone();
         let coordinator_url = coordinator_url.clone();
         let peer = peer.clone();
-        std::sync::Arc::new(move |_| -> mini_tunnel_agent::tunnel::PeerConnectFuture {
-            let endpoint = endpoint.clone();
-            let identity = std::sync::Arc::clone(&identity);
-            let network_id = network_id.clone();
-            let coordinator_url = coordinator_url.clone();
-            let peer = peer.clone();
-            Box::pin(async move {
-                let connection = match connect_mesh_peer(
-                    &endpoint,
-                    &network_id,
-                    &coordinator_url,
-                    &identity,
-                    &peer,
-                    RelayEndpoints::default(),
-                    false,
-                )
-                .await
-                {
-                    Ok(connection) => connection,
-                    Err(error) => {
-                        tracing::warn!(
-                            peer_id = %peer.device_id,
-                            stage = "outbound_recovery_connection",
-                            %error,
-                            "direct recovery candidate connection failed"
-                        );
-                        return Err(error);
-                    }
-                };
-                tracing::debug!(
-                    peer_id = %peer.device_id,
-                    path = connection.channel.transport_name(),
-                    has_ice_consent = connection.channel.has_ice_consent_monitor(),
-                    "direct recovery outbound candidate channel established"
-                );
-                validate_udp_probe(connection.channel, require_ice_consent, &peer.device_id).await
-            })
-        })
+        std::sync::Arc::new(
+            move |try_udp_relay| -> mini_tunnel_agent::tunnel::PeerConnectFuture {
+                let endpoint = endpoint.clone();
+                let identity = std::sync::Arc::clone(&identity);
+                let network_id = network_id.clone();
+                let coordinator_url = coordinator_url.clone();
+                let peer = peer.clone();
+                Box::pin(async move {
+                    let probe_relays = udp_recovery_probe_endpoints(relay_endpoints, try_udp_relay);
+                    let connection = match connect_mesh_peer(
+                        &endpoint,
+                        &network_id,
+                        &coordinator_url,
+                        &identity,
+                        &peer,
+                        probe_relays,
+                        false,
+                    )
+                    .await
+                    {
+                        Ok(connection) => connection,
+                        Err(error) => {
+                            tracing::warn!(
+                                peer_id = %peer.device_id,
+                                stage = "outbound_recovery_connection",
+                                %error,
+                                "direct recovery candidate connection failed"
+                            );
+                            return Err(error);
+                        }
+                    };
+                    tracing::debug!(
+                        peer_id = %peer.device_id,
+                        path = connection.channel.transport_name(),
+                        has_ice_consent = connection.channel.has_ice_consent_monitor(),
+                        "direct recovery outbound candidate channel established"
+                    );
+                    validate_udp_probe(connection.channel, require_ice_consent, &peer.device_id)
+                        .await
+                })
+            },
+        )
     } else {
         let receiver = std::sync::Arc::clone(&receiver);
         let endpoint = endpoint.clone();
@@ -3180,78 +3198,101 @@ fn build_mesh_peer_connectors(
         let coordinator_url = coordinator_url.clone();
         let network_id = network_id.clone();
         let peer = peer.clone();
-        std::sync::Arc::new(move |_| -> mini_tunnel_agent::tunnel::PeerConnectFuture {
-            let receiver = std::sync::Arc::clone(&receiver);
-            let endpoint = endpoint.clone();
-            let identity = std::sync::Arc::clone(&identity);
-            let coordinator_url = coordinator_url.clone();
-            let network_id = network_id.clone();
-            let peer = peer.clone();
-            Box::pin(async move {
-                let mut monitor = select_current_ice_peer_address(
-                    &endpoint,
-                    &coordinator_url,
-                    &network_id,
-                    &peer,
-                    &identity,
-                )
-                .await
-                .map(|(_, monitor)| monitor);
-                tracing::debug!(
-                    peer_id = %peer.device_id,
-                    nominated = monitor.is_some(),
-                    "direct recovery accepted-side ICE checklist completed"
-                );
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
-                let mut channel = match tokio::time::timeout_at(deadline, async {
-                    receiver.lock().await.recv().await
+        std::sync::Arc::new(
+            move |try_udp_relay| -> mini_tunnel_agent::tunnel::PeerConnectFuture {
+                let receiver = std::sync::Arc::clone(&receiver);
+                let endpoint = endpoint.clone();
+                let identity = std::sync::Arc::clone(&identity);
+                let coordinator_url = coordinator_url.clone();
+                let network_id = network_id.clone();
+                let peer = peer.clone();
+                Box::pin(async move {
+                    let use_udp_relay = try_udp_relay && relay_endpoints.udp.is_some();
+                    let direct_wait = if use_udp_relay {
+                        Duration::from_secs(5)
+                    } else {
+                        Duration::from_secs(35)
+                    };
+                    let direct_result = async {
+                        let mut monitor = select_current_ice_peer_address(
+                            &endpoint,
+                            &coordinator_url,
+                            &network_id,
+                            &peer,
+                            &identity,
+                        )
+                        .await
+                        .map(|(_, monitor)| monitor);
+                        tracing::debug!(
+                            peer_id = %peer.device_id,
+                            nominated = monitor.is_some(),
+                            "direct recovery accepted-side ICE checklist completed"
+                        );
+                        let accepted = tokio::time::timeout(direct_wait, async {
+                            receiver.lock().await.recv().await
+                        })
+                        .await;
+                        let mut channel = match accepted {
+                            Ok(Some(channel)) => channel,
+                            Ok(None) => {
+                                if let Some(monitor) = monitor.take() {
+                                    monitor.stop().await;
+                                }
+                                return Err(mini_tunnel_agent::IdentityError::Transport(
+                                    "peer accept dispatcher stopped".to_owned(),
+                                ));
+                            }
+                            Err(_) => {
+                                if let Some(monitor) = monitor.take() {
+                                    monitor.stop().await;
+                                }
+                                return Err(mini_tunnel_agent::IdentityError::Transport(
+                                    "timed out waiting for direct recovery probe".to_owned(),
+                                ));
+                            }
+                        };
+                        tracing::debug!(
+                            peer_id = %peer.device_id,
+                            path = channel.transport_name(),
+                            has_ice_consent = channel.has_ice_consent_monitor(),
+                            "direct recovery accepted candidate channel received"
+                        );
+                        if let Some(monitor) = monitor.take() {
+                            channel.set_ice_consent_monitor(monitor);
+                        }
+                        Ok(channel)
+                    }
+                    .await;
+
+                    match direct_result {
+                        Ok(channel) => {
+                            validate_udp_probe(channel, require_ice_consent, &peer.device_id).await
+                        }
+                        Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer) => {
+                            Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer)
+                        }
+                        Err(direct_error) if use_udp_relay => {
+                            let relay = relay_endpoints.udp.expect("checked above");
+                            tracing::debug!(
+                                peer_id = %peer.device_id,
+                                %direct_error,
+                                "direct recovery failed; trying authenticated UDP Relay"
+                            );
+                            let channel = connect_peer_via_udp_relay(
+                                relay,
+                                &coordinator_url,
+                                &network_id,
+                                &identity,
+                                &peer,
+                            )
+                            .await?;
+                            validate_udp_probe(channel, require_ice_consent, &peer.device_id).await
+                        }
+                        Err(error) => Err(error),
+                    }
                 })
-                .await
-                {
-                    Ok(Some(channel)) => channel,
-                    Ok(None) => {
-                        let error = mini_tunnel_agent::IdentityError::Transport(
-                            "peer accept dispatcher stopped".to_owned(),
-                        );
-                        tracing::warn!(
-                            peer_id = %peer.device_id,
-                            stage = "accepted_recovery_channel_wait",
-                            %error,
-                            "direct recovery candidate connection failed"
-                        );
-                        return Err(error);
-                    }
-                    Err(_) => {
-                        let error = mini_tunnel_agent::IdentityError::Transport(
-                            "timed out waiting for direct probe".to_owned(),
-                        );
-                        tracing::warn!(
-                            peer_id = %peer.device_id,
-                            stage = "accepted_recovery_channel_wait",
-                            %error,
-                            "direct recovery candidate connection failed"
-                        );
-                        return Err(error);
-                    }
-                };
-                tracing::debug!(
-                    peer_id = %peer.device_id,
-                    path = channel.transport_name(),
-                    has_ice_consent = channel.has_ice_consent_monitor(),
-                    "direct recovery accepted candidate channel received"
-                );
-                if let Some(monitor) = monitor.take() {
-                    channel.set_ice_consent_monitor(monitor);
-                }
-                tracing::debug!(
-                    peer_id = %peer.device_id,
-                    path = channel.transport_name(),
-                    has_ice_consent = channel.has_ice_consent_monitor(),
-                    "direct recovery accepted candidate consent attached"
-                );
-                validate_udp_probe(channel, require_ice_consent, &peer.device_id).await
-            })
-        })
+            },
+        )
     };
     (connector, probe, accepted_tx)
 }
@@ -3612,6 +3653,8 @@ async fn validate_udp_probe(
     require_ice_consent: bool,
     peer_id: &str,
 ) -> Result<mini_tunnel_agent::PeerChannel, mini_tunnel_agent::IdentityError> {
+    let require_ice_consent =
+        udp_candidate_requires_ice_consent(require_ice_consent, channel.transport_name());
     let probation = if require_ice_consent {
         ICE_PATH_PROMOTION_PROBATION
     } else {
@@ -3677,7 +3720,7 @@ async fn validate_udp_probe_with_context(
         has_ice_consent = channel.has_ice_consent_monitor(),
         initial_probes,
         probation_ms = consent_window.as_millis() as u64,
-        "starting direct candidate authenticated health validation"
+        "starting UDP candidate authenticated health validation"
     );
     let rtt = match channel
         .probe_health(initial_probes, Duration::from_secs(2))
@@ -3690,7 +3733,7 @@ async fn validate_udp_probe_with_context(
                 path = channel.transport_name(),
                 stage = "initial_authenticated_health_probes",
                 %error,
-                "direct candidate health validation failed"
+                "UDP candidate health validation failed"
             );
             return Err(error);
         }
@@ -3699,7 +3742,7 @@ async fn validate_udp_probe_with_context(
         peer_id = peer_id.unwrap_or("test"),
         path = channel.transport_name(),
         rtt_ms = rtt.as_millis() as u64,
-        "direct candidate initial authenticated health probes passed"
+        "UDP candidate initial authenticated health probes passed"
     );
     if !mini_tunnel_agent::tunnel::path_quality_rtt_is_acceptable(rtt) {
         tracing::warn!(
@@ -3707,10 +3750,10 @@ async fn validate_udp_probe_with_context(
             path = channel.transport_name(),
             stage = "initial_rtt_threshold",
             rtt_ms = rtt.as_millis() as u64,
-            "direct candidate health validation failed"
+            "UDP candidate health validation failed"
         );
         return Err(mini_tunnel_agent::IdentityError::Transport(
-            "direct path probe exceeded RTT threshold".to_owned(),
+            "UDP candidate probe exceeded RTT threshold".to_owned(),
         ));
     }
     if require_ice_consent {
@@ -3719,10 +3762,10 @@ async fn validate_udp_probe_with_context(
                 peer_id = peer_id.unwrap_or("test"),
                 path = channel.transport_name(),
                 stage = "consent_presence_check",
-                "direct candidate health validation failed"
+                "UDP candidate health validation failed"
             );
             return Err(mini_tunnel_agent::IdentityError::Transport(
-                "direct candidate is missing ICE consent".to_owned(),
+                "direct QUIC candidate is missing ICE consent".to_owned(),
             ));
         }
         let deadline = tokio::time::Instant::now() + consent_window;
@@ -3736,10 +3779,10 @@ async fn validate_udp_probe_with_context(
                         peer_id = peer_id.unwrap_or("test"),
                         path = channel.transport_name(),
                         stage = "ice_consent_probation",
-                        "direct candidate health validation failed"
+                        "UDP candidate health validation failed"
                     );
                     return Err(mini_tunnel_agent::IdentityError::Transport(
-                        "ICE consent expired during direct path probation".to_owned(),
+                        "ICE consent expired during direct QUIC probation".to_owned(),
                     ));
                 }
                 _ = tokio::time::sleep_until(deadline) => break,
@@ -3752,7 +3795,7 @@ async fn validate_udp_probe_with_context(
                                 path = channel.transport_name(),
                                 stage = "ice_probation_authenticated_health_probe",
                                 %error,
-                                "direct candidate health validation failed"
+                                "UDP candidate health validation failed"
                             );
                             return Err(error);
                         }
@@ -3763,10 +3806,10 @@ async fn validate_udp_probe_with_context(
                             path = channel.transport_name(),
                             stage = "ice_probation_rtt_threshold",
                             rtt_ms = rtt.as_millis() as u64,
-                            "direct candidate health validation failed"
+                            "UDP candidate health validation failed"
                         );
                         return Err(mini_tunnel_agent::IdentityError::Transport(
-                            "direct path RTT exceeded threshold during probation".to_owned(),
+                            "UDP candidate RTT exceeded threshold during probation".to_owned(),
                         ));
                     }
                 }
@@ -3789,7 +3832,7 @@ async fn validate_udp_probe_with_context(
                                 path = channel.transport_name(),
                                 stage = "probation_authenticated_health_probe",
                                 %error,
-                                "direct candidate health validation failed"
+                                "UDP candidate health validation failed"
                             );
                             return Err(error);
                         }
@@ -3800,10 +3843,10 @@ async fn validate_udp_probe_with_context(
                             path = channel.transport_name(),
                             stage = "probation_rtt_threshold",
                             rtt_ms = rtt.as_millis() as u64,
-                            "direct candidate health validation failed"
+                            "UDP candidate health validation failed"
                         );
                         return Err(mini_tunnel_agent::IdentityError::Transport(
-                            "direct path RTT exceeded threshold during probation".to_owned(),
+                            "UDP candidate RTT exceeded threshold during probation".to_owned(),
                         ));
                     }
                 }
@@ -3815,7 +3858,7 @@ async fn validate_udp_probe_with_context(
         path = channel.transport_name(),
         has_ice_consent = channel.has_ice_consent_monitor(),
         stage = "probation_completed",
-        "direct candidate health validation passed"
+        "UDP candidate health validation passed"
     );
     Ok(channel)
 }
@@ -5295,6 +5338,33 @@ mod tests {
         assert!(mesh_channel_is_elected(false, "Relay/TLS"));
         assert!(!mesh_channel_is_elected(false, "QUIC/UDP"));
         assert!(mesh_channel_is_elected(true, "QUIC/UDP"));
+    }
+
+    #[test]
+    fn reliable_recovery_probe_adds_udp_relay_without_tcp_relay() {
+        let configured = RelayEndpoints {
+            tcp: Some("127.0.0.1:45573".parse().unwrap()),
+            udp: Some("127.0.0.1:45574".parse().unwrap()),
+        };
+        assert_eq!(
+            udp_recovery_probe_endpoints(configured, true),
+            RelayEndpoints {
+                tcp: None,
+                udp: configured.udp,
+            }
+        );
+        assert_eq!(
+            udp_recovery_probe_endpoints(configured, false),
+            RelayEndpoints::default(),
+            "a UDP-active path should probe only for direct recovery"
+        );
+    }
+
+    #[test]
+    fn udp_recovery_requires_ice_consent_only_for_direct_quic() {
+        assert!(udp_candidate_requires_ice_consent(true, "QUIC/UDP"));
+        assert!(!udp_candidate_requires_ice_consent(true, "Relay/QUIC/UDP"));
+        assert!(!udp_candidate_requires_ice_consent(false, "QUIC/UDP"));
     }
 
     #[test]

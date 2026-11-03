@@ -342,7 +342,7 @@ pub struct ReconnectingPeer {
     pub ipv6_address: Option<Ipv6Addr>,
     pub channel: Arc<PeerChannel>,
     pub connector: PeerConnector,
-    /// Direct-only candidate probe used to migrate a healthy TCP/relay session back to UDP.
+    /// Authenticated candidate probe used to migrate a healthy reliable session back to UDP.
     pub probe: Option<PeerConnector>,
     /// Cooldown between path probes. Production callers should use at least 60 seconds.
     pub probe_cooldown: Duration,
@@ -934,8 +934,9 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                 _ = probe_interval.tick(), if probe.is_some() && active.transport_name() != "QUIC/UDP" && probe_task.is_none() => {
                     let connector = Arc::clone(probe.as_ref().expect("guarded above"));
                     let sender = probe_tx.clone();
+                    let try_udp_relay = should_probe_udp_relay_recovery(active.transport_name());
                     probe_task = Some(tokio::spawn(async move {
-                        let result = connector(false).await;
+                        let result = connector(try_udp_relay).await;
                         let _ = sender.send(result).await;
                     }));
                 }
@@ -948,11 +949,12 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                         {
                             let previous_path = active.transport_name();
                             let promoted_path = candidate.transport_name();
+                            let promotion_reason = udp_promotion_reason(promoted_path);
                             tracing::info!(
                                 peer_address = %address,
                                 from_path = previous_path,
                                 to_path = promoted_path,
-                                reason = "healthy_direct_probe",
+                                reason = promotion_reason,
                                 "peer path promoted"
                             );
                             *channel.write().await = Arc::new(candidate);
@@ -960,7 +962,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                             crate::status::update(
                                 address.to_string(), true, promoted_path,
                                 health.rtt.map(|rtt| rtt.as_millis() as u64),
-                                health.probes_succeeded, health.probes_missed, Some("healthy_direct_probe"),
+                                health.probes_succeeded, health.probes_missed, Some(promotion_reason),
                             );
                             break Ok(());
                         }
@@ -1073,11 +1075,12 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         if let Some(Ok(candidate)) = pending_direct_probe {
             if path_rank(candidate.transport_name()) < path_rank(active.transport_name()) {
                 let promoted_path = candidate.transport_name();
+                let promotion_reason = udp_promotion_reason(promoted_path);
                 tracing::info!(
                     peer_address = %address,
                     from_path = active.transport_name(),
                     to_path = promoted_path,
-                    reason = "healthy_direct_probe",
+                    reason = promotion_reason,
                     "peer path promoted after active path closed during direct probe handoff"
                 );
                 active.stop_ice_consent_monitor().await;
@@ -1090,7 +1093,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                     health.rtt.map(|rtt| rtt.as_millis() as u64),
                     health.probes_succeeded,
                     health.probes_missed,
-                    Some("healthy_direct_probe"),
+                    Some(promotion_reason),
                 );
                 continue;
             }
@@ -1248,6 +1251,18 @@ fn path_rank(transport: &str) -> u8 {
 
 fn is_udp_path(transport: &str) -> bool {
     matches!(transport, "QUIC/UDP" | "Relay/QUIC/UDP")
+}
+
+fn should_probe_udp_relay_recovery(active_path: &str) -> bool {
+    matches!(active_path, "TLS/TCP" | "Relay/TLS")
+}
+
+fn udp_promotion_reason(transport: &str) -> &'static str {
+    if transport == "Relay/QUIC/UDP" {
+        "healthy_udp_relay_probe"
+    } else {
+        "healthy_direct_probe"
+    }
 }
 
 /// Route packets across one TUN and multiple independently authenticated peer channels.
@@ -2449,6 +2464,23 @@ mod tests {
     }
 
     #[test]
+    fn udp_relay_recovery_is_only_probed_from_reliable_paths() {
+        assert!(should_probe_udp_relay_recovery("TLS/TCP"));
+        assert!(should_probe_udp_relay_recovery("Relay/TLS"));
+        assert!(!should_probe_udp_relay_recovery("QUIC/UDP"));
+        assert!(!should_probe_udp_relay_recovery("Relay/QUIC/UDP"));
+    }
+
+    #[test]
+    fn udp_recovery_promotion_reason_identifies_relay_path() {
+        assert_eq!(udp_promotion_reason("QUIC/UDP"), "healthy_direct_probe");
+        assert_eq!(
+            udp_promotion_reason("Relay/QUIC/UDP"),
+            "healthy_udp_relay_probe"
+        );
+    }
+
+    #[test]
     fn path_rank_prefers_direct_udp_then_relay_udp_then_reliable_paths() {
         assert!(path_rank("QUIC/UDP") < path_rank("Relay/QUIC/UDP"));
         assert!(path_rank("Relay/QUIC/UDP") < path_rank("TLS/TCP"));
@@ -3611,7 +3643,11 @@ mod tests {
         });
         let probe_endpoint = endpoint_a.clone();
         let probe_identity = Arc::clone(&a);
-        let probe: PeerConnector = Arc::new(move |_| -> PeerConnectFuture {
+        let probe: PeerConnector = Arc::new(move |try_udp_relay| -> PeerConnectFuture {
+            assert!(
+                try_udp_relay,
+                "reliable paths should try the UDP Relay candidate"
+            );
             let endpoint = probe_endpoint.clone();
             let identity = Arc::clone(&probe_identity);
             let peer_id = b_id.clone();
