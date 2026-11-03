@@ -33,6 +33,7 @@ const COORDINATOR_HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
 const ICE_PATH_PROMOTION_PROBATION: Duration = Duration::from_secs(31);
 const COORDINATOR_CA_CERT_FILE_ENV: &str = "MINI_TUNNEL_COORDINATOR_CA_CERT_FILE";
 const MAX_COORDINATOR_CA_BUNDLE_BYTES: u64 = 1024 * 1024;
+const MAX_INVITE_TOKEN_FILE_BYTES: u64 = 4096;
 const ICE_PATH_PROBATION_HEALTH_INTERVAL: Duration = Duration::from_secs(10);
 const DIRECT_PATH_PROMOTION_PROBATION: Duration = Duration::from_secs(31);
 
@@ -293,6 +294,9 @@ enum NetworkCommand {
         network_id: String,
         #[arg(long)]
         device_id: Option<String>,
+        /// Read the one-time invite token from a file (Unix mode 0600 or stricter).
+        #[arg(long)]
+        invite_token_file: Option<PathBuf>,
         #[arg(
             long,
             env = "MINI_TUNNEL_COORDINATOR_URL",
@@ -742,6 +746,67 @@ fn load_ticket_key(
 
 fn ticket_key_file_from_env(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
+}
+
+fn load_invite_token(
+    file_path: Option<&Path>,
+    environment_token: Option<String>,
+) -> Result<String, String> {
+    let token = if let Some(path) = file_path {
+        read_invite_token_file(path)?
+    } else {
+        environment_token
+            .ok_or_else(|| "set MINI_TUNNEL_INVITE_TOKEN or pass --invite-token-file".to_owned())?
+            .trim()
+            .to_owned()
+    };
+
+    if token.is_empty() {
+        return Err("invite token is empty".to_owned());
+    }
+    Ok(token)
+}
+
+fn read_invite_token_file(path: &Path) -> Result<String, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| "could not open invite token file".to_owned())?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "could not inspect invite token file".to_owned())?;
+    if !metadata.is_file() {
+        return Err("invite token file must be a regular file".to_owned());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(
+                "invite token file permissions must deny group and other access".to_owned(),
+            );
+        }
+    }
+    if metadata.len() > MAX_INVITE_TOKEN_FILE_BYTES {
+        return Err("invite token file exceeds the 4096-byte limit".to_owned());
+    }
+
+    let mut contents = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_INVITE_TOKEN_FILE_BYTES + 1)
+        .read_to_end(&mut contents)
+        .map_err(|_| "could not read invite token file".to_owned())?;
+    if contents.len() as u64 > MAX_INVITE_TOKEN_FILE_BYTES {
+        return Err("invite token file exceeds the 4096-byte limit".to_owned());
+    }
+    String::from_utf8(contents)
+        .map(|token| token.trim().to_owned())
+        .map_err(|_| "invite token file is not valid UTF-8".to_owned())
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1868,10 +1933,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             NetworkCommand::Join {
                 network_id,
                 device_id,
+                invite_token_file,
                 coordinator_url,
             } => {
-                let invite_token = std::env::var("MINI_TUNNEL_INVITE_TOKEN")
-                    .map_err(|_| "set MINI_TUNNEL_INVITE_TOKEN before joining")?;
+                let invite_token = load_invite_token(
+                    invite_token_file.as_deref(),
+                    std::env::var("MINI_TUNNEL_INVITE_TOKEN").ok(),
+                )?;
                 let identity = mini_tunnel_agent::Identity::load_or_create()?;
                 let device_id = device_id.unwrap_or_else(|| identity.device_id());
                 if device_id != identity.device_id() {
@@ -5540,6 +5608,86 @@ mod tests {
             load_ticket_key(None, None, "TICKET_KEY", "TICKET_KEY_FILE").unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn invite_token_file_takes_precedence_and_trims_whitespace() {
+        let (directory, path) = secret_fixture(" \nfile-invite-token\n\t");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let actual = load_invite_token(Some(&path), Some("environment-token".to_owned()))
+            .expect("load protected invite file");
+        assert_eq!(actual, "file-invite-token");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn invite_token_environment_value_remains_supported() {
+        assert_eq!(
+            load_invite_token(None, Some(" \nenvironment-token\t".to_owned())).unwrap(),
+            "environment-token"
+        );
+        assert!(
+            load_invite_token(None, None)
+                .unwrap_err()
+                .contains("MINI_TUNNEL_INVITE_TOKEN")
+        );
+        assert!(
+            load_invite_token(None, Some(" \n".to_owned()))
+                .unwrap_err()
+                .contains("empty")
+        );
+    }
+
+    #[test]
+    fn invite_token_file_rejects_missing_oversized_and_empty_files_without_disclosure() {
+        let (directory, path) = secret_fixture("invite-secret-sentinel");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        std::fs::remove_file(&path).unwrap();
+        let missing_error = load_invite_token(Some(&path), None).unwrap_err();
+        assert!(missing_error.contains("open invite token file"));
+        assert!(!missing_error.contains("invite-secret-sentinel"));
+
+        std::fs::write(&path, "invite-secret-sentinel").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        std::fs::write(&path, vec![b'x'; MAX_INVITE_TOKEN_FILE_BYTES as usize + 1]).unwrap();
+        let oversized_error = load_invite_token(Some(&path), None).unwrap_err();
+        assert!(oversized_error.contains("4096-byte limit"));
+
+        std::fs::write(&path, " \n\t").unwrap();
+        let empty_error = load_invite_token(Some(&path), None).unwrap_err();
+        assert!(empty_error.contains("empty"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invite_token_file_rejects_insecure_permissions_and_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let (directory, path) = secret_fixture("invite-secret-sentinel");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let permissions_error = load_invite_token(Some(&path), None).unwrap_err();
+        assert!(permissions_error.contains("deny group and other access"));
+        assert!(!permissions_error.contains("invite-secret-sentinel"));
+
+        let symlink_path = directory.join("invite-token-link");
+        symlink(&path, &symlink_path).unwrap();
+        let symlink_error = load_invite_token(Some(&symlink_path), None).unwrap_err();
+        assert!(symlink_error.contains("open invite token file"));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

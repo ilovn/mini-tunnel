@@ -76,12 +76,17 @@ export MINI_TUNNEL_ADMIN_TOKEN='<admin-token>'
 cargo run -p mini-tunnel -- network invite --network-id '<network-id>'
 ```
 
-Join from another device with the one-time invite token:
+Join from another device with the one-time invite token. Prefer a protected file so the token does not appear in the process list:
 
 ```sh
-export MINI_TUNNEL_INVITE_TOKEN='<invite-token>'
-cargo run -p mini-tunnel -- network join --network-id '<network-id>'
+umask 077
+cat > invite.token
+# paste the one-time token, then press Ctrl-D
+cargo run -p mini-tunnel -- network join --network-id '<network-id>' --invite-token-file invite.token
+rm -f invite.token
 ```
+
+On Unix, the token file must be a regular file with permissions denying group and other access (for example mode `0600`); symlinks and files over 4096 bytes are rejected. `MINI_TUNNEL_INVITE_TOKEN` remains supported for existing automation.
 
 The CLI creates a stable Ed25519 identity at the OS user configuration directory (`device.key`; Unix permissions are restricted to the current user). Inspect the public identity with `cargo run -p mini-tunnel -- identity`. Joining signs the invite proof with this key; the private key is never sent. After a successful join, the CLI atomically saves the network ID, device ID, assigned IPv4 address, and CIDR under the user's configuration directory (`networks/<network-id>.json`, mode 0600 on Unix). Invite tokens, admin tokens, and private keys are not included. Existing members can run `network join` again with a valid invite to create/update the local copy; or pass both local IPv4 and prefix explicitly to tunnel commands until a membership file exists.
 

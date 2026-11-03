@@ -1841,6 +1841,7 @@ dependencies = [
  "futures-util",
  "if-addrs",
  "ipnet",
+ "libc",
  "mini-tunnel-agent",
  "mini-tunnel-coordinator",
  "mini-tunnel-protocol",
