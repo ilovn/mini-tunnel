@@ -37,6 +37,8 @@ use crate::stun::is_stun_datagram;
 pub const MAX_ICE_TRANSMITS_PER_TURN: usize = 64;
 const MAX_SOCKET_QUEUE_CAPACITY: usize = 128;
 const MAX_UDP_DATAGRAM_SIZE: usize = u16::MAX as usize;
+const UDP_RECEIVE_RETRY_BASE: Duration = Duration::from_millis(100);
+const UDP_RECEIVE_RETRY_MAX_SHIFT: u32 = 6;
 const MAX_ICE_SESSIONS: usize = 1024;
 const MAX_SESSION_PEER_ADDRESSES: usize = 16;
 const MAX_PENDING_STUN_QUERIES: usize = 8;
@@ -47,6 +49,31 @@ pub(crate) const ICE_CONSENT_MAX_INTERVAL: Duration = Duration::from_secs(6);
 pub(crate) const ICE_DISCONNECTED_TIMEOUT: Duration = Duration::from_secs(15);
 const ICE_FAILED_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const ICE_DISCONNECTED_RECOVERY_GRACE: Duration = Duration::from_secs(5);
+
+fn udp_receive_retry_delay(kind: io::ErrorKind, consecutive_errors: u32) -> Option<Duration> {
+    matches!(
+        kind,
+        io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+    )
+    .then(|| {
+        let shift = consecutive_errors.min(UDP_RECEIVE_RETRY_MAX_SHIFT);
+        UDP_RECEIVE_RETRY_BASE * (1_u32 << shift)
+    })
+}
+
+async fn wait_for_udp_receive_retry(
+    shutdown_rx: &mut watch::Receiver<bool>,
+    retry_delay: Duration,
+) -> bool {
+    tokio::select! {
+        changed = shutdown_rx.changed() => changed.is_ok() && !*shutdown_rx.borrow(),
+        () = tokio::time::sleep(retry_delay) => true,
+    }
+}
 
 /// Generate an ephemeral ICE credential pair suitable for both rtc-ice and coordinator signaling.
 /// The coordinator accepts the RFC 8445 alphanumeric, `+`, and `/` alphabet; credentials are
@@ -900,6 +927,7 @@ impl quinn::Runtime for IcedQuinnRuntime {
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
             let mut buffer = vec![0; MAX_UDP_DATAGRAM_SIZE];
+            let mut consecutive_receive_errors = 0_u32;
             loop {
                 let (length, peer_addr) = tokio::select! {
                     changed = shutdown_rx.changed() => {
@@ -913,11 +941,40 @@ impl quinn::Runtime for IcedQuinnRuntime {
                         Err(error) => {
                             let diagnostics = &shared_socket.diagnostics;
                             diagnostics.receive_errors.fetch_add(1, Ordering::Relaxed);
-                            tracing::warn!(%error, "shared UDP receive loop stopped");
-                            break;
+                            let kind = error.kind();
+                            let Some(retry_delay) =
+                                udp_receive_retry_delay(kind, consecutive_receive_errors)
+                            else {
+                                tracing::error!(
+                                    ?kind,
+                                    raw_os_error = error.raw_os_error(),
+                                    "shared UDP receive loop stopped after a fatal error"
+                                );
+                                break;
+                            };
+                            consecutive_receive_errors =
+                                consecutive_receive_errors.saturating_add(1);
+                            if consecutive_receive_errors == 1
+                                || consecutive_receive_errors.is_power_of_two()
+                            {
+                                tracing::warn!(
+                                    ?kind,
+                                    consecutive_receive_errors,
+                                    retry_delay_ms = retry_delay.as_millis(),
+                                    "shared UDP receive failed transiently; retrying"
+                                );
+                            }
+                            if !wait_for_udp_receive_retry(&mut shutdown_rx, retry_delay).await {
+                                break;
+                            }
+                            continue;
                         }
                     }
                 };
+                if consecutive_receive_errors > 0 {
+                    tracing::info!(consecutive_receive_errors, "shared UDP receive recovered");
+                    consecutive_receive_errors = 0;
+                }
                 let diagnostics = &shared_socket.diagnostics;
                 diagnostics
                     .received_datagrams
@@ -1862,6 +1919,53 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn transient_udp_receive_errors_use_bounded_backoff_and_fatal_errors_stop() {
+        for kind in [
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::ConnectionReset,
+        ] {
+            assert_eq!(
+                udp_receive_retry_delay(kind, 0),
+                Some(Duration::from_millis(100)),
+                "{kind:?} should be retried"
+            );
+        }
+        assert_eq!(
+            udp_receive_retry_delay(io::ErrorKind::ConnectionReset, 1),
+            Some(Duration::from_millis(200))
+        );
+        assert_eq!(
+            udp_receive_retry_delay(io::ErrorKind::ConnectionRefused, u32::MAX),
+            Some(Duration::from_millis(6_400)),
+            "retry delay must stay capped"
+        );
+        assert_eq!(
+            udp_receive_retry_delay(io::ErrorKind::PermissionDenied, 0),
+            None
+        );
+        assert_eq!(
+            udp_receive_retry_delay(io::ErrorKind::InvalidInput, 0),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_receive_retry_wait_remains_responsive_to_shutdown() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        shutdown_tx.send(true).expect("send shutdown signal");
+        let keep_running = tokio::time::timeout(
+            Duration::from_millis(100),
+            wait_for_udp_receive_retry(&mut shutdown_rx, Duration::from_secs(60)),
+        )
+        .await
+        .expect("shutdown should interrupt retry backoff");
+        assert!(!keep_running);
+    }
 
     #[tokio::test]
     async fn shared_socket_stun_refresh_observes_nat_mapping_changes() {
