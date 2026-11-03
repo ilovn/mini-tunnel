@@ -528,6 +528,23 @@ struct HealthResponse {
     version: String,
 }
 
+async fn fetch_coordinator_health(
+    url: &str,
+) -> Result<HealthResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let endpoint = format!("{}/healthz", url.trim_end_matches('/'));
+    let response = coordinator_http_client(COORDINATOR_HEALTH_TIMEOUT)?
+        .get(endpoint)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<HealthResponse>()
+        .await?;
+    if response.status != "ok" || response.service != "coordinator" {
+        return Err(format!("unexpected health response: {response:?}").into());
+    }
+    Ok(response)
+}
+
 async fn peer_status() -> axum::Json<Vec<mini_tunnel_agent::status::PeerStatus>> {
     axum::Json(mini_tunnel_agent::status::snapshot())
 }
@@ -863,17 +880,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!("Coordinator PostgreSQL schema is up to date");
             }
             CoordinatorCommand::Health { url } => {
-                let endpoint = format!("{}/healthz", url.trim_end_matches('/'));
-                let response = coordinator_http_client(COORDINATOR_HEALTH_TIMEOUT)?
-                    .get(endpoint)
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json::<HealthResponse>()
-                    .await?;
-                if response.status != "ok" || response.service != "coordinator" {
-                    return Err(format!("unexpected health response: {response:?}").into());
-                }
+                let response = fetch_coordinator_health(&url).await?;
                 println!(
                     "{} {}: {}",
                     response.service, response.version, response.status
@@ -5117,9 +5124,43 @@ fn print_tunnel_ready(
 mod tests {
     use super::*;
 
-    #[test]
-    fn coordinator_health_timeout_allows_slow_proxied_networks() {
-        assert_eq!(COORDINATOR_HEALTH_TIMEOUT, Duration::from_secs(10));
+    async fn delayed_healthz() -> impl IntoResponse {
+        tokio::time::sleep(Duration::from_millis(3_200)).await;
+        let mut response = axum::response::Response::new(axum::body::Body::from(
+            r#"{"status":"ok","service":"coordinator","version":"test"}"#,
+        ));
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        response
+    }
+
+    #[tokio::test]
+    async fn coordinator_health_request_accepts_response_after_former_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind delayed health server");
+        let address = listener.local_addr().expect("health server address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/healthz", get(delayed_healthz)),
+            )
+            .await
+            .expect("serve delayed health response");
+        });
+
+        let started = std::time::Instant::now();
+        let result = fetch_coordinator_health(&format!("http://{address}")).await;
+        let elapsed = started.elapsed();
+        server.abort();
+        let _ = server.await;
+
+        let response = result.expect("health response after former 3-second timeout");
+        assert_eq!(response.status, "ok");
+        assert_eq!(response.service, "coordinator");
+        assert!(elapsed >= Duration::from_secs(3));
     }
 
     #[test]
