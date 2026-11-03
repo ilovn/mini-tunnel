@@ -137,7 +137,7 @@ async fn cli_accepts_private_coordinator_ca_for_health_and_rest_without_tls_bypa
         .expect("run health command with missing CA file");
     assert!(!unreadable_ca.status.success());
     let stderr = String::from_utf8_lossy(&unreadable_ca.stderr);
-    assert!(stderr.contains("could not open Coordinator CA certificate bundle"));
+    assert!(stderr.contains("could not inspect Coordinator CA certificate bundle"));
     assert!(!stderr.contains(missing_bundle.to_string_lossy().as_ref()));
 
     server_task.abort();

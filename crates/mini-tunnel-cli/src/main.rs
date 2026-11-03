@@ -2157,6 +2157,19 @@ fn coordinator_http_client_with_ca_bundle(
 }
 
 fn read_coordinator_ca_bundle(path: &Path) -> Result<Vec<reqwest::Certificate>, io::Error> {
+    let path_metadata = std::fs::metadata(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            "could not inspect Coordinator CA certificate bundle",
+        )
+    })?;
+    if !path_metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Coordinator CA certificate bundle must be a regular file",
+        ));
+    }
+
     let file = File::open(path).map_err(|error| {
         io::Error::new(
             error.kind(),
