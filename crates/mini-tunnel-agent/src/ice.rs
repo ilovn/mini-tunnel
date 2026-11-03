@@ -1239,6 +1239,28 @@ impl IceAgentDriver {
         events
     }
 
+    /// Drain state and selection events while running an initial or recovery checklist.
+    ///
+    /// Keeping these events visible makes a failed checklist distinguishable from one that
+    /// reached a connected state but never completed nomination, without logging ICE secrets
+    /// or candidate addresses.
+    fn log_check_events(&mut self) {
+        for event in self.poll_events() {
+            match event {
+                rtc_ice::Event::ConnectionStateChange(state) => {
+                    tracing::debug!(?state, "ICE connectivity state changed during checks");
+                }
+                rtc_ice::Event::SelectedCandidatePairChange(_, _) => {
+                    tracing::debug!("ICE selected a candidate pair during checks");
+                }
+                rtc_ice::Event::RoleChange(controlling) => {
+                    tracing::debug!(controlling, "ICE role changed during checks");
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Read the ICE-selected local/remote socket pair, if nomination has completed.
     pub fn selected_pair(&self) -> Option<(SocketAddr, SocketAddr)> {
         self.agent
@@ -1266,6 +1288,7 @@ impl IceAgentDriver {
         loop {
             let now = Instant::now();
             self.handle_timeout(now)?;
+            self.log_check_events();
             for transmit in self.poll_transmits() {
                 outbound_datagrams = outbound_datagrams.saturating_add(1);
                 router
@@ -1329,6 +1352,7 @@ impl IceAgentDriver {
                     if accepted {
                         agent_accepted_datagrams = agent_accepted_datagrams.saturating_add(1);
                     }
+                    self.log_check_events();
                 }
                 () = tokio::time::sleep_until(tokio::time::Instant::from_std(next_deadline)) => {
                     if Instant::now() >= deadline {
@@ -1344,6 +1368,7 @@ impl IceAgentDriver {
                         );
                         return Err(IceDriverError::Timeout);
                     }
+                    self.log_check_events();
                 }
             }
         }
