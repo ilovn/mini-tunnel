@@ -901,26 +901,41 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                 }
                 result = probe_rx.recv(), if probe_task.is_some() => {
                     probe_task = None;
-                    if let Some(Ok(candidate)) = result
-                        && path_rank(candidate.transport_name()) < path_rank(active.transport_name())
-                    {
-                        let previous_path = active.transport_name();
-                        let promoted_path = candidate.transport_name();
-                        tracing::info!(
+                    match result {
+                        Some(Ok(candidate))
+                            if path_rank(candidate.transport_name())
+                                < path_rank(active.transport_name()) =>
+                        {
+                            let previous_path = active.transport_name();
+                            let promoted_path = candidate.transport_name();
+                            tracing::info!(
+                                peer_address = %address,
+                                from_path = previous_path,
+                                to_path = promoted_path,
+                                reason = "healthy_direct_probe",
+                                "peer path promoted"
+                            );
+                            *channel.write().await = Arc::new(candidate);
+                            let health = channel.read().await.health_snapshot();
+                            crate::status::update(
+                                address.to_string(), true, promoted_path,
+                                health.rtt.map(|rtt| rtt.as_millis() as u64),
+                                health.probes_succeeded, health.probes_missed, Some("healthy_direct_probe"),
+                            );
+                            break Ok(());
+                        }
+                        Some(Ok(candidate)) => candidate.close_async().await,
+                        Some(Err(error)) => tracing::warn!(
                             peer_address = %address,
-                            from_path = previous_path,
-                            to_path = promoted_path,
-                            reason = "healthy_direct_probe",
-                            "peer path promoted"
-                        );
-                        *channel.write().await = Arc::new(candidate);
-                        let health = channel.read().await.health_snapshot();
-                        crate::status::update(
-                            address.to_string(), true, promoted_path,
-                            health.rtt.map(|rtt| rtt.as_millis() as u64),
-                            health.probes_succeeded, health.probes_missed, Some("healthy_direct_probe"),
-                        );
-                        break Ok(());
+                            active_path = active.transport_name(),
+                            %error,
+                            "direct UDP recovery probe failed; retaining the active reliable path"
+                        ),
+                        None => tracing::warn!(
+                            peer_address = %address,
+                            active_path = active.transport_name(),
+                            "direct UDP recovery probe stopped without a result; retaining the active reliable path"
+                        ),
                     }
                 }
                 result = fallback_rx.recv(), if fallback_task.is_some() => {
