@@ -241,6 +241,18 @@ fn effective_health_probe_interval(configured_interval: Duration) -> Duration {
     configured_interval.min(HEALTH_PROBE_INTERVAL)
 }
 
+#[cfg(test)]
+fn quality_detection_budget(
+    policy: PathQualityPolicy,
+    probe_timeout: Duration,
+    probe_interval: Duration,
+) -> Duration {
+    let required_probes = u32::from(policy.bad_windows).saturating_mul(3);
+    // Probe misses are counted while sending the next keepalive, then observed by the
+    // following health tick. Include that polling delay after the final missed probe.
+    probe_timeout + probe_interval * required_probes
+}
+
 fn mesh_path_failure_reason(quality_degraded: bool, failure: &IdentityError) -> &'static str {
     if quality_degraded {
         "quality_threshold"
@@ -2448,18 +2460,23 @@ mod tests {
 
         let default_policy = PathQualityPolicy::default();
         assert_eq!(default_policy.bad_windows, 2);
-        let misses_to_degrade = u32::from(default_policy.bad_windows) * 3;
-        let earliest_complete_windows = crate::HEALTH_PROBE_TIMEOUT
-            + HEALTH_PROBE_INTERVAL * (misses_to_degrade.saturating_sub(1));
+        let quality_detection = quality_detection_budget(
+            default_policy,
+            crate::HEALTH_PROBE_TIMEOUT,
+            HEALTH_PROBE_INTERVAL,
+        );
         let conservative_ice_fallback_deadline = crate::ice::ICE_DISCONNECTED_TIMEOUT
             .saturating_sub(crate::ice::ICE_CONSENT_MAX_INTERVAL);
         assert!(
-            earliest_complete_windows + Duration::from_secs(5)
-                <= conservative_ice_fallback_deadline,
+            quality_detection == Duration::from_millis(3_500),
+            "default quality timing must include the poll after the last missed probe"
+        );
+        assert!(
+            quality_detection + Duration::from_secs(5) <= conservative_ice_fallback_deadline,
             "quality detection must leave five seconds before ICE Disconnected after consent-interval phase"
         );
         assert!(
-            earliest_complete_windows < PEER_IDLE_TIMEOUT,
+            quality_detection < PEER_IDLE_TIMEOUT,
             "default loss windows should be observable before the peer idle timeout"
         );
     }
