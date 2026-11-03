@@ -2318,6 +2318,15 @@ async fn select_ice_peer_address(
     peer: &PeerInfo,
     identity: &mini_tunnel_agent::Identity,
 ) -> Option<(SocketAddr, mini_tunnel_agent::ice::IceConsentMonitor)> {
+    select_ice_peer_address_with_timeout(endpoint, peer, identity, Duration::from_secs(5)).await
+}
+
+async fn select_ice_peer_address_with_timeout(
+    endpoint: &TunnelEndpoint,
+    peer: &PeerInfo,
+    identity: &mini_tunnel_agent::Identity,
+    check_timeout: Duration,
+) -> Option<(SocketAddr, mini_tunnel_agent::ice::IceConsentMonitor)> {
     let local = endpoint.ice.as_ref()?;
     let remote = peer.ice_credentials.as_ref()?;
     let remote_candidates = udp_ice_candidates(&peer.candidates);
@@ -2362,7 +2371,7 @@ async fn select_ice_peer_address(
             &local_ufrag,
             &remote.ufrag,
             &mut datagrams,
-            Duration::from_secs(5),
+            check_timeout,
         )
         .await
         .map(|(_, remote)| remote);
@@ -2407,6 +2416,43 @@ async fn select_ice_peer_address(
             None
         }
     }
+}
+
+/// A peer list can race another agent's startup credential publication. If that happens, the
+/// first checklist uses the peer's previous ufrag and cannot authenticate its checks. Refresh
+/// once after a failed initial checklist and retry only when the peer snapshot actually changed.
+async fn select_ice_peer_address_with_snapshot_refresh(
+    endpoint: &TunnelEndpoint,
+    coordinator_url: &str,
+    network_id: &str,
+    peer: &mut PeerInfo,
+    identity: &mini_tunnel_agent::Identity,
+    check_timeout: Duration,
+) -> Option<(SocketAddr, mini_tunnel_agent::ice::IceConsentMonitor)> {
+    if let Some(selected) =
+        select_ice_peer_address_with_timeout(endpoint, peer, identity, check_timeout).await
+    {
+        return Some(selected);
+    }
+    endpoint.ice.as_ref()?;
+
+    let previous_credentials = peer.ice_credentials.clone();
+    let previous_candidates = peer.candidates.clone();
+    let refreshed = refresh_peer_snapshot_for_ice(coordinator_url, network_id, peer, identity)
+        .await
+        .ok()?;
+    if refreshed.ice_credentials == previous_credentials
+        && refreshed.candidates == previous_candidates
+    {
+        return None;
+    }
+
+    tracing::debug!(
+        peer_id = %peer.device_id,
+        "peer ICE snapshot changed during initial checks; retrying with refreshed credentials and candidates"
+    );
+    *peer = refreshed;
+    select_ice_peer_address_with_timeout(endpoint, peer, identity, check_timeout).await
 }
 
 async fn refresh_peer_snapshot_for_ice(
@@ -2482,9 +2528,20 @@ async fn connect_mesh_peer(
     let peer_key = decode_peer_key(&peer.public_key)
         .map_err(|_| mini_tunnel_agent::IdentityError::UnauthorizedPeer)?;
     let mut nominated_ice_monitor = None;
-    if !reliable_only
-        && let Some((remote, monitor)) = select_ice_peer_address(endpoint, &peer, identity).await
-    {
+    let initial_ice_selection = if reliable_only {
+        None
+    } else {
+        select_ice_peer_address_with_snapshot_refresh(
+            endpoint,
+            coordinator_url,
+            network_id,
+            &mut peer,
+            identity,
+            Duration::from_secs(5),
+        )
+        .await
+    };
+    if let Some((remote, monitor)) = initial_ice_selection {
         match mini_tunnel_agent::connect_peer(
             &endpoint.endpoint,
             remote,
@@ -6159,7 +6216,7 @@ mod tests {
             device_id: peer_identity.device_id(),
             assigned_ipv4: "10.77.0.2".to_owned(),
             public_key: peer_identity.public_key_encoded(),
-            candidates: vec!["127.0.0.1:42000".to_owned()],
+            candidates: vec![peer_address.to_string()],
             ice_credentials: Some(old_credentials),
         };
         let current_peer = PeerInfo {
@@ -6179,6 +6236,26 @@ mod tests {
             .with_state(vec![current_peer.clone()]);
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
         let base_url = format!("http://{coordinator}");
+
+        let mut startup_peer = expected_peer.clone();
+        assert!(
+            select_ice_peer_address_with_snapshot_refresh(
+                &local_endpoint,
+                &base_url,
+                "restart-net",
+                &mut startup_peer,
+                &identity,
+                Duration::from_millis(50),
+            )
+            .await
+            .is_none(),
+            "the peer endpoint is not running an ICE checklist in this refresh-only assertion"
+        );
+        assert_eq!(
+            startup_peer.ice_credentials,
+            Some(fresh_credentials.clone()),
+            "a failed initial checklist must refresh a stale peer snapshot before falling back"
+        );
 
         let refreshed =
             refresh_peer_snapshot_for_ice(&base_url, "restart-net", &expected_peer, &identity)
