@@ -828,6 +828,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     "MINI_TUNNEL_RELAY_TICKET_KEY",
                     "MINI_TUNNEL_RELAY_TICKET_KEY_FILE",
                 )?;
+                if relay_key.is_none() {
+                    eprintln!(
+                        "warning: Coordinator cannot issue Relay tickets without MINI_TUNNEL_RELAY_TICKET_KEY or MINI_TUNNEL_RELAY_TICKET_KEY_FILE; configure the same signing key on the Relay if Relay fallback is offered"
+                    );
+                }
                 let tls_files = match (tls_cert, tls_key) {
                     (Some(certificate), Some(private_key)) => Some((certificate, private_key)),
                     (None, None) => None,
