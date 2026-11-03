@@ -1447,6 +1447,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             accepted = accepted_rx.recv(), if !accept_finished => {
                                 match accepted {
                                     Some((peer, mut channel, remote)) => {
+                                        tracing::debug!(
+                                            peer_id = %peer.device_id,
+                                            path = channel.transport_name(),
+                                            has_ice_consent = channel.has_ice_consent_monitor(),
+                                            "accepted authenticated mesh channel"
+                                        );
                                         if connected.iter().any(|known| {
                                             known.0.device_id == peer.device_id
                                                 && known.1.transport_name() == "QUIC/UDP"
@@ -1492,6 +1498,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 let (peer, keep_outbound, result) = result?;
                                 match result {
                                     Ok(mut connection) => {
+                                        tracing::debug!(
+                                            peer_id = %peer.device_id,
+                                            outbound_elected = keep_outbound,
+                                            path = connection.channel.transport_name(),
+                                            has_ice_consent = connection.channel.has_ice_consent_monitor(),
+                                            "mesh outbound connection completed"
+                                        );
                                         let remote = connection.remote;
                                         if let Some(nominated) = connection.nominated_ice_monitor.take()
                                             && let Some((_, old)) = pending_ice_monitors.insert(peer.device_id.clone(), nominated)
@@ -1502,12 +1515,25 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                         if !keep_outbound && require_ice_consent && channel.transport_name() == "QUIC/UDP" {
                                             if let Some((accepted_peer, mut accepted_channel, accepted_remote)) = pending_accepted_channels.remove(&peer.device_id) {
                                                 if accepted_remote == remote && transfer_peer_ice_consent_monitor(&mut channel, &mut accepted_channel) {
+                                                    tracing::debug!(
+                                                        peer_id = %accepted_peer.device_id,
+                                                        path = accepted_channel.transport_name(),
+                                                        has_ice_consent = accepted_channel.has_ice_consent_monitor(),
+                                                        "selected accepted mesh channel after transferring ICE consent"
+                                                    );
                                                     println!("Connected mesh peer {} at {accepted_remote}", accepted_peer.device_id);
                                                     let connector = peer_connectors.remove(&accepted_peer.device_id).expect("peer connector exists");
                                                     let probe = peer_probes.remove(&accepted_peer.device_id).expect("peer probe exists");
                                                     connected.push((accepted_peer, accepted_channel, accepted_remote, connector, probe));
                                                     first_peer_at.get_or_insert_with(tokio::time::Instant::now);
                                                 } else {
+                                                    tracing::debug!(
+                                                        peer_id = %peer.device_id,
+                                                        accepted_path = accepted_channel.transport_name(),
+                                                        accepted_remote_matches = accepted_remote == remote,
+                                                        probe_has_ice_consent = channel.has_ice_consent_monitor(),
+                                                        "discarding unmatched accepted ICE channel"
+                                                    );
                                                     accepted_channel.close();
                                                     eprintln!("Peer {} direct ICE session had no consent monitor; waiting for reliable fallback", peer.device_id);
                                                 }
@@ -2725,6 +2751,12 @@ fn install_mesh_peer_channel(
         channel.close();
         return;
     };
+    tracing::info!(
+        peer_id = %peer.device_id,
+        path = channel.transport_name(),
+        has_ice_consent = channel.has_ice_consent_monitor(),
+        "installing elected mesh peer path"
+    );
     println!("Connected mesh peer {} at {remote}", peer.device_id);
     connected.push((peer, channel, remote, connector, probe));
 }
