@@ -12,7 +12,10 @@ use std::{
 };
 
 use bytes::BytesMut;
-use rtc_ice::Agent;
+use rtc_ice::{
+    Agent,
+    candidate::{CandidateType as IceCandidateType, candidate_pair::CandidatePairState},
+};
 use rtc_shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use sansio::Protocol;
 use thiserror::Error;
@@ -931,6 +934,24 @@ pub struct IceAgentDriver {
     remote_srflx_candidate_count: usize,
 }
 
+#[derive(Debug, Default, Eq, PartialEq)]
+struct IceCandidatePairSummary {
+    pair_count: usize,
+    waiting_pairs: usize,
+    in_progress_pairs: usize,
+    failed_pairs: usize,
+    succeeded_pairs: usize,
+    nominated_pairs: usize,
+    host_host_pairs: usize,
+    host_srflx_pairs: usize,
+    srflx_host_pairs: usize,
+    srflx_srflx_pairs: usize,
+    other_type_pairs: usize,
+    requests_sent: u64,
+    requests_received: u64,
+    responses_received: u64,
+}
+
 fn candidate_type_counts(candidates: &[SignaledCandidate]) -> (usize, usize) {
     candidates.iter().fold((0, 0), |(host, srflx), candidate| {
         match candidate.candidate_type {
@@ -1292,6 +1313,101 @@ impl IceAgentDriver {
             .map(|(local, remote)| (local.addr(), remote.addr()))
     }
 
+    fn candidate_pair_summary(&self) -> IceCandidatePairSummary {
+        let local_types: HashMap<_, _> = self
+            .agent
+            .get_local_candidates()
+            .iter()
+            .map(|candidate| (candidate.id(), candidate.candidate_type()))
+            .collect();
+        let remote_types: HashMap<_, _> = self
+            .agent
+            .get_remote_candidates()
+            .iter()
+            .map(|candidate| (candidate.id(), candidate.candidate_type()))
+            .collect();
+        let mut summary = IceCandidatePairSummary::default();
+        for pair in self.agent.get_candidate_pairs_stats(Instant::now()) {
+            summary.pair_count += 1;
+            summary.nominated_pairs += usize::from(pair.nominated);
+            summary.requests_sent = summary.requests_sent.saturating_add(pair.requests_sent);
+            summary.requests_received = summary
+                .requests_received
+                .saturating_add(pair.requests_received);
+            summary.responses_received = summary
+                .responses_received
+                .saturating_add(pair.responses_received);
+            match pair.state {
+                CandidatePairState::Waiting => summary.waiting_pairs += 1,
+                CandidatePairState::InProgress => summary.in_progress_pairs += 1,
+                CandidatePairState::Failed => summary.failed_pairs += 1,
+                CandidatePairState::Succeeded => summary.succeeded_pairs += 1,
+                _ => {}
+            }
+            match (
+                local_types.get(pair.local_candidate_id.as_str()),
+                remote_types.get(pair.remote_candidate_id.as_str()),
+            ) {
+                (Some(IceCandidateType::Host), Some(IceCandidateType::Host)) => {
+                    summary.host_host_pairs += 1;
+                }
+                (Some(IceCandidateType::Host), Some(IceCandidateType::ServerReflexive)) => {
+                    summary.host_srflx_pairs += 1;
+                }
+                (Some(IceCandidateType::ServerReflexive), Some(IceCandidateType::Host)) => {
+                    summary.srflx_host_pairs += 1;
+                }
+                (
+                    Some(IceCandidateType::ServerReflexive),
+                    Some(IceCandidateType::ServerReflexive),
+                ) => {
+                    summary.srflx_srflx_pairs += 1;
+                }
+                _ => summary.other_type_pairs += 1,
+            }
+        }
+        summary
+    }
+
+    fn log_checklist_summary(
+        &self,
+        outbound_datagrams: u64,
+        candidate_send_errors: u64,
+        inbound_stun_datagrams: u64,
+        agent_accepted_datagrams: u64,
+        nominated: bool,
+    ) {
+        let pairs = self.candidate_pair_summary();
+        tracing::debug!(
+            local_candidates = self.local_candidate_count,
+            remote_candidates = self.remote_candidate_count,
+            local_host_candidates = self.local_host_candidate_count,
+            local_srflx_candidates = self.local_srflx_candidate_count,
+            remote_host_candidates = self.remote_host_candidate_count,
+            remote_srflx_candidates = self.remote_srflx_candidate_count,
+            outbound_datagrams,
+            candidate_send_errors,
+            inbound_stun_datagrams,
+            agent_accepted_datagrams,
+            ice_pairs = pairs.pair_count,
+            ice_pairs_waiting = pairs.waiting_pairs,
+            ice_pairs_in_progress = pairs.in_progress_pairs,
+            ice_pairs_failed = pairs.failed_pairs,
+            ice_pairs_succeeded = pairs.succeeded_pairs,
+            ice_pairs_nominated = pairs.nominated_pairs,
+            ice_pairs_host_host = pairs.host_host_pairs,
+            ice_pairs_host_srflx = pairs.host_srflx_pairs,
+            ice_pairs_srflx_host = pairs.srflx_host_pairs,
+            ice_pairs_srflx_srflx = pairs.srflx_srflx_pairs,
+            ice_pairs_other_type = pairs.other_type_pairs,
+            ice_pair_requests_sent = pairs.requests_sent,
+            ice_pair_requests_received = pairs.requests_received,
+            ice_pair_responses_received = pairs.responses_received,
+            nominated,
+            "ICE checklist summary"
+        );
+    }
+
     /// Run checks over the endpoint's shared UDP socket until nomination or timeout.
     pub async fn run_checks(
         &mut self,
@@ -1340,36 +1456,22 @@ impl IceAgentDriver {
                 }
             }
             if let Some(pair) = self.selected_pair() {
-                tracing::debug!(
-                    local_candidates = self.local_candidate_count,
-                    remote_candidates = self.remote_candidate_count,
-                    local_host_candidates = self.local_host_candidate_count,
-                    local_srflx_candidates = self.local_srflx_candidate_count,
-                    remote_host_candidates = self.remote_host_candidate_count,
-                    remote_srflx_candidates = self.remote_srflx_candidate_count,
+                self.log_checklist_summary(
                     outbound_datagrams,
                     candidate_send_errors,
                     inbound_stun_datagrams,
                     agent_accepted_datagrams,
-                    nominated = true,
-                    "ICE checklist summary"
+                    true,
                 );
                 return Ok(pair);
             }
             if now >= deadline {
-                tracing::debug!(
-                    local_candidates = self.local_candidate_count,
-                    remote_candidates = self.remote_candidate_count,
-                    local_host_candidates = self.local_host_candidate_count,
-                    local_srflx_candidates = self.local_srflx_candidate_count,
-                    remote_host_candidates = self.remote_host_candidate_count,
-                    remote_srflx_candidates = self.remote_srflx_candidate_count,
+                self.log_checklist_summary(
                     outbound_datagrams,
                     candidate_send_errors,
                     inbound_stun_datagrams,
                     agent_accepted_datagrams,
-                    nominated = false,
-                    "ICE checklist summary"
+                    false,
                 );
                 return Err(IceDriverError::Timeout);
             }
@@ -1388,19 +1490,12 @@ impl IceAgentDriver {
                 }
                 () = tokio::time::sleep_until(tokio::time::Instant::from_std(next_deadline)) => {
                     if Instant::now() >= deadline {
-                        tracing::debug!(
-                            local_candidates = self.local_candidate_count,
-                            remote_candidates = self.remote_candidate_count,
-                            local_host_candidates = self.local_host_candidate_count,
-                            local_srflx_candidates = self.local_srflx_candidate_count,
-                            remote_host_candidates = self.remote_host_candidate_count,
-                            remote_srflx_candidates = self.remote_srflx_candidate_count,
+                        self.log_checklist_summary(
                             outbound_datagrams,
                             candidate_send_errors,
                             inbound_stun_datagrams,
                             agent_accepted_datagrams,
-                            nominated = false,
-                            "ICE checklist summary"
+                            false,
                         );
                         return Err(IceDriverError::Timeout);
                     }
@@ -1742,6 +1837,63 @@ mod tests {
             },
         ];
         assert_eq!(candidate_type_counts(&candidates), (1, 1));
+    }
+
+    #[test]
+    fn checklist_pair_diagnostics_count_candidate_types_without_addresses() {
+        let local_credentials = generate_ice_credentials(1).expect("local credentials");
+        let remote_credentials = generate_ice_credentials(1).expect("remote credentials");
+        let local_candidates = [
+            SignaledCandidate {
+                address: "127.0.0.1:4000".parse().unwrap(),
+                transport: crate::candidate::CandidateTransport::Udp,
+                candidate_type: SignaledCandidateType::Host,
+            },
+            SignaledCandidate {
+                address: "198.51.100.10:5000".parse().unwrap(),
+                transport: crate::candidate::CandidateTransport::Udp,
+                candidate_type: SignaledCandidateType::ServerReflexive {
+                    related_address: "127.0.0.1:4000".parse().unwrap(),
+                },
+            },
+        ];
+        let remote_candidates = [
+            SignaledCandidate {
+                address: "127.0.0.1:4001".parse().unwrap(),
+                transport: crate::candidate::CandidateTransport::Udp,
+                candidate_type: SignaledCandidateType::Host,
+            },
+            SignaledCandidate {
+                address: "203.0.113.10:5001".parse().unwrap(),
+                transport: crate::candidate::CandidateTransport::Udp,
+                candidate_type: SignaledCandidateType::ServerReflexive {
+                    related_address: "127.0.0.1:4001".parse().unwrap(),
+                },
+            },
+        ];
+        let driver = IceAgentDriver::for_peer_with_candidates_on_socket(
+            local_candidates[0].address,
+            &local_credentials,
+            &remote_credentials,
+            &local_candidates,
+            &remote_candidates,
+            true,
+            Instant::now(),
+        )
+        .expect("create ICE driver");
+
+        assert_eq!(
+            driver.candidate_pair_summary(),
+            IceCandidatePairSummary {
+                pair_count: 4,
+                waiting_pairs: 4,
+                host_host_pairs: 1,
+                host_srflx_pairs: 1,
+                srflx_host_pairs: 1,
+                srflx_srflx_pairs: 1,
+                ..IceCandidatePairSummary::default()
+            }
+        );
     }
 
     #[test]
