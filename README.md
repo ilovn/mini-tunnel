@@ -53,7 +53,7 @@ The Coordinator checks the configured certificate and private key every 30 secon
 
 On Unix, the private-key file must not be world-accessible; use mode `0600` or a group-restricted mode such as `0640` when the service account belongs to the trusted key-reading group.
 
-On clients, set `MINI_TUNNEL_COORDINATOR_URL='https://tunnel.example:8443'`. Clients validate the certificate chain and hostname; the CLI has no insecure TLS bypass. A reverse proxy that terminates TLS is also supported while the coordinator remains bound to loopback.
+On clients, set `MINI_TUNNEL_COORDINATOR_URL='https://tunnel.example:8443'`. Clients validate the certificate chain and hostname; the CLI has no insecure TLS bypass. For a private CA, set `MINI_TUNNEL_COORDINATOR_CA_CERT_FILE` to a PEM bundle containing the trusted root certificates. The CLI merges those roots with its normal trust store and applies them to both Coordinator health and API requests. The bundle must be a regular file no larger than 1 MiB. A reverse proxy that terminates TLS is also supported while the coordinator remains bound to loopback.
 
 When the coordinator is behind a reverse proxy, set `--trusted-proxies` to the proxy's source CIDR (repeat the option for multiple proxies), or provide comma-separated CIDRs through `MINI_TUNNEL_COORDINATOR_TRUSTED_PROXIES`. Only requests whose direct TCP peer matches a configured CIDR use `X-Forwarded-For` for per-client rate limiting. The proxy must append the immediate downstream address; malformed chains are ignored. The systemd template trusts only its local `127.0.0.1/32` proxy. Keep `/metrics` off public proxy routes.
 

@@ -1,5 +1,7 @@
 use std::{
+    fs::File,
     future::Future,
+    io::{self, Read},
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::ExitCode,
@@ -28,6 +30,8 @@ use serde::Deserialize;
 
 const PEER_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(5);
 const ICE_PATH_PROMOTION_PROBATION: Duration = Duration::from_secs(31);
+const COORDINATOR_CA_CERT_FILE_ENV: &str = "MINI_TUNNEL_COORDINATOR_CA_CERT_FILE";
+const MAX_COORDINATOR_CA_BUNDLE_BYTES: u64 = 1024 * 1024;
 const ICE_PATH_PROBATION_HEALTH_INTERVAL: Duration = Duration::from_secs(10);
 const DIRECT_PATH_PROMOTION_PROBATION: Duration = Duration::from_secs(31);
 
@@ -859,9 +863,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             CoordinatorCommand::Health { url } => {
                 let endpoint = format!("{}/healthz", url.trim_end_matches('/'));
-                let response = reqwest::Client::builder()
-                    .timeout(Duration::from_secs(3))
-                    .build()?
+                let response = coordinator_http_client(Duration::from_secs(3))?
                     .get(endpoint)
                     .send()
                     .await?
@@ -2113,9 +2115,7 @@ where
     Response: for<'de> Deserialize<'de>,
 {
     let url = format!("{}{path}", base_url.trim_end_matches('/'));
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()?
+    let response = coordinator_http_client(Duration::from_secs(5))?
         .post(url)
         .json(request)
         .send()
@@ -2135,6 +2135,88 @@ where
         code: error.error,
         message: error.message,
     }))
+}
+
+fn coordinator_http_client(
+    timeout: Duration,
+) -> Result<reqwest::Client, Box<dyn std::error::Error + Send + Sync>> {
+    let ca_bundle_path = std::env::var_os(COORDINATOR_CA_CERT_FILE_ENV).map(PathBuf::from);
+    coordinator_http_client_with_ca_bundle(timeout, ca_bundle_path.as_deref())
+}
+
+fn coordinator_http_client_with_ca_bundle(
+    timeout: Duration,
+    ca_bundle_path: Option<&Path>,
+) -> Result<reqwest::Client, Box<dyn std::error::Error + Send + Sync>> {
+    let mut builder = reqwest::Client::builder().timeout(timeout);
+    if let Some(ca_bundle_path) = ca_bundle_path {
+        let certificates = read_coordinator_ca_bundle(ca_bundle_path)?;
+        builder = builder.tls_certs_merge(certificates);
+    }
+    Ok(builder.build()?)
+}
+
+fn read_coordinator_ca_bundle(path: &Path) -> Result<Vec<reqwest::Certificate>, io::Error> {
+    let file = File::open(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            "could not open Coordinator CA certificate bundle",
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            "could not inspect Coordinator CA certificate bundle",
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Coordinator CA certificate bundle must be a regular file",
+        ));
+    }
+    if metadata.len() > MAX_COORDINATOR_CA_BUNDLE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Coordinator CA certificate bundle exceeds the 1 MiB limit",
+        ));
+    }
+
+    let mut contents = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_COORDINATOR_CA_BUNDLE_BYTES + 1)
+        .read_to_end(&mut contents)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                "could not read Coordinator CA certificate bundle",
+            )
+        })?;
+    if contents.len() as u64 > MAX_COORDINATOR_CA_BUNDLE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Coordinator CA certificate bundle exceeds the 1 MiB limit",
+        ));
+    }
+    if contents.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Coordinator CA certificate bundle is empty",
+        ));
+    }
+
+    let certificates = reqwest::Certificate::from_pem_bundle(&contents).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Coordinator CA certificate bundle is not valid PEM",
+        )
+    })?;
+    if certificates.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Coordinator CA certificate bundle contains no certificates",
+        ));
+    }
+    Ok(certificates)
 }
 
 #[derive(Debug)]
@@ -5020,6 +5102,50 @@ fn print_tunnel_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coordinator_ca_bundle_rejects_empty_non_pem_and_oversized_files_safely() {
+        let directory = std::env::temp_dir().join(format!(
+            "mini-tunnel-coordinator-ca-bundle-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).expect("create temporary directory");
+
+        let empty = directory.join("empty.pem");
+        std::fs::write(&empty, []).expect("write empty CA bundle");
+        let error = read_coordinator_ca_bundle(&empty).expect_err("empty bundle must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("is empty"));
+
+        let malformed = directory.join("malformed.pem");
+        std::fs::write(&malformed, "PRIVATE_TEST_SENTINEL").expect("write malformed CA bundle");
+        let error =
+            read_coordinator_ca_bundle(&malformed).expect_err("malformed bundle must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains("Coordinator CA certificate bundle")
+        );
+        assert!(!error.to_string().contains("PRIVATE_TEST_SENTINEL"));
+
+        let oversized = directory.join("oversized.pem");
+        std::fs::write(
+            &oversized,
+            vec![b'A'; MAX_COORDINATOR_CA_BUNDLE_BYTES as usize + 1],
+        )
+        .expect("write oversized CA bundle");
+        let error =
+            read_coordinator_ca_bundle(&oversized).expect_err("oversized bundle must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("1 MiB limit"));
+
+        let error = read_coordinator_ca_bundle(&directory)
+            .expect_err("directories must not be accepted as CA bundles");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("regular file"));
+        std::fs::remove_dir_all(directory).expect("remove temporary directory");
+    }
 
     #[test]
     fn mesh_uses_only_ip_families_available_on_its_tun() {
