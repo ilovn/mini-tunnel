@@ -1389,6 +1389,10 @@ impl IceAgentDriver {
             candidate_send_errors,
             inbound_stun_datagrams,
             agent_accepted_datagrams,
+            nominated,
+            "ICE checklist summary"
+        );
+        tracing::debug!(
             ice_pairs = pairs.pair_count,
             ice_pairs_waiting = pairs.waiting_pairs,
             ice_pairs_in_progress = pairs.in_progress_pairs,
@@ -1403,8 +1407,8 @@ impl IceAgentDriver {
             ice_pair_requests_sent = pairs.requests_sent,
             ice_pair_requests_received = pairs.requests_received,
             ice_pair_responses_received = pairs.responses_received,
-            nominated,
-            "ICE checklist summary"
+            nominated_pairs = pairs.nominated_pairs,
+            "ICE candidate-pair summary"
         );
     }
 
