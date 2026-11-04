@@ -1394,7 +1394,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 &identity,
                                 &peer,
                                 relay_endpoints,
-                                false,
+                                MeshPeerConnectOptions {
+                                    reliable_only: false,
+                                    ice_probe_validation: IceProbeValidation::InitialConnection,
+                                },
                             )
                             .await;
                             (peer, keep_outbound, result)
@@ -2803,6 +2806,24 @@ struct MeshPeerConnection {
     nominated_ice_monitor: Option<(SocketAddr, mini_tunnel_agent::ice::IceConsentMonitor)>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IceProbeValidation {
+    InitialConnection,
+    Recovery,
+}
+
+#[derive(Clone, Copy)]
+struct MeshPeerConnectOptions {
+    reliable_only: bool,
+    ice_probe_validation: IceProbeValidation,
+}
+
+impl IceProbeValidation {
+    fn needs_initial_probation(self) -> bool {
+        self == Self::InitialConnection
+    }
+}
+
 async fn connect_mesh_peer(
     endpoint: &TunnelEndpoint,
     network_id: &str,
@@ -2810,7 +2831,7 @@ async fn connect_mesh_peer(
     identity: &mini_tunnel_agent::Identity,
     peer: &PeerInfo,
     relay_endpoints: RelayEndpoints,
-    reliable_only: bool,
+    options: MeshPeerConnectOptions,
 ) -> Result<MeshPeerConnection, mini_tunnel_agent::IdentityError> {
     let mut peer = peer.clone();
     if let Ok(current) = discover_peer(coordinator_url, network_id, &peer.device_id, identity).await
@@ -2832,7 +2853,7 @@ async fn connect_mesh_peer(
     let peer_key = decode_peer_key(&peer.public_key)
         .map_err(|_| mini_tunnel_agent::IdentityError::UnauthorizedPeer)?;
     let mut nominated_ice_monitor = None;
-    let initial_ice_selection = if reliable_only {
+    let initial_ice_selection = if options.reliable_only {
         None
     } else {
         select_ice_peer_address_with_snapshot_refresh(
@@ -2858,21 +2879,31 @@ async fn connect_mesh_peer(
         {
             Ok(mut channel) => {
                 channel.set_ice_consent_monitor(monitor);
-                match validate_initial_ice_udp_probe(channel, &peer.device_id).await {
-                    Ok(channel) => {
-                        return Ok(MeshPeerConnection {
-                            channel,
-                            remote,
-                            nominated_ice_monitor: None,
-                        });
+                if options.ice_probe_validation.needs_initial_probation() {
+                    match validate_initial_ice_udp_probe(channel, &peer.device_id).await {
+                        Ok(channel) => {
+                            return Ok(MeshPeerConnection {
+                                channel,
+                                remote,
+                                nominated_ice_monitor: None,
+                            });
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                peer_id = %peer.device_id,
+                                %error,
+                                "ICE nominated path failed initial health probation; trying candidates"
+                            );
+                        }
                     }
-                    Err(error) => {
-                        tracing::warn!(
-                            peer_id = %peer.device_id,
-                            %error,
-                            "ICE nominated path failed initial health probation; trying candidates"
-                        );
-                    }
+                } else {
+                    // The recovery connector performs a longer authenticated probation after
+                    // both peers have established and monitored the nominated channel.
+                    return Ok(MeshPeerConnection {
+                        channel,
+                        remote,
+                        nominated_ice_monitor: None,
+                    });
                 }
             }
             Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer) => {
@@ -2885,7 +2916,7 @@ async fn connect_mesh_peer(
             }
         }
     }
-    let candidates = candidates_for_path(&peer.candidates, reliable_only);
+    let candidates = candidates_for_path(&peer.candidates, options.reliable_only);
     let direct_result = mini_tunnel_agent::connect_peer_candidates(
         &endpoint.endpoint,
         &candidates,
@@ -2932,7 +2963,9 @@ async fn connect_mesh_peer(
             ) {
                 return Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer);
             }
-            let channel = if !reliable_only && let Some(relay) = relay_endpoints.udp {
+            let channel = if !options.reliable_only
+                && let Some(relay) = relay_endpoints.udp
+            {
                 match connect_peer_via_udp_relay(
                     relay,
                     coordinator_url,
@@ -3090,7 +3123,10 @@ fn build_mesh_peer_connectors(
                         &identity,
                         &peer,
                         relay_endpoints,
-                        force_reliable,
+                        MeshPeerConnectOptions {
+                            reliable_only: force_reliable,
+                            ice_probe_validation: IceProbeValidation::InitialConnection,
+                        },
                     )
                     .await
                     .map(|connection| connection.channel)
@@ -3212,7 +3248,10 @@ fn build_mesh_peer_connectors(
                         &identity,
                         &peer,
                         probe_relays,
-                        false,
+                        MeshPeerConnectOptions {
+                            reliable_only: false,
+                            ice_probe_validation: IceProbeValidation::Recovery,
+                        },
                     )
                     .await
                     {
@@ -5339,6 +5378,12 @@ fn print_tunnel_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_ice_probe_defers_to_full_path_probation() {
+        assert!(IceProbeValidation::InitialConnection.needs_initial_probation());
+        assert!(!IceProbeValidation::Recovery.needs_initial_probation());
+    }
 
     async fn delayed_healthz() -> impl IntoResponse {
         tokio::time::sleep(Duration::from_millis(3_200)).await;
