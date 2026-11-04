@@ -19,8 +19,9 @@ static MESH_DROPPED_PACKETS: AtomicU64 = AtomicU64::new(0);
 const MESH_EVENT_QUEUE_PER_PEER: usize = 8;
 // At the maximum 9000-byte packet size, this caps queued payloads at about 8.8 MiB.
 const MAX_MESH_EVENT_QUEUE_CAPACITY: usize = 1024;
-// One 9000-byte outbound packet per each of 4096 peers caps this queue at about 35.2 MiB.
-const MESH_OUTBOUND_QUEUE_PER_PEER: usize = 1;
+// At most 8 queued packets per peer, with a global budget of 1024 packets (~8.8 MiB at MTU 9000).
+const MESH_OUTBOUND_QUEUE_PER_PEER: usize = 8;
+const MESH_OUTBOUND_QUEUE_GLOBAL: usize = 1024;
 const MESH_OUTBOUND_PACKET_TTL: Duration = Duration::from_secs(5);
 const EARLY_FALLBACK_MISSES: u64 = 1;
 const HEALTH_PROBE_INTERVAL: Duration = Duration::from_millis(400);
@@ -114,10 +115,24 @@ fn try_queue_mesh_packet(
     sender: &tokio::sync::mpsc::Sender<QueuedMeshPacket>,
     address: Ipv4Addr,
     packet: Vec<u8>,
+    budget: &Arc<tokio::sync::Semaphore>,
 ) -> MeshPacketDelivery {
+    let permit = match Arc::clone(budget).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            MESH_DROPPED_PACKETS.fetch_add(1, Ordering::Relaxed);
+            crate::status::record_packet(
+                &address.to_string(),
+                crate::status::PacketCounter::Dropped,
+            );
+            tracing::debug!(peer_address = %address, "dropping outbound mesh packet because the global packet budget is full");
+            return MeshPacketDelivery::Dropped;
+        }
+    };
     match sender.try_send(QueuedMeshPacket {
         payload: packet,
         queued_at: Instant::now(),
+        _budget_permit: permit,
     }) {
         Ok(()) => MeshPacketDelivery::Queued,
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -138,6 +153,7 @@ fn try_queue_mesh_packet(
 struct QueuedMeshPacket {
     payload: Vec<u8>,
     queued_at: Instant,
+    _budget_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 fn mesh_packet_expired(queued_at: Instant, now: Instant) -> bool {
@@ -154,6 +170,12 @@ fn discard_queued_mesh_packets(
     }
     if dropped > 0 {
         MESH_DROPPED_PACKETS.fetch_add(dropped, Ordering::Relaxed);
+        for _ in 0..dropped {
+            crate::status::record_packet(
+                &address.to_string(),
+                crate::status::PacketCounter::Dropped,
+            );
+        }
         tracing::debug!(peer_address = %address, dropped, "discarding queued mesh packets after path failure");
     }
     usize::try_from(dropped).unwrap_or(usize::MAX)
@@ -1400,6 +1422,7 @@ async fn pump_mesh_with_quality_interval<T: TunnelPacketIo>(
     if peers.is_empty() && updates.is_none() {
         return Err(PeerTunnelError::NoPeers);
     }
+    let outbound_budget = Arc::new(tokio::sync::Semaphore::new(MESH_OUTBOUND_QUEUE_GLOBAL));
     let mut channels = HashMap::with_capacity(peers.len());
     let mut outbound_receivers = HashMap::with_capacity(peers.len());
     let mut ipv6_routes = HashMap::new();
@@ -1459,7 +1482,12 @@ async fn pump_mesh_with_quality_interval<T: TunnelPacketIo>(
                 };
                 if let Some(peer_key) = peer_key
                     && let Some(runtime) = channels.get(&peer_key)
-                    && try_queue_mesh_packet(&runtime.outbound, peer_key, packet)
+                    && try_queue_mesh_packet(
+                        &runtime.outbound,
+                        peer_key,
+                        packet,
+                        &outbound_budget,
+                    )
                         == MeshPacketDelivery::ReceiverClosed
                 {
                     tracing::debug!(peer_address = %peer_key, "dropping packet because the peer send task stopped");
@@ -2438,23 +2466,37 @@ mod tests {
 
     #[tokio::test]
     async fn mesh_outbound_queue_isolates_a_full_peer_queue() {
-        let peer_a = Ipv4Addr::new(10, 77, 0, 2);
-        let peer_b = Ipv4Addr::new(10, 77, 0, 3);
+        let peer_a =
+            Ipv4Addr::from(<[u8; 4]>::try_from(&uuid::Uuid::new_v4().as_bytes()[..4]).unwrap());
+        let peer_b =
+            Ipv4Addr::from(<[u8; 4]>::try_from(&uuid::Uuid::new_v4().as_bytes()[..4]).unwrap());
         let (slow_sender, mut slow_receiver) = mpsc::channel(MESH_OUTBOUND_QUEUE_PER_PEER);
         let (fast_sender, mut fast_receiver) = mpsc::channel(MESH_OUTBOUND_QUEUE_PER_PEER);
+        let budget = Arc::new(tokio::sync::Semaphore::new(MESH_OUTBOUND_QUEUE_GLOBAL));
         let before = mesh_dropped_packets_total();
+        crate::status::update(peer_a.to_string(), true, "test", None, 0, 0, None);
 
+        for sequence in 0..MESH_OUTBOUND_QUEUE_PER_PEER {
+            assert_eq!(
+                try_queue_mesh_packet(&slow_sender, peer_a, vec![sequence as u8], &budget),
+                MeshPacketDelivery::Queued
+            );
+        }
         assert_eq!(
-            try_queue_mesh_packet(&slow_sender, peer_a, vec![1]),
-            MeshPacketDelivery::Queued
-        );
-        assert_eq!(
-            try_queue_mesh_packet(&slow_sender, peer_a, vec![2]),
+            try_queue_mesh_packet(&slow_sender, peer_a, vec![99], &budget),
             MeshPacketDelivery::Dropped
         );
         assert!(mesh_dropped_packets_total() > before);
         assert_eq!(
-            try_queue_mesh_packet(&fast_sender, peer_b, vec![3]),
+            crate::status::snapshot()
+                .into_iter()
+                .find(|status| status.peer == peer_a.to_string())
+                .unwrap()
+                .packets_dropped_total,
+            1
+        );
+        assert_eq!(
+            try_queue_mesh_packet(&fast_sender, peer_b, vec![3], &budget),
             MeshPacketDelivery::Queued,
             "a slow peer's full queue does not consume another peer's capacity"
         );
@@ -2472,7 +2514,41 @@ mod tests {
                 .await
                 .expect("slow peer packet")
                 .payload,
-            vec![1]
+            vec![0]
+        );
+    }
+
+    #[tokio::test]
+    async fn mesh_outbound_global_budget_bounds_all_peer_queues() {
+        let peer_a =
+            Ipv4Addr::from(<[u8; 4]>::try_from(&uuid::Uuid::new_v4().as_bytes()[..4]).unwrap());
+        let peer_b =
+            Ipv4Addr::from(<[u8; 4]>::try_from(&uuid::Uuid::new_v4().as_bytes()[..4]).unwrap());
+        let (sender_a, mut receiver_a) = mpsc::channel(MESH_OUTBOUND_QUEUE_PER_PEER);
+        let (sender_b, _receiver_b) = mpsc::channel(MESH_OUTBOUND_QUEUE_PER_PEER);
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        crate::status::update(peer_b.to_string(), true, "test", None, 0, 0, None);
+
+        assert_eq!(
+            try_queue_mesh_packet(&sender_a, peer_a, vec![1], &budget),
+            MeshPacketDelivery::Queued
+        );
+        assert_eq!(
+            try_queue_mesh_packet(&sender_b, peer_b, vec![2], &budget),
+            MeshPacketDelivery::Dropped
+        );
+        assert_eq!(
+            crate::status::snapshot()
+                .into_iter()
+                .find(|status| status.peer == peer_b.to_string())
+                .unwrap()
+                .packets_dropped_total,
+            1
+        );
+        drop(receiver_a.recv().await.expect("first queued packet"));
+        assert_eq!(
+            try_queue_mesh_packet(&sender_b, peer_b, vec![3], &budget),
+            MeshPacketDelivery::Queued
         );
     }
 
@@ -2595,16 +2671,27 @@ mod tests {
 
     #[tokio::test]
     async fn path_failure_discards_already_queued_mesh_packets() {
-        let address = Ipv4Addr::new(10, 77, 0, 2);
+        let address =
+            Ipv4Addr::from(<[u8; 4]>::try_from(&uuid::Uuid::new_v4().as_bytes()[..4]).unwrap());
         let (sender, mut receiver) = mpsc::channel(MESH_OUTBOUND_QUEUE_PER_PEER);
+        let budget = Arc::new(tokio::sync::Semaphore::new(MESH_OUTBOUND_QUEUE_GLOBAL));
         let before = mesh_dropped_packets_total();
+        crate::status::update(address.to_string(), true, "test", None, 0, 0, None);
         assert_eq!(
-            try_queue_mesh_packet(&sender, address, vec![1]),
+            try_queue_mesh_packet(&sender, address, vec![1], &budget),
             MeshPacketDelivery::Queued
         );
         assert_eq!(discard_queued_mesh_packets(&mut receiver, address), 1);
         assert!(receiver.try_recv().is_err());
         assert!(mesh_dropped_packets_total() > before);
+        assert_eq!(
+            crate::status::snapshot()
+                .into_iter()
+                .find(|status| status.peer == address.to_string())
+                .unwrap()
+                .packets_dropped_total,
+            1
+        );
     }
 
     #[test]
