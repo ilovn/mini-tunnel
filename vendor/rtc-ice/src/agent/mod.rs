@@ -663,9 +663,10 @@ impl Agent {
         remote_ufrag: String,
         remote_pwd: String,
     ) -> Result<()> {
+        // ICE credentials authenticate connectivity checks. Never include them in logs.
         debug!(
-            "Started agent: isControlling? {}, remoteUfrag: {}, remotePwd: {}",
-            is_controlling, remote_ufrag, remote_pwd
+            "Started agent connectivity checks; controlling role: {}",
+            is_controlling
         );
         self.set_remote_credentials(remote_ufrag, remote_pwd)?;
         self.is_controlling = is_controlling;
