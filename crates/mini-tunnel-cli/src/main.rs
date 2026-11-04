@@ -3299,6 +3299,17 @@ fn build_mesh_peer_connectors(
                     } else {
                         Duration::from_secs(35)
                     };
+                    // The shared accept queue can contain a QUIC connection left over from
+                    // an earlier failed recovery attempt. Drain it before starting fresh ICE
+                    // checks so this attempt cannot attach new consent to a stale channel.
+                    let discarded = discard_queued_reconnect_channels(&receiver).await;
+                    if discarded > 0 {
+                        tracing::debug!(
+                            peer_id = %peer.device_id,
+                            discarded,
+                            "discarded queued accepted channels before direct recovery"
+                        );
+                    }
                     let direct_result = async {
                         let mut monitor = select_current_ice_peer_address(
                             &endpoint,
@@ -3405,6 +3416,17 @@ where
     .await
     .ok()
     .flatten()
+}
+
+async fn discard_queued_reconnect_channels<T>(
+    receiver: &std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<T>>>,
+) -> usize {
+    let mut receiver = receiver.lock().await;
+    let mut discarded = 0;
+    while receiver.try_recv().is_ok() {
+        discarded += 1;
+    }
+    discarded
 }
 
 fn spawn_single_peer_acceptors(
@@ -8016,6 +8038,18 @@ mod tests {
         let receiver = std::sync::Arc::new(tokio::sync::Mutex::new(receiver));
         let selected =
             receive_reconnect_channel(receiver, true, Duration::from_millis(10), |_| false).await;
+        assert_eq!(selected, None);
+    }
+
+    #[tokio::test]
+    async fn direct_recovery_discards_channels_queued_by_earlier_attempts() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        sender.send("stale-quic").await.unwrap();
+        let receiver = std::sync::Arc::new(tokio::sync::Mutex::new(receiver));
+
+        assert_eq!(discard_queued_reconnect_channels(&receiver).await, 1);
+        let selected =
+            receive_reconnect_channel(receiver, false, Duration::from_millis(10), |_| false).await;
         assert_eq!(selected, None);
     }
 
