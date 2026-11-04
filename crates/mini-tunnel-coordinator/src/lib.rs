@@ -4730,13 +4730,17 @@ mod tests {
             )),
             ..CoordinatorState::default()
         };
-        let network_id = Uuid::parse_str(&network_id).expect("network UUID");
-        let output_length = output.lock().expect("audit buffer").len();
-        postgres_state.audit_success("network_created", network_id, None);
-        assert_eq!(output.lock().expect("audit buffer").len(), output_length);
+        let postgres_network_id = Uuid::new_v4();
+        postgres_state.audit_success("network_created", postgres_network_id, None);
+        let records_before_discard =
+            String::from_utf8(output.lock().expect("audit buffer").clone())
+                .expect("valid UTF-8 audit records");
+        assert!(!records_before_discard.contains(&postgres_network_id.to_string()));
         postgres_state.discard_pending_audit_events();
-        assert_eq!(output.lock().expect("audit buffer").len(), output_length);
-        postgres_state.audit_success("network_created", network_id, None);
+        let records_after_discard = String::from_utf8(output.lock().expect("audit buffer").clone())
+            .expect("valid UTF-8 audit records");
+        assert!(!records_after_discard.contains(&postgres_network_id.to_string()));
+        postgres_state.audit_success("network_created", postgres_network_id, None);
         postgres_state.flush_pending_audit_events();
 
         let records = String::from_utf8(output.lock().expect("audit buffer").clone())
@@ -4754,6 +4758,7 @@ mod tests {
                 "missing audit event {event}: {records}"
             );
         }
+        assert!(records.contains(&postgres_network_id.to_string()));
         assert!(records.contains(&network_id.to_string()));
         assert!(records.contains(&device_id));
         assert!(records.contains("outcome=\"success\""));
