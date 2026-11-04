@@ -72,6 +72,7 @@ fn try_deliver_mesh_packet(
     };
     if !reserved {
         MESH_DROPPED_PACKETS.fetch_add(1, Ordering::Relaxed);
+        crate::status::record_packet(&address.to_string(), crate::status::PacketCounter::Dropped);
         tracing::debug!(peer_address = %address, "dropping inbound mesh packet because the peer event quota is full");
         return MeshPacketDelivery::Dropped;
     }
@@ -87,6 +88,10 @@ fn try_deliver_mesh_packet(
                 pending.fetch_sub(1, Ordering::Relaxed);
             }
             MESH_DROPPED_PACKETS.fetch_add(1, Ordering::Relaxed);
+            crate::status::record_packet(
+                &address.to_string(),
+                crate::status::PacketCounter::Dropped,
+            );
             tracing::debug!(peer_address = %address, "dropping inbound mesh packet because the TUN event queue is full");
             MeshPacketDelivery::Dropped
         }
@@ -117,6 +122,10 @@ fn try_queue_mesh_packet(
         Ok(()) => MeshPacketDelivery::Queued,
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
             MESH_DROPPED_PACKETS.fetch_add(1, Ordering::Relaxed);
+            crate::status::record_packet(
+                &address.to_string(),
+                crate::status::PacketCounter::Dropped,
+            );
             tracing::debug!(peer_address = %address, "dropping outbound mesh packet because the peer send queue is full");
             MeshPacketDelivery::Dropped
         }
@@ -355,6 +364,7 @@ pub enum MeshPeerUpdate {
 }
 
 struct MeshPeerRuntime {
+    traffic: crate::status::PeerTrafficCounter,
     ipv6_address: Option<Ipv6Addr>,
     channel: Arc<tokio::sync::RwLock<Arc<PeerChannel>>>,
     connector: Option<PeerConnector>,
@@ -366,6 +376,7 @@ struct MeshPeerRuntime {
 
 struct MeshPeerReceiver {
     address: Ipv4Addr,
+    traffic: crate::status::PeerTrafficCounter,
     channel: Arc<tokio::sync::RwLock<Arc<PeerChannel>>>,
     connector: Option<PeerConnector>,
     probe: Option<PeerConnector>,
@@ -377,6 +388,7 @@ struct MeshPeerReceiver {
 }
 
 fn new_mesh_peer_runtime(
+    address: Ipv4Addr,
     ipv6_address: Option<Ipv6Addr>,
     channel: Arc<PeerChannel>,
     connector: Option<PeerConnector>,
@@ -389,6 +401,7 @@ fn new_mesh_peer_runtime(
     let (outbound, outbound_rx) = tokio::sync::mpsc::channel(MESH_OUTBOUND_QUEUE_PER_PEER);
     (
         MeshPeerRuntime {
+            traffic: crate::status::traffic_counter(&address.to_string()),
             ipv6_address,
             channel: Arc::new(tokio::sync::RwLock::new(channel)),
             connector,
@@ -625,6 +638,7 @@ pub async fn pump_peer_packets<T: TunnelPacketIo>(
         initial_health.probes_missed,
         None,
     );
+    let traffic = crate::status::traffic_counter(&key);
     let outcome = loop {
         tokio::select! {
             _ = peer.wait_ice_consent_failure() => {
@@ -639,6 +653,7 @@ pub async fn pump_peer_packets<T: TunnelPacketIo>(
                 if let Err(error) = peer.send_packet(&packet).await {
                     break Err(error.into());
                 }
+                traffic.record(crate::status::PacketCounter::Sent);
             }
             result = tokio::time::timeout_at(last_received + Duration::from_secs(30), &mut inbound) => {
                 let packet = match result {
@@ -647,12 +662,17 @@ pub async fn pump_peer_packets<T: TunnelPacketIo>(
                     Err(_) => break Err(IdentityError::Transport("peer keepalive timed out".to_owned()).into()),
                 };
                 last_received = tokio::time::Instant::now();
-                if !packet.is_empty()
-                    && let Err(error) = packet_io
+                if !packet.is_empty() {
+                    match packet_io
                         .write_inbound_ip_packet(&packet, peer_ipv4, peer_ipv6)
                         .await
-                {
-                    break Err(error.into());
+                    {
+                        Ok(()) => traffic.record(crate::status::PacketCounter::Received),
+                        Err(TunError::InvalidPacket(_)) => {
+                            traffic.record(crate::status::PacketCounter::Rejected)
+                        }
+                        Err(error) => break Err(error.into()),
+                    }
                 }
                 inbound = Box::pin(peer.recv_packet());
             }
@@ -686,6 +706,7 @@ pub async fn pump_peer_packets<T: TunnelPacketIo>(
 async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
     let MeshPeerReceiver {
         address,
+        traffic,
         channel,
         connector,
         probe,
@@ -791,12 +812,14 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                     let Some(packet) = outbound else { return };
                     if mesh_packet_expired(packet.queued_at, Instant::now()) {
                         MESH_DROPPED_PACKETS.fetch_add(1, Ordering::Relaxed);
+                        traffic.record(crate::status::PacketCounter::Dropped);
                         tracing::debug!(peer_address = %address, "dropping expired queued mesh packet");
                         continue;
                     }
                     if let Err(error) = active.send_packet(&packet.payload).await {
                         break Err(error);
                     }
+                    traffic.record(crate::status::PacketCounter::Sent);
                 }
                 _ = keepalive.tick() => {
                     let health = active.health_snapshot();
@@ -1386,8 +1409,14 @@ async fn pump_mesh_with_quality_interval<T: TunnelPacketIo>(
         {
             return Err(PeerTunnelError::DuplicatePeerAddress);
         }
-        let (runtime, outbound_rx) =
-            new_mesh_peer_runtime(ipv6_address, channel, connector, probe, probe_cooldown);
+        let (runtime, outbound_rx) = new_mesh_peer_runtime(
+            address,
+            ipv6_address,
+            channel,
+            connector,
+            probe,
+            probe_cooldown,
+        );
         if channels.insert(address, runtime).is_some() {
             return Err(PeerTunnelError::DuplicatePeerAddress);
         }
@@ -1451,7 +1480,8 @@ async fn pump_mesh_with_quality_interval<T: TunnelPacketIo>(
                             address,
                             runtime.ipv6_address,
                         ).await {
-                        Ok(()) | Err(TunError::InvalidPacket(_)) => {}
+                        Ok(()) => runtime.traffic.record(crate::status::PacketCounter::Received),
+                        Err(TunError::InvalidPacket(_)) => runtime.traffic.record(crate::status::PacketCounter::Rejected),
                         Err(error) => return Err(error.into()),
                         }
                     }
@@ -1494,6 +1524,7 @@ async fn pump_mesh_with_quality_interval<T: TunnelPacketIo>(
                             continue;
                         }
                         let (runtime, outbound_rx) = new_mesh_peer_runtime(
+                            address,
                             peer.ipv6_address,
                             peer.channel,
                             Some(peer.connector),
@@ -1551,6 +1582,7 @@ fn spawn_mesh_receiver(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(receive_mesh_peer(MeshPeerReceiver {
         address,
+        traffic: runtime.traffic.clone(),
         channel: Arc::clone(&runtime.channel),
         connector: runtime.connector.clone(),
         probe: runtime.probe.clone(),
@@ -4202,6 +4234,19 @@ mod tests {
                 .expect("A received packet"),
             packet_b
         );
+        let statuses = crate::status::snapshot();
+        let status_a = statuses
+            .iter()
+            .find(|status| status.peer == format!("peer@{b_ip}"))
+            .expect("peer A status exists");
+        assert_eq!(status_a.packets_sent_total, 1);
+        assert_eq!(status_a.packets_received_total, 1);
+        let status_b = statuses
+            .iter()
+            .find(|status| status.peer == format!("peer@{a_ip}"))
+            .expect("peer B status exists");
+        assert_eq!(status_b.packets_sent_total, 1);
+        assert_eq!(status_b.packets_received_total, 1);
 
         endpoint_a.close(0_u32.into(), b"test disconnect");
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), pump_a)
