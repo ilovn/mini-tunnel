@@ -1,6 +1,75 @@
 # Linux systemd deployment templates
 
-These templates install the coordinator and opaque TCP relay as separate, unprivileged services. They require systemd 247 or newer for the complete sandbox profile. They do not configure a firewall, TLS proxy, certificate renewal, or secret distribution. Review those choices for your host before enabling the units.
+The Coordinator and opaque Relay templates run as unprivileged server services; the separate peer template grants only the TUN/route privileges required by a client mesh. All templates require systemd 247 or newer for the complete sandbox profile. They do not configure a firewall, TLS proxy, certificate renewal, or secret distribution. Review those choices for your host before enabling the units.
+
+## Linux peer mesh service
+
+`mini-tunnel-peer@.service` runs one mesh network per systemd instance under the dedicated `mini-tunnel` account. It enables ICE, configures the selected STUN service, installs only authenticated peer host routes, and restarts the foreground CLI after an unexpected exit. It grants `CAP_NET_ADMIN`, access to `/dev/net/tun`, and the `AF_NETLINK` family required for TUN and route setup. It explicitly removes Coordinator admin, invite, and Relay signing-key variables before starting the peer process.
+
+Install the account if it is not already present from a Coordinator/Relay deployment, then install the binary. The peer service keeps its identity and joined-network membership beneath `/var/lib/mini-tunnel`; systemd creates that state directory with mode `0700`:
+
+```sh
+getent passwd mini-tunnel >/dev/null || \
+  sudo useradd --system --home-dir /var/lib/mini-tunnel --create-home \
+    --shell /usr/sbin/nologin mini-tunnel
+sudo install -m 0755 mini-tunnel /usr/local/bin/mini-tunnel
+sudo install -d -o root -g root -m 0755 /etc/mini-tunnel
+sudo install -d -o mini-tunnel -g mini-tunnel -m 0700 /var/lib/mini-tunnel
+sudo install -m 0644 mini-tunnel-peer@.service /etc/systemd/system/mini-tunnel-peer@.service
+```
+
+Create a root-owned per-network environment file. Values must not contain whitespace; `BIND_ADDRESS` is the local UDP socket, and `STUN_SERVER` is one numeric `host:port` endpoint. If running more than one network on a host, assign a distinct UDP bind port and status port to each instance:
+
+```sh
+sudo install -o root -g root -m 0600 /dev/null /etc/mini-tunnel/peer-office.env
+sudoedit /etc/mini-tunnel/peer-office.env
+```
+
+The file contains non-secret connection settings:
+
+```ini
+NETWORK_ID=00000000-0000-0000-0000-000000000000
+BIND_ADDRESS=0.0.0.0:42000
+STUN_SERVER=111.206.174.3:3478
+MINI_TUNNEL_COORDINATOR_URL=https://coordinator.example:8443
+MINI_TUNNEL_RELAY_SERVER=relay.example:42001
+MINI_TUNNEL_STATUS_LISTEN=127.0.0.1:42003
+```
+
+For a private Coordinator CA, configure `MINI_TUNNEL_COORDINATOR_CA_CERT_FILE` in the environment file and install a readable CA bundle outside the protected state directory. The listener for the peer status endpoint must remain loopback-only. If running more than one instance, assign a distinct `MINI_TUNNEL_STATUS_LISTEN` port to each.
+
+Enroll the service identity once before starting the unit. Transfer the one-use invite token in a protected file; never put it in the environment file or command arguments. Join as the same service account and with the same XDG paths the unit uses:
+
+```sh
+sudo install -o mini-tunnel -g mini-tunnel -m 0600 invite.token \
+  /var/lib/mini-tunnel/invite.token
+sudo -u mini-tunnel env \
+  HOME=/var/lib/mini-tunnel \
+  XDG_CONFIG_HOME=/var/lib/mini-tunnel/.config \
+  XDG_DATA_HOME=/var/lib/mini-tunnel/.local/share \
+  MINI_TUNNEL_COORDINATOR_URL=https://coordinator.example:8443 \
+  MINI_TUNNEL_COORDINATOR_CA_CERT_FILE=/etc/mini-tunnel/tls/coordinator-ca.pem \
+  /usr/local/bin/mini-tunnel network join \
+    --network-id 00000000-0000-0000-0000-000000000000 \
+    --invite-token-file /var/lib/mini-tunnel/invite.token
+sudo rm -f /var/lib/mini-tunnel/invite.token
+```
+
+If the Coordinator uses a publicly trusted certificate, omit the `MINI_TUNNEL_COORDINATOR_CA_CERT_FILE` line from the enrollment command. After the one-time join succeeds, delete the token file; the running peer unit strips admin tokens, invite tokens, database URLs, and Relay signing keys from its environment.
+
+Then start and inspect the instance:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now mini-tunnel-peer@office.service
+sudo systemctl status mini-tunnel-peer@office.service
+sudo journalctl -fu mini-tunnel-peer@office.service
+mini-tunnel peer status --url http://127.0.0.1:42003
+```
+
+The device private key is stored by the application with user-only permissions. `StateDirectory` persists it across service restarts. The unit is intentionally not installed or enabled by package scripts; administrators opt in after enrolling the device. To stop one network, run `sudo systemctl disable --now mini-tunnel-peer@office.service`. Keep `/var/lib/mini-tunnel` while any instance uses the identity or memberships. Replacing the binary can be rolled back by restoring the previous binary and restarting the unit; membership state is not migrated by a binary update.
+
+The unit's `ProtectSystem=strict`, `ProtectHome`, `NoNewPrivileges`, private temporary directory, capability bounding set, device policy, address-family allowlist, and process/kernel protections constrain the peer. The service cannot create arbitrary devices or access network administration without `CAP_NET_ADMIN`; that capability is required to create TUN and install the explicit peer routes. Do not add `CAP_NET_RAW`, disable `NoNewPrivileges`, or expose the status endpoint publicly.
 
 ## Network exposure
 
@@ -113,9 +182,9 @@ Enable either `mini-tunnel-coordinator.service` for a single-node JSON snapshot 
 
 PostgreSQL stores short-lived ICE credentials and relay pairing metadata alongside durable network state. Restrict database access and protect database disks and backups accordingly; ICE passwords are ephemeral credentials, not long-term secrets.
 
-On Unix, both services treat systemd's default `SIGTERM` and `Ctrl+C` as graceful shutdown signals. The relay waits up to its configured shutdown grace period for paired sessions to finish; the coordinator stops accepting new requests and completes in-flight requests.
+On Unix, the services treat systemd's default `SIGTERM` and `Ctrl+C` as graceful shutdown signals. The peer mesh stops forwarding and removes its managed peer routes and TUN; the Relay waits up to its configured shutdown grace period for paired sessions to finish; the Coordinator stops accepting new requests and completes in-flight requests.
 
-`ProtectSystem=strict`, `NoNewPrivileges`, and the dedicated account limit service access. Both units drop all Linux capabilities, hide device nodes, and protect kernel control interfaces, the system clock, and other processes in procfs. Namespace creation and writable-executable memory are disabled. The relay does not need TUN or network-administration capabilities. These services do not run the peer TUN client; client-side interface and route setup requires a separate, explicit privilege model.
+`ProtectSystem=strict`, `NoNewPrivileges`, and the dedicated account limit service access. The Coordinator and Relay units drop all Linux capabilities and hide device nodes; neither needs TUN or network-administration rights. They protect kernel control interfaces, the system clock, and other processes in procfs. Namespace creation and writable-executable memory are disabled. The peer unit has a separate, narrow exception for `CAP_NET_ADMIN`, `/dev/net/tun`, and `AF_NETLINK` because the TUN and explicit host-route lifecycle requires those privileges.
 
 ## Upgrade and rollback
 

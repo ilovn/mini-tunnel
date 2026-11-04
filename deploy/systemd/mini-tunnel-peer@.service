@@ -1,0 +1,52 @@
+[Unit]
+Description=mini-tunnel peer mesh (%i)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+ConditionPathExists=/etc/mini-tunnel/peer-%i.env
+
+[Service]
+Type=simple
+User=mini-tunnel
+Group=mini-tunnel
+EnvironmentFile=/etc/mini-tunnel/peer-%i.env
+Environment=HOME=/var/lib/mini-tunnel
+Environment=XDG_CONFIG_HOME=/var/lib/mini-tunnel/.config
+Environment=XDG_DATA_HOME=/var/lib/mini-tunnel/.local/share
+UnsetEnvironment=MINI_TUNNEL_ADMIN_TOKEN MINI_TUNNEL_INVITE_TOKEN MINI_TUNNEL_COORDINATOR_DATABASE_URL MINI_TUNNEL_RELAY_TICKET_KEY MINI_TUNNEL_RELAY_TICKET_KEY_FILE MINI_TUNNEL_RELAY_PREVIOUS_TICKET_KEY MINI_TUNNEL_RELAY_PREVIOUS_TICKET_KEY_FILE
+ExecStart=/usr/local/bin/mini-tunnel peer tunnel mesh --bind ${BIND_ADDRESS} --network-id ${NETWORK_ID} --stun-server ${STUN_SERVER} --ice --manage-route
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=20s
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+StateDirectory=mini-tunnel
+StateDirectoryMode=0700
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+PrivateDevices=false
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectHostname=true
+ProtectClock=true
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
