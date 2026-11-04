@@ -27,6 +27,8 @@ const EARLY_FALLBACK_MISSES: u64 = 1;
 const HEALTH_PROBE_INTERVAL: Duration = Duration::from_millis(400);
 const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DIRECT_PROBE_HANDOFF_GRACE: Duration = Duration::from_secs(2);
+const DIRECT_PROBE_BACKOFF_MAX: Duration = Duration::from_secs(300);
+const DIRECT_PROBE_BACKOFF_RESET_AFTER: Duration = Duration::from_secs(60);
 
 fn mesh_event_queue_capacity(peer_count: usize) -> usize {
     peer_count
@@ -314,6 +316,25 @@ pub fn path_quality_rtt_is_acceptable(rtt: Duration) -> bool {
 
 fn path_quality_rtt_is_acceptable_with_policy(rtt: Duration, policy: PathQualityPolicy) -> bool {
     rtt <= policy.max_rtt
+}
+
+fn next_direct_probe_cooldown(
+    current: Duration,
+    base: Duration,
+    active_direct_stability: Duration,
+) -> Duration {
+    if active_direct_stability >= DIRECT_PROBE_BACKOFF_RESET_AFTER {
+        return base;
+    }
+    current
+        .saturating_mul(2)
+        .min(base.max(DIRECT_PROBE_BACKOFF_MAX))
+}
+
+fn direct_probe_interval(cooldown: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + cooldown, cooldown);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
 }
 
 #[derive(Default)]
@@ -738,8 +759,10 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         event_tx,
         quality_interval,
     } = receiver;
+    let mut recovery_probe_cooldown = probe_cooldown;
     loop {
         let active = Arc::clone(&*channel.read().await);
+        let active_path_started_at = Instant::now();
         // Probe often enough to observe a sustained UDP loss window before the QUIC idle timeout.
         // User-configured shorter intervals remain respected for tests and constrained deployments.
         let mut keepalive =
@@ -768,9 +791,8 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
             None,
         );
         let mut force_reliable = false;
-        let mut probe_interval =
-            tokio::time::interval_at(tokio::time::Instant::now() + probe_cooldown, probe_cooldown);
-        probe_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut recovery_backoff_applied = false;
+        let mut probe_interval = direct_probe_interval(recovery_probe_cooldown);
         let (probe_tx, mut probe_rx) = tokio::sync::mpsc::channel(1);
         let mut probe_task = None;
         let (fallback_tx, mut fallback_rx) = tokio::sync::mpsc::channel(1);
@@ -914,6 +936,22 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                         .await;
                     }
                     if is_udp_path(active.transport_name()) && quality_degraded && !force_reliable {
+                        let previous_probe_cooldown = recovery_probe_cooldown;
+                        let direct_path_stability = active_path_started_at.elapsed();
+                        recovery_probe_cooldown = next_direct_probe_cooldown(
+                            recovery_probe_cooldown,
+                            probe_cooldown,
+                            direct_path_stability,
+                        );
+                        probe_interval = direct_probe_interval(recovery_probe_cooldown);
+                        recovery_backoff_applied = true;
+                        tracing::debug!(
+                            peer_address = %address,
+                            previous_probe_cooldown_ms = previous_probe_cooldown.as_millis() as u64,
+                            next_probe_cooldown_ms = recovery_probe_cooldown.as_millis() as u64,
+                            direct_path_stability_ms = direct_path_stability.as_millis() as u64,
+                            "updated direct UDP recovery probe cooldown after quality fallback"
+                        );
                         let degradation_age = udp_degradation_started_at.map(|started| started.elapsed());
                         let disconnected_deadline_remaining = degradation_age
                             .map(conservative_ice_disconnected_remaining);
@@ -987,7 +1025,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                 }
                 result = probe_rx.recv(), if probe_task.is_some() => {
                     probe_task = None;
-                    match result {
+                    let recovery_failed = match result {
                         Some(Ok(candidate))
                             if path_rank(candidate.transport_name())
                                 < path_rank(active.transport_name()) =>
@@ -1011,18 +1049,42 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                             );
                             break Ok(());
                         }
-                        Some(Ok(candidate)) => candidate.close_async().await,
-                        Some(Err(error)) => tracing::warn!(
+                        Some(Ok(candidate)) => {
+                            candidate.close_async().await;
+                            true
+                        }
+                        Some(Err(error)) => {
+                            tracing::warn!(
+                                peer_address = %address,
+                                active_path = active.transport_name(),
+                                %error,
+                                "direct UDP recovery probe failed; retaining the active reliable path"
+                            );
+                            true
+                        }
+                        None => {
+                            tracing::warn!(
+                                peer_address = %address,
+                                active_path = active.transport_name(),
+                                "direct UDP recovery probe stopped without a result; retaining the active reliable path"
+                            );
+                            true
+                        }
+                    };
+                    if recovery_failed {
+                        let previous_probe_cooldown = recovery_probe_cooldown;
+                        recovery_probe_cooldown = next_direct_probe_cooldown(
+                            recovery_probe_cooldown,
+                            probe_cooldown,
+                            Duration::ZERO,
+                        );
+                        probe_interval = direct_probe_interval(recovery_probe_cooldown);
+                        tracing::debug!(
                             peer_address = %address,
-                            active_path = active.transport_name(),
-                            %error,
-                            "direct UDP recovery probe failed; retaining the active reliable path"
-                        ),
-                        None => tracing::warn!(
-                            peer_address = %address,
-                            active_path = active.transport_name(),
-                            "direct UDP recovery probe stopped without a result; retaining the active reliable path"
-                        ),
+                            previous_probe_cooldown_ms = previous_probe_cooldown.as_millis() as u64,
+                            next_probe_cooldown_ms = recovery_probe_cooldown.as_millis() as u64,
+                            "updated direct UDP recovery probe cooldown after unsuccessful probe"
+                        );
                     }
                 }
                 result = fallback_rx.recv(), if fallback_task.is_some() => {
@@ -1148,6 +1210,22 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         let health = active.health_snapshot();
         if is_udp_path(active.transport_name()) && matches!(&failure, IdentityError::Transport(_)) {
             force_reliable = true;
+            if !recovery_backoff_applied {
+                let previous_probe_cooldown = recovery_probe_cooldown;
+                let direct_path_stability = active_path_started_at.elapsed();
+                recovery_probe_cooldown = next_direct_probe_cooldown(
+                    recovery_probe_cooldown,
+                    probe_cooldown,
+                    direct_path_stability,
+                );
+                tracing::debug!(
+                    peer_address = %address,
+                    previous_probe_cooldown_ms = previous_probe_cooldown.as_millis() as u64,
+                    next_probe_cooldown_ms = recovery_probe_cooldown.as_millis() as u64,
+                    direct_path_stability_ms = direct_path_stability.as_millis() as u64,
+                    "updated direct UDP recovery probe cooldown after transport failure"
+                );
+            }
         }
         if let Some(candidate) = ready_fallback.take() {
             if path_rank(candidate.transport_name()) > path_rank(active.transport_name()) {
@@ -2886,6 +2964,44 @@ mod tests {
             Duration::from_millis(901),
             policy
         ));
+    }
+
+    #[test]
+    fn direct_probe_failures_use_bounded_exponential_backoff() {
+        let base = Duration::from_secs(60);
+        let mut cooldown = base;
+        for expected_seconds in [120, 240, 300, 300] {
+            cooldown = next_direct_probe_cooldown(cooldown, base, Duration::ZERO);
+            assert_eq!(cooldown, Duration::from_secs(expected_seconds));
+        }
+    }
+
+    #[test]
+    fn stable_direct_path_resets_recovery_probe_backoff_to_base() {
+        let base = Duration::from_secs(60);
+        assert_eq!(
+            next_direct_probe_cooldown(
+                Duration::from_secs(300),
+                base,
+                DIRECT_PROBE_BACKOFF_RESET_AFTER,
+            ),
+            base
+        );
+    }
+
+    #[test]
+    fn recovery_probe_backoff_preserves_caller_cooldowns() {
+        let long_base = Duration::from_secs(3600);
+        assert_eq!(
+            next_direct_probe_cooldown(long_base, long_base, Duration::ZERO),
+            long_base
+        );
+
+        let short_base = Duration::from_millis(25);
+        assert_eq!(
+            next_direct_probe_cooldown(short_base, short_base, Duration::ZERO),
+            Duration::from_millis(50)
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
