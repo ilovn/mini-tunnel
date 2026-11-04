@@ -31,10 +31,12 @@ use serde::Deserialize;
 const PEER_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(5);
 const COORDINATOR_HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
 const ICE_PATH_PROMOTION_PROBATION: Duration = Duration::from_secs(31);
+const ICE_INITIAL_PATH_PROBATION: Duration = Duration::from_secs(5);
 const COORDINATOR_CA_CERT_FILE_ENV: &str = "MINI_TUNNEL_COORDINATOR_CA_CERT_FILE";
 const MAX_COORDINATOR_CA_BUNDLE_BYTES: u64 = 1024 * 1024;
 const MAX_INVITE_TOKEN_FILE_BYTES: u64 = 4096;
 const ICE_PATH_PROBATION_HEALTH_INTERVAL: Duration = Duration::from_secs(10);
+const ICE_INITIAL_PATH_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
 const DIRECT_PATH_PROMOTION_PROBATION: Duration = Duration::from_secs(31);
 
 #[derive(Debug, Parser)]
@@ -2487,6 +2489,14 @@ fn udp_candidate_requires_ice_consent(ice_enabled: bool, transport: &str) -> boo
     ice_enabled && transport == "QUIC/UDP"
 }
 
+fn reject_unnominated_ice_udp_channel(
+    ice_enabled: bool,
+    transport: &str,
+    has_ice_consent_monitor: bool,
+) -> bool {
+    udp_candidate_requires_ice_consent(ice_enabled, transport) && !has_ice_consent_monitor
+}
+
 fn mesh_reconnect_direct_wait(relay_endpoints: RelayEndpoints, force_reliable: bool) -> Duration {
     if force_reliable && relay_endpoints.tcp.is_some() {
         // Both peers commonly request fallback together. Keep this accept grace
@@ -2524,7 +2534,16 @@ async fn connect_tunnel_peer(
         {
             Ok(mut channel) => {
                 channel.set_ice_consent_monitor(monitor);
-                return Ok((channel, remote));
+                match validate_initial_ice_udp_probe(channel, &peer.device_id).await {
+                    Ok(channel) => return Ok((channel, remote)),
+                    Err(error) => {
+                        tracing::warn!(
+                            peer_id = %peer.device_id,
+                            %error,
+                            "ICE nominated path failed initial health probation; trying advertised candidates"
+                        );
+                    }
+                }
             }
             Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer) => {
                 monitor.stop().await;
@@ -2545,6 +2564,21 @@ async fn connect_tunnel_peer(
         peer_key,
     )
     .await;
+    let direct_result = match direct_result {
+        Ok((channel, _remote))
+            if reject_unnominated_ice_udp_channel(
+                endpoint.ice.is_some(),
+                channel.transport_name(),
+                channel.has_ice_consent_monitor(),
+            ) =>
+        {
+            channel.close();
+            Err(mini_tunnel_agent::CandidateConnectError::Unreachable(
+                "ICE-enabled UDP candidate was not nominated and has no consent monitor".into(),
+            ))
+        }
+        result => result,
+    };
     match direct_result {
         Ok(connection) => Ok(connection),
         Err(mini_tunnel_agent::CandidateConnectError::UnauthorizedPeer) => {
@@ -2824,7 +2858,7 @@ async fn connect_mesh_peer(
         {
             Ok(mut channel) => {
                 channel.set_ice_consent_monitor(monitor);
-                match validate_udp_probe(channel, true, &peer.device_id).await {
+                match validate_initial_ice_udp_probe(channel, &peer.device_id).await {
                     Ok(channel) => {
                         return Ok(MeshPeerConnection {
                             channel,
@@ -2863,9 +2897,11 @@ async fn connect_mesh_peer(
     .await;
     let direct_result = match direct_result {
         Ok((channel, _remote))
-            if endpoint.ice.is_some()
-                && channel.transport_name() == "QUIC/UDP"
-                && !channel.has_ice_consent_monitor() =>
+            if reject_unnominated_ice_udp_channel(
+                endpoint.ice.is_some(),
+                channel.transport_name(),
+                channel.has_ice_consent_monitor(),
+            ) =>
         {
             channel.close();
             Err(mini_tunnel_agent::CandidateConnectError::Unreachable(
@@ -3676,6 +3712,20 @@ async fn validate_udp_probe(
         require_ice_consent,
         probation,
         ICE_PATH_PROBATION_HEALTH_INTERVAL,
+        Some(peer_id),
+    )
+    .await
+}
+
+async fn validate_initial_ice_udp_probe(
+    channel: mini_tunnel_agent::PeerChannel,
+    peer_id: &str,
+) -> Result<mini_tunnel_agent::PeerChannel, mini_tunnel_agent::IdentityError> {
+    validate_udp_probe_with_context(
+        channel,
+        true,
+        ICE_INITIAL_PATH_PROBATION,
+        ICE_INITIAL_PATH_HEALTH_INTERVAL,
         Some(peer_id),
     )
     .await
@@ -5376,6 +5426,12 @@ mod tests {
         assert!(udp_candidate_requires_ice_consent(true, "QUIC/UDP"));
         assert!(!udp_candidate_requires_ice_consent(true, "Relay/QUIC/UDP"));
         assert!(!udp_candidate_requires_ice_consent(false, "QUIC/UDP"));
+        assert!(reject_unnominated_ice_udp_channel(true, "QUIC/UDP", false));
+        assert!(!reject_unnominated_ice_udp_channel(true, "QUIC/UDP", true));
+        assert!(!reject_unnominated_ice_udp_channel(true, "TLS/TCP", false));
+        assert!(!reject_unnominated_ice_udp_channel(
+            false, "QUIC/UDP", false
+        ));
     }
 
     #[test]
@@ -7457,17 +7513,37 @@ mod tests {
             ice_credentials: published[1].ice_credentials.clone(),
         };
         let server_endpoint = endpoint_b.endpoint.clone();
+        let identity_b_path = temp.join("b/device.key");
         let peer_id_a = peer_a.device_id.clone();
         let peer_key_a = identity_a.public_key();
         let peer_key_b = identity_b.public_key();
-        let accept = mini_tunnel_agent::accept_peer(
-            &server_endpoint,
-            "test-network",
-            &identity_b,
-            &peer_id_a,
-            peer_key_a,
-        );
-        let (connected, selected_b, accepted) = tokio::join!(
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel(1);
+        let accept = tokio::spawn(async move {
+            let identity_b = mini_tunnel_agent::Identity::load_or_create_at(identity_b_path)
+                .expect("reload accepting identity");
+            let channel = mini_tunnel_agent::accept_peer(
+                &server_endpoint,
+                "test-network",
+                &identity_b,
+                &peer_id_a,
+                peer_key_a,
+            )
+            .await
+            .expect("accept authenticated peer");
+            let channel = std::sync::Arc::new(channel);
+            let responder_channel = std::sync::Arc::clone(&channel);
+            let responder = tokio::spawn(async move {
+                while let Ok(packet) = responder_channel.recv_packet().await {
+                    if !packet.is_empty() && packet_tx.send(packet).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let _ = accepted_tx.send((channel, responder));
+        });
+        let initial_connect_started = tokio::time::Instant::now();
+        let (connected, selected_b, accept_result) = tokio::join!(
             connect_tunnel_peer(
                 &endpoint_a,
                 &peer_b,
@@ -7480,14 +7556,35 @@ mod tests {
             select_ice_peer_address(&endpoint_b, &peer_a, &identity_b),
             accept,
         );
+        accept_result.expect("join peer accept task");
         let (channel_a, remote) = connected.expect("connect via ICE-nominated path");
+        assert!(
+            initial_connect_started.elapsed() < Duration::from_secs(20),
+            "initial ICE validation uses the short probation, not the reliable-path recovery window"
+        );
+        assert!(
+            channel_a.health_snapshot().probes_succeeded >= 3,
+            "initial ICE path must pass authenticated health probes before becoming active"
+        );
         let (selected_address_b, monitor_b) = selected_b.expect("peer B ICE nomination");
         assert_eq!(
             selected_address_b,
             endpoint_a.endpoint.local_addr().unwrap()
         );
         assert_eq!(remote, endpoint_b.endpoint.local_addr().unwrap());
-        let mut channel_b = accepted.expect("accept peer");
+        let (channel_b, responder) = accepted_rx.await.expect("accepted peer channel");
+        channel_a
+            .send_packet(b"cli-ice-e2e")
+            .await
+            .expect("send tunnel payload");
+        assert_eq!(
+            packet_rx.recv().await.expect("receive tunnel payload"),
+            b"cli-ice-e2e"
+        );
+        channel_a.close();
+        responder.await.expect("join peer health responder");
+        let mut channel_b = std::sync::Arc::try_unwrap(channel_b)
+            .unwrap_or_else(|_| panic!("health responder releases accepted channel"));
         let (stale_monitor, _, _) = mini_tunnel_agent::ice::IceConsentMonitor::new();
         let mismatched_remote = SocketAddr::new(
             selected_address_b.ip(),
@@ -7501,18 +7598,6 @@ mod tests {
             attach_nominated_ice_monitor(&mut channel_b, selected_address_b, monitor_b).await,
             "retain the accepted authenticated direct channel only with consent for its nominated remote"
         );
-        channel_a
-            .send_packet(b"cli-ice-e2e")
-            .await
-            .expect("send tunnel payload");
-        assert_eq!(
-            channel_b
-                .recv_packet()
-                .await
-                .expect("receive tunnel payload"),
-            b"cli-ice-e2e"
-        );
-        channel_a.close();
         channel_b.close();
         endpoint_a.endpoint.close(0_u32.into(), b"test complete");
         endpoint_b.endpoint.close(0_u32.into(), b"test complete");

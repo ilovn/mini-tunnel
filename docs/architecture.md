@@ -107,7 +107,7 @@ UDP “不稳定”的判定需区分丢包、拥塞和运营商 QoS：用户数
 
 核心控制消息：`RegisterDevice, Heartbeat, ListPeers, CandidateUpdate, ConnectivityCheck, SessionReady, RelayTicket, NetworkConfig, Revoke, Error`。核心数据消息只运 overlay IP packet；传输层必须提供 peer 身份、会话 epoch 和防重放属性。消息采用 protobuf 或 postcard/CBOR 的带版本 schema，首版选 protobuf 以方便跨版本诊断；不要把任意 serde 内部表示当长期 wire contract。
 
-**当前实现与原建议的差异**：Coordinator 当前是版本化路径的 HTTPS REST API，消息体为 JSON，没有 WebSocket、protobuf/CBOR schema 或通用协议版本协商。直连优先使用 QUIC；RFC 8445 ICE 是显式 `--ice` 的实验性能力，未启用时使用候选拨号器。Relay 提供 ticket 授权的 TCP stream 和 UDP 加密 datagram 转发；CLI 可选 UDP relay fallback 使用独立 Quinn socket，路径恢复可降级至 TCP relay。UDP relay 内层 QUIC payload 限为 1208 bytes，公网 NAT/QoS 矩阵仍未完成。`network diagnose` 检查 peer snapshot 和候选发布；运行中的 peer 活动路径、RTT、探测 loss 和最近切换原因可通过 loopback 本机 status 接口查询。
+**当前实现与原建议的差异**：Coordinator 当前是版本化路径的 HTTPS REST API，消息体为 JSON，没有 WebSocket、protobuf/CBOR schema 或通用协议版本协商。直连优先使用 QUIC；RFC 8445 ICE 是显式 `--ice` 的实验性能力，未启用时使用候选拨号器。Relay 提供 ticket 授权的 TCP stream 和 UDP 加密 datagram 转发；CLI 可选 UDP relay fallback 使用独立 Quinn socket，路径恢复可降级至 TCP relay。UDP relay 内层 QUIC payload 限为 1208 bytes；启用 ICE 时，首次 direct QUIC 需通过 3 次认证健康探测和 5 秒 probation（每秒探测）后才投入使用，失败则继续候选/Relay；可靠路径恢复仍使用 31 秒 probation。公网 NAT/QoS 矩阵仍未完成。`network diagnose` 检查 peer snapshot 和候选发布；运行中的 peer 活动路径、RTT、探测 loss 和最近切换原因可通过 loopback 本机 status 接口查询。
 
 TCP fallback 的帧格式：`u32_be frame_length | encrypted_packet`，最大 frame 长度受 MTU/实现上限约束；接收端先验证长度再分配内存。TCP 本身有序可靠，拥塞和丢包会阻塞该连接后续所有 packet；因此按 peer 建连接、限制队列、丢弃过期的非必要包，不做无界缓存。
 
