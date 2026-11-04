@@ -2506,7 +2506,9 @@ fn mesh_reconnect_direct_wait(relay_endpoints: RelayEndpoints, force_reliable: b
         // short so they do not wait in lockstep before pairing their relay tickets.
         Duration::from_millis(250)
             .min(mini_tunnel_relay::DEFAULT_PAIR_TIMEOUT.saturating_sub(Duration::from_millis(250)))
-    } else if !force_reliable && relay_endpoints.udp.is_some() {
+    } else if !force_reliable && (relay_endpoints.udp.is_some() || relay_endpoints.tcp.is_some()) {
+        // A failed active path has already exhausted its direct connection. Keep
+        // a short inbound grace, then let both peers request fresh relay tickets.
         Duration::from_secs(10)
     } else if force_reliable {
         Duration::from_secs(35)
@@ -5543,7 +5545,7 @@ mod tests {
     }
 
     #[test]
-    fn reliable_mesh_reconnect_starts_tcp_relay_before_pair_timeout() {
+    fn mesh_reconnect_starts_available_tcp_relay_without_long_grace() {
         let tcp_relay = RelayEndpoints {
             tcp: Some("127.0.0.1:45573".parse().unwrap()),
             udp: None,
@@ -5556,6 +5558,10 @@ mod tests {
             tcp: tcp_relay.tcp,
             udp: Some("127.0.0.1:45574".parse().unwrap()),
         };
+        let udp_relay = RelayEndpoints {
+            tcp: None,
+            udp: both_relays.udp,
+        };
         assert_eq!(
             mesh_reconnect_direct_wait(both_relays, true),
             Duration::from_millis(250),
@@ -5566,6 +5572,10 @@ mod tests {
             Duration::from_secs(10),
             "normal recovery still allows the direct/UDP relay grace"
         );
+        assert_eq!(
+            mesh_reconnect_direct_wait(udp_relay, false),
+            Duration::from_secs(10)
+        );
 
         assert_eq!(
             mesh_reconnect_direct_wait(RelayEndpoints::default(), true),
@@ -5573,9 +5583,14 @@ mod tests {
             "without a relay, retain the longer direct TCP accept window"
         );
         assert_eq!(
-            mesh_reconnect_direct_wait(tcp_relay, false),
+            mesh_reconnect_direct_wait(RelayEndpoints::default(), false),
             Duration::from_secs(65),
-            "normal reconnect retains its direct-path grace"
+            "without any relay, preserve the direct-only grace"
+        );
+        assert_eq!(
+            mesh_reconnect_direct_wait(tcp_relay, false),
+            Duration::from_secs(10),
+            "failed non-reliable paths should not wait 65 seconds before TCP Relay pairing"
         );
     }
 
