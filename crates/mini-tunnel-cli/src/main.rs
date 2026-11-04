@@ -5,7 +5,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::ExitCode,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -4294,12 +4294,70 @@ struct TunnelIceState {
 
 const MAX_PEER_CANDIDATES: usize = 8;
 const MAX_STUN_SERVERS: usize = 4;
+const STUN_MAPPING_STALE_AFTER: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StunMapping {
     server: SocketAddr,
     mapped: SocketAddr,
     related: SocketAddr,
+}
+
+#[derive(Clone, Debug)]
+struct CachedStunMapping {
+    mapping: StunMapping,
+    refreshed_at: Instant,
+}
+
+#[derive(Clone, Debug, Default)]
+struct StunMappingCache {
+    entries: Vec<CachedStunMapping>,
+}
+
+impl StunMappingCache {
+    fn new(mappings: Vec<StunMapping>, now: Instant) -> Self {
+        let mut cache = Self::default();
+        cache.refresh(mappings, now);
+        cache
+    }
+
+    fn refresh(&mut self, refreshed: Vec<StunMapping>, now: Instant) -> bool {
+        let mut changed = false;
+        for mapping in refreshed {
+            if let Some(previous) = self
+                .entries
+                .iter_mut()
+                .find(|entry| entry.mapping.server == mapping.server)
+            {
+                if previous.mapping != mapping {
+                    previous.mapping = mapping;
+                    changed = true;
+                }
+                previous.refreshed_at = now;
+            } else {
+                self.entries.push(CachedStunMapping {
+                    mapping,
+                    refreshed_at: now,
+                });
+                changed = true;
+            }
+        }
+        let previous_len = self.entries.len();
+        self.entries.retain(|entry| {
+            now.saturating_duration_since(entry.refreshed_at) < STUN_MAPPING_STALE_AFTER
+        });
+        changed || previous_len != self.entries.len()
+    }
+
+    fn mappings(&self) -> Vec<StunMapping> {
+        let mut mappings = self
+            .entries
+            .iter()
+            .map(|entry| entry.mapping.clone())
+            .collect::<Vec<_>>();
+        mappings.sort_by_key(|mapping| mapping.server);
+        mappings
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4397,25 +4455,6 @@ fn current_primary_host(
         .map(|mapping| mapping.related)
         .find(|related| host_candidates.contains(related))
         .or_else(|| host_candidates.first().copied())
-}
-
-fn merge_stun_mappings(current: &mut Vec<StunMapping>, refreshed: Vec<StunMapping>) -> bool {
-    let mut changed = false;
-    for mapping in refreshed {
-        if let Some(previous) = current
-            .iter_mut()
-            .find(|previous| previous.server == mapping.server)
-        {
-            if *previous != mapping {
-                *previous = mapping;
-                changed = true;
-            }
-        } else {
-            current.push(mapping);
-            changed = true;
-        }
-    }
-    changed
 }
 
 async fn peer_endpoint_with_optional_stun(
@@ -4536,7 +4575,7 @@ async fn create_tunnel_endpoint(
         let task_excluded_candidate_interfaces =
             std::sync::Arc::clone(&excluded_candidate_interfaces);
         tokio::spawn(async move {
-            let mut active_mappings = mappings;
+            let mut mapping_cache = StunMappingCache::new(mappings, Instant::now());
             let mut active_host_candidates = initial_host_candidates;
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
@@ -4563,7 +4602,8 @@ async fn create_tunnel_endpoint(
                     refresh_bound_address,
                     &active_host_candidates,
                 );
-                let mapping_set_changed = merge_stun_mappings(&mut active_mappings, refreshed);
+                let mapping_set_changed = mapping_cache.refresh(refreshed, Instant::now());
+                let active_mappings = mapping_cache.mappings();
                 let primary_host = current_primary_host(
                     refresh_bound_address,
                     &active_mappings,
@@ -4750,7 +4790,7 @@ async fn create_tunnel_endpoint(
         let task_excluded_candidate_interfaces =
             std::sync::Arc::clone(&excluded_candidate_interfaces);
         tokio::spawn(async move {
-            let mut active_mappings = mappings;
+            let mut mapping_cache = StunMappingCache::new(mappings, Instant::now());
             let mut active_host_candidates = initial_host_candidates;
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
@@ -4768,7 +4808,8 @@ async fn create_tunnel_endpoint(
                 let mut refreshed =
                     gather_stun_mappings(&router, &socket, &refresh_stun_servers, bound).await;
                 update_mapping_related_addresses(&mut refreshed, bound, &active_host_candidates);
-                let mapping_set_changed = merge_stun_mappings(&mut active_mappings, refreshed);
+                let mapping_set_changed = mapping_cache.refresh(refreshed, Instant::now());
+                let active_mappings = mapping_cache.mappings();
                 let related =
                     current_primary_host(bound, &active_mappings, &active_host_candidates);
                 let next_candidates = compose_non_ice_candidates(
@@ -5899,12 +5940,17 @@ mod tests {
             mapped: "198.51.100.13:43000".parse().unwrap(),
             related,
         };
-        let mut mappings = vec![
-            mapping_a.clone(),
-            mapping_b.clone(),
-            mapping_c.clone(),
-            mapping_d.clone(),
-        ];
+        let now = Instant::now();
+        let mut mapping_cache = StunMappingCache::new(
+            vec![
+                mapping_a.clone(),
+                mapping_b.clone(),
+                mapping_c.clone(),
+                mapping_d.clone(),
+            ],
+            now,
+        );
+        let mut mappings = mapping_cache.mappings();
         let mut candidates = compose_ice_candidates(
             &["tcp://203.0.113.9:443".to_owned()],
             Some(related),
@@ -5926,8 +5972,9 @@ mod tests {
             mapped: "198.51.100.20:42000".parse().unwrap(),
             ..mapping_a.clone()
         };
-        assert!(merge_stun_mappings(&mut mappings, vec![changed_a.clone()]));
-        assert!(!merge_stun_mappings(&mut mappings, Vec::new()));
+        assert!(mapping_cache.refresh(vec![changed_a.clone()], now + Duration::from_secs(10)));
+        assert!(!mapping_cache.refresh(Vec::new(), now + Duration::from_secs(20)));
+        mappings = mapping_cache.mappings();
         candidates = compose_ice_candidates(
             &["tcp://203.0.113.9:443".to_owned()],
             Some(related),
@@ -5939,6 +5986,42 @@ mod tests {
         assert!(candidates.contains(&format!("srflx://{}|{related}", changed_a.mapped)));
         assert!(!candidates.contains(&format!("srflx://{}|{related}", mapping_a.mapped)));
         assert!(candidates.contains(&format!("srflx://{}|{related}", mapping_b.mapped)));
+    }
+
+    #[test]
+    fn stale_stun_mapping_survives_one_missed_refresh_then_expires_independently() {
+        let now = Instant::now();
+        let server_a: SocketAddr = "192.0.2.21:3478".parse().unwrap();
+        let server_b: SocketAddr = "192.0.2.22:3478".parse().unwrap();
+        let related: SocketAddr = "10.0.0.4:42000".parse().unwrap();
+        let mapping_a = StunMapping {
+            server: server_a,
+            mapped: "198.51.100.21:42000".parse().unwrap(),
+            related,
+        };
+        let mapping_b = StunMapping {
+            server: server_b,
+            mapped: "198.51.100.22:43000".parse().unwrap(),
+            related,
+        };
+        let mut cache = StunMappingCache::new(vec![mapping_a.clone(), mapping_b.clone()], now);
+
+        assert!(!cache.refresh(Vec::new(), now + Duration::from_secs(60)));
+        assert_eq!(cache.mappings(), vec![mapping_a.clone(), mapping_b.clone()]);
+
+        let rebound_a = StunMapping {
+            mapped: "203.0.113.21:52000".parse().unwrap(),
+            ..mapping_a.clone()
+        };
+        assert!(cache.refresh(vec![rebound_a.clone()], now + Duration::from_secs(120)));
+        assert_eq!(cache.mappings(), vec![rebound_a.clone()]);
+
+        let recovered_b = StunMapping {
+            mapped: "203.0.113.22:53000".parse().unwrap(),
+            ..mapping_b
+        };
+        assert!(cache.refresh(vec![recovered_b.clone()], now + Duration::from_secs(180)));
+        assert_eq!(cache.mappings(), vec![rebound_a, recovered_b]);
     }
 
     #[test]
@@ -6206,8 +6289,9 @@ mod tests {
             mapped: mapping,
             related: old_related,
         };
-        let mut mappings = Vec::new();
-        assert!(merge_stun_mappings(&mut mappings, vec![old.clone()]));
+        let now = Instant::now();
+        let mut mapping_cache = StunMappingCache::new(vec![old.clone()], now);
+        let mut mappings = mapping_cache.mappings();
         let candidates = compose_ice_candidates(
             &explicit,
             Some(old_related),
@@ -6218,21 +6302,22 @@ mod tests {
         .unwrap();
         assert_eq!(candidates[1], format!("srflx://{mapping}|{old_related}"));
 
-        assert!(merge_stun_mappings(
-            &mut mappings,
+        assert!(mapping_cache.refresh(
             vec![StunMapping {
                 related: new_related,
                 ..old.clone()
-            }]
+            }],
+            now + Duration::from_secs(10),
         ));
-        assert!(merge_stun_mappings(
-            &mut mappings,
+        assert!(mapping_cache.refresh(
             vec![StunMapping {
                 mapped: new_mapping,
                 related: new_related,
                 ..old
-            }]
+            }],
+            now + Duration::from_secs(20),
         ));
+        mappings = mapping_cache.mappings();
         let candidates = compose_ice_candidates(
             &explicit,
             Some(new_related),
