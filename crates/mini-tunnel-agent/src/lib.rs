@@ -3079,7 +3079,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_path_establishes_pinned_tls_and_transfers_overlay_frames() {
+    async fn relay_path_recovers_after_server_restart_and_transfers_overlay_frames() {
         let temp =
             std::env::temp_dir().join(format!("mini-tunnel-relay-agent-{}", uuid::Uuid::new_v4()));
         let a = Identity::load_or_create_at(temp.join("a/device.key")).unwrap();
@@ -3145,8 +3145,55 @@ mod tests {
             b"through opaque relay"
         );
         task.abort();
+        let _ = task.await;
         drop(channel_a);
         drop(channel_b);
+
+        // Model the coordinator issuing fresh, one-use tickets for the same
+        // still-live peer pairing after Relay has restarted. The session ID
+        // must remain stable across retries while ticket IDs rotate.
+        let restarted_listener = tokio::net::TcpListener::bind(relay_addr).await.unwrap();
+        let restarted_server =
+            mini_tunnel_relay::RelayServer::new(mini_tunnel_relay::RelayConfig::new(secret));
+        let restarted_task =
+            tokio::spawn(async move { restarted_server.run(restarted_listener).await });
+        let recovered_ticket_a = ticket(&a, &b, 3);
+        let recovered_ticket_b = ticket(&b, &a, 4);
+        let a_id = a.device_id();
+        let b_id = b.device_id();
+        let (recovered_a, recovered_b) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(
+                connect_relay_peer(
+                    relay_addr,
+                    &recovered_ticket_a,
+                    "relay-test",
+                    &a,
+                    &b_id,
+                    b.public_key()
+                ),
+                connect_relay_peer(
+                    relay_addr,
+                    &recovered_ticket_b,
+                    "relay-test",
+                    &b,
+                    &a_id,
+                    a.public_key()
+                ),
+            )
+        })
+        .await
+        .expect("paired peers should recover promptly after Relay restarts");
+        let recovered_a = recovered_a.unwrap();
+        let recovered_b = recovered_b.unwrap();
+        recovered_a
+            .send_packet(b"overlay after relay restart")
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered_b.recv_packet().await.unwrap(),
+            b"overlay after relay restart"
+        );
+        restarted_task.abort();
         fs::remove_dir_all(temp).unwrap();
     }
 

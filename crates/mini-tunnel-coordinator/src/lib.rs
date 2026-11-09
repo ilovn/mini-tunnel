@@ -811,24 +811,22 @@ impl CoordinatorState {
         if pair_key.1 > pair_key.2 {
             std::mem::swap(&mut pair_key.1, &mut pair_key.2);
         }
-        let expires_at_ms = now.saturating_add(45_000);
-        let session_id = {
+        let (session_id, expires_at_ms) = {
             let mut pairs = lock_recover(&self.relay_pairs);
             pairs.retain(|_, pair| pair.expires_at_ms > now);
             if pairs.len() >= 8192 && !pairs.contains_key(&pair_key) {
                 return Err(ApiError::Conflict("relay pairing capacity reached"));
             }
             if let Some(pair) = pairs.get(&pair_key) {
-                if pair.first_device != request.device_id {
-                    let id = pair.session_id;
-                    pairs.remove(&pair_key);
-                    id
-                } else {
-                    pair.session_id
-                }
+                // Keep the pairing ID for its full short TTL. Either endpoint
+                // may retry while a previously issued ticket is still in
+                // flight, and Relay only pairs inverse claims with matching
+                // session IDs. Ticket IDs remain unique for replay protection.
+                (pair.session_id, pair.expires_at_ms)
             } else {
                 let mut session_id = [0_u8; 16];
                 random_fill(&mut session_id).map_err(|_| ApiError::Internal)?;
+                let expires_at_ms = now.saturating_add(45_000);
                 pairs.insert(
                     pair_key,
                     RelayPair {
@@ -837,7 +835,7 @@ impl CoordinatorState {
                         first_device: request.device_id.clone(),
                     },
                 );
-                session_id
+                (session_id, expires_at_ms)
             }
         };
         let mut ticket_id = [0_u8; 16];
@@ -5365,14 +5363,42 @@ mod tests {
             .relay_ticket(network_id, make(&key_b, &id_b, &id_a))
             .await
             .unwrap();
+        // The first device may retry while the opposite peer's earlier ticket
+        // is still connecting to the Relay. All tickets in the pairing window
+        // must therefore retain the same session ID.
+        let ticket_a_retry = state
+            .relay_ticket(network_id, make(&key_a, &id_a, &id_b))
+            .await
+            .unwrap();
         let claims_a =
             mini_tunnel_protocol::verify_relay_ticket(&[9; 32], &ticket_a.ticket, now).unwrap();
         let claims_b =
             mini_tunnel_protocol::verify_relay_ticket(&[9; 32], &ticket_b.ticket, now).unwrap();
+        let claims_a_retry =
+            mini_tunnel_protocol::verify_relay_ticket(&[9; 32], &ticket_a_retry.ticket, now)
+                .unwrap();
         assert_eq!(claims_a.session_id, claims_b.session_id);
+        assert_eq!(claims_a.session_id, claims_a_retry.session_id);
         assert_eq!(ticket_a.session_id, claims_a.session_id);
         assert_eq!(ticket_b.session_id, claims_b.session_id);
         assert_ne!(claims_a.ticket_id, claims_b.ticket_id);
+        assert_ne!(claims_a.ticket_id, claims_a_retry.ticket_id);
+        {
+            let mut pairs = lock_recover(&state.relay_pairs);
+            pairs
+                .get_mut(&(
+                    network_id,
+                    id_a.clone().min(id_b.clone()),
+                    id_a.clone().max(id_b.clone()),
+                ))
+                .expect("pair entry should be retained during its TTL")
+                .expires_at_ms = 0;
+        }
+        let ticket_after_expiry = state
+            .relay_ticket(network_id, make(&key_a, &id_a, &id_b))
+            .await
+            .unwrap();
+        assert_ne!(ticket_after_expiry.session_id, ticket_a.session_id);
         assert!(matches!(
             state
                 .relay_ticket(network_id, make(&key_a, &id_a, &"f".repeat(32)))

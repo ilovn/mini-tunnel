@@ -3448,6 +3448,185 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mesh_recovers_overlay_after_relay_restart_without_restarting_peers() {
+        use std::sync::atomic::AtomicU64;
+
+        fn relay_connector(
+            relay_addr: SocketAddr,
+            identity: Arc<Identity>,
+            peer: Arc<Identity>,
+            session_id: [u8; 16],
+            ticket_key: [u8; 32],
+            next_ticket: Arc<AtomicU64>,
+        ) -> PeerConnector {
+            Arc::new(move |_| {
+                let identity = Arc::clone(&identity);
+                let peer = Arc::clone(&peer);
+                let next_ticket = Arc::clone(&next_ticket);
+                Box::pin(async move {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("system clock after Unix epoch")
+                        .as_millis() as u64;
+                    let ticket_sequence = next_ticket
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        .to_be_bytes();
+                    let mut ticket_id = [0_u8; 16];
+                    ticket_id[8..].copy_from_slice(&ticket_sequence);
+                    let ticket = mini_tunnel_protocol::issue_relay_ticket(
+                        &ticket_key,
+                        &mini_tunnel_protocol::RelayTicketClaims {
+                            version: mini_tunnel_protocol::RELAY_TICKET_VERSION,
+                            network_id: "mesh-restart-test".into(),
+                            source_device_id: identity.device_id(),
+                            target_device_id: peer.device_id(),
+                            session_id,
+                            ticket_id,
+                            expires_at_ms: now + 60_000,
+                        },
+                    )
+                    .expect("issue unique relay ticket");
+                    crate::connect_relay_peer(
+                        relay_addr,
+                        &ticket,
+                        "mesh-restart-test",
+                        &identity,
+                        &peer.device_id(),
+                        peer.public_key(),
+                    )
+                    .await
+                })
+            })
+        }
+
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-mesh-relay-restart-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let a = Arc::new(Identity::load_or_create_at(temp.join("a/key")).unwrap());
+        let b = Arc::new(Identity::load_or_create_at(temp.join("b/key")).unwrap());
+        let ticket_key = [41_u8; 32];
+        let session_id = [42_u8; 16];
+        let relay_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap();
+        let server =
+            mini_tunnel_relay::RelayServer::new(mini_tunnel_relay::RelayConfig::new(ticket_key));
+        let relay_task = tokio::spawn(async move { server.run(relay_listener).await });
+        let connect_a = relay_connector(
+            relay_addr,
+            Arc::clone(&a),
+            Arc::clone(&b),
+            session_id,
+            ticket_key,
+            Arc::new(AtomicU64::new(1)),
+        );
+        let connect_b = relay_connector(
+            relay_addr,
+            Arc::clone(&b),
+            Arc::clone(&a),
+            session_id,
+            ticket_key,
+            Arc::new(AtomicU64::new(100)),
+        );
+        let (initial_a, initial_b) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(connect_a(true), connect_b(true))
+        })
+        .await
+        .expect("initial peers should pair through Relay");
+        let local_ip = Ipv4Addr::new(10, 253, 0, 1);
+        let peer_ip = Ipv4Addr::new(10, 253, 0, 2);
+        let (outbound_a, outbound_a_rx) = mpsc::channel(4);
+        let (inbound_a, _inbound_a_rx) = mpsc::channel(4);
+        let (_outbound_b, outbound_b_rx) = mpsc::channel(4);
+        let (inbound_b, mut inbound_b_rx) = mpsc::channel(4);
+        let io_a = Arc::new(MockPacketIo {
+            outbound: Mutex::new(outbound_a_rx),
+            inbound: inbound_a,
+            local_ipv4: local_ip,
+            local_ipv6: None,
+            mtu: 1500,
+        });
+        let io_b = Arc::new(MockPacketIo {
+            outbound: Mutex::new(outbound_b_rx),
+            inbound: inbound_b,
+            local_ipv4: peer_ip,
+            local_ipv6: None,
+            mtu: 1500,
+        });
+        let pump_io_a = Arc::clone(&io_a);
+        let pump_a = tokio::spawn(async move {
+            pump_peer_mesh_reconnecting(
+                &*pump_io_a,
+                vec![ReconnectingPeer {
+                    address: peer_ip,
+                    ipv6_address: None,
+                    channel: Arc::new(initial_a.expect("connect peer A")),
+                    connector: connect_a,
+                    probe: None,
+                    probe_cooldown: Duration::from_secs(3600),
+                }],
+            )
+            .await
+        });
+        let pump_io_b = Arc::clone(&io_b);
+        let pump_b = tokio::spawn(async move {
+            pump_peer_mesh_reconnecting(
+                &*pump_io_b,
+                vec![ReconnectingPeer {
+                    address: local_ip,
+                    ipv6_address: None,
+                    channel: Arc::new(initial_b.expect("connect peer B")),
+                    connector: connect_b,
+                    probe: None,
+                    probe_cooldown: Duration::from_secs(3600),
+                }],
+            )
+            .await
+        });
+
+        outbound_a
+            .send(packet(local_ip, peer_ip, 28))
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), inbound_b_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            packet(local_ip, peer_ip, 28),
+            "overlay traffic should flow before the outage"
+        );
+
+        relay_task.abort();
+        let _ = relay_task.await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let restarted_listener = tokio::net::TcpListener::bind(relay_addr).await.unwrap();
+        let restarted_server =
+            mini_tunnel_relay::RelayServer::new(mini_tunnel_relay::RelayConfig::new(ticket_key));
+        let restarted_task =
+            tokio::spawn(async move { restarted_server.run(restarted_listener).await });
+        outbound_a
+            .send(packet(local_ip, peer_ip, 28))
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(8), inbound_b_rx.recv())
+                .await
+                .expect("mesh should recover after Relay restart")
+                .expect("packet should arrive after recovery"),
+            packet(local_ip, peer_ip, 28)
+        );
+
+        pump_a.abort();
+        pump_b.abort();
+        restarted_task.abort();
+        let _ = tokio::join!(pump_a, pump_b, restarted_task);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
     async fn mesh_reuses_prepared_reliable_fallback_after_non_ice_udp_failure() {
         async fn tcp_pair(a: Arc<Identity>, b: Arc<Identity>) -> (PeerChannel, PeerChannel) {
             let listener = peer_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
