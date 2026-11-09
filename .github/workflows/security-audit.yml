@@ -21,6 +21,15 @@ jobs:
         run: cargo install cargo-audit --version 0.22.2 --locked
 
       - name: Check RustSec advisories
-        # SQLx's disabled MySQL driver leaves rsa in Cargo.lock; no fixed release is available.
-        # CI ignores only this advisory while continuing to check every other dependency.
-        run: cargo audit --ignore RUSTSEC-2023-0071
+        # SQLx's disabled MySQL driver leaves rsa in Cargo.lock with no fix.
+        # Its disabled SQLite driver also locks libsqlite3-sys; SQLx 0.9 requires Rust 1.94,
+        # above this project's Rust 1.89 MSRV, so neither optional driver is built.
+        # Keep auditing all active dependencies and every other advisory.
+        run: |
+          sqlite_tree="$(cargo tree -i libsqlite3-sys --target all --locked --prefix none 2>/dev/null)"
+          if [ -n "$sqlite_tree" ]; then
+            printf '%s\n' "$sqlite_tree"
+            echo 'The SQLite driver became active; remove its advisory exception and resolve the vulnerability.' >&2
+            exit 1
+          fi
+          cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459
