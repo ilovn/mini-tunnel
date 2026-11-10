@@ -32,6 +32,7 @@ const PEER_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(5);
 const COORDINATOR_HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
 const ICE_PATH_PROMOTION_PROBATION: Duration = Duration::from_secs(31);
 const ICE_INITIAL_PATH_PROBATION: Duration = Duration::from_secs(5);
+const INITIAL_ICE_SNAPSHOT_REFRESH_RETRIES: usize = 2;
 const COORDINATOR_CA_CERT_FILE_ENV: &str = "MINI_TUNNEL_COORDINATOR_CA_CERT_FILE";
 const MAX_COORDINATOR_CA_BUNDLE_BYTES: u64 = 1024 * 1024;
 const MAX_INVITE_TOKEN_FILE_BYTES: u64 = 4096;
@@ -2743,9 +2744,10 @@ async fn select_ice_peer_address_with_timeout(
     }
 }
 
-/// A peer list can race another agent's startup credential publication. If that happens, the
-/// first checklist uses the peer's previous ufrag and cannot authenticate its checks. Refresh
-/// once after a failed initial checklist and retry only when the peer snapshot actually changed.
+/// A peer list can race another agent's startup credential publication. If that happens, an
+/// initial checklist can use a prior ufrag, and the refreshed snapshot can itself be superseded
+/// while the retry is running. Retry only when signed peer ICE data changes, with a fixed cap so
+/// unreachable peers still move on to direct candidates and Relay fallback.
 async fn select_ice_peer_address_with_snapshot_refresh(
     endpoint: &TunnelEndpoint,
     coordinator_url: &str,
@@ -2761,23 +2763,32 @@ async fn select_ice_peer_address_with_snapshot_refresh(
     }
     endpoint.ice.as_ref()?;
 
-    let previous_credentials = peer.ice_credentials.clone();
-    let previous_candidates = peer.candidates.clone();
-    let refreshed = refresh_peer_snapshot_for_ice(coordinator_url, network_id, peer, identity)
-        .await
-        .ok()?;
-    if refreshed.ice_credentials == previous_credentials
-        && refreshed.candidates == previous_candidates
-    {
-        return None;
-    }
+    for retry in 1..=INITIAL_ICE_SNAPSHOT_REFRESH_RETRIES {
+        let previous_credentials = peer.ice_credentials.clone();
+        let previous_candidates = peer.candidates.clone();
+        let refreshed = refresh_peer_snapshot_for_ice(coordinator_url, network_id, peer, identity)
+            .await
+            .ok()?;
+        if refreshed.ice_credentials == previous_credentials
+            && refreshed.candidates == previous_candidates
+        {
+            return None;
+        }
 
-    tracing::debug!(
-        peer_id = %peer.device_id,
-        "peer ICE snapshot changed during initial checks; retrying with refreshed credentials and candidates"
-    );
-    *peer = refreshed;
-    select_ice_peer_address_with_timeout(endpoint, peer, identity, check_timeout).await
+        tracing::debug!(
+            peer_id = %peer.device_id,
+            retry,
+            max_retries = INITIAL_ICE_SNAPSHOT_REFRESH_RETRIES,
+            "peer ICE snapshot changed during initial checks; retrying with refreshed credentials and candidates"
+        );
+        *peer = refreshed;
+        if let Some(selected) =
+            select_ice_peer_address_with_timeout(endpoint, peer, identity, check_timeout).await
+        {
+            return Some(selected);
+        }
+    }
+    None
 }
 
 async fn refresh_peer_snapshot_for_ice(
@@ -7045,6 +7056,20 @@ mod tests {
         axum::Json(PeerListResponse { peers })
     }
 
+    type IcePeerSnapshotSequence =
+        std::sync::Arc<tokio::sync::Mutex<std::collections::VecDeque<PeerInfo>>>;
+
+    async fn ice_peer_snapshot_sequence_handler(
+        axum::extract::State(sequence): axum::extract::State<IcePeerSnapshotSequence>,
+    ) -> axum::Json<PeerListResponse> {
+        let peer = sequence
+            .lock()
+            .await
+            .pop_front()
+            .expect("only the expected bounded snapshot refreshes are requested");
+        axum::Json(PeerListResponse { peers: vec![peer] })
+    }
+
     #[tokio::test]
     async fn shutdown_signal_accepts_either_signal_source() {
         let result = select_shutdown_signal(
@@ -7148,19 +7173,25 @@ mod tests {
         let base_url = format!("http://{coordinator}");
 
         let mut startup_peer = expected_peer.clone();
+        let initial_ice_started = tokio::time::Instant::now();
         assert!(
-            select_ice_peer_address_with_snapshot_refresh(
-                &local_endpoint,
-                &base_url,
-                "restart-net",
-                &mut startup_peer,
-                &identity,
-                Duration::from_millis(50),
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                select_ice_peer_address_with_snapshot_refresh(
+                    &local_endpoint,
+                    &base_url,
+                    "restart-net",
+                    &mut startup_peer,
+                    &identity,
+                    Duration::from_millis(50),
+                ),
             )
             .await
+            .expect("unchanged snapshot must keep startup ICE bounded")
             .is_none(),
             "the peer endpoint is not running an ICE checklist in this refresh-only assertion"
         );
+        assert!(initial_ice_started.elapsed() < Duration::from_secs(1));
         assert_eq!(
             startup_peer.ice_credentials,
             Some(fresh_credentials.clone()),
@@ -8020,6 +8051,160 @@ mod tests {
         udp_relay.shutdown();
         udp_server.await.expect("UDP relay task");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn initial_ice_refreshes_again_when_snapshot_changes_during_retry() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-initial-ice-retry-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let identity_a = mini_tunnel_agent::Identity::load_or_create_at(temp.join("a/device.key"))
+            .expect("identity A");
+        let mut identity_b =
+            mini_tunnel_agent::Identity::load_or_create_at(temp.join("b/device.key"))
+                .expect("identity B");
+        let mut identity_paths = vec![temp.join("b/device.key")];
+        while identity_a.device_id() > identity_b.device_id() {
+            let path = temp.join(format!("b/peer-{}.key", identity_paths.len()));
+            identity_b = mini_tunnel_agent::Identity::load_or_create_at(path.clone())
+                .expect("identity B ordered after identity A");
+            identity_paths.push(path);
+        }
+
+        let credentials_a =
+            mini_tunnel_agent::ice::generate_ice_credentials(3).expect("current ICE credentials A");
+        let intermediate_credentials_a = mini_tunnel_agent::ice::generate_ice_credentials(2)
+            .expect("intermediate ICE credentials A");
+        let stale_credentials_a =
+            mini_tunnel_agent::ice::generate_ice_credentials(1).expect("stale ICE credentials A");
+        let credentials_b =
+            mini_tunnel_agent::ice::generate_ice_credentials(1).expect("current ICE credentials B");
+        let make_endpoint =
+            |identity: &mini_tunnel_agent::Identity,
+             credentials: mini_tunnel_protocol::IceCredentials| {
+                let iced = mini_tunnel_agent::ice::peer_endpoint_with_ice(
+                    identity,
+                    "127.0.0.1:0".parse().unwrap(),
+                    16,
+                )
+                .expect("create test ICE endpoint");
+                let address = iced.endpoint.local_addr().expect("endpoint address");
+                (
+                    TunnelEndpoint {
+                        endpoint: iced.endpoint,
+                        excluded_candidate_interfaces: std::sync::Arc::new(std::sync::RwLock::new(
+                            std::collections::HashSet::new(),
+                        )),
+                        ice: Some(TunnelIceState {
+                            credentials,
+                            socket: iced.socket,
+                            router: iced.ice_router,
+                            local_socket_addr: address,
+                            local_candidates: std::sync::Arc::new(tokio::sync::RwLock::new(vec![
+                                mini_tunnel_agent::candidate::SignaledCandidate {
+                                    address,
+                                    transport:
+                                        mini_tunnel_agent::candidate::CandidateTransport::Udp,
+                                    candidate_type:
+                                        mini_tunnel_agent::candidate::CandidateType::Host,
+                                },
+                            ])),
+                        }),
+                    },
+                    address,
+                )
+            };
+
+        let (endpoint_a, address_a) = make_endpoint(&identity_a, credentials_a.clone());
+        let (endpoint_b, _) = make_endpoint(&identity_b, credentials_b.clone());
+        let peer_a = PeerInfo {
+            device_id: identity_a.device_id(),
+            assigned_ipv4: "10.78.0.1".to_owned(),
+            public_key: identity_a.public_key_encoded(),
+            candidates: vec![address_a.to_string()],
+            ice_credentials: Some(credentials_a.clone()),
+        };
+        let stale_peer_a = PeerInfo {
+            ice_credentials: Some(stale_credentials_a),
+            ..peer_a.clone()
+        };
+        let intermediate_peer_a = PeerInfo {
+            ice_credentials: Some(intermediate_credentials_a),
+            ..peer_a.clone()
+        };
+        let peer_b = PeerInfo {
+            device_id: identity_b.device_id(),
+            assigned_ipv4: "10.78.0.2".to_owned(),
+            public_key: identity_b.public_key_encoded(),
+            candidates: vec![endpoint_b.endpoint.local_addr().unwrap().to_string()],
+            ice_credentials: Some(credentials_b),
+        };
+
+        let sequence: IcePeerSnapshotSequence =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::from([
+                intermediate_peer_a,
+                peer_a,
+            ])));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock coordinator");
+        let coordinator = listener.local_addr().expect("coordinator address");
+        let app = Router::new()
+            .route(
+                "/v1/networks/ice-retry-net/peers",
+                axum::routing::post(ice_peer_snapshot_sequence_handler),
+            )
+            .with_state(std::sync::Arc::clone(&sequence));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let coordinator_url = format!("http://{coordinator}");
+
+        let peer_b_for_check = peer_b.clone();
+        let endpoint_a_for_check = endpoint_a.clone();
+        let identity_a_path = temp.join("a/device.key");
+        let accepting_check = tokio::spawn(async move {
+            let identity_a = mini_tunnel_agent::Identity::load_or_create_at(identity_a_path)
+                .expect("reload identity A");
+            select_ice_peer_address_with_timeout(
+                &endpoint_a_for_check,
+                &peer_b_for_check,
+                &identity_a,
+                Duration::from_secs(2),
+            )
+            .await
+        });
+
+        let peer_b_path = identity_paths.last().expect("identity B path").clone();
+        let identity_b =
+            mini_tunnel_agent::Identity::load_or_create_at(peer_b_path).expect("reload identity B");
+        let mut initial_peer = stale_peer_a;
+        let selected = tokio::time::timeout(
+            Duration::from_secs(3),
+            select_ice_peer_address_with_snapshot_refresh(
+                &endpoint_b,
+                &coordinator_url,
+                "ice-retry-net",
+                &mut initial_peer,
+                &identity_b,
+                Duration::from_millis(150),
+            ),
+        )
+        .await
+        .expect("bounded ICE snapshot retries");
+        let Some((_, monitor)) = selected else {
+            panic!("a second peer snapshot update should recover initial ICE nomination");
+        };
+        drop(monitor);
+        let accepting = accepting_check.await.expect("join accepting ICE checklist");
+        let Some((_, accepting_monitor)) = accepting else {
+            panic!("the accepting ICE checklist should nominate the same direct path");
+        };
+        drop(accepting_monitor);
+        assert!(sequence.lock().await.is_empty());
+        server.abort();
+        drop(endpoint_a);
+        drop(endpoint_b);
+        std::fs::remove_dir_all(&temp).expect("remove temporary peer identities");
     }
 
     #[test]
