@@ -8,7 +8,7 @@ use std::{
     pin::Pin,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     sync::{Arc, OnceLock},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use thiserror::Error;
@@ -554,6 +554,84 @@ async fn wait_for_ice_consent_state_change(
     current
 }
 
+async fn wait_for_ice_consent_failure_signal(
+    receiver: &mut Option<tokio::sync::watch::Receiver<bool>>,
+) -> bool {
+    let Some(receiver) = receiver else {
+        return std::future::pending::<bool>().await;
+    };
+    loop {
+        if *receiver.borrow() {
+            return true;
+        }
+        if receiver.changed().await.is_err() {
+            return false;
+        }
+    }
+}
+
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn start_retired_ice_consent_observation(
+    peer_address: Ipv4Addr,
+    active: &Arc<PeerChannel>,
+    fallback_path: &str,
+) -> Option<(Arc<PeerChannel>, u64, Instant)> {
+    if !active.has_ice_consent_monitor() {
+        return None;
+    }
+    if active
+        .ice_consent_failure_receiver()
+        .is_some_and(|receiver| *receiver.borrow())
+    {
+        tracing::debug!(
+            peer_address = %peer_address,
+            path = active.transport_name(),
+            "ICE consent had already failed before reliable fallback became active"
+        );
+        return None;
+    }
+    let fallback_ready_at_unix_ms = unix_timestamp_ms();
+    let fallback_ready_at = Instant::now();
+    tracing::info!(
+        peer_address = %peer_address,
+        from_path = active.transport_name(),
+        to_path = fallback_path,
+        fallback_ready_at_unix_ms,
+        "starting bounded ICE consent observation on retired UDP path"
+    );
+    Some((
+        Arc::clone(active),
+        fallback_ready_at_unix_ms,
+        fallback_ready_at,
+    ))
+}
+
+async fn stop_retired_ice_consent_observation(
+    peer_address: Ipv4Addr,
+    retired: &mut Option<(Arc<PeerChannel>, u64, Instant)>,
+    reason: &'static str,
+) {
+    if let Some((peer, fallback_ready_at_unix_ms, fallback_ready_at)) = retired.take() {
+        let observation_ended_at_unix_ms = unix_timestamp_ms();
+        tracing::info!(
+            peer_address = %peer_address,
+            fallback_ready_at_unix_ms,
+            observation_ended_at_unix_ms,
+            ice_consent_observation_ms = fallback_ready_at.elapsed().as_millis() as u64,
+            reason,
+            "stopping bounded ICE consent observation"
+        );
+        peer.stop_ice_consent_monitor().await;
+    }
+}
+
 impl Deref for MeshReceiverTasks {
     type Target = HashMap<Ipv4Addr, tokio::task::JoinHandle<()>>;
 
@@ -760,6 +838,9 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         quality_interval,
     } = receiver;
     let mut recovery_probe_cooldown = probe_cooldown;
+    // Keep the previous nominated UDP session alive only as an ICE consent observer after
+    // switching packet forwarding to a reliable path. The recovery probe cadence bounds it.
+    let mut retired_ice_consent: Option<(Arc<PeerChannel>, u64, Instant)> = None;
     loop {
         let active = Arc::clone(&*channel.read().await);
         let active_path_started_at = Instant::now();
@@ -792,6 +873,10 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         );
         let mut force_reliable = false;
         let mut recovery_backoff_applied = false;
+        let mut retired_consent_failure = retired_ice_consent
+            .as_ref()
+            .and_then(|(peer, _, _)| peer.ice_consent_failure_receiver());
+        let mut observe_retired_consent = retired_consent_failure.is_some();
         let mut probe_interval = direct_probe_interval(recovery_probe_cooldown);
         let (probe_tx, mut probe_rx) = tokio::sync::mpsc::channel(1);
         let mut probe_task = None;
@@ -821,6 +906,34 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                 }
                 _ = active.wait_ice_consent_failure() => {
                     break Err(IdentityError::Transport("ICE consent expired".to_owned()));
+                }
+                consent_failed = wait_for_ice_consent_failure_signal(&mut retired_consent_failure), if observe_retired_consent => {
+                    if let Some((retired, fallback_ready_at_unix_ms, fallback_ready_at)) = retired_ice_consent.take() {
+                        if consent_failed {
+                            let consent_expiry_observed_at_unix_ms = unix_timestamp_ms();
+                            tracing::info!(
+                                peer_address = %address,
+                                fallback_ready_at_unix_ms,
+                                consent_expiry_observed_at_unix_ms,
+                                ice_consent_observation_ms = fallback_ready_at.elapsed().as_millis() as u64,
+                                active_path = active.transport_name(),
+                                reason = "ice_consent_expired_after_reliable_fallback",
+                                "retired direct ICE consent monitor reported expiry while reliable path remained active"
+                            );
+                        } else {
+                            tracing::warn!(
+                                peer_address = %address,
+                                fallback_ready_at_unix_ms,
+                                observation_ms = fallback_ready_at.elapsed().as_millis() as u64,
+                                active_path = active.transport_name(),
+                                reason = "ice_consent_monitor_stopped_without_failure",
+                                "retired ICE consent monitor stopped before reporting expiry"
+                            );
+                        }
+                        retired.stop_ice_consent_monitor().await;
+                        retired_consent_failure = None;
+                        observe_retired_consent = false;
+                    }
                 }
                 degraded = wait_for_ice_consent_state_change(
                     &mut ice_consent_degraded,
@@ -992,6 +1105,11 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                                 conservative_ice_disconnected_remaining_ms = udp_degradation_started_at.map(|started: Instant| conservative_ice_disconnected_remaining(started.elapsed()).as_millis() as u64),
                                 "peer path switched to prepared reliable fallback"
                             );
+                            retired_ice_consent = start_retired_ice_consent_observation(
+                                address,
+                                &active,
+                                fallback_path,
+                            );
                             *channel.write().await = Arc::new(candidate);
                             let health = channel.read().await.health_snapshot();
                             crate::status::update(
@@ -1015,6 +1133,11 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                     }
                 }
                 _ = probe_interval.tick(), if probe.is_some() && active.transport_name() != "QUIC/UDP" && probe_task.is_none() => {
+                    stop_retired_ice_consent_observation(
+                        address,
+                        &mut retired_ice_consent,
+                        "direct_recovery_probe_started",
+                    ).await;
                     let connector = Arc::clone(probe.as_ref().expect("guarded above"));
                     let sender = probe_tx.clone();
                     let try_udp_relay = should_probe_udp_relay_recovery(active.transport_name());
@@ -1105,6 +1228,11 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                                     conservative_ice_disconnected_remaining_ms = udp_degradation_started_at.map(|started: Instant| conservative_ice_disconnected_remaining(started.elapsed()).as_millis() as u64),
                                     "peer path switched to reliable fallback"
                                 );
+                                retired_ice_consent = start_retired_ice_consent_observation(
+                                    address,
+                                    &active,
+                                    fallback_path,
+                                );
                                 *channel.write().await = Arc::new(candidate);
                                 let health = channel.read().await.health_snapshot();
                                 crate::status::update(
@@ -1174,7 +1302,14 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                 if let Some(task) = fallback_task.take() {
                     task.abort();
                 }
-                active.stop_ice_consent_monitor().await;
+                if retired_ice_consent
+                    .as_ref()
+                    .is_some_and(|(retired, _, _)| Arc::ptr_eq(retired, &active))
+                {
+                    active.close();
+                } else {
+                    active.stop_ice_consent_monitor().await;
+                }
                 continue;
             }
             Err(failure) => failure,
@@ -1206,7 +1341,6 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
             }
             candidate.close_async().await;
         }
-        active.stop_ice_consent_monitor().await;
         let health = active.health_snapshot();
         if is_udp_path(active.transport_name()) && matches!(&failure, IdentityError::Transport(_)) {
             force_reliable = true;
@@ -1241,6 +1375,8 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                     conservative_ice_disconnected_remaining_ms = udp_degradation_started_at.map(|started: Instant| conservative_ice_disconnected_remaining(started.elapsed()).as_millis() as u64),
                     "peer path recovered immediately with a prepared reliable channel"
                 );
+                retired_ice_consent =
+                    start_retired_ice_consent_observation(address, &active, fallback_path);
                 active.close_async().await;
                 *channel.write().await = Arc::new(candidate);
                 let recovered_health = channel.read().await.health_snapshot();
@@ -1257,6 +1393,13 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
             }
             candidate.close_async().await;
         }
+        active.stop_ice_consent_monitor().await;
+        stop_retired_ice_consent_observation(
+            address,
+            &mut retired_ice_consent,
+            "active_reliable_path_failed",
+        )
+        .await;
         crate::status::update(
             address.to_string(),
             false,
@@ -2195,18 +2338,30 @@ mod tests {
         let accept_udp = tokio::spawn(async move {
             accept_peer(&server_endpoint, network, &server_identity, &a_id, a_key).await
         });
-        let initial = Arc::new(
-            connect_peer(
-                &endpoint_a,
-                endpoint_b.local_addr().expect("endpoint B address"),
-                network,
-                &a,
-                &b_id,
-                b_key,
-            )
-            .await
-            .expect("establish authenticated QUIC over veth"),
-        );
+        let mut initial_channel = connect_peer(
+            &endpoint_a,
+            endpoint_b.local_addr().expect("endpoint B address"),
+            network,
+            &a,
+            &b_id,
+            b_key,
+        )
+        .await
+        .expect("establish authenticated QUIC over veth");
+        let (monitor, mut cancel, failure_sender) = crate::ice::IceConsentMonitor::new();
+        let mut failure_observer = monitor.failure_receiver();
+        let cancel_observer = cancel.clone();
+        let (expire_tx, expire_rx) = tokio::sync::oneshot::channel();
+        monitor
+            .set_task(tokio::spawn(async move {
+                tokio::select! {
+                    _ = cancel.changed() => {}
+                    _ = expire_rx => failure_sender.send_replace(true),
+                }
+            }))
+            .await;
+        initial_channel.set_ice_consent_monitor(monitor);
+        let initial = Arc::new(initial_channel);
         let remote_initial = accept_udp.await.expect("join UDP accept").unwrap();
         let remote_initial = Arc::new(remote_initial);
         let responder_task = {
@@ -2321,6 +2476,45 @@ mod tests {
         })
         .await
         .expect("degraded UDP quality should promote the prepared TCP path before forwarding");
+
+        assert!(
+            !*failure_observer.borrow() && !*cancel_observer.borrow(),
+            "the old ICE consent monitor must remain active after TCP fallback"
+        );
+        expire_tx
+            .send(())
+            .expect("request deterministic consent expiry after fallback");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !*failure_observer.borrow() {
+                failure_observer
+                    .changed()
+                    .await
+                    .expect("monitor reports deterministic consent expiry");
+            }
+        })
+        .await
+        .expect("consent monitor remains observable after fallback");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if *cancel_observer.borrow() {
+                    break;
+                }
+                cancel_observer
+                    .changed()
+                    .await
+                    .expect("observer owner stops monitor after expiry");
+            }
+        })
+        .await
+        .expect("mesh cleans up retired ICE monitor after expiry");
+        assert!(
+            crate::status::snapshot().into_iter().any(|status| {
+                status.peer == peer_ip.to_string()
+                    && status.online
+                    && status.active_path == "TLS/TCP"
+            }),
+            "consent expiry on the retired UDP path must not interrupt TCP forwarding"
+        );
 
         outbound_tx
             .send(packet(local_ip, peer_ip, 28))
@@ -2745,6 +2939,40 @@ mod tests {
             quality_detection < PEER_IDLE_TIMEOUT,
             "default loss windows should be observable before the peer idle timeout"
         );
+    }
+
+    #[tokio::test]
+    async fn retired_ice_consent_observer_reports_only_explicit_failure() {
+        let (failure_sender, failure_receiver) = tokio::sync::watch::channel(false);
+        let mut receiver = Some(failure_receiver);
+        let observer =
+            tokio::spawn(async move { wait_for_ice_consent_failure_signal(&mut receiver).await });
+        tokio::task::yield_now().await;
+        assert!(!observer.is_finished());
+        failure_sender.send_replace(true);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), observer)
+                .await
+                .expect("observer wakes after consent failure")
+                .expect("observer task")
+        );
+
+        let (failure_sender, failure_receiver) = tokio::sync::watch::channel(false);
+        let mut receiver = Some(failure_receiver);
+        let observer =
+            tokio::spawn(async move { wait_for_ice_consent_failure_signal(&mut receiver).await });
+        drop(failure_sender);
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), observer)
+                .await
+                .expect("observer exits after monitor closes")
+                .expect("observer task")
+        );
+    }
+
+    #[test]
+    fn consent_observation_timestamps_use_unix_milliseconds() {
+        assert!(unix_timestamp_ms() > 1_700_000_000_000);
     }
 
     #[tokio::test]
