@@ -2,6 +2,13 @@
 
 Status: **public NAT/QoS matrix incomplete**. The loopback ICE mapping proxy verifies packet rewriting and session behavior, but it does not establish interoperability across public NATs. The VPS smoke test and the RouterOS/office fallback observation below are additional runtime evidence; neither completes a matrix case.
 
+### ICE mesh election fix: attested build and cold-start observations (2026-11-10)
+
+- The mesh path election/health-validation fix is commit `5a598dd` and was included in successful [CI run 42764935359](https://github.com/ilovn/mini-tunnel/actions/runs/42764935359), built from workflow commit `bc71bd6dbcfbc21954774cb33d44c4a7bc73952b`. All six CI jobs passed. The x86_64 and ARM64 release archives passed SHA-256 sidecar checks and GitHub artifact attestation verification against that exact source digest; both VPS endpoints ran those prebuilt artifacts.
+- On the Guangzhou x86_64 VPS and USB-backed RouterOS Debian ARM64 container, one run nominated direct ICE candidates but initially fell back to Relay/TLS. The background authenticated direct-path recovery later promoted both peers to QUIC/UDP; Relay metrics returned to zero active connections/sessions. Overlay pings passed 30/30 in both directions with 0% loss (mean RTT 11.57 ms and 11.30 ms).
+- Additional clean starts were inconsistent: several reached the startup deadline without an ICE nomination and came online over Relay/TLS. A run with explicit physical-interface binds also timed out ICE. This topology therefore verifies that nominated direct UDP can recover and carry overlay traffic, but does not yet verify reliable direct selection during cold startup. The previous field runs documented below exercise different commits/topologies and should not be combined into a single success rate.
+- Both temporary network memberships were revoked. Peers, Coordinator, Relay, SSH forwards, test listeners, overlay routes, and task-owned temporary directories were removed. The Guangzhou EasyTier processes/interfaces and the ARM container's original veth/default route remained present. No persistent firewall, route, service, or RouterOS setting was changed.
+
 ### ICE consent observer field attempts (2026-11-10; consent expiry not measured)
 
 - Used the attested x86_64 and ARM64 artifacts from CI run [42754900346](https://github.com/ilovn/mini-tunnel/actions/runs/42754900346), built from commit `06205f25eb3e1973de33e16f7cef4aa83e17d6cd`; checksums and GitHub attestations were verified before staging. The test topology was the Guangzhou VPS plus the USB-backed RouterOS Debian ARM64 container, with an isolated temporary Coordinator/Relay and overlay `10.247.253.0/24`.
