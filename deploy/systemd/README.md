@@ -22,6 +22,18 @@ sudo deploy/install-peer.sh \
   --udp-relay-server relay.example:42003
 ```
 
+To obtain the Linux binary directly on a peer from a successful CI run, use the independent downloader. Prefer a full commit for reproducible deployment:
+
+```sh
+export GITHUB_TOKEN='...'
+deploy/download-peer.sh \
+  --commit 0000000000000000000000000000000000000000 \
+  --output-dir ./mini-tunnel-download
+sudo deploy/install-peer.sh --binary ./mini-tunnel-download/mini-tunnel ...
+```
+
+GitHub requires authentication for Actions artifact downloads. Set the token only as a process environment variable; the script does not save it.
+
 Omit either Relay option if that transport is not configured. For a private CA, add `--coordinator-ca ./coordinator-ca.pem`. Before installing, `--validate-only` checks the binary, UUID, endpoint syntax, invite-file type/permissions, and presence of the unit template without changing the machine. The installer copies the invite into `/var/lib/mini-tunnel` with mode `0600`, consumes it for enrollment, and removes the temporary copy. It does not delete the source invite file. It refuses to overwrite an existing peer instance config; use a new `--instance` for another network. After installation, inspect it with:
 
 ```sh

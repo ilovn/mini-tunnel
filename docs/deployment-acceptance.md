@@ -18,6 +18,25 @@ The archives contain one `mini-tunnel` binary with these expected SHA-256 values
 | x86_64 | `c76038bf4edd4ce442be53a13295e6ccb656391988476edcf7deead1335bdda7` |
 | aarch64 | `90887c822be27b9ed27a38249e02ac0230e1f1674b498313c423fbb89a87fc6c` |
 
+On a Linux peer, `deploy/download-peer.sh` can obtain an artifact from a successful CI run and verify the ZIP structure, inner archive SHA-256, and single regular binary layout. Always pass a full commit SHA for reproducible acceptance:
+
+```sh
+GITHUB_TOKEN='...' deploy/download-peer.sh \
+  --commit 4ac3ef96e66d4566b8204a3ce71e8ac83d54cd71 \
+  --output-dir ./mini-tunnel-download
+```
+
+GitHub requires an authenticated API request for Actions artifact ZIP downloads. To avoid placing the token in a permanent shell file, read it into the current shell first:
+
+```sh
+read -rs GITHUB_TOKEN && export GITHUB_TOKEN
+deploy/download-peer.sh \
+  --commit 4ac3ef96e66d4566b8204a3ce71e8ac83d54cd71 \
+  --output-dir ./mini-tunnel-download
+```
+
+The script writes `download.json` with the commit, CI run, artifact, archive checksum, binary checksum, and verification list. Record that file with the deployment evidence.
+
 On the peer, confirm the CPU and OS before selecting the archive:
 
 ```sh
