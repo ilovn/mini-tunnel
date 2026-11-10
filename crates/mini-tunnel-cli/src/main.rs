@@ -1536,6 +1536,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         (SocketAddr, mini_tunnel_agent::ice::IceConsentMonitor),
                     >::new();
                     let mut ice_validations = tokio::task::JoinSet::new();
+                    let mut initial_ice_validation_complete = std::collections::HashSet::new();
                     let mut accept_finished = accept_tasks.is_empty();
                     let mut ice_monitor_finished = false;
                     let startup_deadline = tokio::time::Instant::now() + Duration::from_secs(45);
@@ -1788,6 +1789,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                                 connection.0.device_id, connection.2
                                             );
                                             install_mesh_peer_channel(&mut connected, connection);
+                                            initial_ice_validation_complete.insert(peer_id.clone());
                                             peer_connectors.remove(&peer_id);
                                             peer_probes.remove(&peer_id);
                                             first_peer_at.get_or_insert_with(tokio::time::Instant::now);
@@ -1829,12 +1831,24 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     for (_, (_, monitor)) in pending_ice_monitors.drain() {
                         monitor.stop().await;
                     }
-                    let connected = validate_elected_mesh_ice_paths(
-                        connected,
-                        require_ice_consent,
-                        &local_device_id,
-                    )
-                    .await;
+                    let (already_validated, validation_pending): (Vec<_>, Vec<_>) =
+                        connected.into_iter().partition(|(peer, channel, _, _, _)| {
+                            !mesh_peer_needs_initial_ice_validation(
+                                &peer.device_id,
+                                channel.transport_name(),
+                                require_ice_consent,
+                                &initial_ice_validation_complete,
+                            )
+                        });
+                    let mut connected = already_validated;
+                    connected.extend(
+                        validate_elected_mesh_ice_paths(
+                            validation_pending,
+                            require_ice_consent,
+                            &local_device_id,
+                        )
+                        .await,
+                    );
                     if connected.is_empty() {
                         println!(
                             "No mesh peers are connected yet; waiting for membership updates."
@@ -2990,6 +3004,15 @@ type ConnectedMeshPeer = (
     mini_tunnel_agent::tunnel::PeerConnector,
     mini_tunnel_agent::tunnel::PeerConnector,
 );
+
+fn mesh_peer_needs_initial_ice_validation(
+    peer_id: &str,
+    transport: &str,
+    ice_enabled: bool,
+    validation_complete: &std::collections::HashSet<String>,
+) -> bool {
+    ice_enabled && transport == "QUIC/UDP" && !validation_complete.contains(peer_id)
+}
 
 #[derive(Clone)]
 struct MeshPeerConnectOptions {
@@ -8107,6 +8130,27 @@ mod tests {
         endpoint_b.endpoint.close(0_u32.into(), b"test complete");
         coordinator_task.abort();
         std::fs::remove_dir_all(temp).expect("remove test identities");
+    }
+
+    #[test]
+    fn startup_validated_ice_path_is_not_probated_twice_after_mesh_settle() {
+        let completed = std::collections::HashSet::from(["peer-a".to_owned()]);
+
+        assert!(!mesh_peer_needs_initial_ice_validation(
+            "peer-a", "QUIC/UDP", true, &completed,
+        ));
+        assert!(mesh_peer_needs_initial_ice_validation(
+            "peer-b", "QUIC/UDP", true, &completed,
+        ));
+        assert!(!mesh_peer_needs_initial_ice_validation(
+            "peer-a",
+            "Relay/TLS",
+            true,
+            &completed,
+        ));
+        assert!(!mesh_peer_needs_initial_ice_validation(
+            "peer-b", "QUIC/UDP", false, &completed,
+        ));
     }
 
     #[tokio::test]
