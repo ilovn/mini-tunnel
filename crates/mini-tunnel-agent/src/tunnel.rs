@@ -2356,7 +2356,9 @@ mod tests {
             .set_task(tokio::spawn(async move {
                 tokio::select! {
                     _ = cancel.changed() => {}
-                    _ = expire_rx => failure_sender.send_replace(true),
+                    _ = expire_rx => {
+                        failure_sender.send_replace(true);
+                    }
                 }
             }))
             .await;
