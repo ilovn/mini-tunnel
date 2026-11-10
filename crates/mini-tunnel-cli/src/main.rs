@@ -1413,7 +1413,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 relay_endpoints,
                                 MeshPeerConnectOptions {
                                     reliable_only: false,
-                                    ice_probe_validation: IceProbeValidation::InitialConnection,
+                                    ice_probe_validation: IceProbeValidation::ElectedMeshInitial,
                                 },
                             )
                             .await;
@@ -1724,6 +1724,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     for (_, (_, monitor)) in pending_ice_monitors.drain() {
                         monitor.stop().await;
                     }
+                    let connected = validate_elected_mesh_ice_paths(
+                        connected,
+                        require_ice_consent,
+                        &local_device_id,
+                    )
+                    .await;
                     if connected.is_empty() {
                         println!(
                             "No mesh peers are connected yet; waiting for membership updates."
@@ -2838,8 +2844,18 @@ struct MeshPeerConnection {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IceProbeValidation {
     InitialConnection,
+    /// Validate the selected ICE channel after mesh election pairs each outbound/inbound path.
+    ElectedMeshInitial,
     Recovery,
 }
+
+type ConnectedMeshPeer = (
+    PeerInfo,
+    mini_tunnel_agent::PeerChannel,
+    SocketAddr,
+    mini_tunnel_agent::tunnel::PeerConnector,
+    mini_tunnel_agent::tunnel::PeerConnector,
+);
 
 #[derive(Clone, Copy)]
 struct MeshPeerConnectOptions {
@@ -3798,19 +3814,35 @@ async fn validate_udp_probe(
         DIRECT_PATH_PROMOTION_PROBATION
     };
     validate_udp_probe_with_context(
-        channel,
+        &channel,
         require_ice_consent,
         probation,
         ICE_PATH_PROBATION_HEALTH_INTERVAL,
         Some(peer_id),
     )
-    .await
+    .await?;
+    Ok(channel)
 }
 
 async fn validate_initial_ice_udp_probe(
     channel: mini_tunnel_agent::PeerChannel,
     peer_id: &str,
 ) -> Result<mini_tunnel_agent::PeerChannel, mini_tunnel_agent::IdentityError> {
+    validate_udp_probe_with_context(
+        &channel,
+        true,
+        ICE_INITIAL_PATH_PROBATION,
+        ICE_INITIAL_PATH_HEALTH_INTERVAL,
+        Some(peer_id),
+    )
+    .await?;
+    Ok(channel)
+}
+
+async fn validate_initial_ice_udp_probe_ref(
+    channel: &mini_tunnel_agent::PeerChannel,
+    peer_id: &str,
+) -> Result<(), mini_tunnel_agent::IdentityError> {
     validate_udp_probe_with_context(
         channel,
         true,
@@ -3821,6 +3853,84 @@ async fn validate_initial_ice_udp_probe(
     .await
 }
 
+async fn validate_elected_mesh_ice_paths(
+    connected: Vec<ConnectedMeshPeer>,
+    ice_enabled: bool,
+    local_device_id: &str,
+) -> Vec<ConnectedMeshPeer> {
+    let validations = connected.into_iter().map(|(peer, channel, remote, connector, probe)| {
+        async move {
+            if !ice_enabled || channel.transport_name() != "QUIC/UDP" {
+                return Some((peer, channel, remote, connector, probe));
+            }
+
+            let peer_id = peer.device_id.clone();
+            let owns_outbound = local_device_id < peer_id.as_str();
+            let validation = if channel.has_ice_consent_monitor() && owns_outbound {
+                validate_initial_ice_udp_probe_ref(&channel, &peer_id).await
+            } else if channel.has_ice_consent_monitor() {
+                channel
+                    .serve_health_probe_requests(
+                        3,
+                        ICE_INITIAL_PATH_PROBATION + Duration::from_secs(5),
+                        ICE_INITIAL_PATH_PROBATION + ICE_INITIAL_PATH_HEALTH_INTERVAL,
+                    )
+                    .await
+            } else {
+                Err(mini_tunnel_agent::IdentityError::Transport(
+                    "elected direct QUIC mesh channel is missing ICE consent".to_owned(),
+                ))
+            };
+            match validation {
+                Ok(()) => Some((peer, channel, remote, connector, probe)),
+                Err(error) => {
+                    let health = channel.health_snapshot();
+                    tracing::warn!(
+                        peer_id = %peer_id,
+                        %error,
+                        probes_succeeded = health.probes_succeeded,
+                        probes_missed = health.probes_missed,
+                        "elected ICE path failed initial health probation; switching to reliable path"
+                    );
+                    channel.stop_ice_consent_monitor().await;
+                    channel.close();
+                    match connector(true).await {
+                        Ok(channel)
+                            if matches!(channel.transport_name(), "TLS/TCP" | "Relay/TLS") =>
+                        {
+                            let remote = channel.remote_address();
+                            Some((peer, channel, remote, connector, probe))
+                        }
+                        Ok(channel) => {
+                            let path = channel.transport_name();
+                            channel.close();
+                            tracing::error!(
+                                peer_id = %peer_id,
+                                path,
+                                "reliable mesh connector returned a non-reliable path"
+                            );
+                            None
+                        }
+                        Err(fallback_error) => {
+                            tracing::error!(
+                                peer_id = %peer_id,
+                                %error,
+                                %fallback_error,
+                                probes_succeeded = health.probes_succeeded,
+                                probes_missed = health.probes_missed,
+                                "elected ICE path and reliable fallback both failed"
+                            );
+                            None
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    join_all(validations).await.into_iter().flatten().collect()
+}
+
 #[cfg(test)]
 async fn validate_udp_probe_with_window(
     channel: mini_tunnel_agent::PeerChannel,
@@ -3828,13 +3938,14 @@ async fn validate_udp_probe_with_window(
     consent_window: Duration,
 ) -> Result<mini_tunnel_agent::PeerChannel, mini_tunnel_agent::IdentityError> {
     validate_udp_probe_with_context(
-        channel,
+        &channel,
         require_ice_consent,
         consent_window,
         ICE_PATH_PROBATION_HEALTH_INTERVAL,
         None,
     )
-    .await
+    .await?;
+    Ok(channel)
 }
 
 #[cfg(test)]
@@ -3845,22 +3956,23 @@ async fn validate_udp_probe_with_timing(
     health_interval: Duration,
 ) -> Result<mini_tunnel_agent::PeerChannel, mini_tunnel_agent::IdentityError> {
     validate_udp_probe_with_context(
-        channel,
+        &channel,
         require_ice_consent,
         consent_window,
         health_interval,
         None,
     )
-    .await
+    .await?;
+    Ok(channel)
 }
 
 async fn validate_udp_probe_with_context(
-    channel: mini_tunnel_agent::PeerChannel,
+    channel: &mini_tunnel_agent::PeerChannel,
     require_ice_consent: bool,
     consent_window: Duration,
     health_interval: Duration,
     peer_id: Option<&str>,
-) -> Result<mini_tunnel_agent::PeerChannel, mini_tunnel_agent::IdentityError> {
+) -> Result<(), mini_tunnel_agent::IdentityError> {
     // Recovery from a reliable path needs more evidence than initial direct dialing:
     // several clean probes plus a probation window prevent a lucky short burst from
     // promoting a lossy UDP candidate.
@@ -4011,7 +4123,7 @@ async fn validate_udp_probe_with_context(
         stage = "probation_completed",
         "UDP candidate health validation passed"
     );
-    Ok(channel)
+    Ok(())
 }
 
 fn candidates_for_path(candidates: &[String], reliable_only: bool) -> Vec<String> {
@@ -7825,10 +7937,30 @@ mod tests {
             std::env::temp_dir().join(format!("mini-tunnel-mesh-ice-{}", uuid::Uuid::new_v4()));
         let identity_a = mini_tunnel_agent::Identity::load_or_create_at(temp.join("a/device.key"))
             .expect("identity A");
-        let identity_b = mini_tunnel_agent::Identity::load_or_create_at(temp.join("b/device.key"))
-            .expect("identity B");
-        let identity_c = mini_tunnel_agent::Identity::load_or_create_at(temp.join("c/device.key"))
-            .expect("identity C");
+        let mut identity_b =
+            mini_tunnel_agent::Identity::load_or_create_at(temp.join("b/device.key"))
+                .expect("identity B");
+        let mut b_attempt = 0;
+        while identity_b.device_id() <= identity_a.device_id() {
+            b_attempt += 1;
+            identity_b = mini_tunnel_agent::Identity::load_or_create_at(
+                temp.join(format!("b-larger-{b_attempt}.key")),
+            )
+            .expect("identity B elected after A");
+        }
+        let mut identity_c =
+            mini_tunnel_agent::Identity::load_or_create_at(temp.join("c/device.key"))
+                .expect("identity C");
+        let mut c_attempt = 0;
+        while identity_c.device_id() <= identity_a.device_id()
+            || identity_c.device_id() == identity_b.device_id()
+        {
+            c_attempt += 1;
+            identity_c = mini_tunnel_agent::Identity::load_or_create_at(
+                temp.join(format!("c-larger-{c_attempt}.key")),
+            )
+            .expect("identity C elected after A and distinct from B");
+        }
         let create_endpoint = |identity: &mini_tunnel_agent::Identity| {
             mini_tunnel_agent::ice::peer_endpoint_with_ice(
                 identity,
@@ -7893,21 +8025,25 @@ mod tests {
         let (a_to_c_address, a_to_c_monitor) = a_to_c.expect("ICE peer C");
         assert_eq!(a_to_b_address, address_b);
         assert_eq!(a_to_c_address, address_c);
-        assert_eq!(
-            b_to_a.map(|(address, monitor)| {
-                drop(monitor);
-                address
-            }),
-            Some(address_a)
-        );
-        assert_eq!(
-            c_to_a.map(|(address, monitor)| {
-                drop(monitor);
-                address
-            }),
-            Some(address_a)
-        );
+        let (b_to_a_address, monitor_b) = b_to_a.expect("ICE peer A from B");
+        let (c_to_a_address, monitor_c) = c_to_a.expect("ICE peer A from C");
+        assert_eq!(b_to_a_address, address_a);
+        assert_eq!(c_to_a_address, address_a);
 
+        let accept_a_b = mini_tunnel_agent::accept_peer(
+            &endpoint_a.endpoint,
+            "mesh-ice-test",
+            &identity_a,
+            &peer_b.device_id,
+            identity_b.public_key(),
+        );
+        let accept_a_c = mini_tunnel_agent::accept_peer(
+            &endpoint_a.endpoint,
+            "mesh-ice-test",
+            &identity_a,
+            &peer_c.device_id,
+            identity_c.public_key(),
+        );
         let accept_b = mini_tunnel_agent::accept_peer(
             &endpoint_b.endpoint,
             "mesh-ice-test",
@@ -7922,7 +8058,16 @@ mod tests {
             &peer_a.device_id,
             identity_a.public_key(),
         );
-        let (connect_b, connect_c, channel_b, channel_c) = tokio::join!(
+        let (
+            connect_a_b,
+            connect_a_c,
+            connect_b_a,
+            connect_c_a,
+            accepted_a_b,
+            accepted_a_c,
+            accepted_b,
+            accepted_c,
+        ) = tokio::join!(
             mini_tunnel_agent::connect_peer(
                 &endpoint_a.endpoint,
                 a_to_b_address,
@@ -7939,15 +8084,144 @@ mod tests {
                 &peer_c.device_id,
                 identity_c.public_key(),
             ),
+            mini_tunnel_agent::connect_peer(
+                &endpoint_b.endpoint,
+                b_to_a_address,
+                "mesh-ice-test",
+                &identity_b,
+                &peer_a.device_id,
+                identity_a.public_key(),
+            ),
+            mini_tunnel_agent::connect_peer(
+                &endpoint_c.endpoint,
+                c_to_a_address,
+                "mesh-ice-test",
+                &identity_c,
+                &peer_a.device_id,
+                identity_a.public_key(),
+            ),
+            accept_a_b,
+            accept_a_c,
             accept_b,
             accept_c,
         );
-        let mut channel_a_b = connect_b.expect("QUIC peer B");
+        let mut channel_a_b = connect_a_b.expect("A elected outbound QUIC peer B");
         channel_a_b.set_ice_consent_monitor(a_to_b_monitor);
-        let mut channel_a_c = connect_c.expect("QUIC peer C");
+        let mut channel_a_c = connect_a_c.expect("A elected outbound QUIC peer C");
         channel_a_c.set_ice_consent_monitor(a_to_c_monitor);
-        let channel_b = channel_b.expect("accept peer B");
-        let channel_c = channel_c.expect("accept peer C");
+        let duplicate_a_b = accepted_a_b.expect("accept B's losing outbound path on A");
+        let duplicate_a_c = accepted_a_c.expect("accept C's losing outbound path on A");
+        let mut probe_b = connect_b_a.expect("B's non-elected outbound path to A");
+        probe_b.set_ice_consent_monitor(monitor_b);
+        let mut probe_c = connect_c_a.expect("C's non-elected outbound path to A");
+        probe_c.set_ice_consent_monitor(monitor_c);
+        let mut channel_b = accepted_b.expect("accept A's elected outbound path on B");
+        let mut channel_c = accepted_c.expect("accept A's elected outbound path on C");
+        assert!(transfer_peer_ice_consent_monitor(
+            &mut probe_b,
+            &mut channel_b
+        ));
+        assert!(transfer_peer_ice_consent_monitor(
+            &mut probe_c,
+            &mut channel_c
+        ));
+        duplicate_a_b.close();
+        duplicate_a_c.close();
+
+        let unexpected_reliable_fallback: mini_tunnel_agent::tunnel::PeerConnector =
+            std::sync::Arc::new(|_| {
+                Box::pin(async {
+                    Err(mini_tunnel_agent::IdentityError::Transport(
+                        "healthy elected ICE path unexpectedly requested Relay".to_owned(),
+                    ))
+                })
+            });
+        let local_device_id_a = identity_a.device_id();
+        let local_device_id_b = identity_b.device_id();
+        let local_device_id_c = identity_c.device_id();
+        let (validated_a, validated_b, validated_c) = tokio::join!(
+            validate_elected_mesh_ice_paths(
+                vec![
+                    (
+                        peer_b.clone(),
+                        channel_a_b,
+                        address_b,
+                        std::sync::Arc::clone(&unexpected_reliable_fallback),
+                        std::sync::Arc::clone(&unexpected_reliable_fallback),
+                    ),
+                    (
+                        peer_c.clone(),
+                        channel_a_c,
+                        address_c,
+                        std::sync::Arc::clone(&unexpected_reliable_fallback),
+                        std::sync::Arc::clone(&unexpected_reliable_fallback),
+                    ),
+                ],
+                true,
+                &local_device_id_a,
+            ),
+            validate_elected_mesh_ice_paths(
+                vec![(
+                    peer_a.clone(),
+                    channel_b,
+                    address_a,
+                    std::sync::Arc::clone(&unexpected_reliable_fallback),
+                    std::sync::Arc::clone(&unexpected_reliable_fallback),
+                )],
+                true,
+                &local_device_id_b,
+            ),
+            validate_elected_mesh_ice_paths(
+                vec![(
+                    peer_a.clone(),
+                    channel_c,
+                    address_a,
+                    std::sync::Arc::clone(&unexpected_reliable_fallback),
+                    std::sync::Arc::clone(&unexpected_reliable_fallback),
+                )],
+                true,
+                &local_device_id_c,
+            ),
+        );
+        let mut validated_a = validated_a;
+        let mut validated_b = validated_b;
+        let mut validated_c = validated_c;
+        let channel_a_b = validated_a.remove(0).1;
+        let channel_a_c = validated_a.remove(0).1;
+        let channel_b = validated_b.remove(0).1;
+        let channel_c = validated_c.remove(0).1;
+        assert!(
+            if identity_a.device_id() < peer_b.device_id {
+                channel_a_b.health_snapshot().probes_succeeded >= 3
+            } else {
+                channel_a_b.health_probe_requests_received() >= 3
+            },
+            "the elected owner validates while the accepted side answers health probes"
+        );
+        assert!(
+            if identity_a.device_id() < peer_c.device_id {
+                channel_a_c.health_snapshot().probes_succeeded >= 3
+            } else {
+                channel_a_c.health_probe_requests_received() >= 3
+            },
+            "the elected owner validates while the accepted side answers health probes"
+        );
+        assert!(
+            if identity_b.device_id() < peer_a.device_id {
+                channel_b.health_snapshot().probes_succeeded >= 3
+            } else {
+                channel_b.health_probe_requests_received() >= 3
+            },
+            "the elected owner validates while the accepted side answers health probes"
+        );
+        assert!(
+            if identity_c.device_id() < peer_a.device_id {
+                channel_c.health_snapshot().probes_succeeded >= 3
+            } else {
+                channel_c.health_probe_requests_received() >= 3
+            },
+            "the elected owner validates while the accepted side answers health probes"
+        );
         channel_a_b.send_packet(b"mesh-peer-b").await.unwrap();
         channel_a_c.send_packet(b"mesh-peer-c").await.unwrap();
         assert_eq!(channel_b.recv_packet().await.unwrap(), b"mesh-peer-b");

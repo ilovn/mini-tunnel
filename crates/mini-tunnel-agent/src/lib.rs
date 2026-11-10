@@ -357,6 +357,7 @@ struct PeerHealth {
     outstanding: HashMap<u64, Instant>,
     probes_succeeded: u64,
     probes_missed: u64,
+    probe_requests_received: u64,
 }
 
 #[derive(Default)]
@@ -726,6 +727,72 @@ impl PeerChannel {
             .unwrap_or_default()
     }
 
+    /// Number of authenticated health pings received on this channel.
+    #[must_use]
+    pub fn health_probe_requests_received(&self) -> u64 {
+        self.health
+            .lock()
+            .map(|health| health.probe_requests_received)
+            .unwrap_or_default()
+    }
+
+    /// Respond to a peer's initial health probation while mesh election is settling.
+    ///
+    /// The accepted side may need to keep reading the selected channel while the
+    /// deterministic outbound owner validates it. `response_grace` keeps the
+    /// receive pump alive through the owner's consent probation after the minimum
+    /// request count has arrived. Non-health packets are buffered for the normal
+    /// tunnel reader.
+    pub async fn serve_health_probe_requests(
+        &self,
+        minimum_requests: u64,
+        request_timeout: Duration,
+        response_grace: Duration,
+    ) -> Result<(), IdentityError> {
+        if minimum_requests == 0
+            || minimum_requests > 8
+            || request_timeout.is_zero()
+            || request_timeout > Duration::from_secs(30)
+            || response_grace > Duration::from_secs(30)
+        {
+            return Err(IdentityError::InvalidFrame);
+        }
+        let target = self
+            .health_probe_requests_received()
+            .saturating_add(minimum_requests);
+        let request_deadline = tokio::time::Instant::now() + request_timeout;
+        while self.health_probe_requests_received() < target {
+            let packet =
+                tokio::time::timeout_at(request_deadline, self.recv_packet_from_transport())
+                    .await
+                    .map_err(|_| {
+                        IdentityError::Transport("timed out waiting for peer health probes".into())
+                    })??;
+            if !packet.is_empty() {
+                self.pending_probe_packets
+                    .lock()
+                    .map_err(|_| IdentityError::InvalidFrame)?
+                    .push(packet)?;
+            }
+        }
+
+        let grace_deadline = tokio::time::Instant::now() + response_grace;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(grace_deadline) => return Ok(()),
+                packet = self.recv_packet_from_transport() => {
+                    let packet = packet?;
+                    if !packet.is_empty() {
+                        self.pending_probe_packets
+                            .lock()
+                            .map_err(|_| IdentityError::InvalidFrame)?
+                            .push(packet)?;
+                    }
+                }
+            }
+        }
+    }
+
     /// Validate a candidate path with authenticated ping/pong exchanges before it replaces a live path.
     pub async fn probe_health(
         &self,
@@ -841,6 +908,10 @@ impl PeerChannel {
                         .map_err(|_| IdentityError::InvalidFrame)?,
                 );
                 if payload[0] == HEALTH_PING {
+                    if let Ok(mut health) = self.health.lock() {
+                        health.probe_requests_received =
+                            health.probe_requests_received.saturating_add(1);
+                    }
                     let mut pong = payload.to_vec();
                     pong[0] = HEALTH_PONG;
                     self.send_packet(&pong).await?;
@@ -2685,6 +2756,70 @@ mod tests {
             channel_a.recv_packet().await.expect("buffered payload"),
             payload,
             "candidate probing must not consume peer data"
+        );
+
+        endpoint_a.close(0_u32.into(), b"test complete");
+        endpoint_b.close(0_u32.into(), b"test complete");
+        fs::remove_dir_all(temp).expect("remove test identities");
+    }
+
+    #[tokio::test]
+    async fn elected_mesh_responder_answers_initial_probes_and_buffers_peer_data() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-elected-probe-responder-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let a = Identity::load_or_create_at(temp.join("a/device.key")).expect("identity A");
+        let b = Identity::load_or_create_at(temp.join("b/device.key")).expect("identity B");
+        let endpoint_a = peer_endpoint(&a, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .expect("endpoint A");
+        let endpoint_b = peer_endpoint(&b, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .expect("endpoint B");
+        let remote = endpoint_b.local_addr().expect("endpoint B address");
+        let a_id = a.device_id();
+        let a_key = a.public_key();
+        let b_id = b.device_id();
+        let b_key = b.public_key();
+        let server_endpoint = endpoint_b.clone();
+        let accept = tokio::spawn(async move {
+            accept_peer(&server_endpoint, "elected-probe", &b, &a_id, a_key).await
+        });
+        let channel_a = connect_peer(&endpoint_a, remote, "elected-probe", &a, &b_id, b_key)
+            .await
+            .expect("authenticated outbound channel");
+        let channel_b = accept
+            .await
+            .expect("accept task")
+            .expect("accepted channel");
+        assert!(matches!(
+            channel_b
+                .serve_health_probe_requests(9, Duration::from_secs(2), Duration::from_secs(1))
+                .await,
+            Err(IdentityError::InvalidFrame)
+        ));
+
+        let responder = tokio::spawn(async move {
+            channel_b
+                .serve_health_probe_requests(3, Duration::from_secs(2), Duration::from_millis(500))
+                .await
+                .expect("respond through the elected owner's initial probation");
+            assert!(channel_b.health_probe_requests_received() >= 3);
+            channel_b
+        });
+        channel_a
+            .probe_health(3, Duration::from_secs(2))
+            .await
+            .expect("elected outbound owner validates direct path");
+        let payload = b"peer data arriving during mesh election grace";
+        channel_a
+            .send_packet(payload)
+            .await
+            .expect("send data during responder grace");
+        let channel_b = responder.await.expect("join elected responder");
+        assert_eq!(
+            channel_b.recv_packet().await.expect("read buffered data"),
+            payload,
+            "the temporary health responder must preserve application packets"
         );
 
         endpoint_a.close(0_u32.into(), b"test complete");
