@@ -1386,6 +1386,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let mut peer_connectors = std::collections::HashMap::new();
                     let mut peer_probes = std::collections::HashMap::new();
                     let mut accepted_peer_senders = std::collections::HashMap::new();
+                    let (ice_monitor_tx, mut ice_monitor_rx) =
+                        tokio::sync::mpsc::unbounded_channel();
                     for peer in peers.iter().cloned() {
                         let keep_outbound = local_device_id < peer.device_id;
                         let (connector, probe, accepted_peer_tx) = build_mesh_peer_connectors(
@@ -1403,6 +1405,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let identity = std::sync::Arc::clone(&identity);
                         let network_id = network_id.clone();
                         let coordinator_url = coordinator_url.clone();
+                        let ice_monitor_tx = ice_monitor_tx.clone();
                         attempts.spawn(async move {
                             let result = connect_mesh_peer(
                                 &endpoint,
@@ -1414,12 +1417,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 MeshPeerConnectOptions {
                                     reliable_only: false,
                                     ice_probe_validation: IceProbeValidation::ElectedMeshInitial,
+                                    early_ice_monitor_tx: Some(ice_monitor_tx),
                                 },
                             )
                             .await;
                             (peer, keep_outbound, result)
                         });
                     }
+                    drop(ice_monitor_tx);
                     let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::channel(64);
                     let require_ice_consent = endpoint.ice.is_some();
                     let allowed_members = peers
@@ -1525,18 +1530,21 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         mini_tunnel_agent::tunnel::PeerConnector,
                     )> = Vec::new();
                     let mut pending_accepted_channels = std::collections::HashMap::new();
+                    let mut validating_peers = std::collections::HashSet::new();
                     let mut pending_ice_monitors = std::collections::HashMap::<
                         String,
                         (SocketAddr, mini_tunnel_agent::ice::IceConsentMonitor),
                     >::new();
+                    let mut ice_validations = tokio::task::JoinSet::new();
                     let mut accept_finished = accept_tasks.is_empty();
+                    let mut ice_monitor_finished = false;
                     let startup_deadline = tokio::time::Instant::now() + Duration::from_secs(45);
                     let mut first_peer_at = None;
                     loop {
-                        if attempts.is_empty() && peers.is_empty() {
+                        if attempts.is_empty() && peers.is_empty() && ice_validations.is_empty() {
                             break;
                         }
-                        if attempts.is_empty() && accept_finished {
+                        if attempts.is_empty() && accept_finished && ice_validations.is_empty() {
                             break;
                         }
                         let settle_deadline = mesh_startup_settle_deadline(
@@ -1546,6 +1554,37 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             Duration::from_secs(1),
                         );
                         tokio::select! {
+                            nominated = ice_monitor_rx.recv(), if !ice_monitor_finished => {
+                                if let Some((peer_id, nominated_remote, monitor)) = nominated {
+                                    // A nominated monitor can arrive while this peer's connector is
+                                    // still trying direct candidates or Relay. Pair it immediately
+                                    // so the accepted QUIC channel can answer initial probes.
+                                    if let Some((peer, mut channel, remote)) = pending_accepted_channels.remove(&peer_id) {
+                                        if attach_nominated_ice_monitor(&mut channel, nominated_remote, monitor).await {
+                                            if let Some(connection) = clone_mesh_peer_channel(
+                                                peer,
+                                                channel,
+                                                remote,
+                                                &peer_connectors,
+                                                &peer_probes,
+                                            ) {
+                                                start_mesh_ice_validation(
+                                                    &mut ice_validations,
+                                                    &mut validating_peers,
+                                                    connection,
+                                                    local_device_id.clone(),
+                                                );
+                                            }
+                                        } else {
+                                            channel.close();
+                                        }
+                                    } else if let Some((_, old)) = pending_ice_monitors.insert(peer_id, (nominated_remote, monitor)) {
+                                        old.stop().await;
+                                    }
+                                } else {
+                                    ice_monitor_finished = true;
+                                }
+                            }
                             accepted = accepted_rx.recv(), if !accept_finished => {
                                 match accepted {
                                     Some((peer, mut channel, remote)) => {
@@ -1573,15 +1612,21 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                                     nominated_remote,
                                                     monitor,
                                                 ).await {
-                                                    install_mesh_peer_channel(
-                                                        &mut connected,
+                                                    let connection = clone_mesh_peer_channel(
                                                         peer,
                                                         channel,
                                                         remote,
-                                                        &mut peer_connectors,
-                                                        &mut peer_probes,
+                                                        &peer_connectors,
+                                                        &peer_probes,
                                                     );
-                                                    first_peer_at.get_or_insert_with(tokio::time::Instant::now);
+                                                    if let Some(connection) = connection {
+                                                        start_mesh_ice_validation(
+                                                            &mut ice_validations,
+                                                            &mut validating_peers,
+                                                            connection,
+                                                            local_device_id.clone(),
+                                                        );
+                                                    }
                                                 } else {
                                                     if let Some((_, duplicate, _)) = pending_accepted_channels.insert(peer.device_id.clone(), (peer, channel, remote)) {
                                                         tracing::debug!(
@@ -1616,6 +1661,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 let (peer, keep_outbound, result) = result?;
                                 match result {
                                     Ok(mut connection) => {
+                                        let peer_already_connected = connected
+                                            .iter()
+                                            .any(|known| known.0.device_id == peer.device_id);
+                                        let peer_direct_path_validating = validating_peers
+                                            .contains(&peer.device_id)
+                                            && connection.channel.transport_name() == "QUIC/UDP";
+                                        if peer_already_connected || peer_direct_path_validating {
+                                            connection.channel.close();
+                                            if let Some((_, monitor)) = connection.nominated_ice_monitor.take() {
+                                                monitor.stop().await;
+                                            }
+                                            continue;
+                                        }
                                         tracing::debug!(
                                             peer_id = %peer.device_id,
                                             outbound_elected = keep_outbound,
@@ -1639,11 +1697,25 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                                         has_ice_consent = accepted_channel.has_ice_consent_monitor(),
                                                         "selected accepted mesh channel after transferring ICE consent"
                                                     );
-                                                    println!("Connected mesh peer {} at {accepted_remote}", accepted_peer.device_id);
-                                                    let connector = peer_connectors.remove(&accepted_peer.device_id).expect("peer connector exists");
-                                                    let probe = peer_probes.remove(&accepted_peer.device_id).expect("peer probe exists");
-                                                    connected.push((accepted_peer, accepted_channel, accepted_remote, connector, probe));
-                                                    first_peer_at.get_or_insert_with(tokio::time::Instant::now);
+                                                    tracing::debug!(
+                                                        peer_id = %accepted_peer.device_id,
+                                                        "accepted ICE path attached to its consent monitor; starting health probation"
+                                                    );
+                                                    let connection = clone_mesh_peer_channel(
+                                                        accepted_peer,
+                                                        accepted_channel,
+                                                        accepted_remote,
+                                                        &peer_connectors,
+                                                        &peer_probes,
+                                                    );
+                                                    if let Some(connection) = connection {
+                                                        start_mesh_ice_validation(
+                                                            &mut ice_validations,
+                                                            &mut validating_peers,
+                                                            connection,
+                                                            local_device_id.clone(),
+                                                        );
+                                                    }
                                                 } else {
                                                     tracing::debug!(
                                                         peer_id = %peer.device_id,
@@ -1675,11 +1747,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                                 );
                                                 channel.close();
                                             } else {
-                                                println!("Connected mesh peer {} at {remote}", peer.device_id);
                                                 let connector = peer_connectors.remove(&peer.device_id).expect("peer connector exists");
                                                 let probe = peer_probes.remove(&peer.device_id).expect("peer probe exists");
-                                                connected.push((peer, channel, remote, connector, probe));
-                                                first_peer_at.get_or_insert_with(tokio::time::Instant::now);
+                                                if require_ice_consent && channel.transport_name() == "QUIC/UDP" {
+                                                    start_mesh_ice_validation(
+                                                        &mut ice_validations,
+                                                        &mut validating_peers,
+                                                        (peer, channel, remote, connector, probe),
+                                                        local_device_id.clone(),
+                                                    );
+                                                } else {
+                                                    println!("Connected mesh peer {} at {remote}", peer.device_id);
+                                                    connected.push((peer, channel, remote, connector, probe));
+                                                    first_peer_at.get_or_insert_with(tokio::time::Instant::now);
+                                                }
                                             }
                                         } else {
                                             // This authenticated reverse connection opened the
@@ -1697,7 +1778,30 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     Err(error) => eprintln!("Peer {} UDP probe unavailable: {error}", peer.device_id),
                                 }
                             }
-                            _ = tokio::time::sleep_until(settle_deadline), if first_peer_at.is_some() => break,
+                            validated = ice_validations.join_next(), if !ice_validations.is_empty() => {
+                                    if let Some(result) = validated {
+                                    match result {
+                                            Ok((_, peer_id, Some(connection))) => {
+                                            validating_peers.remove(&peer_id);
+                                            println!(
+                                                "Connected mesh peer {} at {}",
+                                                connection.0.device_id, connection.2
+                                            );
+                                            install_mesh_peer_channel(&mut connected, connection);
+                                            peer_connectors.remove(&peer_id);
+                                            peer_probes.remove(&peer_id);
+                                            first_peer_at.get_or_insert_with(tokio::time::Instant::now);
+                                        }
+                                            Ok((_, peer_id, None)) => {
+                                            validating_peers.remove(&peer_id);
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(%error, "mesh ICE path validation task failed");
+                                        }
+                                    }
+                                }
+                            }
+                            _ = tokio::time::sleep_until(settle_deadline), if first_peer_at.is_some() && ice_validations.is_empty() => break,
                             _ = tokio::time::sleep_until(startup_deadline), if first_peer_at.is_none() => break,
                         }
                     }
@@ -1709,14 +1813,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             && attach_nominated_ice_monitor(&mut channel, nominated_remote, monitor)
                                 .await
                         {
-                            install_mesh_peer_channel(
-                                &mut connected,
+                            if let Some(connection) = take_mesh_peer_channel(
                                 peer,
                                 channel,
                                 remote,
                                 &mut peer_connectors,
                                 &mut peer_probes,
-                            );
+                            ) {
+                                connected.push(connection);
+                            }
                             continue;
                         }
                         channel.close();
@@ -2681,6 +2786,14 @@ async fn select_ice_peer_address_with_timeout(
     };
     let local_ufrag = local.credentials.ufrag.clone();
     let controlling = identity.device_id() < peer.device_id;
+    tracing::debug!(
+        peer_id = %peer.device_id,
+        local_device_id = %identity.device_id(),
+        controlling,
+        local_credential_generation = local.credentials.generation,
+        remote_credential_generation = remote.generation,
+        "starting ICE connectivity checks"
+    );
     let mut driver =
         match mini_tunnel_agent::ice::IceAgentDriver::for_peer_with_candidates_on_socket(
             local.local_socket_addr,
@@ -2771,12 +2884,35 @@ async fn select_ice_peer_address_with_snapshot_refresh(
     }
     endpoint.ice.as_ref()?;
 
+    retry_ice_after_snapshot_refresh(
+        peer,
+        |expected_peer| async move {
+            refresh_peer_snapshot_for_ice(coordinator_url, network_id, &expected_peer, identity)
+                .await
+        },
+        |refreshed_peer| async move {
+            select_ice_peer_address_with_timeout(endpoint, &refreshed_peer, identity, check_timeout)
+                .await
+        },
+    )
+    .await
+}
+
+async fn retry_ice_after_snapshot_refresh<T, E, Refresh, RefreshFuture, Select, SelectFuture>(
+    peer: &mut PeerInfo,
+    mut refresh: Refresh,
+    mut select: Select,
+) -> Option<T>
+where
+    Refresh: FnMut(PeerInfo) -> RefreshFuture,
+    RefreshFuture: std::future::Future<Output = Result<PeerInfo, E>>,
+    Select: FnMut(PeerInfo) -> SelectFuture,
+    SelectFuture: std::future::Future<Output = Option<T>>,
+{
     for retry in 1..=INITIAL_ICE_SNAPSHOT_REFRESH_RETRIES {
         let previous_credentials = peer.ice_credentials.clone();
         let previous_candidates = peer.candidates.clone();
-        let refreshed = refresh_peer_snapshot_for_ice(coordinator_url, network_id, peer, identity)
-            .await
-            .ok()?;
+        let refreshed = refresh(peer.clone()).await.ok()?;
         let snapshot_changed = refreshed.ice_credentials != previous_credentials
             || refreshed.candidates != previous_candidates;
         tracing::debug!(
@@ -2787,8 +2923,7 @@ async fn select_ice_peer_address_with_snapshot_refresh(
             "retrying initial ICE checklist after startup credential synchronization"
         );
         *peer = refreshed;
-        let selected =
-            select_ice_peer_address_with_timeout(endpoint, peer, identity, check_timeout).await;
+        let selected = select(peer.clone()).await;
         if let Some(selected) = selected {
             return Some(selected);
         }
@@ -2856,10 +2991,17 @@ type ConnectedMeshPeer = (
     mini_tunnel_agent::tunnel::PeerConnector,
 );
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct MeshPeerConnectOptions {
     reliable_only: bool,
     ice_probe_validation: IceProbeValidation,
+    early_ice_monitor_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<(
+            String,
+            SocketAddr,
+            mini_tunnel_agent::ice::IceConsentMonitor,
+        )>,
+    >,
 }
 
 impl IceProbeValidation {
@@ -2955,7 +3097,23 @@ async fn connect_mesh_peer(
                 return Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer);
             }
             Err(error) => {
-                nominated_ice_monitor = Some((remote, monitor));
+                if identity.device_id() > peer.device_id
+                    && let Some(sender) = &options.early_ice_monitor_tx
+                {
+                    match sender.send((peer.device_id.clone(), remote, monitor)) {
+                        Ok(()) => tracing::debug!(
+                            peer_id = %peer.device_id,
+                            %remote,
+                            %error,
+                            "published nominated ICE consent monitor before reliable fallback"
+                        ),
+                        Err(error) => {
+                            nominated_ice_monitor = Some((remote, error.0.2));
+                        }
+                    }
+                } else {
+                    nominated_ice_monitor = Some((remote, monitor));
+                }
                 tracing::debug!(peer_id = %peer.device_id, %error, "ICE nominated path failed QUIC setup; trying candidates")
             }
         }
@@ -3082,51 +3240,84 @@ async fn attach_nominated_ice_monitor(
     }
 }
 
-fn install_mesh_peer_channel(
-    connected: &mut Vec<(
-        PeerInfo,
-        mini_tunnel_agent::PeerChannel,
-        SocketAddr,
-        mini_tunnel_agent::tunnel::PeerConnector,
-        mini_tunnel_agent::tunnel::PeerConnector,
-    )>,
+fn clone_mesh_peer_channel(
     peer: PeerInfo,
     channel: mini_tunnel_agent::PeerChannel,
     remote: SocketAddr,
-    connectors: &mut std::collections::HashMap<String, mini_tunnel_agent::tunnel::PeerConnector>,
-    probes: &mut std::collections::HashMap<String, mini_tunnel_agent::tunnel::PeerConnector>,
-) {
-    if let Some(index) = connected
-        .iter()
-        .position(|known| known.0.device_id == peer.device_id)
-    {
-        if channel.transport_name() == "QUIC/UDP"
-            && connected[index].1.transport_name() != "QUIC/UDP"
-        {
-            let old = std::mem::replace(&mut connected[index].1, channel);
-            old.close();
-            connected[index].2 = remote;
-        } else {
-            channel.close();
-        }
-        return;
-    }
-    let Some(connector) = connectors.remove(&peer.device_id) else {
+    connectors: &std::collections::HashMap<String, mini_tunnel_agent::tunnel::PeerConnector>,
+    probes: &std::collections::HashMap<String, mini_tunnel_agent::tunnel::PeerConnector>,
+) -> Option<ConnectedMeshPeer> {
+    let Some(connector) = connectors.get(&peer.device_id).cloned() else {
         channel.close();
-        return;
+        return None;
     };
-    let Some(probe) = probes.remove(&peer.device_id) else {
+    let Some(probe) = probes.get(&peer.device_id).cloned() else {
         channel.close();
-        return;
+        return None;
     };
     tracing::info!(
         peer_id = %peer.device_id,
         path = channel.transport_name(),
         has_ice_consent = channel.has_ice_consent_monitor(),
-        "installing elected mesh peer path"
+        "preparing elected mesh peer path for health probation"
     );
-    println!("Connected mesh peer {} at {remote}", peer.device_id);
-    connected.push((peer, channel, remote, connector, probe));
+    Some((peer, channel, remote, connector, probe))
+}
+
+fn take_mesh_peer_channel(
+    peer: PeerInfo,
+    channel: mini_tunnel_agent::PeerChannel,
+    remote: SocketAddr,
+    connectors: &mut std::collections::HashMap<String, mini_tunnel_agent::tunnel::PeerConnector>,
+    probes: &mut std::collections::HashMap<String, mini_tunnel_agent::tunnel::PeerConnector>,
+) -> Option<ConnectedMeshPeer> {
+    let Some(connector) = connectors.remove(&peer.device_id) else {
+        channel.close();
+        return None;
+    };
+    let Some(probe) = probes.remove(&peer.device_id) else {
+        channel.close();
+        return None;
+    };
+    Some((peer, channel, remote, connector, probe))
+}
+
+fn start_mesh_ice_validation(
+    validations: &mut tokio::task::JoinSet<(String, String, Option<ConnectedMeshPeer>)>,
+    validating_peers: &mut std::collections::HashSet<String>,
+    connection: ConnectedMeshPeer,
+    local_device_id: String,
+) {
+    let peer_id = connection.0.device_id.clone();
+    let validating_device_id = local_device_id.clone();
+    validating_peers.insert(peer_id.clone());
+    validations.spawn(async move {
+        let connection = validate_elected_mesh_ice_paths(vec![connection], true, &local_device_id)
+            .await
+            .into_iter()
+            .next();
+        (validating_device_id, peer_id, connection)
+    });
+}
+
+fn install_mesh_peer_channel(
+    connected: &mut Vec<ConnectedMeshPeer>,
+    (peer, channel, remote, connector, probe): ConnectedMeshPeer,
+) {
+    if let Some(existing) = connected
+        .iter_mut()
+        .find(|existing| existing.0.device_id == peer.device_id)
+    {
+        if channel.transport_name() == "QUIC/UDP" && existing.1.transport_name() != "QUIC/UDP" {
+            let old = std::mem::replace(&mut existing.1, channel);
+            old.close();
+            existing.2 = remote;
+        } else {
+            channel.close();
+        }
+    } else {
+        connected.push((peer, channel, remote, connector, probe));
+    }
 }
 
 fn build_mesh_peer_connectors(
@@ -3170,6 +3361,7 @@ fn build_mesh_peer_connectors(
                         MeshPeerConnectOptions {
                             reliable_only: force_reliable,
                             ice_probe_validation: IceProbeValidation::InitialConnection,
+                            early_ice_monitor_tx: None,
                         },
                     )
                     .await
@@ -3295,6 +3487,7 @@ fn build_mesh_peer_connectors(
                         MeshPeerConnectOptions {
                             reliable_only: false,
                             ice_probe_validation: IceProbeValidation::Recovery,
+                            early_ice_monitor_tx: None,
                         },
                     )
                     .await
@@ -7167,20 +7360,6 @@ mod tests {
         axum::Json(PeerListResponse { peers })
     }
 
-    type IcePeerSnapshotSequence =
-        std::sync::Arc<tokio::sync::Mutex<std::collections::VecDeque<PeerInfo>>>;
-
-    async fn ice_peer_snapshot_sequence_handler(
-        axum::extract::State(sequence): axum::extract::State<IcePeerSnapshotSequence>,
-    ) -> axum::Json<PeerListResponse> {
-        let peer = sequence
-            .lock()
-            .await
-            .pop_front()
-            .expect("only the expected bounded snapshot refreshes are requested");
-        axum::Json(PeerListResponse { peers: vec![peer] })
-    }
-
     #[tokio::test]
     async fn shutdown_signal_accepts_either_signal_source() {
         let result = select_shutdown_signal(
@@ -8138,57 +8317,91 @@ mod tests {
         let local_device_id_a = identity_a.device_id();
         let local_device_id_b = identity_b.device_id();
         let local_device_id_c = identity_c.device_id();
-        let (validated_a, validated_b, validated_c) = tokio::join!(
-            validate_elected_mesh_ice_paths(
-                vec![
-                    (
-                        peer_b.clone(),
-                        channel_a_b,
-                        address_b,
-                        std::sync::Arc::clone(&unexpected_reliable_fallback),
-                        std::sync::Arc::clone(&unexpected_reliable_fallback),
-                    ),
-                    (
-                        peer_c.clone(),
-                        channel_a_c,
-                        address_c,
-                        std::sync::Arc::clone(&unexpected_reliable_fallback),
-                        std::sync::Arc::clone(&unexpected_reliable_fallback),
-                    ),
-                ],
-                true,
-                &local_device_id_a,
+        let connector = || std::sync::Arc::clone(&unexpected_reliable_fallback);
+        let mut validations = tokio::task::JoinSet::new();
+        let mut validating_peers = std::collections::HashSet::new();
+        start_mesh_ice_validation(
+            &mut validations,
+            &mut validating_peers,
+            (
+                peer_b.clone(),
+                channel_a_b,
+                address_b,
+                connector(),
+                connector(),
             ),
-            validate_elected_mesh_ice_paths(
-                vec![(
-                    peer_a.clone(),
-                    channel_b,
-                    address_a,
-                    std::sync::Arc::clone(&unexpected_reliable_fallback),
-                    std::sync::Arc::clone(&unexpected_reliable_fallback),
-                )],
-                true,
-                &local_device_id_b,
-            ),
-            validate_elected_mesh_ice_paths(
-                vec![(
-                    peer_a.clone(),
-                    channel_c,
-                    address_a,
-                    std::sync::Arc::clone(&unexpected_reliable_fallback),
-                    std::sync::Arc::clone(&unexpected_reliable_fallback),
-                )],
-                true,
-                &local_device_id_c,
-            ),
+            local_device_id_a.clone(),
         );
-        let mut validated_a = validated_a;
-        let mut validated_b = validated_b;
-        let mut validated_c = validated_c;
-        let channel_a_b = validated_a.remove(0).1;
-        let channel_a_c = validated_a.remove(0).1;
-        let channel_b = validated_b.remove(0).1;
-        let channel_c = validated_c.remove(0).1;
+        start_mesh_ice_validation(
+            &mut validations,
+            &mut validating_peers,
+            (
+                peer_c.clone(),
+                channel_a_c,
+                address_c,
+                connector(),
+                connector(),
+            ),
+            local_device_id_a.clone(),
+        );
+        start_mesh_ice_validation(
+            &mut validations,
+            &mut validating_peers,
+            (
+                peer_a.clone(),
+                channel_b,
+                address_a,
+                connector(),
+                connector(),
+            ),
+            local_device_id_b.clone(),
+        );
+        start_mesh_ice_validation(
+            &mut validations,
+            &mut validating_peers,
+            (
+                peer_a.clone(),
+                channel_c,
+                address_a,
+                connector(),
+                connector(),
+            ),
+            local_device_id_c.clone(),
+        );
+        let pending_reliable_fallback = tokio::spawn(std::future::pending::<()>());
+        let validated = tokio::time::timeout(Duration::from_secs(20), async {
+            let mut validated = std::collections::HashMap::new();
+            while let Some(result) = validations.join_next().await {
+                let (local_device_id, peer_id, connection) =
+                    result.expect("join ICE health validation");
+                validated.insert(
+                    (local_device_id, peer_id),
+                    connection.expect("healthy nominated ICE path"),
+                );
+            }
+            validated
+        })
+        .await
+        .expect("health validation completes while a reliable fallback attempt remains pending");
+        assert!(!pending_reliable_fallback.is_finished());
+        pending_reliable_fallback.abort();
+        let mut validated = validated;
+        let channel_a_b = validated
+            .remove(&(local_device_id_a.clone(), peer_b.device_id.clone()))
+            .expect("validated peer B path")
+            .1;
+        let channel_a_c = validated
+            .remove(&(local_device_id_a.clone(), peer_c.device_id.clone()))
+            .expect("validated peer C path")
+            .1;
+        let channel_b = validated
+            .remove(&(local_device_id_b.clone(), peer_a.device_id.clone()))
+            .expect("validated peer A path at B")
+            .1;
+        let channel_c = validated
+            .remove(&(local_device_id_c.clone(), peer_a.device_id.clone()))
+            .expect("validated peer A path at C")
+            .1;
         assert!(
             if identity_a.device_id() < peer_b.device_id {
                 channel_a_b.health_snapshot().probes_succeeded >= 3
@@ -8328,158 +8541,57 @@ mod tests {
 
     #[tokio::test]
     async fn initial_ice_retries_across_unchanged_snapshots_until_fresh_credentials() {
-        let temp = std::env::temp_dir().join(format!(
-            "mini-tunnel-initial-ice-retry-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let identity_a = mini_tunnel_agent::Identity::load_or_create_at(temp.join("a/device.key"))
-            .expect("identity A");
-        let mut identity_b =
-            mini_tunnel_agent::Identity::load_or_create_at(temp.join("b/device.key"))
-                .expect("identity B");
-        let mut identity_paths = vec![temp.join("b/device.key")];
-        while identity_a.device_id() > identity_b.device_id() {
-            let path = temp.join(format!("b/peer-{}.key", identity_paths.len()));
-            identity_b = mini_tunnel_agent::Identity::load_or_create_at(path.clone())
-                .expect("identity B ordered after identity A");
-            identity_paths.push(path);
-        }
-
-        let credentials_a =
-            mini_tunnel_agent::ice::generate_ice_credentials(3).expect("current ICE credentials A");
-        let stale_credentials_a =
-            mini_tunnel_agent::ice::generate_ice_credentials(1).expect("stale ICE credentials A");
-        let credentials_b =
-            mini_tunnel_agent::ice::generate_ice_credentials(1).expect("current ICE credentials B");
-        let make_endpoint =
-            |identity: &mini_tunnel_agent::Identity,
-             credentials: mini_tunnel_protocol::IceCredentials| {
-                let iced = mini_tunnel_agent::ice::peer_endpoint_with_ice(
-                    identity,
-                    "127.0.0.1:0".parse().unwrap(),
-                    16,
-                )
-                .expect("create test ICE endpoint");
-                let address = iced.endpoint.local_addr().expect("endpoint address");
-                (
-                    TunnelEndpoint {
-                        endpoint: iced.endpoint,
-                        excluded_candidate_interfaces: std::sync::Arc::new(std::sync::RwLock::new(
-                            std::collections::HashSet::new(),
-                        )),
-                        ice: Some(TunnelIceState {
-                            credentials,
-                            socket: iced.socket,
-                            router: iced.ice_router,
-                            local_socket_addr: address,
-                            local_candidates: std::sync::Arc::new(tokio::sync::RwLock::new(vec![
-                                mini_tunnel_agent::candidate::SignaledCandidate {
-                                    address,
-                                    transport:
-                                        mini_tunnel_agent::candidate::CandidateTransport::Udp,
-                                    candidate_type:
-                                        mini_tunnel_agent::candidate::CandidateType::Host,
-                                },
-                            ])),
-                        }),
-                    },
-                    address,
-                )
-            };
-
-        let (endpoint_a, address_a) = make_endpoint(&identity_a, credentials_a.clone());
-        let (endpoint_b, _) = make_endpoint(&identity_b, credentials_b.clone());
-        let peer_a = PeerInfo {
-            device_id: identity_a.device_id(),
+        let current_credentials =
+            mini_tunnel_agent::ice::generate_ice_credentials(3).expect("current ICE credentials");
+        let stale_credentials =
+            mini_tunnel_agent::ice::generate_ice_credentials(1).expect("stale ICE credentials");
+        let current_peer = PeerInfo {
+            device_id: "peer-a".to_owned(),
             assigned_ipv4: "10.78.0.1".to_owned(),
-            public_key: identity_a.public_key_encoded(),
-            candidates: vec![address_a.to_string()],
-            ice_credentials: Some(credentials_a.clone()),
+            public_key: "public-key-a".to_owned(),
+            candidates: vec!["127.0.0.1:42000".to_owned()],
+            ice_credentials: Some(current_credentials),
         };
-        let stale_peer_a = PeerInfo {
-            ice_credentials: Some(stale_credentials_a),
-            ..peer_a.clone()
+        let stale_peer = PeerInfo {
+            ice_credentials: Some(stale_credentials),
+            ..current_peer.clone()
         };
-        let peer_b = PeerInfo {
-            device_id: identity_b.device_id(),
-            assigned_ipv4: "10.78.0.2".to_owned(),
-            public_key: identity_b.public_key_encoded(),
-            candidates: vec![endpoint_b.endpoint.local_addr().unwrap().to_string()],
-            ice_credentials: Some(credentials_b),
-        };
-
-        let sequence: IcePeerSnapshotSequence =
+        let snapshots =
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::from([
-                stale_peer_a.clone(),
-                stale_peer_a.clone(),
-                peer_a,
+                stale_peer.clone(),
+                stale_peer.clone(),
+                current_peer,
             ])));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind mock coordinator");
-        let coordinator = listener.local_addr().expect("coordinator address");
-        let app = Router::new()
-            .route(
-                "/v1/networks/ice-retry-net/peers",
-                axum::routing::post(ice_peer_snapshot_sequence_handler),
-            )
-            .with_state(std::sync::Arc::clone(&sequence));
-        let server = tokio::spawn(async move { axum::serve(listener, app).await });
-        let coordinator_url = format!("http://{coordinator}");
-
-        let peer_b_for_check = peer_b.clone();
-        let endpoint_a_for_check = endpoint_a.clone();
-        let identity_a_path = temp.join("a/device.key");
-        let accepting_check = tokio::spawn(async move {
-            let identity_a = mini_tunnel_agent::Identity::load_or_create_at(identity_a_path)
-                .expect("reload identity A");
-            select_ice_peer_address_with_timeout(
-                &endpoint_a_for_check,
-                &peer_b_for_check,
-                &identity_a,
-                Duration::from_secs(2),
-            )
-            .await
-        });
-
-        let peer_b_path = identity_paths.last().expect("identity B path").clone();
-        let identity_b =
-            mini_tunnel_agent::Identity::load_or_create_at(peer_b_path).expect("reload identity B");
-        let mut initial_peer = stale_peer_a;
-        let selected = tokio::time::timeout(
-            Duration::from_secs(3),
-            select_ice_peer_address_with_snapshot_refresh(
-                &endpoint_b,
-                &coordinator_url,
-                "ice-retry-net",
-                &mut initial_peer,
-                &identity_b,
-                Duration::from_millis(150),
-            ),
-        )
-        .await
-        .expect("bounded ICE snapshot retries");
-        let Some((_, monitor)) = selected else {
-            panic!(
-                "a later peer credential publication should recover initial ICE nomination (remaining snapshots: {}, final generation: {})",
-                sequence.lock().await.len(),
-                initial_peer
+        let mut initial_peer = stale_peer;
+        let remote: SocketAddr = "127.0.0.1:42000".parse().expect("candidate address");
+        let selected = retry_ice_after_snapshot_refresh(
+            &mut initial_peer,
+            {
+                let snapshots = std::sync::Arc::clone(&snapshots);
+                move |_| {
+                    let snapshots = std::sync::Arc::clone(&snapshots);
+                    async move { snapshots.lock().await.pop_front().ok_or(()) }
+                }
+            },
+            |peer| {
+                let generation = peer
                     .ice_credentials
                     .as_ref()
-                    .map_or(0, |credentials| credentials.generation)
-            );
-        };
-        drop(monitor);
-        let accepting = accepting_check.await.expect("join accepting ICE checklist");
-        let Some((_, accepting_monitor)) = accepting else {
-            panic!("the accepting ICE checklist should nominate the same direct path");
-        };
-        drop(accepting_monitor);
-        assert!(sequence.lock().await.is_empty());
-        server.abort();
-        drop(endpoint_a);
-        drop(endpoint_b);
-        std::fs::remove_dir_all(&temp).expect("remove temporary peer identities");
+                    .map_or(0, |credentials| credentials.generation);
+                async move { (generation == 3).then_some(remote) }
+            },
+        )
+        .await;
+
+        assert_eq!(selected, Some(remote));
+        assert_eq!(
+            initial_peer
+                .ice_credentials
+                .as_ref()
+                .map(|credentials| credentials.generation),
+            Some(3)
+        );
+        assert!(snapshots.lock().await.is_empty());
     }
 
     #[test]
