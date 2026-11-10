@@ -50,13 +50,13 @@ jobs:
             -o APT::Update::Error-Mode=any \
             -o Acquire::Retries=5 -o Acquire::https::Timeout=20 \
             -o Acquire::https::CAInfo=/tmp/runner-ca-certificates.crt install \
-            --no-install-recommends build-essential ca-certificates curl pkg-config tar gzip
+            --no-install-recommends -y build-essential ca-certificates curl pkg-config tar gzip
 
       - name: Install build prerequisites
         if: matrix.target == 'aarch64'
         run: |
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends \
+          DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
             build-essential ca-certificates curl pkg-config tar gzip
 
       - name: Check out source
