@@ -39,6 +39,7 @@ repository=ilovn/mini-tunnel
 architecture=auto
 commit=
 run_id=
+artifact_id=
 release=
 output_dir=./mini-tunnel-download
 force=false
