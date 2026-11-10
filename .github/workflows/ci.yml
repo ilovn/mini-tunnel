@@ -27,7 +27,8 @@ jobs:
     steps:
       - name: Install build prerequisites
         run: |
-          apt-get update
+          apt-get -o APT::Update::Error-Mode=any \
+            -o Acquire::Retries=5 -o Acquire::http::Timeout=20 update
           DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
             build-essential ca-certificates curl pkg-config tar gzip
 
