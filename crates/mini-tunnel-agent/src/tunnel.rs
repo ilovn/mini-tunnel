@@ -2350,7 +2350,7 @@ mod tests {
         .expect("establish authenticated QUIC over veth");
         let (monitor, mut cancel, failure_sender) = crate::ice::IceConsentMonitor::new();
         let mut failure_observer = monitor.failure_receiver();
-        let cancel_observer = cancel.clone();
+        let mut cancel_observer = cancel.clone();
         let (expire_tx, expire_rx) = tokio::sync::oneshot::channel();
         monitor
             .set_task(tokio::spawn(async move {
