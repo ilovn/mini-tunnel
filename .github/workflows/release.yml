@@ -130,8 +130,6 @@ jobs:
           EXPECTED_NAMES: mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz.sha256 mini-tunnel-linux-aarch64-ubuntu22.04.tar.gz mini-tunnel-linux-aarch64-ubuntu22.04.tar.gz.sha256
         run: |
           set -euo pipefail
-          mkdir staging
-          gh run download "$GITHUB_RUN_ID" --dir staging
           actual_names="$(find staging -type f -printf '%f\n' | sort)"
           expected_names="$(printf '%s\n' $EXPECTED_NAMES | sort)"
           diff -u <(printf '%s\n' "$expected_names") <(printf '%s\n' "$actual_names")
