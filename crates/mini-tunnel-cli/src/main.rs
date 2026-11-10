@@ -688,9 +688,21 @@ async fn relay_metrics(State(relay): State<RelayMetricsState>) -> impl IntoRespo
          # HELP mini_tunnel_udp_relay_auth_rate_limited_total UDP relay authentication packets rejected by per-source rate limits.\n\
          # TYPE mini_tunnel_udp_relay_auth_rate_limited_total counter\n\
          mini_tunnel_udp_relay_auth_rate_limited_total {}\n\
-         # HELP mini_tunnel_udp_relay_dropped_datagrams_total Invalid or unauthorized UDP relay packets dropped.\n\
+         # HELP mini_tunnel_udp_relay_dropped_datagrams_total UDP relay packets rejected or dropped for any reason.\n\
          # TYPE mini_tunnel_udp_relay_dropped_datagrams_total counter\n\
-         mini_tunnel_udp_relay_dropped_datagrams_total {}\n",
+         mini_tunnel_udp_relay_dropped_datagrams_total {}\n\
+         # HELP mini_tunnel_udp_relay_malformed_datagrams_total Malformed UDP relay packets dropped.\n\
+         # TYPE mini_tunnel_udp_relay_malformed_datagrams_total counter\n\
+         mini_tunnel_udp_relay_malformed_datagrams_total {}\n\
+         # HELP mini_tunnel_udp_relay_authentication_rejections_total UDP relay authentication and authorization rejections, excluding rate limits.\n\
+         # TYPE mini_tunnel_udp_relay_authentication_rejections_total counter\n\
+         mini_tunnel_udp_relay_authentication_rejections_total {}\n\
+         # HELP mini_tunnel_udp_relay_session_rejections_total UDP relay datagrams rejected for unknown sessions or unregistered sources.\n\
+         # TYPE mini_tunnel_udp_relay_session_rejections_total counter\n\
+         mini_tunnel_udp_relay_session_rejections_total {}\n\
+         # HELP mini_tunnel_udp_relay_capacity_rejections_total UDP relay packets rejected because bounded state capacity was reached.\n\
+         # TYPE mini_tunnel_udp_relay_capacity_rejections_total counter\n\
+         mini_tunnel_udp_relay_capacity_rejections_total {}\n",
         stats.active_connections,
         stats.max_connections,
         stats.max_connections_per_source_ip,
@@ -704,6 +716,10 @@ async fn relay_metrics(State(relay): State<RelayMetricsState>) -> impl IntoRespo
         udp_stats.forwarded_datagrams_total,
         udp_stats.auth_rate_limited_total,
         udp_stats.dropped_datagrams_total,
+        udp_stats.malformed_datagrams_total,
+        udp_stats.authentication_rejections_total,
+        udp_stats.session_rejections_total,
+        udp_stats.capacity_rejections_total,
     );
     (
         [(
@@ -7996,6 +8012,11 @@ mod tests {
         assert!(body.contains("mini_tunnel_udp_relay_active_sessions 0"));
         assert!(body.contains("mini_tunnel_udp_relay_forwarded_datagrams_total 0"));
         assert!(body.contains("mini_tunnel_udp_relay_auth_rate_limited_total 1"));
+        assert!(body.contains("mini_tunnel_udp_relay_dropped_datagrams_total 2"));
+        assert!(body.contains("mini_tunnel_udp_relay_malformed_datagrams_total 1"));
+        assert!(body.contains("mini_tunnel_udp_relay_authentication_rejections_total 0"));
+        assert!(body.contains("mini_tunnel_udp_relay_session_rejections_total 0"));
+        assert!(body.contains("mini_tunnel_udp_relay_capacity_rejections_total 0"));
         udp_relay.shutdown();
         udp_server.await.expect("UDP relay task");
         server.abort();

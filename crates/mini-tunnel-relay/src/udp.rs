@@ -88,6 +88,10 @@ pub struct UdpRelayStats {
     pub forwarded_datagrams_total: u64,
     pub dropped_datagrams_total: u64,
     pub auth_rate_limited_total: u64,
+    pub malformed_datagrams_total: u64,
+    pub authentication_rejections_total: u64,
+    pub session_rejections_total: u64,
+    pub capacity_rejections_total: u64,
 }
 
 #[derive(Clone)]
@@ -101,7 +105,19 @@ struct Inner {
     forwarded: AtomicU64,
     dropped: AtomicU64,
     auth_rate_limited: AtomicU64,
+    malformed: AtomicU64,
+    authentication_rejected: AtomicU64,
+    session_rejected: AtomicU64,
+    capacity_rejected: AtomicU64,
     shutdown: watch::Sender<bool>,
+}
+
+#[derive(Clone, Copy)]
+enum DropReason {
+    Malformed,
+    Authentication,
+    Session,
+    Capacity,
 }
 
 #[derive(Default)]
@@ -173,6 +189,10 @@ impl UdpRelayServer {
                 forwarded: AtomicU64::new(0),
                 dropped: AtomicU64::new(0),
                 auth_rate_limited: AtomicU64::new(0),
+                malformed: AtomicU64::new(0),
+                authentication_rejected: AtomicU64::new(0),
+                session_rejected: AtomicU64::new(0),
+                capacity_rejected: AtomicU64::new(0),
                 shutdown,
             }),
         }
@@ -191,6 +211,13 @@ impl UdpRelayServer {
             forwarded_datagrams_total: self.inner.forwarded.load(Ordering::Relaxed),
             dropped_datagrams_total: self.inner.dropped.load(Ordering::Relaxed),
             auth_rate_limited_total: self.inner.auth_rate_limited.load(Ordering::Relaxed),
+            malformed_datagrams_total: self.inner.malformed.load(Ordering::Relaxed),
+            authentication_rejections_total: self
+                .inner
+                .authentication_rejected
+                .load(Ordering::Relaxed),
+            session_rejections_total: self.inner.session_rejected.load(Ordering::Relaxed),
+            capacity_rejections_total: self.inner.capacity_rejected.load(Ordering::Relaxed),
         }
     }
 
@@ -263,7 +290,7 @@ impl UdpRelayServer {
             return self.handle_proof(socket, source, packet).await;
         }
         let Ok((session_id, _)) = decode_udp_relay_datagram(packet) else {
-            return Ok(false);
+            return Ok(self.reject(DropReason::Malformed));
         };
         let target = {
             let mut state = self.inner.state.lock().await;
@@ -299,11 +326,22 @@ impl UdpRelayServer {
             }
         };
         let Some(target) = target else {
-            return Ok(false);
+            return Ok(self.reject(DropReason::Session));
         };
         socket.send_to(packet, target).await?;
         self.inner.forwarded.fetch_add(1, Ordering::Relaxed);
         Ok(true)
+    }
+
+    fn reject(&self, reason: DropReason) -> bool {
+        let counter = match reason {
+            DropReason::Malformed => &self.inner.malformed,
+            DropReason::Authentication => &self.inner.authentication_rejected,
+            DropReason::Session => &self.inner.session_rejected,
+            DropReason::Capacity => &self.inner.capacity_rejected,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        false
     }
 
     async fn admit_auth_attempt(&self, source_ip: IpAddr) -> bool {
@@ -328,18 +366,18 @@ impl UdpRelayServer {
         packet: &[u8],
     ) -> io::Result<bool> {
         if packet.len() < 8 + 2 + 1 + 32 || packet.get(..8) != Some(HELLO.as_slice()) {
-            return Ok(false);
+            return Ok(self.reject(DropReason::Malformed));
         }
         let ticket_length = usize::from(u16::from_be_bytes([packet[8], packet[9]]));
         if ticket_length == 0
             || ticket_length > MAX_TICKET_LENGTH
             || packet.len() != 10 + ticket_length + 32
         {
-            return Ok(false);
+            return Ok(self.reject(DropReason::Malformed));
         }
         let ticket_bytes = &packet[10..10 + ticket_length];
         let Ok(ticket) = std::str::from_utf8(ticket_bytes) else {
-            return Ok(false);
+            return Ok(self.reject(DropReason::Malformed));
         };
         let now_ms =
             unix_time_ms().ok_or_else(|| io::Error::other("system clock is before epoch"))?;
@@ -353,22 +391,22 @@ impl UdpRelayServer {
                     .and_then(|key| verify_relay_ticket(key, ticket, now_ms))
             });
         let Ok(claims) = claims else {
-            return Ok(false);
+            return Ok(self.reject(DropReason::Authentication));
         };
         if claims.expires_at_ms.saturating_sub(now_ms) > MAX_TICKET_LIFETIME_MS {
-            return Ok(false);
+            return Ok(self.reject(DropReason::Authentication));
         }
         let public_key: [u8; 32] = packet[10 + ticket_length..]
             .try_into()
             .map_err(|_| io::Error::other("invalid public key length"))?;
         if mini_tunnel_protocol::device_id_from_public_key(&public_key) != claims.source_device_id {
-            return Ok(false);
+            return Ok(self.reject(DropReason::Authentication));
         }
         let mut state = self.inner.state.lock().await;
         let now = tokio::time::Instant::now();
         prune_expired_state(&mut state, now, now_ms);
         if state.used_tickets.contains_key(&claims.ticket_id) {
-            return Ok(false);
+            return Ok(self.reject(DropReason::Authentication));
         }
         if let Some(pending) = state.pending.get(&source)
             && pending.claims == claims
@@ -387,7 +425,7 @@ impl UdpRelayServer {
         if !state.pending.contains_key(&source)
             && state.pending.len() >= self.inner.config.max_pending.max(1)
         {
-            return Ok(false);
+            return Ok(self.reject(DropReason::Capacity));
         }
         state.pending.insert(
             source,
@@ -413,18 +451,18 @@ impl UdpRelayServer {
         packet: &[u8],
     ) -> io::Result<bool> {
         if packet.len() < 8 + 2 + 1 + 32 + 64 || packet.get(..8) != Some(PROOF.as_slice()) {
-            return Ok(false);
+            return Ok(self.reject(DropReason::Malformed));
         }
         let ticket_length = usize::from(u16::from_be_bytes([packet[8], packet[9]]));
         if ticket_length == 0
             || ticket_length > MAX_TICKET_LENGTH
             || packet.len() != 10 + ticket_length + 32 + 64
         {
-            return Ok(false);
+            return Ok(self.reject(DropReason::Malformed));
         }
         let ticket = std::str::from_utf8(&packet[10..10 + ticket_length]).ok();
         let Some(ticket) = ticket else {
-            return Ok(false);
+            return Ok(self.reject(DropReason::Malformed));
         };
         let mut state = self.inner.state.lock().await;
         let now_ms =
@@ -441,7 +479,7 @@ impl UdpRelayServer {
                     .and_then(|key| verify_relay_ticket(key, ticket, now_ms))
             }) {
             Ok(claims) => claims.ticket_id,
-            Err(_) => return Ok(false),
+            Err(_) => return Ok(self.reject(DropReason::Authentication)),
         };
         if let Some(existing) = state.accepted_proofs.get(&ticket_id) {
             let session_id =
@@ -456,14 +494,14 @@ impl UdpRelayServer {
                     },
                 ) {
                     Ok(claims) => claims.session_id,
-                    Err(_) => return Ok(false),
+                    Err(_) => return Ok(self.reject(DropReason::Authentication)),
                 };
             let paired = state.sessions.get(&session_id).is_some_and(|session| {
                 session.endpoints.iter().all(Option::is_some)
                     && session.endpoints.contains(&Some(source))
             });
             if existing.packet.as_slice() != packet || !paired {
-                return Ok(false);
+                return Ok(self.reject(DropReason::Authentication));
             }
             drop(state);
             let mut response = Vec::with_capacity(24);
@@ -473,7 +511,7 @@ impl UdpRelayServer {
             return Ok(true);
         }
         let Some(pending) = state.pending.remove(&source) else {
-            return Ok(false);
+            return Ok(self.reject(DropReason::Authentication));
         };
         let public_key: [u8; 32] = packet[10 + ticket_length..10 + ticket_length + 32]
             .try_into()
@@ -494,11 +532,11 @@ impl UdpRelayServer {
                         .and_then(|key| verify_relay_ticket(key, ticket, now_ms))
                 }), Ok(ref claims) if claims == &pending.claims)
         {
-            return Ok(false);
+            return Ok(self.reject(DropReason::Authentication));
         }
         let verifying_key = match VerifyingKey::from_bytes(&public_key) {
             Ok(key) => key,
-            Err(_) => return Ok(false),
+            Err(_) => return Ok(self.reject(DropReason::Authentication)),
         };
         if verifying_key
             .verify_strict(
@@ -507,10 +545,10 @@ impl UdpRelayServer {
             )
             .is_err()
         {
-            return Ok(false);
+            return Ok(self.reject(DropReason::Authentication));
         }
         if state.used_tickets.len() >= MAX_USED_TICKETS {
-            return Ok(false);
+            return Ok(self.reject(DropReason::Capacity));
         }
         let claims = pending.claims;
         let session_id = claims.session_id;
@@ -522,7 +560,7 @@ impl UdpRelayServer {
         if !state.sessions.contains_key(&session_id)
             && state.sessions.len() >= self.inner.config.max_sessions.max(1)
         {
-            return Ok(false);
+            return Ok(self.reject(DropReason::Capacity));
         }
         let session = state.sessions.entry(session_id).or_insert_with(|| Session {
             expires_at_ms: claims.expires_at_ms,
@@ -532,7 +570,7 @@ impl UdpRelayServer {
             endpoints: [None, None],
         });
         if session.endpoints[target_index].is_some() {
-            return Ok(false);
+            return Ok(self.reject(DropReason::Authentication));
         }
         session.expires_at_ms = session.expires_at_ms.min(claims.expires_at_ms);
         session.endpoints[target_index] = Some(source);
@@ -863,6 +901,82 @@ mod tests {
         assert_eq!(state.auth_rate_limits.len(), 1);
         drop(state);
 
+        relay.shutdown();
+        server.await.expect("relay task");
+    }
+
+    #[tokio::test]
+    async fn dropped_udp_packets_are_classified_into_disjoint_reasons() {
+        let key = [33; 32];
+        let alice = identity(11);
+        let bob = identity(12);
+        let valid_ticket = ticket(&key, &alice, &bob, 13, 1_000);
+        let mut config = UdpRelayConfig::new(key);
+        config.max_pending = 1;
+        let relay = UdpRelayServer::new(config);
+        let now = tokio::time::Instant::now();
+        let now_ms = unix_time_ms().expect("current time");
+        relay.inner.state.lock().await.pending.insert(
+            "127.0.0.1:9".parse().expect("seed source"),
+            Pending {
+                claims: RelayTicketClaims {
+                    version: RELAY_TICKET_VERSION,
+                    network_id: "network-test".to_owned(),
+                    source_device_id: "pending-source".to_owned(),
+                    target_device_id: "pending-target".to_owned(),
+                    session_id: [1; 16],
+                    ticket_id: [2; 16],
+                    expires_at_ms: now_ms + 1_000,
+                },
+                public_key: [3; 32],
+                challenge: [4; 32],
+                expires_at: now + CHALLENGE_TTL,
+            },
+        );
+        let relay_socket = UdpSocket::bind("127.0.0.1:0").await.expect("relay socket");
+        let relay_address = relay_socket.local_addr().expect("relay address");
+        let server = {
+            let relay = relay.clone();
+            tokio::spawn(async move { relay.run(relay_socket).await.expect("relay run") })
+        };
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+        let hello =
+            udp_relay_hello(&valid_ticket, &alice.verifying_key().to_bytes()).expect("valid hello");
+        let unknown_session = mini_tunnel_protocol::encode_udp_relay_datagram(&[99; 16], b"x")
+            .expect("valid relay data frame");
+        for packet in [
+            b"malformed".to_vec(),
+            udp_relay_hello("not-a-valid-ticket", &[5; 32]).expect("invalid-ticket hello"),
+            unknown_session,
+            hello,
+        ] {
+            client
+                .send_to(&packet, relay_address)
+                .await
+                .expect("send rejected packet");
+        }
+        timeout(Duration::from_secs(1), async {
+            while relay.stats().await.dropped_datagrams_total < 4 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("drop counter timeout");
+        let stats = relay.stats().await;
+        assert_eq!(stats.dropped_datagrams_total, 4);
+        assert_eq!(stats.malformed_datagrams_total, 1);
+        assert_eq!(stats.authentication_rejections_total, 1);
+        assert_eq!(stats.session_rejections_total, 1);
+        assert_eq!(stats.capacity_rejections_total, 1);
+        assert_eq!(stats.auth_rate_limited_total, 0);
+        assert_eq!(
+            stats.dropped_datagrams_total,
+            stats.malformed_datagrams_total
+                + stats.authentication_rejections_total
+                + stats.session_rejections_total
+                + stats.capacity_rejections_total
+                + stats.auth_rate_limited_total
+        );
         relay.shutdown();
         server.await.expect("relay task");
     }
