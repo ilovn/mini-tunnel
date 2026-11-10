@@ -32,7 +32,7 @@ const PEER_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(5);
 const COORDINATOR_HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
 const ICE_PATH_PROMOTION_PROBATION: Duration = Duration::from_secs(31);
 const ICE_INITIAL_PATH_PROBATION: Duration = Duration::from_secs(5);
-const INITIAL_ICE_SNAPSHOT_REFRESH_RETRIES: usize = 2;
+const INITIAL_ICE_SNAPSHOT_REFRESH_RETRIES: usize = 3;
 const COORDINATOR_CA_CERT_FILE_ENV: &str = "MINI_TUNNEL_COORDINATOR_CA_CERT_FILE";
 const MAX_COORDINATOR_CA_BUNDLE_BYTES: u64 = 1024 * 1024;
 const MAX_INVITE_TOKEN_FILE_BYTES: u64 = 4096;
@@ -8327,7 +8327,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_ice_retries_until_both_peers_publish_fresh_credentials() {
+    async fn initial_ice_retries_across_unchanged_snapshots_until_fresh_credentials() {
         let temp = std::env::temp_dir().join(format!(
             "mini-tunnel-initial-ice-retry-{}",
             uuid::Uuid::new_v4()
@@ -8410,6 +8410,7 @@ mod tests {
 
         let sequence: IcePeerSnapshotSequence =
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::from([
+                stale_peer_a.clone(),
                 stale_peer_a.clone(),
                 peer_a,
             ])));
