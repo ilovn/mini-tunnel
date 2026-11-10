@@ -2751,9 +2751,11 @@ async fn select_ice_peer_address_with_timeout(
 }
 
 /// A peer list can race another agent's startup credential publication. If that happens, an
-/// initial checklist can use a prior ufrag, and the refreshed snapshot can itself be superseded
-/// while the retry is running. Retry only when signed peer ICE data changes, with a fixed cap so
-/// unreachable peers still move on to direct candidates and Relay fallback.
+/// initial checklist can use a prior ufrag. The other peer may still be publishing its fresh
+/// credentials when this side first refreshes, or may have refreshed its view of our credentials
+/// while our view of theirs stayed unchanged. Retry the bounded checklist even when the signed
+/// peer snapshot is unchanged so both sides get another rendezvous; unreachable peers still move
+/// on to direct candidates and Relay fallback after a fixed number of attempts.
 async fn select_ice_peer_address_with_snapshot_refresh(
     endpoint: &TunnelEndpoint,
     coordinator_url: &str,
@@ -2775,22 +2777,19 @@ async fn select_ice_peer_address_with_snapshot_refresh(
         let refreshed = refresh_peer_snapshot_for_ice(coordinator_url, network_id, peer, identity)
             .await
             .ok()?;
-        if refreshed.ice_credentials == previous_credentials
-            && refreshed.candidates == previous_candidates
-        {
-            return None;
-        }
-
+        let snapshot_changed = refreshed.ice_credentials != previous_credentials
+            || refreshed.candidates != previous_candidates;
         tracing::debug!(
             peer_id = %peer.device_id,
             retry,
             max_retries = INITIAL_ICE_SNAPSHOT_REFRESH_RETRIES,
-            "peer ICE snapshot changed during initial checks; retrying with refreshed credentials and candidates"
+            snapshot_changed,
+            "retrying initial ICE checklist after startup credential synchronization"
         );
         *peer = refreshed;
-        if let Some(selected) =
-            select_ice_peer_address_with_timeout(endpoint, peer, identity, check_timeout).await
-        {
+        let selected =
+            select_ice_peer_address_with_timeout(endpoint, peer, identity, check_timeout).await;
+        if let Some(selected) = selected {
             return Some(selected);
         }
     }
@@ -8328,7 +8327,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_ice_refreshes_again_when_snapshot_changes_during_retry() {
+    async fn initial_ice_retries_until_both_peers_publish_fresh_credentials() {
         let temp = std::env::temp_dir().join(format!(
             "mini-tunnel-initial-ice-retry-{}",
             uuid::Uuid::new_v4()
@@ -8348,8 +8347,6 @@ mod tests {
 
         let credentials_a =
             mini_tunnel_agent::ice::generate_ice_credentials(3).expect("current ICE credentials A");
-        let intermediate_credentials_a = mini_tunnel_agent::ice::generate_ice_credentials(2)
-            .expect("intermediate ICE credentials A");
         let stale_credentials_a =
             mini_tunnel_agent::ice::generate_ice_credentials(1).expect("stale ICE credentials A");
         let credentials_b =
@@ -8403,10 +8400,6 @@ mod tests {
             ice_credentials: Some(stale_credentials_a),
             ..peer_a.clone()
         };
-        let intermediate_peer_a = PeerInfo {
-            ice_credentials: Some(intermediate_credentials_a),
-            ..peer_a.clone()
-        };
         let peer_b = PeerInfo {
             device_id: identity_b.device_id(),
             assigned_ipv4: "10.78.0.2".to_owned(),
@@ -8417,7 +8410,7 @@ mod tests {
 
         let sequence: IcePeerSnapshotSequence =
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::from([
-                intermediate_peer_a,
+                stale_peer_a.clone(),
                 peer_a,
             ])));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -8466,7 +8459,14 @@ mod tests {
         .await
         .expect("bounded ICE snapshot retries");
         let Some((_, monitor)) = selected else {
-            panic!("a second peer snapshot update should recover initial ICE nomination");
+            panic!(
+                "a later peer credential publication should recover initial ICE nomination (remaining snapshots: {}, final generation: {})",
+                sequence.lock().await.len(),
+                initial_peer
+                    .ice_credentials
+                    .as_ref()
+                    .map_or(0, |credentials| credentials.generation)
+            );
         };
         drop(monitor);
         let accepting = accepting_check.await.expect("join accepting ICE checklist");
