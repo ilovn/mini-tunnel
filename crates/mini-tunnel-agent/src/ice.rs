@@ -3653,13 +3653,17 @@ mod tests {
 
     #[tokio::test]
     async fn iced_socket_counts_quinn_datagrams_dropped_from_a_full_queue() {
-        let temp =
-            std::env::temp_dir().join(format!("mini-tunnel-quinn-queue-{}", uuid::Uuid::new_v4()));
-        let identity =
-            crate::Identity::load_or_create_at(temp.join("device.key")).expect("identity");
-        let endpoint = super::peer_endpoint_with_ice(&identity, "127.0.0.1:0".parse().unwrap(), 1)
-            .expect("ICE endpoint");
-        let address = endpoint.endpoint.local_addr().expect("endpoint address");
+        let (runtime, socket_handle, _ice_datagrams) = IcedQuinnRuntime::new(1);
+        let udp_socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("UDP socket");
+        udp_socket
+            .set_nonblocking(true)
+            .expect("set socket nonblocking");
+        // Keep the Quinn receive queue alive without starting a Quinn endpoint/poller that could
+        // consume the first datagram before the second fills this one-entry test queue.
+        let quinn_socket =
+            <IcedQuinnRuntime as quinn::Runtime>::wrap_udp_socket(&runtime, udp_socket)
+                .expect("wrap Quinn UDP socket");
+        let address = socket_handle.local_addr().expect("endpoint address");
         let sender = UdpSocket::bind("127.0.0.1:0").await.expect("sender socket");
 
         for datagram in [&b"quic-one"[..], &b"quic-two"[..]] {
@@ -3669,14 +3673,18 @@ mod tests {
                 .expect("send non-STUN datagram");
         }
         tokio::time::timeout(Duration::from_secs(1), async {
-            while endpoint.socket.diagnostics().received_datagrams < 2 {
+            loop {
+                let diagnostics = socket_handle.diagnostics();
+                if diagnostics.received_datagrams == 2 && diagnostics.quinn_queue_drops == 1 {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("both datagrams should reach the shared socket");
 
-        let diagnostics = endpoint.socket.diagnostics();
+        let diagnostics = socket_handle.diagnostics();
         assert_eq!(diagnostics.received_datagrams, 2);
         assert_eq!(diagnostics.received_stun_datagrams, 0);
         assert_eq!(diagnostics.received_other_datagrams, 2);
@@ -3684,7 +3692,6 @@ mod tests {
         assert_eq!(diagnostics.quinn_queue_drops, 1);
         assert_eq!(diagnostics.receive_errors, 0);
 
-        endpoint.endpoint.close(0_u32.into(), b"test complete");
-        let _ = fs::remove_dir_all(temp);
+        drop(quinn_socket);
     }
 }
