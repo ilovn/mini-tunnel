@@ -2,6 +2,13 @@
 
 Status: **public NAT/QoS matrix incomplete**. The loopback ICE mapping proxy verifies packet rewriting and session behavior, but it does not establish interoperability across public NATs. The VPS smoke test and the RouterOS/office fallback observation below are additional runtime evidence; neither completes a matrix case.
 
+### ICE credential-skew retry: staggered restart (2026-11-10)
+
+- Tested commit `f1b91f965a0069753968106daa454a7474d5757f` from successful [CI run 42777168889](https://github.com/ilovn/mini-tunnel/actions/runs/42777168889), all six jobs passed. The x86_64 and ARM64 release archives passed sidecar checksum and GitHub attestation checks for the exact repository, workflow, and source digest before transfer; both hosts ran those prebuilt artifacts.
+- On the Guangzhou x86_64 VPS and the USB-backed RouterOS Debian ARM64 NAT container, a deliberately staggered restart exercised the expanded credential retry window. The Guangzhou endpoint saw two unchanged peer snapshots, then a changed snapshot on retry three; both endpoints accepted STUN checks and nominated. Guangzhou's first nominated QUIC setup failed with `connection lost` and its consent later expired. Background ICE recovery subsequently authenticated and promoted both endpoints to direct `QUIC/UDP`.
+- After recovery, overlay ping passed 20/20 each direction with 0% loss (mean RTT 11.782 ms Guangzhou→ARM64 and 11.662 ms ARM64→Guangzhou). Both peer status endpoints showed online over QUIC/UDP, with zero drops or rejects. This confirms recovery in this controlled sample; the initial QUIC setup failure shows that nomination is not itself proof of a usable path.
+- Temporary memberships, peers, Coordinator, Relay, SSH forwards, and files were removed. The Guangzhou default route, EasyTier processes and original TUNs remained; the ARM64 default route and veth remained. No persistent firewall, route, service, or RouterOS configuration changed. This single sample does not establish success rate across NAT/QoS types, TCP downgrade under a deliberately induced UDP outage, or long-duration reliability.
+
 ### ICE mesh election fix: attested build and cold-start observations (2026-11-10)
 
 - The mesh path election/health-validation fix is commit `5a598dd` and was included in successful [CI run 42764935359](https://github.com/ilovn/mini-tunnel/actions/runs/42764935359), built from workflow commit `bc71bd6dbcfbc21954774cb33d44c4a7bc73952b`. All six CI jobs passed. The x86_64 and ARM64 release archives passed SHA-256 sidecar checks and GitHub artifact attestation verification against that exact source digest; both VPS endpoints ran those prebuilt artifacts.
