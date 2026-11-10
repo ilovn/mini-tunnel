@@ -2,6 +2,13 @@
 
 Status: **public NAT/QoS matrix incomplete**. The loopback ICE mapping proxy verifies packet rewriting and session behavior, but it does not establish interoperability across public NATs. The VPS smoke test and the RouterOS/office fallback observation below are additional runtime evidence; neither completes a matrix case.
 
+### ICE consent observer field preflight (2026-11-10; consent expiry not measured)
+
+- Used the attested x86_64 and ARM64 artifacts from CI run [42754900346](https://github.com/ilovn/mini-tunnel/actions/runs/42754900346), built from commit `06205f25eb3e1973de33e16f7cef4aa83e17d6cd`; checksums and GitHub attestations were verified before staging. The test topology was the Guangzhou VPS plus the USB-backed RouterOS Debian ARM64 container, with an isolated temporary Coordinator/Relay and overlay `10.247.253.0/24`.
+- Initial peer attempts ran while the Coordinator lacked the Relay ticket signing key. After configuring the same temporary key on Coordinator and Relay and restarting only the Coordinator, both members were discoverable and established an authenticated Relay/TLS path. Bidirectional overlay probes passed 5/5 in each direction, with status online and 0% reported loss.
+- The intended direct-UDP baseline could not be established: the ARM64 NAT candidate `223.74.118.54:1264` timed out in the peer's direct recovery probe. The active Relay path remained online. No UDP impairment rule or watchdog was installed, and therefore this run provides no observation of ICE consent expiry, fallback timestamps, or consent-expiry telemetry.
+- Cleanup revoked both temporary members, stopped the test Coordinator and Relay, and confirmed no `10.247.253.0/24` route remained. Existing EasyTier interfaces on the VPS were left intact. This is a failed precondition for the consent experiment, not an ICE consent or QoS result; repeat after obtaining a stable direct UDP baseline on this NAT underlay.
+
 ## Preliminary single-client observation (not matrix evidence)
 
 On 2026-11-01, one UDP socket on the development host sent STUN Binding requests to `stun.l.google.com:19302` and `global.stun.twilio.com:3478`. Both returned valid responses with the same XOR-MAPPED IPv4 address and port. The mapped endpoint is intentionally omitted. This only records the mapping seen by one client for those two STUN destinations at that time; it does not classify the NAT, establish behavior toward a peer destination, or prove ICE/direct tunnel connectivity. It does not satisfy any matrix case above, and the matrix remains unexecuted.
