@@ -2,6 +2,34 @@
 
 The Coordinator and opaque Relay templates run as unprivileged server services; the separate peer template grants only the TUN/route privileges required by a client mesh. All templates require systemd 247 or newer for the complete sandbox profile. They do not configure a firewall, TLS proxy, certificate renewal, or secret distribution. Review those choices for your host before enabling the units.
 
+## Quick install for a Linux peer
+
+`deploy/install-peer.sh` installs an already-built Linux binary and enrolls one systemd peer. It never compiles or downloads code, creates a Coordinator network, or issues an invite. Create the network and a one-use invite on the Coordinator first, then copy the invite to the peer over a protected channel with mode `0600`. The Coordinator must be reachable over HTTPS in normal deployments; use `--coordinator-ca` when it uses a private CA.
+
+From a checkout containing the script and unit template, run as root (or prefix with `sudo`):
+
+```sh
+sudo deploy/install-peer.sh \
+  --binary ./mini-tunnel \
+  --network-id 00000000-0000-0000-0000-000000000000 \
+  --coordinator-url https://coordinator.example:8443 \
+  --invite-token-file ./invite.token \
+  --instance office \
+  --stun-server 111.206.174.2:3478 \
+  --relay-server relay.example:42001 \
+  --udp-relay-server relay.example:42003
+```
+
+Omit either Relay option if that transport is not configured. For a private CA, add `--coordinator-ca ./coordinator-ca.pem`. Before installing, `--validate-only` checks the binary, UUID, endpoint syntax, invite-file type/permissions, and presence of the unit template without changing the machine. The installer copies the invite into `/var/lib/mini-tunnel` with mode `0600`, consumes it for enrollment, and removes the temporary copy. It does not delete the source invite file. It refuses to overwrite an existing peer instance config; use a new `--instance` for another network. After installation, inspect it with:
+
+```sh
+sudo systemctl status mini-tunnel-peer@office.service
+sudo journalctl -fu mini-tunnel-peer@office.service
+sudo -u mini-tunnel /usr/local/bin/mini-tunnel peer status --url http://127.0.0.1:42003
+```
+
+The script requires Linux, systemd 247+, `/dev/net/tun`, and a binary for the target CPU architecture. It does not open firewall ports. For multiple networks on one host, use a distinct `--instance`, `--bind-address`, and `--status-listen` port for each instance. For rollback, stop/disable the instance with `sudo systemctl disable --now mini-tunnel-peer@office.service`; its identity and membership remain under `/var/lib/mini-tunnel`, and its config remains under `/etc/mini-tunnel` so a stopped deployment can be inspected or restarted.
+
 ## Linux peer mesh service
 
 `mini-tunnel-peer@.service` runs one mesh network per systemd instance under the dedicated `mini-tunnel` account. It enables ICE, configures the selected STUN service, installs only authenticated peer host routes, and restarts the foreground CLI after an unexpected exit. It grants `CAP_NET_ADMIN`, access to `/dev/net/tun`, and the `AF_NETLINK` family required for TUN and route setup. It explicitly removes Coordinator admin, invite, and Relay signing-key variables before starting the peer process.
