@@ -14,10 +14,11 @@ Usage:
     [--arch auto|x86_64|aarch64] [--commit <full-sha>|--run-id <id>] \
     [--repo owner/name] [--force]
 
-The default fetches a published GitHub Release asset without a token. Use
---commit or --run-id only for pre-release validation of a successful CI run.
-GitHub CI artifacts are retained for 30 days; this script does not create or
-install services.
+With no source option, fetch the newest stable published GitHub Release asset
+without a token. Pass --release for a reproducible deployment. Use --commit or
+--run-id only for pre-release validation of a successful CI run. GitHub CI
+artifacts are retained for 30 days; this script does not create or install
+services.
 
 For the CI artifact mode, set GITHUB_TOKEN because Actions artifact ZIP
 downloads require authentication. The token is read only from the environment
@@ -67,6 +68,9 @@ selected=0
 [[ -n "$commit" ]] && selected=$((selected + 1))
 [[ -n "$run_id" ]] && selected=$((selected + 1))
 ((selected <= 1)) || die "use only one of --release, --commit, or --run-id"
+if [[ -z "$release" && -z "$commit" && -z "$run_id" ]]; then
+  release=latest
+fi
 [[ -n "$release" || -n "${GITHUB_TOKEN:-}" ]] || die "GITHUB_TOKEN is required for the CI artifact mode"
 case "$architecture" in
   auto|x86_64|aarch64) ;;
@@ -78,7 +82,6 @@ command -v curl >/dev/null || die "curl is required"
 command -v python3 >/dev/null || die "python3 is required for safe archive handling"
 command -v tar >/dev/null || die "tar is required"
 command -v gzip >/dev/null || die "gzip is required"
-[[ -n "$release" || -n "${GITHUB_TOKEN:-}" ]] || die "GITHUB_TOKEN is required because GitHub Actions artifact ZIP downloads require authentication"
 
 case "$(uname -s)" in
   Linux|Darwin) ;;
@@ -190,10 +193,19 @@ PY
 }
 
 if [[ -n "$release" ]]; then
+  requested_release=$release
   release_json_file="$temp_dir/release.json"
-  printf 'Looking up release %s...\n' "$release" >&2
-  api_get "/releases/tags/$release" "$release_json_file"
+  if [[ "$requested_release" == latest ]]; then
+    printf 'Looking up the latest stable release...\n' >&2
+    api_get "/releases/latest" "$release_json_file"
+  else
+    printf 'Looking up release %s...\n' "$requested_release" >&2
+    api_get "/releases/tags/$requested_release" "$release_json_file"
+  fi
   release_json=$(cat "$release_json_file")
+  release=$(release_field "$release_json" tag_name)
+  [[ "$release" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || die "GitHub returned an invalid release tag: $release"
+  [[ "$requested_release" == latest || "$requested_release" == "$release" ]] || die "GitHub returned unexpected release tag: $release"
   [[ "$(release_field "$release_json" draft)" == False ]] || die "release $release is a draft, not a published release"
   assets_json=$(RELEASE_JSON=$release_json python3 - <<'PY'
 import json

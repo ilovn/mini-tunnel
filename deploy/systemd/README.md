@@ -22,16 +22,14 @@ sudo deploy/install-peer.sh \
   --udp-relay-server relay.example:42003
 ```
 
-To obtain a published Linux binary directly on a peer, use the independent downloader with a named release:
+To obtain a published Linux binary directly on a peer, run the independent downloader without options to fetch the newest stable release:
 
 ```sh
-deploy/download-peer.sh \
-  --release v0.1.0 \
-  --output-dir ./mini-tunnel-download
+deploy/download-peer.sh
 sudo deploy/install-peer.sh --binary ./mini-tunnel-download/mini-tunnel ...
 ```
 
-Published release downloads do not require `GITHUB_TOKEN`. To validate a not-yet-released CI artifact, replace `--release` with `--commit` (preferred) or `--run-id` and set `GITHUB_TOKEN`; set the token only as a process environment variable, and the script does not save it.
+Published release downloads do not require `GITHUB_TOKEN`. For reproducible deployment, pass `--release vX.Y.Z`. To validate a not-yet-released CI artifact, replace the release option with `--commit` (preferred) or `--run-id` and set `GITHUB_TOKEN`; set the token only as a process environment variable, and the script does not save it.
 
 Omit either Relay option if that transport is not configured. For a private CA, add `--coordinator-ca ./coordinator-ca.pem`. Before installing, `--validate-only` checks the binary, UUID, endpoint syntax, invite-file type/permissions, and presence of the unit template without changing the machine. The installer copies the invite into `/var/lib/mini-tunnel` with mode `0600`, consumes it for enrollment, and removes the temporary copy. It does not delete the source invite file. It refuses to overwrite an existing peer instance config; use a new `--instance` for another network. After installation, inspect it with:
 

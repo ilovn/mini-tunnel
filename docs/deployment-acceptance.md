@@ -18,7 +18,7 @@ The archives contain one `mini-tunnel` binary with these expected SHA-256 values
 | x86_64 | `c76038bf4edd4ce442be53a13295e6ccb656391988476edcf7deead1335bdda7` |
 | aarch64 | `90887c822be27b9ed27a38249e02ac0230e1f1674b498313c423fbb89a87fc6c` |
 
-On a Linux peer, `deploy/download-peer.sh --release vX.Y.Z` obtains a published GitHub Release asset without a token and verifies its GitHub asset digest, published SHA-256 file, and single regular binary layout. For reproducible release acceptance, use a fixed release tag:
+On a Linux peer, `deploy/download-peer.sh --release vX.Y.Z` obtains a published GitHub Release asset without a token and verifies its GitHub asset digest, published SHA-256 file, and single regular binary layout. Without a source option, the downloader selects the newest stable release. For reproducible release acceptance, use a fixed release tag:
 
 ```sh
 deploy/download-peer.sh \
