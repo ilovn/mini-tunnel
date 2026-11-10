@@ -6,6 +6,8 @@ The Coordinator and opaque Relay templates run as unprivileged server services; 
 
 `deploy/install-peer.sh` installs an already-built Linux binary and enrolls one systemd peer. It never compiles or downloads code, creates a Coordinator network, or issues an invite. Create the network and a one-use invite on the Coordinator first, then copy the invite to the peer over a protected channel with mode `0600`. The Coordinator must be reachable over HTTPS in normal deployments; use `--coordinator-ca` when it uses a private CA.
 
+For a bounded first-install acceptance procedure, including artifact checksums, startup/status checks, bidirectional overlay traffic, evidence capture, and rollback, see the [peer deployment acceptance runbook](../../docs/deployment-acceptance.md).
+
 From a checkout containing the script and unit template, run as root (or prefix with `sudo`):
 
 ```sh
