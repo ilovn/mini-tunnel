@@ -18,7 +18,10 @@ jobs:
   linux-release:
     name: Linux x86_64 release binary (Ubuntu 20.04 baseline)
     runs-on: ubuntu-latest
-    container: ubuntu:20.04
+    container:
+      image: ubuntu:20.04
+      volumes:
+        - /etc/ssl/certs:/etc/ssl/certs:ro
     timeout-minutes: 45
     permissions:
       attestations: write
