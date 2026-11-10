@@ -3,19 +3,25 @@ set -Eeuo pipefail
 
 usage() {
   cat <<'EOF'
-Download a mini-tunnel Linux peer binary from a successful GitHub CI run.
+Download a mini-tunnel Linux peer binary from GitHub.
 
 Usage:
   deploy/download-peer.sh [--output-dir ./mini-tunnel-download] \
-    [--arch auto|x86_64|aarch64] [--commit <full-sha>] [--run-id <id>] \
+    [--arch auto|x86_64|aarch64] [--release vX.Y.Z] \
     [--repo owner/name] [--force]
 
-The default discovers the newest successful main-branch CI run with a usable
-artifact. Prefer --commit for reproducible deployments. GitHub CI artifacts are
-retained for 30 days; this script does not create or install services.
+  deploy/download-peer.sh [--output-dir ./mini-tunnel-download] \
+    [--arch auto|x86_64|aarch64] [--commit <full-sha>|--run-id <id>] \
+    [--repo owner/name] [--force]
 
-Set GITHUB_TOKEN to use an authenticated GitHub API request. The token is read
-only from the environment and is never written to disk or output.
+The default fetches a published GitHub Release asset without a token. Use
+--commit or --run-id only for pre-release validation of a successful CI run.
+GitHub CI artifacts are retained for 30 days; this script does not create or
+install services.
+
+For the CI artifact mode, set GITHUB_TOKEN because Actions artifact ZIP
+downloads require authentication. The token is read only from the environment
+and is never written to disk or output.
 EOF
 }
 
@@ -33,6 +39,7 @@ repository=ilovn/mini-tunnel
 architecture=auto
 commit=
 run_id=
+release=
 output_dir=./mini-tunnel-download
 force=false
 
@@ -42,6 +49,7 @@ while (($#)); do
     --arch) (($# >= 2)) || usage_error "--arch needs a value"; architecture=$2; shift 2 ;;
     --commit) (($# >= 2)) || usage_error "--commit needs a value"; commit=$2; shift 2 ;;
     --run-id) (($# >= 2)) || usage_error "--run-id needs a value"; run_id=$2; shift 2 ;;
+    --release) (($# >= 2)) || usage_error "--release needs a value"; release=$2; shift 2 ;;
     --output-dir) (($# >= 2)) || usage_error "--output-dir needs a value"; output_dir=$2; shift 2 ;;
     --force) force=true; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -52,6 +60,13 @@ done
 [[ "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "invalid repository: $repository"
 [[ -z "$run_id" || "$run_id" =~ ^[0-9]+$ ]] || die "run ID must be numeric"
 [[ -z "$commit" || "$commit" =~ ^[0-9a-fA-F]{40}$ ]] || die "commit must be a full 40-character SHA-1"
+[[ -z "$release" || "$release" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || die "invalid release tag: $release"
+selected=0
+[[ -n "$release" ]] && selected=$((selected + 1))
+[[ -n "$commit" ]] && selected=$((selected + 1))
+[[ -n "$run_id" ]] && selected=$((selected + 1))
+((selected <= 1)) || die "use only one of --release, --commit, or --run-id"
+[[ -n "$release" || -n "${GITHUB_TOKEN:-}" ]] || die "GITHUB_TOKEN is required for the CI artifact mode"
 case "$architecture" in
   auto|x86_64|aarch64) ;;
   *) die "architecture must be auto, x86_64, or aarch64" ;;
@@ -62,7 +77,7 @@ command -v curl >/dev/null || die "curl is required"
 command -v python3 >/dev/null || die "python3 is required for safe archive handling"
 command -v tar >/dev/null || die "tar is required"
 command -v gzip >/dev/null || die "gzip is required"
-[[ -n "${GITHUB_TOKEN:-}" ]] || die "GITHUB_TOKEN is required because GitHub Actions artifact ZIP downloads require authentication"
+[[ -n "$release" || -n "${GITHUB_TOKEN:-}" ]] || die "GITHUB_TOKEN is required because GitHub Actions artifact ZIP downloads require authentication"
 
 case "$(uname -s)" in
   Linux|Darwin) ;;
@@ -84,7 +99,8 @@ case "$architecture" in
 esac
 
 api_base=https://api.github.com
-auth_header=(--header "Authorization: Bearer $GITHUB_TOKEN")
+auth_header=()
+[[ -z "${GITHUB_TOKEN:-}" ]] || auth_header=(--header "Authorization: Bearer $GITHUB_TOKEN")
 
 temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/mini-tunnel-download.XXXXXX")
 metadata_tmp=
@@ -135,7 +151,120 @@ print("" if value is None else str(value))
 PY
 }
 
-if [[ -n "$run_id" ]]; then
+release_field() {
+  RELEASE_JSON=$1 FIELD=$2 python3 - <<'PY'
+import json
+import os
+
+field = os.environ["FIELD"]
+release = json.loads(os.environ["RELEASE_JSON"])
+value = release.get(field)
+print("" if value is None else str(value))
+PY
+}
+
+asset_field() {
+  ASSET_JSON=$1 FIELD=$2 python3 - <<'PY'
+import json
+import os
+
+field = os.environ["FIELD"]
+asset = json.loads(os.environ["ASSET_JSON"])
+value = asset.get(field)
+print("" if value is None else str(value))
+PY
+}
+
+sha256_file() {
+  FILE_PATH=$1 python3 - <<'PY'
+import hashlib
+import os
+
+digest = hashlib.sha256()
+with open(os.environ["FILE_PATH"], "rb") as input_file:
+    while chunk := input_file.read(1024 * 1024):
+        digest.update(chunk)
+print(digest.hexdigest())
+PY
+}
+
+if [[ -n "$release" ]]; then
+  release_json_file="$temp_dir/release.json"
+  printf 'Looking up release %s...\n' "$release" >&2
+  api_get "/releases/tags/$release" "$release_json_file"
+  release_json=$(cat "$release_json_file")
+  [[ "$(release_field "$release_json" draft)" == False ]] || die "release $release is a draft, not a published release"
+  assets_json=$(RELEASE_JSON=$release_json python3 - <<'PY'
+import json
+import os
+
+assets = json.loads(os.environ["RELEASE_JSON"]).get("assets", [])
+print(json.dumps(assets))
+PY
+)
+  archive_asset=$(ASSETS_JSON=$assets_json ARCHIVE_NAME=$artifact_name.tar.gz python3 - <<'PY'
+import json
+import os
+
+name = os.environ["ARCHIVE_NAME"]
+for asset in json.loads(os.environ["ASSETS_JSON"]):
+    if asset.get("name") == name and asset.get("state") == "uploaded":
+        print(json.dumps(asset, separators=(",", ":")))
+        break
+PY
+)
+  [[ -n "$archive_asset" ]] || die "release $release has no uploaded archive named $artifact_name.tar.gz"
+  checksum_asset=$(ASSETS_JSON=$assets_json ARCHIVE_NAME=$artifact_name.tar.gz.sha256 python3 - <<'PY'
+import json
+import os
+
+name = os.environ["ARCHIVE_NAME"]
+for asset in json.loads(os.environ["ASSETS_JSON"]):
+    if asset.get("name") == name and asset.get("state") == "uploaded":
+        print(json.dumps(asset, separators=(",", ":")))
+        break
+PY
+)
+  [[ -n "$checksum_asset" ]] || die "release $release has no uploaded checksum named $artifact_name.tar.gz.sha256"
+
+  archive_path="$temp_dir/$artifact_name.tar.gz"
+  checksum_path="$temp_dir/$artifact_name.tar.gz.sha256"
+  archive_url=$(asset_field "$archive_asset" browser_download_url)
+  checksum_url=$(asset_field "$checksum_asset" browser_download_url)
+  printf 'Downloading release archive...\n' >&2
+  curl --silent --show-error --fail --location --retry 3 --retry-delay 2 \
+    --connect-timeout 15 --max-time 600 \
+    --output "$archive_path" "$archive_url"
+  curl --silent --show-error --fail --location --retry 3 --retry-delay 2 \
+    --connect-timeout 15 --max-time 60 \
+    --output "$checksum_path" "$checksum_url"
+  archive_sha256=$(asset_field "$archive_asset" digest)
+  [[ "$archive_sha256" =~ ^sha256:[0-9a-fA-F]{64}$ ]] || die "GitHub did not return a valid release asset digest"
+  archive_sha256=${archive_sha256#sha256:}
+
+  head_commitish=$(release_field "$release_json" target_commitish)
+  [[ "$head_commitish" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || die "release $release did not return a valid target commit reference"
+  commit_json_file="$temp_dir/commit.json"
+  api_get "/commits/$head_commitish" "$commit_json_file"
+  commit_json=$(cat "$commit_json_file")
+  head_sha=$(COMMIT_JSON=$commit_json python3 - <<'PY'
+import json
+import os
+
+print(json.loads(os.environ["COMMIT_JSON"]).get("sha", ""))
+PY
+)
+  created_at=$(COMMIT_JSON=$commit_json python3 - <<'PY'
+import json
+import os
+
+print(json.loads(os.environ["COMMIT_JSON"]).get("commit", {}).get("committer", {}).get("date", ""))
+PY
+)
+fi
+
+if [[ -z "$release" ]]; then
+  if [[ -n "$run_id" ]]; then
   run_json_file="$temp_dir/selected-run.json"
   api_get "/actions/runs/$run_id" "$run_json_file"
   run_json=$(cat "$run_json_file")
@@ -235,7 +364,7 @@ curl --silent --show-error --fail --location --retry 3 --retry-delay 2 \
   --output "$artifact_zip" \
   "$api_base/repos/$repository/actions/artifacts/$artifact_id/zip"
 
-extract_zip() {
+  extract_zip() {
   ZIP_PATH=$1 DESTINATION=$2 python3 - <<'PY'
 import os
 import pathlib
@@ -268,12 +397,13 @@ with zipfile.ZipFile(source) as archive:
 PY
 }
 
-extract_zip "$artifact_zip" "$temp_dir/extracted"
-printf 'Verifying inner archive checksum...\n' >&2
-archive_path="$temp_dir/extracted/$artifact_name.tar.gz"
-checksum_path="$temp_dir/extracted/$artifact_name.tar.gz.sha256"
-[[ -f "$archive_path" && ! -L "$archive_path" ]] || die "extracted archive is missing or unsafe"
-[[ -f "$checksum_path" && ! -L "$checksum_path" ]] || die "extracted checksum file is missing or unsafe"
+  extract_zip "$artifact_zip" "$temp_dir/extracted"
+  printf 'Verifying inner archive checksum...\n' >&2
+  archive_path="$temp_dir/extracted/$artifact_name.tar.gz"
+  checksum_path="$temp_dir/extracted/$artifact_name.tar.gz.sha256"
+  [[ -f "$archive_path" && ! -L "$archive_path" ]] || die "extracted archive is missing or unsafe"
+  [[ -f "$checksum_path" && ! -L "$checksum_path" ]] || die "extracted checksum file is missing or unsafe"
+fi
 
 checksum_fields=$(CHECKSUM_PATH=$checksum_path ARCHIVE_NAME=$artifact_name.tar.gz python3 - <<'PY'
 import os
@@ -293,21 +423,11 @@ PY
 )
 read -r archive_name expected_checksum <<<"$checksum_fields"
 
-sha256_file() {
-  FILE_PATH=$1 python3 - <<'PY'
-import hashlib
-import os
-
-digest = hashlib.sha256()
-with open(os.environ["FILE_PATH"], "rb") as input_file:
-    while chunk := input_file.read(1024 * 1024):
-        digest.update(chunk)
-print(digest.hexdigest())
-PY
-}
-
 actual_checksum=$(sha256_file "$archive_path")
 [[ "$actual_checksum" == "$expected_checksum" ]] || die "archive checksum mismatch: expected $expected_checksum, got $actual_checksum"
+if [[ -n "$release" ]]; then
+  [[ "$actual_checksum" == "$archive_sha256" ]] || die "GitHub release digest does not match downloaded archive"
+fi
 
 tar_listing=$(tar -tzf "$archive_path")
 [[ "$tar_listing" == "mini-tunnel" ]] || die "release archive must contain only mini-tunnel; got: $tar_listing"
@@ -343,6 +463,8 @@ metadata_path="$output_dir/download.json"
 metadata_tmp="$output_dir/.download.$$.json"
 METADATA_PATH=$metadata_tmp \
 REPOSITORY=$repository \
+MODE=$([[ -n "$release" ]] && printf release || printf ci-artifact) \
+RELEASE_TAG=$release \
 COMMIT_SHA=$head_sha \
 RUN_ID=$run_id \
 ARTIFACT_ID=$artifact_id \
@@ -357,16 +479,22 @@ import os
 
 metadata = {
     "repository": os.environ["REPOSITORY"],
+    "mode": os.environ["MODE"],
     "commit_sha": os.environ["COMMIT_SHA"],
-    "ci_run_id": int(os.environ["RUN_ID"]),
-    "artifact_id": int(os.environ["ARTIFACT_ID"]),
     "artifact_name": os.environ["ARTIFACT_NAME"],
     "archive_sha256": os.environ["ARCHIVE_SHA256"],
     "binary_sha256": os.environ["BINARY_SHA256"],
-    "ci_created_at": os.environ["CREATED_AT"],
     "downloaded_at": os.environ["GENERATED_AT"],
-    "verified": ["artifact_zip_crc", "inner_archive_sha256", "single_regular_binary"],
 }
+if os.environ["MODE"] == "ci-artifact":
+    metadata["ci_run_id"] = int(os.environ["RUN_ID"])
+    metadata["artifact_id"] = int(os.environ["ARTIFACT_ID"])
+    metadata["ci_created_at"] = os.environ["CREATED_AT"]
+    metadata["verified"] = ["artifact_zip_crc", "inner_archive_sha256", "single_regular_binary"]
+else:
+    metadata["release"] = os.environ["RELEASE_TAG"]
+    metadata["created_at"] = os.environ["CREATED_AT"]
+    metadata["verified"] = ["asset_digest", "published_sha256", "single_regular_binary"]
 with open(os.environ["METADATA_PATH"], "w", encoding="utf-8") as output_file:
     json.dump(metadata, output_file, indent=2, sort_keys=True)
     output_file.write("\n")
@@ -376,7 +504,11 @@ metadata_tmp=
 
 printf 'Downloaded %s\n' "$final_binary"
 printf 'Commit: %s\n' "$head_sha"
-printf 'CI run: %s\n' "$run_id"
-printf 'Artifact: %s (%s)\n' "$artifact_name" "$artifact_id"
+if [[ -n "$release" ]]; then
+  printf 'Release: %s\n' "$release"
+else
+  printf 'CI run: %s\n' "$run_id"
+  printf 'Artifact: %s (%s)\n' "$artifact_name" "$artifact_id"
+fi
 printf 'Binary SHA-256: %s\n' "$binary_sha256"
 printf 'Provenance: %s\n' "$metadata_path"

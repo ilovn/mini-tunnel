@@ -4,7 +4,7 @@ This runbook validates one release binary on one Linux peer. Complete it before 
 
 ## Release selection
 
-Use the matching Linux archive from a successful CI run. For commit `4ac3ef96e66d4566b8204a3ce71e8ac83d54cd71`, CI run `42806196808` produced:
+Use the matching Linux archive from a published GitHub Release. For the earlier pre-release CI validation, commit `4ac3ef96e66d4566b8204a3ce71e8ac83d54cd71` and CI run `42806196808` produced:
 
 | Artifact | Archive SHA-256 |
 | --- | --- |
@@ -18,7 +18,15 @@ The archives contain one `mini-tunnel` binary with these expected SHA-256 values
 | x86_64 | `c76038bf4edd4ce442be53a13295e6ccb656391988476edcf7deead1335bdda7` |
 | aarch64 | `90887c822be27b9ed27a38249e02ac0230e1f1674b498313c423fbb89a87fc6c` |
 
-On a Linux peer, `deploy/download-peer.sh` can obtain an artifact from a successful CI run and verify the ZIP structure, inner archive SHA-256, and single regular binary layout. Always pass a full commit SHA for reproducible acceptance:
+On a Linux peer, `deploy/download-peer.sh --release vX.Y.Z` obtains a published GitHub Release asset without a token and verifies its GitHub asset digest, published SHA-256 file, and single regular binary layout. For reproducible release acceptance, use a fixed release tag:
+
+```sh
+deploy/download-peer.sh \
+  --release v0.1.0 \
+  --output-dir ./mini-tunnel-download
+```
+
+For a pre-release CI artifact, the script can obtain an artifact from a successful CI run and additionally verifies the ZIP structure and CI provenance. Always pass a full commit SHA:
 
 ```sh
 GITHUB_TOKEN='...' deploy/download-peer.sh \
@@ -35,7 +43,7 @@ deploy/download-peer.sh \
   --output-dir ./mini-tunnel-download
 ```
 
-The script writes `download.json` with the commit, CI run, artifact, archive checksum, binary checksum, and verification list. Record that file with the deployment evidence.
+The script writes `download.json` with the source mode, commit, release or CI provenance, archive checksum, binary checksum, and verification list. Record that file with the deployment evidence.
 
 On the peer, confirm the CPU and OS before selecting the archive:
 
