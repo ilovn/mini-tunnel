@@ -482,31 +482,50 @@ impl UdpRelayServer {
             Err(_) => return Ok(self.reject(DropReason::Authentication)),
         };
         if let Some(existing) = state.accepted_proofs.get(&ticket_id) {
-            let session_id =
-                match verify_relay_ticket(&self.inner.config.ticket_key, ticket, now_ms).or_else(
-                    |error| {
-                        self.inner
-                            .config
-                            .previous_ticket_key
-                            .as_ref()
-                            .ok_or(error)
-                            .and_then(|key| verify_relay_ticket(key, ticket, now_ms))
-                    },
-                ) {
-                    Ok(claims) => claims.session_id,
-                    Err(_) => return Ok(self.reject(DropReason::Authentication)),
-                };
-            let paired = state.sessions.get(&session_id).is_some_and(|session| {
-                session.endpoints.iter().all(Option::is_some)
-                    && session.endpoints.contains(&Some(source))
-            });
-            if existing.packet.as_slice() != packet || !paired {
+            let claims = match verify_relay_ticket(&self.inner.config.ticket_key, ticket, now_ms)
+                .or_else(|error| {
+                    self.inner
+                        .config
+                        .previous_ticket_key
+                        .as_ref()
+                        .ok_or(error)
+                        .and_then(|key| verify_relay_ticket(key, ticket, now_ms))
+                }) {
+                Ok(claims) => claims,
+                Err(_) => return Ok(self.reject(DropReason::Authentication)),
+            };
+            if existing.packet.as_slice() != packet {
                 return Ok(self.reject(DropReason::Authentication));
+            }
+            let source_index = if claims.source_device_id < claims.target_device_id {
+                0
+            } else {
+                1
+            };
+            let paired = state
+                .sessions
+                .get(&claims.session_id)
+                .is_some_and(|session| {
+                    session.endpoints.iter().all(Option::is_some)
+                        && session.endpoints.contains(&Some(source))
+                });
+            let waiting_for_peer = state
+                .sessions
+                .get(&claims.session_id)
+                .is_some_and(|session| {
+                    session.endpoints[source_index] == Some(source)
+                        && session.endpoints[1 - source_index].is_none()
+                });
+            if waiting_for_peer {
+                return Ok(true);
+            }
+            if !paired {
+                return Ok(self.reject(DropReason::Session));
             }
             drop(state);
             let mut response = Vec::with_capacity(24);
             response.extend_from_slice(READY);
-            response.extend_from_slice(&session_id);
+            response.extend_from_slice(&claims.session_id);
             socket.send_to(&response, source).await?;
             return Ok(true);
         }
@@ -1089,6 +1108,70 @@ mod tests {
             b"MTUREADY\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09"
         );
         proof
+    }
+
+    #[tokio::test]
+    async fn accepted_udp_proof_retries_wait_for_the_second_peer_without_rejection() {
+        let key = [45; 32];
+        let alice = identity(21);
+        let bob = identity(22);
+        let alice_ticket = ticket(&key, &alice, &bob, 23, 1_000);
+        let bob_ticket = ticket(&key, &bob, &alice, 24, 1_000);
+        let relay = UdpRelayServer::new(UdpRelayConfig::new(key));
+        let relay_socket = UdpSocket::bind("127.0.0.1:0").await.expect("relay socket");
+        let relay_address = relay_socket.local_addr().expect("relay address");
+        let runner = {
+            let relay = relay.clone();
+            tokio::spawn(async move { relay.run(relay_socket).await.expect("run relay") })
+        };
+        let alice_socket = UdpSocket::bind("127.0.0.1:0").await.expect("alice socket");
+        let hello =
+            udp_relay_hello(&alice_ticket, &alice.verifying_key().to_bytes()).expect("alice hello");
+        alice_socket
+            .send_to(&hello, relay_address)
+            .await
+            .expect("send hello");
+        let mut response = [0; 64];
+        let length = timeout(Duration::from_secs(1), alice_socket.recv(&mut response))
+            .await
+            .expect("challenge timeout")
+            .expect("challenge");
+        assert_eq!(&response[..8], CHALLENGE);
+        let challenge: [u8; 32] = response[8..length].try_into().expect("challenge bytes");
+        let proof = udp_relay_proof(&alice_ticket, &challenge, &alice).expect("alice proof");
+        for _ in 0..2 {
+            alice_socket
+                .send_to(&proof, relay_address)
+                .await
+                .expect("send proof");
+        }
+        alice_socket
+            .send_to(b"drain-test", relay_address)
+            .await
+            .expect("send ordering marker");
+        timeout(Duration::from_secs(1), async {
+            while relay.stats().await.malformed_datagrams_total != 1 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("proof retry processing timeout");
+        let stats = relay.stats().await;
+        assert_eq!(stats.active_sessions, 1);
+        assert_eq!(stats.dropped_datagrams_total, 1);
+        assert_eq!(stats.malformed_datagrams_total, 1);
+        assert_eq!(stats.authentication_rejections_total, 0);
+
+        let bob_socket = UdpSocket::bind("127.0.0.1:0").await.expect("bob socket");
+        authenticate(&bob_socket, relay_address, &bob_ticket, &bob).await;
+        let length = timeout(Duration::from_secs(1), alice_socket.recv(&mut response))
+            .await
+            .expect("alice ready timeout")
+            .expect("alice ready");
+        assert_eq!(&response[..8], READY);
+        assert_eq!(&response[8..length], &[9; 16]);
+        relay.shutdown();
+        runner.await.expect("relay task");
     }
 
     #[tokio::test]
