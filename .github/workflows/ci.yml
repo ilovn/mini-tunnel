@@ -10,8 +10,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  # Keep only the latest verification for a ref; a new run also replaces a stuck run.
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'automatic' }}
+  # Push/PR runs replace stale checks. A manual recovery run gets a separate group
+  # so it can build the latest source when GitHub leaves an older run stuck.
   cancel-in-progress: true
 
 jobs:
