@@ -1418,7 +1418,7 @@ mod tests {
         let (stop_responder, stop_rx) = tokio::sync::oneshot::channel();
         let (return_channel, channel_rx) = tokio::sync::oneshot::channel();
         let response_task = tokio::spawn(async move {
-            let mut channel_b = channel_b;
+            let channel_b = channel_b;
             let mut stop_rx = stop_rx;
             loop {
                 tokio::select! {
