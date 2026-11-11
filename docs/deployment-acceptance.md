@@ -18,7 +18,7 @@ The archives contain one `mini-tunnel` binary with these expected SHA-256 values
 | x86_64 | `c76038bf4edd4ce442be53a13295e6ccb656391988476edcf7deead1335bdda7` |
 | aarch64 | `90887c822be27b9ed27a38249e02ac0230e1f1674b498313c423fbb89a87fc6c` |
 
-On a Linux peer, `deploy/download-peer.sh --release vX.Y.Z` obtains a published GitHub Release asset without a token and verifies its GitHub asset digest, published SHA-256 file, and single regular binary layout. Without a source option, the downloader selects the newest stable release. For reproducible release acceptance, use a fixed release tag:
+On a Linux peer, `deploy/download-peer.sh --release vX.Y.Z` obtains a published GitHub Release asset without setting `GITHUB_TOKEN` and verifies its GitHub asset digest, published SHA-256 file, tag source commit, archive layout, and GitHub Sigstore provenance. Install a recent GitHub CLI (`gh`) with `attestation verify` support first; the downloader fetches the public attestation bundle anonymously and fails closed if provenance cannot be verified. No `gh auth login` is required for public releases. It pins the expected `ilovn/mini-tunnel` release workflow, tag, and source commit. Without a source option, the downloader selects the newest stable release. For reproducible release acceptance, use a fixed release tag:
 
 ```sh
 deploy/download-peer.sh \
@@ -26,7 +26,7 @@ deploy/download-peer.sh \
   --output-dir ./mini-tunnel-download
 ```
 
-For a pre-release CI artifact, the script can obtain an artifact from a successful CI run and additionally verifies the ZIP structure and CI provenance. Always pass a full commit SHA:
+For a pre-release CI artifact, the script can obtain an artifact from a successful CI run and verifies its ZIP structure, successful main-branch run, archive checksum, and GitHub Sigstore provenance from the expected CI workflow. Always pass a full commit SHA:
 
 ```sh
 GITHUB_TOKEN='...' deploy/download-peer.sh \

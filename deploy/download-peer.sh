@@ -22,7 +22,9 @@ services.
 
 For the CI artifact mode, set GITHUB_TOKEN because Actions artifact ZIP
 downloads require authentication. The token is read only from the environment
-and is never written to disk or output.
+and is never written to disk or output. A recent GitHub CLI (gh) with artifact
+attestation support is required to verify the archive's Sigstore provenance
+against the repository, workflow, source ref, and source commit before use.
 EOF
 }
 
@@ -42,6 +44,8 @@ commit=
 run_id=
 artifact_id=
 release=
+attestation_workflow=
+attestation_source_ref=
 output_dir=./mini-tunnel-download
 force=false
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -83,6 +87,7 @@ command -v curl >/dev/null || die "curl is required"
 command -v python3 >/dev/null || die "python3 is required for safe archive handling"
 command -v tar >/dev/null || die "tar is required"
 command -v gzip >/dev/null || die "gzip is required"
+command -v gh >/dev/null || die "GitHub CLI (gh) is required to verify Sigstore provenance"
 
 case "$(uname -s)" in
   Linux|Darwin) ;;
@@ -278,6 +283,8 @@ PY
   done
   [[ "$object_type" == commit && "$object_sha" =~ ^[0-9a-fA-F]{40}$ ]] || die "release tag $release did not resolve to a commit"
   head_sha=$(printf '%s' "$object_sha" | tr '[:upper:]' '[:lower:]')
+  attestation_workflow=release.yml
+  attestation_source_ref="refs/tags/$release"
   commit_json_file="$temp_dir/commit.json"
   api_get "/commits/$head_sha" "$commit_json_file"
   commit_json=$(cat "$commit_json_file")
@@ -391,8 +398,13 @@ status=$(run_field "$run_json" status)
 conclusion=$(run_field "$run_json" conclusion)
 head_sha=$(run_field "$run_json" head_sha)
 created_at=$(run_field "$run_json" created_at)
+event=$(run_field "$run_json" event)
+head_branch=$(run_field "$run_json" head_branch)
 [[ "$status" == completed && "$conclusion" == success ]] || die "CI run $run_id is not completed successfully"
 [[ "$head_sha" =~ ^[0-9a-fA-F]{40}$ ]] || die "CI run $run_id did not return a valid source commit"
+[[ "$event" != pull_request && "$head_branch" == main ]] || die "CI run $run_id is not a main-branch build"
+attestation_workflow=ci.yml
+attestation_source_ref=refs/heads/main
 
 artifact_json_file="$temp_dir/artifact-$artifact_id.json"
 printf 'Validating artifact %s...\n' "$artifact_id" >&2
@@ -474,6 +486,11 @@ if [[ -n "$release" ]]; then
   [[ "$actual_checksum" == "$archive_sha256" ]] || die "GitHub release digest does not match downloaded archive"
 fi
 
+printf 'Verifying GitHub Sigstore provenance...\n' >&2
+"$script_dir/verify-peer-attestation.sh" \
+  "$archive_path" "$repository" "$attestation_workflow" \
+  "$attestation_source_ref" "$head_sha"
+
 tar_listing=$(tar -tzf "$archive_path")
 [[ "$tar_listing" == "mini-tunnel" ]] || die "release archive must contain only mini-tunnel; got: $tar_listing"
 staging_dir="$temp_dir/binary"
@@ -537,11 +554,11 @@ if os.environ["MODE"] == "ci-artifact":
     metadata["ci_run_id"] = int(os.environ["RUN_ID"])
     metadata["artifact_id"] = int(os.environ["ARTIFACT_ID"])
     metadata["ci_created_at"] = os.environ["CREATED_AT"]
-    metadata["verified"] = ["artifact_zip_crc", "inner_archive_sha256", "single_regular_binary"]
+    metadata["verified"] = ["artifact_zip_crc", "inner_archive_sha256", "single_regular_binary", "sigstore_provenance"]
 else:
     metadata["release"] = os.environ["RELEASE_TAG"]
     metadata["created_at"] = os.environ["CREATED_AT"]
-    metadata["verified"] = ["asset_digest", "published_sha256", "tag_ref_commit", "single_regular_binary"]
+    metadata["verified"] = ["asset_digest", "published_sha256", "tag_ref_commit", "single_regular_binary", "sigstore_provenance"]
 with open(os.environ["METADATA_PATH"], "w", encoding="utf-8") as output_file:
     json.dump(metadata, output_file, indent=2, sort_keys=True)
     output_file.write("\n")

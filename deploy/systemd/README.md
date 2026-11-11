@@ -21,7 +21,7 @@ deploy/quick-install-peer.sh --release latest --arch auto -- \
   --udp-relay-server relay.example:42003
 ```
 
-The wrapper downloads only an attested release artifact through `download-peer.sh`; it never builds on the peer. It then invokes `install-peer.sh`, using `sudo` only for installation when needed. Download options go before `--`; all remaining options are passed to the installer after `--`. For example, to install an exact successful CI commit before it has a published release:
+The wrapper downloads a release artifact through `download-peer.sh`, which checks its published digests and fails closed unless GitHub CLI (`gh`) verifies the Sigstore attestation against the expected repository, workflow, source ref, and commit. It fetches the public attestation bundle anonymously; no `gh auth login` is needed for a public release. It never builds on the peer. Install a recent GitHub CLI with `attestation verify` support before running it. The wrapper then invokes `install-peer.sh`, using `sudo` only for installation when needed. Download options go before `--`; all remaining options are passed to the installer after `--`. For example, to install an exact successful CI commit before it has a published release:
 
 ```sh
 export GITHUB_TOKEN # provide a read-only Actions token through your secret manager
