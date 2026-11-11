@@ -29,6 +29,7 @@ const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DIRECT_PROBE_HANDOFF_GRACE: Duration = Duration::from_secs(2);
 const DIRECT_PROBE_BACKOFF_MAX: Duration = Duration::from_secs(300);
 const DIRECT_PROBE_BACKOFF_RESET_AFTER: Duration = Duration::from_secs(60);
+const IMMEDIATE_DIRECT_PROBE_DELAY: Duration = Duration::from_millis(1);
 
 fn mesh_event_queue_capacity(peer_count: usize) -> usize {
     peer_count
@@ -404,6 +405,8 @@ pub struct ReconnectingPeer {
 pub enum MeshPeerUpdate {
     Add(ReconnectingPeer),
     Remove(Ipv4Addr),
+    /// The Coordinator published new candidates or ICE credentials for this peer.
+    CandidatesChanged(Ipv4Addr),
 }
 
 struct MeshPeerRuntime {
@@ -413,6 +416,7 @@ struct MeshPeerRuntime {
     connector: Option<PeerConnector>,
     probe: Option<PeerConnector>,
     probe_cooldown: Duration,
+    candidate_refresh: tokio::sync::mpsc::Sender<()>,
     pending_events: Arc<AtomicUsize>,
     outbound: tokio::sync::mpsc::Sender<QueuedMeshPacket>,
 }
@@ -424,6 +428,7 @@ struct MeshPeerReceiver {
     connector: Option<PeerConnector>,
     probe: Option<PeerConnector>,
     probe_cooldown: Duration,
+    candidate_refresh_rx: tokio::sync::mpsc::Receiver<()>,
     pending_events: Arc<AtomicUsize>,
     outbound_rx: tokio::sync::mpsc::Receiver<QueuedMeshPacket>,
     event_tx: tokio::sync::mpsc::Sender<MeshEvent>,
@@ -440,8 +445,10 @@ fn new_mesh_peer_runtime(
 ) -> (
     MeshPeerRuntime,
     tokio::sync::mpsc::Receiver<QueuedMeshPacket>,
+    tokio::sync::mpsc::Receiver<()>,
 ) {
     let (outbound, outbound_rx) = tokio::sync::mpsc::channel(MESH_OUTBOUND_QUEUE_PER_PEER);
+    let (candidate_refresh, candidate_refresh_rx) = tokio::sync::mpsc::channel(1);
     (
         MeshPeerRuntime {
             traffic: crate::status::traffic_counter(&address.to_string()),
@@ -450,10 +457,12 @@ fn new_mesh_peer_runtime(
             connector,
             probe,
             probe_cooldown,
+            candidate_refresh,
             pending_events: Arc::new(AtomicUsize::new(0)),
             outbound,
         },
         outbound_rx,
+        candidate_refresh_rx,
     )
 }
 
@@ -832,6 +841,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         connector,
         probe,
         probe_cooldown,
+        mut candidate_refresh_rx,
         pending_events,
         mut outbound_rx,
         event_tx,
@@ -878,6 +888,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
             .and_then(|(peer, _, _)| peer.ice_consent_failure_receiver());
         let mut observe_retired_consent = retired_consent_failure.is_some();
         let mut probe_interval = direct_probe_interval(recovery_probe_cooldown);
+        let mut candidate_refresh_pending = false;
         let (probe_tx, mut probe_rx) = tokio::sync::mpsc::channel(1);
         let mut probe_task = None;
         let (fallback_tx, mut fallback_rx) = tokio::sync::mpsc::channel(1);
@@ -977,6 +988,22 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                         break Err(error);
                     }
                     traffic.record(crate::status::PacketCounter::Sent);
+                }
+                refresh = candidate_refresh_rx.recv(), if probe.is_some() && active.transport_name() != "QUIC/UDP" => {
+                    if refresh.is_some() {
+                        recovery_probe_cooldown = probe_cooldown;
+                        if probe_task.is_some() {
+                            candidate_refresh_pending = true;
+                        } else {
+                            probe_interval = direct_probe_interval(IMMEDIATE_DIRECT_PROBE_DELAY);
+                        }
+                        tracing::debug!(
+                            peer_address = %address,
+                            active_path = active.transport_name(),
+                            next_probe_cooldown_ms = recovery_probe_cooldown.as_millis() as u64,
+                            "peer candidates changed; scheduling an authenticated direct recovery probe"
+                        );
+                    }
                 }
                 _ = keepalive.tick() => {
                     let health = active.health_snapshot();
@@ -1196,12 +1223,18 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                     };
                     if recovery_failed {
                         let previous_probe_cooldown = recovery_probe_cooldown;
-                        recovery_probe_cooldown = next_direct_probe_cooldown(
-                            recovery_probe_cooldown,
-                            probe_cooldown,
-                            Duration::ZERO,
-                        );
-                        probe_interval = direct_probe_interval(recovery_probe_cooldown);
+                        if candidate_refresh_pending {
+                            candidate_refresh_pending = false;
+                            recovery_probe_cooldown = probe_cooldown;
+                            probe_interval = direct_probe_interval(IMMEDIATE_DIRECT_PROBE_DELAY);
+                        } else {
+                            recovery_probe_cooldown = next_direct_probe_cooldown(
+                                recovery_probe_cooldown,
+                                probe_cooldown,
+                                Duration::ZERO,
+                            );
+                            probe_interval = direct_probe_interval(recovery_probe_cooldown);
+                        }
                         tracing::debug!(
                             peer_address = %address,
                             previous_probe_cooldown_ms = previous_probe_cooldown.as_millis() as u64,
@@ -1646,6 +1679,7 @@ async fn pump_mesh_with_quality_interval<T: TunnelPacketIo>(
     let outbound_budget = Arc::new(tokio::sync::Semaphore::new(MESH_OUTBOUND_QUEUE_GLOBAL));
     let mut channels = HashMap::with_capacity(peers.len());
     let mut outbound_receivers = HashMap::with_capacity(peers.len());
+    let mut candidate_refresh_receivers = HashMap::with_capacity(peers.len());
     let mut ipv6_routes = HashMap::new();
     for (address, ipv6_address, channel, connector, probe, probe_cooldown) in peers {
         if let Some(ipv6_address) = ipv6_address
@@ -1653,7 +1687,7 @@ async fn pump_mesh_with_quality_interval<T: TunnelPacketIo>(
         {
             return Err(PeerTunnelError::DuplicatePeerAddress);
         }
-        let (runtime, outbound_rx) = new_mesh_peer_runtime(
+        let (runtime, outbound_rx, candidate_refresh_rx) = new_mesh_peer_runtime(
             address,
             ipv6_address,
             channel,
@@ -1665,6 +1699,7 @@ async fn pump_mesh_with_quality_interval<T: TunnelPacketIo>(
             return Err(PeerTunnelError::DuplicatePeerAddress);
         }
         outbound_receivers.insert(address, outbound_rx);
+        candidate_refresh_receivers.insert(address, candidate_refresh_rx);
     }
 
     let (event_tx, mut event_rx) =
@@ -1674,12 +1709,16 @@ async fn pump_mesh_with_quality_interval<T: TunnelPacketIo>(
         let outbound_rx = outbound_receivers
             .remove(&address)
             .expect("every initial peer has an outbound queue");
+        let candidate_refresh_rx = candidate_refresh_receivers
+            .remove(&address)
+            .expect("every initial peer has a candidate refresh queue");
         receivers.insert(
             address,
             spawn_mesh_receiver(
                 address,
                 runtime,
                 outbound_rx,
+                candidate_refresh_rx,
                 event_tx.clone(),
                 quality_interval,
             ),
@@ -1772,7 +1811,7 @@ async fn pump_mesh_with_quality_interval<T: TunnelPacketIo>(
                             peer.channel.close_async().await;
                             continue;
                         }
-                        let (runtime, outbound_rx) = new_mesh_peer_runtime(
+                        let (runtime, outbound_rx, candidate_refresh_rx) = new_mesh_peer_runtime(
                             address,
                             peer.ipv6_address,
                             peer.channel,
@@ -1786,11 +1825,17 @@ async fn pump_mesh_with_quality_interval<T: TunnelPacketIo>(
                                 address,
                                 &runtime,
                                 outbound_rx,
+                                candidate_refresh_rx,
                                 event_tx.clone(),
                                 quality_interval,
                             ),
                         );
                         channels.insert(address, runtime);
+                    }
+                    Some(MeshPeerUpdate::CandidatesChanged(address)) => {
+                        if let Some(runtime) = channels.get(&address) {
+                            let _ = runtime.candidate_refresh.try_send(());
+                        }
                     }
                     Some(MeshPeerUpdate::Remove(address)) => {
                         if let Some(runtime) = channels.remove(&address) {
@@ -1826,6 +1871,7 @@ fn spawn_mesh_receiver(
     address: Ipv4Addr,
     runtime: &MeshPeerRuntime,
     outbound_rx: tokio::sync::mpsc::Receiver<QueuedMeshPacket>,
+    candidate_refresh_rx: tokio::sync::mpsc::Receiver<()>,
     event_tx: tokio::sync::mpsc::Sender<MeshEvent>,
     quality_interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
@@ -1836,6 +1882,7 @@ fn spawn_mesh_receiver(
         connector: runtime.connector.clone(),
         probe: runtime.probe.clone(),
         probe_cooldown: runtime.probe_cooldown,
+        candidate_refresh_rx,
         pending_events: Arc::clone(&runtime.pending_events),
         outbound_rx,
         event_tx,
@@ -4326,8 +4373,9 @@ mod tests {
             mtu: 1500,
         });
         let pump_io = Arc::clone(&io);
+        let (updates_tx, updates_rx) = mpsc::channel(2);
         let pump = tokio::spawn(async move {
-            pump_peer_mesh_reconnecting(
+            pump_peer_mesh_dynamic(
                 &*pump_io,
                 vec![ReconnectingPeer {
                     address: peer_ip,
@@ -4335,11 +4383,16 @@ mod tests {
                     channel: Arc::new(initial),
                     connector,
                     probe: Some(probe),
-                    probe_cooldown: Duration::from_millis(25),
+                    probe_cooldown: Duration::from_secs(3600),
                 }],
+                updates_rx,
             )
             .await
         });
+        updates_tx
+            .send(MeshPeerUpdate::CandidatesChanged(peer_ip))
+            .await
+            .unwrap();
         let remote = tokio::time::timeout(Duration::from_secs(3), accepted_rx.recv())
             .await
             .unwrap()
@@ -4350,10 +4403,16 @@ mod tests {
             .send(packet(local_ip, peer_ip, 28))
             .await
             .unwrap();
-        let received = tokio::time::timeout(Duration::from_secs(3), remote.recv_packet())
-            .await
-            .unwrap()
-            .unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let received = remote.recv_packet().await.unwrap();
+                if !received.is_empty() {
+                    break received;
+                }
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(received.len(), 28);
         let promoted_status = tokio::time::timeout(Duration::from_secs(2), async {
             loop {

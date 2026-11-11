@@ -3856,6 +3856,26 @@ fn mesh_membership_diff(
     (removed, added)
 }
 
+fn mesh_candidate_changes(
+    known: &std::collections::HashMap<String, PeerInfo>,
+    snapshot: &[PeerInfo],
+) -> Vec<Ipv4Addr> {
+    let mut changed = snapshot
+        .iter()
+        .filter_map(|peer| {
+            let previous = known.get(&peer.device_id)?;
+            (previous.assigned_ipv4 == peer.assigned_ipv4
+                && (previous.candidates != peer.candidates
+                    || previous.ice_credentials != peer.ice_credentials))
+                .then(|| peer.assigned_ipv4.parse::<Ipv4Addr>().ok())
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    changed.sort_unstable();
+    changed.dedup();
+    changed
+}
+
 async fn stop_mesh_after_membership_revocation(
     error: &CoordinatorApiError,
     known: &std::collections::HashMap<String, PeerInfo>,
@@ -3976,6 +3996,7 @@ fn spawn_mesh_membership_refresh(config: MeshMembershipRefresh) -> tokio::task::
             };
 
             let (removed, added) = mesh_membership_diff(&known, &peers);
+            let candidates_changed = mesh_candidate_changes(&known, &peers);
             let next = peers
                 .iter()
                 .map(|peer| (peer.device_id.clone(), peer.clone()))
@@ -3991,6 +4012,11 @@ fn spawn_mesh_membership_refresh(config: MeshMembershipRefresh) -> tokio::task::
                         .await;
                 }
                 eprintln!("mesh peer {device_id} was removed or its address changed");
+            }
+            for address in candidates_changed {
+                let _ = updates_tx
+                    .send(mini_tunnel_agent::tunnel::MeshPeerUpdate::CandidatesChanged(address))
+                    .await;
             }
 
             let mut additions = Vec::with_capacity(added.len());
@@ -4678,6 +4704,11 @@ async fn run_peer_mesh(
                     {
                         eprintln!("could not remove IPv6 route for mesh peer {peer_ipv6}: {error}");
                     }
+                }
+                Some(mini_tunnel_agent::tunnel::MeshPeerUpdate::CandidatesChanged(address)) => {
+                    let _ = pump_updates_tx
+                        .send(mini_tunnel_agent::tunnel::MeshPeerUpdate::CandidatesChanged(address))
+                        .await;
                 }
                 None => updates_open = false,
             }
@@ -8874,6 +8905,43 @@ mod tests {
     }
 
     #[test]
+    fn mesh_candidate_changes_ignore_unchanged_members_and_detect_new_mappings_or_ice_credentials()
+    {
+        let mut first = PeerInfo {
+            device_id: "peer-a".to_owned(),
+            assigned_ipv4: "10.77.0.2".to_owned(),
+            public_key: URL_SAFE_NO_PAD.encode([1_u8; 32]),
+            candidates: Vec::new(),
+            ice_credentials: None,
+        };
+        let mut second = PeerInfo {
+            device_id: "peer-b".to_owned(),
+            assigned_ipv4: "10.77.0.3".to_owned(),
+            public_key: URL_SAFE_NO_PAD.encode([2_u8; 32]),
+            candidates: Vec::new(),
+            ice_credentials: None,
+        };
+        let known = [
+            (first.device_id.clone(), first.clone()),
+            (second.device_id.clone(), second.clone()),
+        ]
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+        assert!(mesh_candidate_changes(&known, &[first.clone(), second.clone()]).is_empty());
+
+        first.ice_credentials = Some(mini_tunnel_protocol::IceCredentials {
+            ufrag: "fresh-a".to_owned(),
+            password: "fresh-password-a".to_owned(),
+            generation: 1,
+        });
+        second.candidates.push("198.51.100.7:42000".to_owned());
+        assert_eq!(
+            mesh_candidate_changes(&known, &[first, second]),
+            vec![Ipv4Addr::new(10, 77, 0, 2), Ipv4Addr::new(10, 77, 0, 3)]
+        );
+    }
+
+    #[test]
     fn mesh_startup_keeps_collecting_until_pending_peer_attempts_finish() {
         let started = tokio::time::Instant::now();
         let startup_deadline = started + Duration::from_secs(45);
@@ -9022,6 +9090,9 @@ mod tests {
             .map(|update| match update {
                 mini_tunnel_agent::tunnel::MeshPeerUpdate::Remove(address) => address,
                 mini_tunnel_agent::tunnel::MeshPeerUpdate::Add(_) => panic!("unexpected peer add"),
+                mini_tunnel_agent::tunnel::MeshPeerUpdate::CandidatesChanged(_) => {
+                    panic!("unexpected candidate refresh")
+                }
             })
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
