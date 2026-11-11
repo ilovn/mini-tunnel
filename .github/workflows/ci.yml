@@ -20,6 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ubuntu:20.04
+      options: --dns 1.1.1.1 --dns 8.8.8.8
       volumes:
         - /etc/ssl/certs/ca-certificates.crt:/tmp/runner-ca-certificates.crt:ro
     timeout-minutes: 45
@@ -31,9 +32,16 @@ jobs:
       - name: Install build prerequisites
         run: |
           sed -i 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' /etc/apt/sources.list
-          apt-get -o APT::Update::Error-Mode=any \
-            -o Acquire::Retries=5 -o Acquire::https::Timeout=20 \
-            -o Acquire::https::CAInfo=/tmp/runner-ca-certificates.crt update
+          for attempt in 1 2 3; do
+            if apt-get -o APT::Update::Error-Mode=any \
+              -o Acquire::Retries=5 -o Acquire::https::Timeout=20 \
+              -o Acquire::https::CAInfo=/tmp/runner-ca-certificates.crt update; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then exit 1; fi
+            echo "apt index update failed; retrying after DNS/network backoff ($attempt/3)"
+            sleep "$((attempt * 10))"
+          done
           DEBIAN_FRONTEND=noninteractive apt-get \
             -o Acquire::https::CAInfo=/tmp/runner-ca-certificates.crt \
             install --no-install-recommends -y \
@@ -84,7 +92,9 @@ jobs:
   linux-release-arm64:
     name: Linux ARM64 release binary (Ubuntu 22.04 baseline)
     runs-on: ubuntu-24.04-arm
-    container: ubuntu:22.04
+    container:
+      image: ubuntu:22.04
+      options: --dns 1.1.1.1 --dns 8.8.8.8
     timeout-minutes: 45
     permissions:
       attestations: write
@@ -93,7 +103,16 @@ jobs:
     steps:
       - name: Install build prerequisites
         run: |
-          apt-get update
+          for attempt in 1 2 3; do
+            if apt-get -o APT::Update::Error-Mode=any \
+              -o Acquire::Retries=5 -o Acquire::http::Timeout=20 \
+              -o Acquire::https::Timeout=20 update; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then exit 1; fi
+            echo "apt index update failed; retrying after DNS/network backoff ($attempt/3)"
+            sleep "$((attempt * 10))"
+          done
           DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
             build-essential ca-certificates curl pkg-config tar gzip
 
