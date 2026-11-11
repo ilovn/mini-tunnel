@@ -289,14 +289,22 @@ if [[ -z "$release" ]]; then
 elif [[ -n "$commit" ]]; then
   printf 'Looking up CI run for commit %s...\n' "$commit" >&2
   runs_file="$temp_dir/runs.json"
-  api_get "/actions/workflows/ci.yml/runs?head_sha=$commit&status=success&per_page=100" "$runs_file"
-  run_id=$(RUNS_JSON=$(cat "$runs_file") COMMIT_SHA=$commit python3 - <<'PY'
+  # List recent runs and select the exact successful commit client-side. The
+  # workflow-runs endpoint does not support a head_sha filter.
+  api_get "/actions/workflows/ci.yml/runs?per_page=100" "$runs_file"
+  run_id=$(RUNS_FILE=$runs_file COMMIT_SHA=$commit python3 - <<'PY'
 import json
 import os
 import sys
 
-runs = json.loads(os.environ["RUNS_JSON"]).get("workflow_runs", [])
-successful = [run for run in runs if run.get("head_sha", "").lower() == os.environ.get("COMMIT_SHA", "").lower()]
+runs = json.load(open(os.environ["RUNS_FILE"], encoding="utf-8")).get("workflow_runs", [])
+successful = [
+    run for run in runs
+    if run.get("status") == "completed"
+    and run.get("conclusion") == "success"
+    and run.get("event") != "pull_request"
+    and run.get("head_sha", "").lower() == os.environ.get("COMMIT_SHA", "").lower()
+]
 if not successful:
     sys.exit(2)
 successful.sort(key=lambda run: run.get("created_at") or "", reverse=True)
@@ -306,15 +314,16 @@ PY
 else
   printf 'Discovering successful main-branch CI runs...\n' >&2
   runs_file="$temp_dir/runs.json"
-  api_get "/actions/workflows/ci.yml/runs?branch=main&status=success&per_page=100" "$runs_file"
-  candidate_run_ids=$(RUNS_JSON=$(cat "$runs_file") python3 - <<'PY'
+  api_get "/actions/workflows/ci.yml/runs?per_page=100" "$runs_file"
+  candidate_run_ids=$(RUNS_FILE=$runs_file python3 - <<'PY'
 import json
 import os
 
-runs = json.loads(os.environ["RUNS_JSON"]).get("workflow_runs", [])
+runs = json.load(open(os.environ["RUNS_FILE"], encoding="utf-8")).get("workflow_runs", [])
 runs.sort(key=lambda run: run.get("created_at") or "", reverse=True)
 for run in runs:
-    if run.get("conclusion") == "success" and run.get("event") != "pull_request":
+    if (run.get("status") == "completed" and run.get("conclusion") == "success"
+            and run.get("event") != "pull_request" and run.get("head_branch") == "main"):
         print(run["id"])
 PY
 )
