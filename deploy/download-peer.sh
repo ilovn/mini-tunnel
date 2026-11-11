@@ -44,6 +44,7 @@ artifact_id=
 release=
 output_dir=./mini-tunnel-download
 force=false
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 while (($#)); do
   case "$1" in
@@ -255,18 +256,40 @@ PY
   [[ "$archive_sha256" =~ ^sha256:[0-9a-fA-F]{64}$ ]] || die "GitHub did not return a valid release asset digest"
   archive_sha256=${archive_sha256#sha256:}
 
-  head_commitish=$(release_field "$release_json" target_commitish)
-  [[ "$head_commitish" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || die "release $release did not return a valid target commit reference"
+  encoded_release=$(RELEASE_TAG=$release python3 - <<'PY'
+import os
+from urllib.parse import quote
+
+print(quote(os.environ["RELEASE_TAG"], safe=""))
+PY
+)
+  tag_ref_file="$temp_dir/tag-ref.json"
+  api_get "/git/ref/tags/$encoded_release" "$tag_ref_file"
+  object_ref=$(python3 "$script_dir/release_source.py" ref "$release" "$tag_ref_file") || die "could not resolve release tag $release"
+  read -r object_type object_sha <<<"$object_ref"
+  tag_depth=0
+  while [[ "$object_type" == tag ]]; do
+    ((tag_depth < 8)) || die "release tag $release exceeds the supported annotated-tag depth"
+    tag_object_file="$temp_dir/tag-object-$tag_depth.json"
+    api_get "/git/tags/$object_sha" "$tag_object_file"
+    object_ref=$(python3 "$script_dir/release_source.py" tag "$object_sha" "$tag_object_file") || die "could not resolve annotated release tag $release"
+    read -r object_type object_sha <<<"$object_ref"
+    tag_depth=$((tag_depth + 1))
+  done
+  [[ "$object_type" == commit && "$object_sha" =~ ^[0-9a-fA-F]{40}$ ]] || die "release tag $release did not resolve to a commit"
+  head_sha=$(printf '%s' "$object_sha" | tr '[:upper:]' '[:lower:]')
   commit_json_file="$temp_dir/commit.json"
-  api_get "/commits/$head_commitish" "$commit_json_file"
+  api_get "/commits/$head_sha" "$commit_json_file"
   commit_json=$(cat "$commit_json_file")
-  head_sha=$(COMMIT_JSON=$commit_json python3 - <<'PY'
+  commit_api_sha=$(COMMIT_JSON=$commit_json python3 - <<'PY'
 import json
 import os
 
 print(json.loads(os.environ["COMMIT_JSON"]).get("sha", ""))
 PY
 )
+  normalized_commit_api_sha=$(printf '%s' "$commit_api_sha" | tr '[:upper:]' '[:lower:]')
+  [[ "$normalized_commit_api_sha" == "$head_sha" ]] || die "GitHub commit response did not match the resolved release tag"
   created_at=$(COMMIT_JSON=$commit_json python3 - <<'PY'
 import json
 import os
@@ -487,6 +510,7 @@ METADATA_PATH=$metadata_tmp \
 REPOSITORY=$repository \
 MODE=$([[ -n "$release" ]] && printf release || printf ci-artifact) \
 RELEASE_TAG=$release \
+SOURCE_RESOLUTION=$([[ -n "$release" ]] && printf git-tag-ref || printf ci-workflow-run) \
 COMMIT_SHA=$head_sha \
 RUN_ID=$run_id \
 ARTIFACT_ID=$artifact_id \
@@ -503,6 +527,7 @@ metadata = {
     "repository": os.environ["REPOSITORY"],
     "mode": os.environ["MODE"],
     "commit_sha": os.environ["COMMIT_SHA"],
+    "source_commit_resolution": os.environ["SOURCE_RESOLUTION"],
     "artifact_name": os.environ["ARTIFACT_NAME"],
     "archive_sha256": os.environ["ARCHIVE_SHA256"],
     "binary_sha256": os.environ["BINARY_SHA256"],
@@ -516,7 +541,7 @@ if os.environ["MODE"] == "ci-artifact":
 else:
     metadata["release"] = os.environ["RELEASE_TAG"]
     metadata["created_at"] = os.environ["CREATED_AT"]
-    metadata["verified"] = ["asset_digest", "published_sha256", "single_regular_binary"]
+    metadata["verified"] = ["asset_digest", "published_sha256", "tag_ref_commit", "single_regular_binary"]
 with open(os.environ["METADATA_PATH"], "w", encoding="utf-8") as output_file:
     json.dump(metadata, output_file, indent=2, sort_keys=True)
     output_file.write("\n")

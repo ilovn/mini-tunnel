@@ -226,6 +226,10 @@ jobs:
         if: runner.os == 'Linux'
         run: python3 deploy/systemd/check_units.py
 
+      - name: Check release source metadata parsing
+        if: runner.os == 'Linux'
+        run: python3 -m unittest discover -s deploy -p 'test_*.py' -v
+
       - name: Audit Cargo dependencies
         if: runner.os == 'Linux'
         run: |

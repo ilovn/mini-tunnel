@@ -43,7 +43,7 @@ deploy/download-peer.sh \
   --output-dir ./mini-tunnel-download
 ```
 
-The script writes `download.json` with the source mode, commit, release or CI provenance, archive checksum, binary checksum, and verification list. Record that file with the deployment evidence.
+The script writes `download.json` with the source mode, commit, release or CI provenance, archive checksum, binary checksum, and verification list. For a published Release it resolves `commit_sha` from the release tag's Git reference, including annotated tags; for a CI artifact it uses the successful workflow run's `head_sha`. It does not use the current `main` branch as the Release source. Record this file with the deployment evidence.
 
 On the peer, confirm the CPU and OS before selecting the archive:
 
