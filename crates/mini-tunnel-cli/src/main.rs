@@ -3079,6 +3079,11 @@ async fn abort_and_drain_mesh_initial_attempts(
                 );
                 monitor.stop().await;
             }
+            // Successful ICE setup attaches its consent monitor directly to the
+            // channel and leaves nominated_ice_monitor empty. Stop it explicitly:
+            // PeerChannel::close_async closes transport but does not await monitor
+            // shutdown or release the monitor task's ufrag registration.
+            connection.channel.stop_ice_consent_monitor().await;
             connection.channel.close_async().await;
         }
     }
@@ -9501,6 +9506,126 @@ mod tests {
             .register_guarded(local_ufrag, remote_ufrag, 8)
             .expect("retry can register after the cancelled startup attempt is joined");
         drop(registration);
+    }
+
+    #[tokio::test]
+    async fn draining_startup_channel_awaits_its_attached_ice_monitor() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-startup-channel-monitor-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let identity_a = mini_tunnel_agent::Identity::load_or_create_at(temp.join("a/device.key"))
+            .expect("identity A");
+        let identity_b = mini_tunnel_agent::Identity::load_or_create_at(temp.join("b/device.key"))
+            .expect("identity B");
+        let endpoint_a =
+            mini_tunnel_agent::peer_endpoint(&identity_a, "127.0.0.1:0".parse().unwrap())
+                .expect("endpoint A");
+        let endpoint_b =
+            mini_tunnel_agent::peer_endpoint(&identity_b, "127.0.0.1:0".parse().unwrap())
+                .expect("endpoint B");
+        let accept_endpoint = endpoint_b.clone();
+        let accept_identity = std::sync::Arc::new(
+            mini_tunnel_agent::Identity::load_or_create_at(temp.join("b/device.key"))
+                .expect("reload identity B"),
+        );
+        let accept_peer_id = identity_a.device_id();
+        let accept_peer_key = identity_a.public_key();
+        let accept = tokio::spawn(async move {
+            mini_tunnel_agent::accept_peer(
+                &accept_endpoint,
+                "startup-monitor-cleanup",
+                &accept_identity,
+                &accept_peer_id,
+                accept_peer_key,
+            )
+            .await
+            .expect("accept startup channel")
+        });
+        let channel = mini_tunnel_agent::connect_peer(
+            &endpoint_a,
+            endpoint_b.local_addr().unwrap(),
+            "startup-monitor-cleanup",
+            &identity_a,
+            &identity_b.device_id(),
+            identity_b.public_key(),
+        )
+        .await
+        .expect("connect startup channel");
+        let remote_channel = accept.await.expect("join accept task");
+
+        let router = mini_tunnel_agent::ice::IceDatagramRouterHandle::default();
+        let local_ufrag = "startupChannelLocal".to_owned();
+        let remote_ufrag = "startupChannelRemote".to_owned();
+        let (_datagrams, registration) = router
+            .register_guarded(local_ufrag.clone(), remote_ufrag.clone(), 8)
+            .expect("register ICE session owned by channel monitor");
+        let (monitor, mut cancelled, _) = mini_tunnel_agent::ice::IceConsentMonitor::new();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (stop_requested_tx, stop_requested_rx) = tokio::sync::oneshot::channel();
+        let (allow_stop_tx, allow_stop_rx) = tokio::sync::oneshot::channel();
+        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+        let monitor_task = tokio::spawn(async move {
+            let _registration = registration;
+            started_tx.send(()).expect("test waits for monitor startup");
+            let _ = cancelled.changed().await;
+            stop_requested_tx
+                .send(())
+                .expect("test observes monitor stop request");
+            let _ = allow_stop_rx.await;
+            let _ = stopped_tx.send(());
+        });
+        monitor.set_task(monitor_task).await;
+        let mut channel = channel;
+        channel.set_ice_consent_monitor(monitor);
+        started_rx.await.expect("monitor registered ICE session");
+
+        let peer = PeerInfo {
+            device_id: identity_b.device_id(),
+            assigned_ipv4: "10.70.0.2".to_owned(),
+            public_key: identity_b.public_key_encoded(),
+            candidates: Vec::new(),
+            ice_credentials: None,
+        };
+        let mut attempts = tokio::task::JoinSet::<MeshInitialConnectionAttempt>::new();
+        attempts.spawn(async move {
+            (
+                peer,
+                true,
+                Ok(MeshPeerConnection {
+                    remote: channel.remote_address(),
+                    channel,
+                    nominated_ice_monitor: None,
+                }),
+            )
+        });
+
+        let drain = tokio::spawn(async move {
+            abort_and_drain_mesh_initial_attempts(&mut attempts).await;
+        });
+        stop_requested_rx
+            .await
+            .expect("startup drain signals the attached ICE monitor");
+        assert!(
+            !drain.is_finished(),
+            "startup drain must wait for attached monitor task termination"
+        );
+        allow_stop_tx
+            .send(())
+            .expect("allow monitor task to release its registration");
+        drain.await.expect("join startup drain");
+        stopped_rx
+            .await
+            .expect("startup drain awaits the channel's attached ICE monitor");
+        let (_datagrams, registration) = router
+            .register_guarded(local_ufrag, remote_ufrag, 8)
+            .expect("retry can register after channel monitor task has stopped");
+        drop(registration);
+
+        remote_channel.close_async().await;
+        endpoint_a.close(0_u32.into(), b"test complete");
+        endpoint_b.close(0_u32.into(), b"test complete");
+        std::fs::remove_dir_all(temp).expect("remove test identities");
     }
 
     #[tokio::test]
