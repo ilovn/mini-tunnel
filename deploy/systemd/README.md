@@ -34,6 +34,21 @@ deploy/quick-install-peer.sh \
 
 The CI artifact mode requires `GITHUB_TOKEN` with Actions artifact read access; the token is only read from the process environment. Published release downloads do not require a token. For reproducibility, pass a fixed `--release vX.Y.Z`. The standalone `download-peer.sh` and `install-peer.sh` remain available when you want to inspect or verify the downloaded artifact before installing it.
 
+## Upgrade an installed peer
+
+Use `deploy/quick-upgrade-peer.sh` for an existing active instance. It requires one explicit source (`--release`, `--commit`, or `--run-id`) so an upgrade cannot silently select a stale `latest` release. The downloader verifies checksums and Sigstore provenance before the upgrade helper receives the prebuilt binary; no Rust toolchain or target-side compilation is used. For a CI artifact, provide a short-lived read-only Actions token through the environment:
+
+```sh
+read -rsp 'GitHub read-only token: ' GITHUB_TOKEN; echo
+export GITHUB_TOKEN
+deploy/quick-upgrade-peer.sh --run-id <successful-run-id> --arch auto --instance office
+unset GITHUB_TOKEN
+```
+
+For a published release, use `deploy/quick-upgrade-peer.sh --release vX.Y.Z --arch auto --instance office`; no GitHub token is needed for a public repository. The wrapper calls `sudo` only for the local upgrade operation. It refuses an unknown or stopped instance, non-loopback status listener, or a candidate that cannot run `--help` as the unprivileged `mini-tunnel` service account. It stages the downloaded bytes in a root-owned directory before use, so the root helper never executes the user-owned temporary binary. It takes a per-instance lock, saves the old executable below `/usr/local/lib/mini-tunnel/backups/<instance>/`, atomically replaces `/usr/local/bin/mini-tunnel`, restarts only `mini-tunnel-peer@<instance>.service`, and waits for that service plus its loopback status endpoint to return valid JSON. A temporary loss of remote peers does not fail the local service health check.
+
+If restart or status validation fails, or the helper receives SIGINT/SIGTERM after replacement, it atomically restores the prior executable and restarts the same instance. The old binary backup remains for manual recovery. If automatic rollback also fails, both the old binary and failed candidate are retained in the backup directory and the error prints their paths. SIGKILL, host power loss, and storage failure cannot be handled by an in-process rollback; the executable replacement remains atomic and the old binary is backed up before replacement. Inspect `systemctl status mini-tunnel-peer@office.service` and `journalctl -u mini-tunnel-peer@office.service`, then restore a retained backup with `sudo install -m 0755 <backup> /usr/local/bin/mini-tunnel.new && sudo mv -f /usr/local/bin/mini-tunnel.new /usr/local/bin/mini-tunnel && sudo systemctl restart mini-tunnel-peer@office.service`. Instance identity, membership, and `/etc/mini-tunnel/peer-office.env` are not rewritten. Keep backups until the new peer is accepted; remove older backups manually only after confirming rollback is no longer needed.
+
 Omit either Relay option if that transport is not configured. For a private CA, add `--coordinator-ca ./coordinator-ca.pem`. Before installing, `--validate-only` checks the binary, UUID, endpoint syntax, invite-file type/permissions, and presence of the unit template without changing the machine. The installer copies the invite into `/var/lib/mini-tunnel` with mode `0600`, consumes it for enrollment, and removes the temporary copy. It does not delete the source invite file. It refuses to overwrite an existing peer instance config; use a new `--instance` for another network. After installation, inspect it with:
 
 ```sh
@@ -230,4 +245,6 @@ On Unix, the services treat systemd's default `SIGTERM` and `Ctrl+C` as graceful
 
 ## Upgrade and rollback
 
-Keep the previous binary and a backup of `/var/lib/mini-tunnel/coordinator-state.json` before replacing the executable. Install a new binary atomically, run `systemctl restart` for the changed service, and inspect `systemctl status` and its journal. To roll back, restore the prior binary and, only if the new version migrated state, restore the matching state backup while the coordinator is stopped. The current JSON state is versioned but does not have an automated downgrade migration.
+For a peer, use the rollback-safe [quick upgrade procedure](#upgrade-an-installed-peer). It changes only the selected peer executable and preserves its identity and membership state.
+
+Coordinator and Relay upgrades remain a separate manual operation. Keep the previous binary and a backup of `/var/lib/mini-tunnel/coordinator-state.json` before replacing the executable. Install a new binary atomically, run `systemctl restart` for the changed service, and inspect `systemctl status` and its journal. To roll back, restore the prior binary and, only if the new version migrated state, restore the matching state backup while the Coordinator is stopped. The current JSON state is versioned but does not have an automated downgrade migration.

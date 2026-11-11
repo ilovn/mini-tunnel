@@ -1,0 +1,140 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+SCRIPT = ROOT / "quick-upgrade-peer.sh"
+
+
+class QuickUpgradePeerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="mini-tunnel-quick-upgrade-test-")
+        self.root = Path(self.temp.name)
+        self.fake_deploy = self.root / "deploy"
+        self.fake_deploy.mkdir()
+        shutil.copy2(SCRIPT, self.fake_deploy / SCRIPT.name)
+        (self.fake_deploy / SCRIPT.name).chmod(0o755)
+        self.download_log = self.root / "download.json"
+        self.upgrade_log = self.root / "upgrade.json"
+        (self.fake_deploy / "download-peer.sh").write_text(
+            f"""#!{sys.executable}
+import json, os, pathlib, sys
+args = sys.argv[1:]
+pathlib.Path(os.environ["DOWNLOAD_LOG"]).write_text(json.dumps(args))
+output = pathlib.Path(args[args.index("--output-dir") + 1])
+output.mkdir(parents=True)
+binary = output / "mini-tunnel"
+binary.write_text("prebuilt", encoding="ascii")
+binary.chmod(0o755)
+if os.environ.get("FAIL_DOWNLOAD") == "1":
+    raise SystemExit(23)
+""",
+            encoding="utf-8",
+        )
+        fake_python = self.root / "python3"
+        fake_python.write_text(
+            f"""#!{sys.executable}
+import json, os, pathlib, sys
+args = sys.argv[1:]
+binary = pathlib.Path(args[args.index("--binary") + 1])
+assert binary.read_text(encoding="ascii") == "prebuilt"
+assert "GITHUB_TOKEN" not in os.environ and "GH_TOKEN" not in os.environ
+pathlib.Path(os.environ["UPGRADE_LOG"]).write_text(json.dumps(args))
+""",
+            encoding="utf-8",
+        )
+        fake_sudo = self.root / "sudo"
+        fake_sudo.write_text("#!/bin/sh\nexec \"$@\"\n", encoding="utf-8")
+        fake_uname = self.root / "uname"
+        fake_uname.write_text("#!/bin/sh\necho Linux\n", encoding="utf-8")
+        for executable in (self.fake_deploy / "download-peer.sh", fake_python, fake_sudo, fake_uname):
+            executable.chmod(0o755)
+        self.fake_bin = self.root / "bin"
+        self.fake_bin.mkdir()
+        for name in ("python3", "sudo", "uname"):
+            (self.fake_bin / name).symlink_to(self.root / name)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def run_script(self, *args: str, **extra_env: str) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        env["PATH"] = f"{self.fake_bin}{os.pathsep}{env['PATH']}"
+        env["DOWNLOAD_LOG"] = str(self.download_log)
+        env["UPGRADE_LOG"] = str(self.upgrade_log)
+        env["TMPDIR"] = str(self.root)
+        env.update(extra_env)
+        return subprocess.run(
+            [str(self.fake_deploy / SCRIPT.name), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+    def test_download_verification_and_instance_arguments_are_forwarded(self) -> None:
+        result = self.run_script(
+            "--repo", "ilovn/mini-tunnel", "--arch", "aarch64", "--run-id", "43100395658",
+            "--instance", "office", "--health-timeout", "45",
+            GITHUB_TOKEN="read-only-token",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        download_args = json.loads(self.download_log.read_text(encoding="utf-8"))
+        self.assertEqual(
+            download_args[2:],
+            ["--repo", "ilovn/mini-tunnel", "--arch", "aarch64", "--run-id", "43100395658"],
+        )
+        upgrade_args = json.loads(self.upgrade_log.read_text(encoding="utf-8"))
+        binary = upgrade_args[upgrade_args.index("--binary") + 1]
+        self.assertTrue(binary.endswith("/download/mini-tunnel"))
+        self.assertEqual(
+            upgrade_args[upgrade_args.index("--instance"):],
+            ["--instance", "office", "--health-timeout", "45"],
+        )
+        self.assertFalse(Path(binary).exists(), "temporary download is removed")
+
+    def test_failed_download_never_invokes_upgrade_or_prints_token(self) -> None:
+        result = self.run_script(
+            "--release", "v1.2.3", "--instance", "office",
+            FAIL_DOWNLOAD="1", GITHUB_TOKEN="secret-token-must-not-be-printed",
+        )
+        self.assertEqual(result.returncode, 23)
+        self.assertFalse(self.upgrade_log.exists())
+        self.assertNotIn("secret-token-must-not-be-printed", result.stdout + result.stderr)
+
+    def test_requires_existing_instance_name_and_rejects_binary_override(self) -> None:
+        missing = self.run_script("--instance", "office")
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertFalse(self.download_log.exists())
+        release = self.run_script("--release", "v1.2.3")
+        self.assertNotEqual(release.returncode, 0)
+        self.assertFalse(self.download_log.exists())
+        latest = self.run_script("--release", "latest", "--instance", "office")
+        self.assertNotEqual(latest.returncode, 0)
+        self.assertFalse(self.download_log.exists())
+        mixed_sources = self.run_script(
+            "--release", "v1.2.3", "--run-id", "43100395658", "--instance", "office"
+        )
+        self.assertNotEqual(mixed_sources.returncode, 0)
+        self.assertFalse(self.download_log.exists())
+        invalid_timeout = self.run_script(
+            "--release", "v1.2.3", "--instance", "office", "--health-timeout", "0"
+        )
+        self.assertNotEqual(invalid_timeout.returncode, 0)
+        self.assertFalse(self.download_log.exists())
+        override = self.run_script("--instance", "office", "--binary", "/tmp/unverified")
+        self.assertNotEqual(override.returncode, 0)
+        self.assertFalse(self.download_log.exists())
+        self.assertFalse(self.upgrade_log.exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
