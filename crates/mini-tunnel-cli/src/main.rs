@@ -3926,6 +3926,13 @@ struct MeshMembershipRefresh {
 }
 
 fn spawn_mesh_membership_refresh(config: MeshMembershipRefresh) -> tokio::task::JoinHandle<()> {
+    spawn_mesh_membership_refresh_with_period(config, Duration::from_secs(30))
+}
+
+fn spawn_mesh_membership_refresh_with_period(
+    config: MeshMembershipRefresh,
+    period: Duration,
+) -> tokio::task::JoinHandle<()> {
     let MeshMembershipRefresh {
         coordinator_url,
         network_id,
@@ -3944,7 +3951,6 @@ fn spawn_mesh_membership_refresh(config: MeshMembershipRefresh) -> tokio::task::
             .map(|peer| (peer.device_id.clone(), peer))
             .collect::<std::collections::HashMap<_, _>>();
         let mut pending = std::collections::HashMap::<String, tokio::task::JoinHandle<()>>::new();
-        let period = Duration::from_secs(30);
         let mut refresh = tokio::time::interval(period);
         refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -7525,6 +7531,24 @@ mod tests {
         axum::Json(PeerListResponse { peers })
     }
 
+    #[derive(Clone)]
+    struct MutablePeerSnapshot {
+        peers: std::sync::Arc<tokio::sync::RwLock<Vec<PeerInfo>>>,
+        requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    async fn mutable_peer_snapshot_handler(
+        axum::extract::State(state): axum::extract::State<MutablePeerSnapshot>,
+        axum::Json(_request): axum::Json<PeerListRequest>,
+    ) -> axum::Json<PeerListResponse> {
+        state
+            .requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        axum::Json(PeerListResponse {
+            peers: state.peers.read().await.clone(),
+        })
+    }
+
     #[tokio::test]
     async fn shutdown_signal_accepts_either_signal_source() {
         let result = select_shutdown_signal(
@@ -8939,6 +8963,393 @@ mod tests {
             mesh_candidate_changes(&known, &[first, second]),
             vec![Ipv4Addr::new(10, 77, 0, 2), Ipv4Addr::new(10, 77, 0, 3)]
         );
+    }
+
+    struct MembershipRefreshPacketIo {
+        outbound: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+        inbound: tokio::sync::mpsc::Sender<Vec<u8>>,
+        local_ipv4: Ipv4Addr,
+        mtu: usize,
+    }
+
+    impl mini_tunnel_agent::tunnel::TunnelPacketIo for MembershipRefreshPacketIo {
+        async fn read_outbound_packet(
+            &self,
+        ) -> Result<Vec<u8>, mini_tunnel_agent::tun_device::TunError> {
+            let packet = self.outbound.lock().await.recv().await.ok_or_else(|| {
+                mini_tunnel_agent::tun_device::TunError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "test packet source closed",
+                ))
+            })?;
+            mini_tunnel_agent::tun_device::validate_outbound_packet(
+                &packet,
+                self.local_ipv4,
+                None,
+                self.mtu,
+            )?;
+            Ok(packet)
+        }
+
+        async fn write_inbound_packet(
+            &self,
+            packet: &[u8],
+            expected_peer_ipv4: Ipv4Addr,
+        ) -> Result<(), mini_tunnel_agent::tun_device::TunError> {
+            mini_tunnel_agent::tun_device::validate_inbound_ipv4(
+                packet,
+                self.local_ipv4,
+                expected_peer_ipv4,
+                self.mtu,
+            )?;
+            self.inbound.send(packet.to_vec()).await.map_err(|_| {
+                mini_tunnel_agent::tun_device::TunError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "test packet sink closed",
+                ))
+            })
+        }
+    }
+
+    fn membership_test_packet(source: Ipv4Addr, destination: Ipv4Addr) -> Vec<u8> {
+        let mut packet = vec![0; 28];
+        packet[0] = 0x45;
+        let packet_len = packet.len() as u16;
+        packet[2..4].copy_from_slice(&packet_len.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&source.octets());
+        packet[16..20].copy_from_slice(&destination.octets());
+        packet
+    }
+
+    #[tokio::test]
+    async fn coordinator_candidate_refresh_dispatches_live_mesh_to_direct_udp() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-live-candidate-refresh-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let local_identity = std::sync::Arc::new(
+            mini_tunnel_agent::Identity::load_or_create_at(temp.join("local/key"))
+                .expect("local identity"),
+        );
+        let mut remote_identity =
+            mini_tunnel_agent::Identity::load_or_create_at(temp.join("remote-0/key"))
+                .expect("remote identity");
+        let mut remote_identity_path = temp.join("remote-0/key");
+        while local_identity.device_id() > remote_identity.device_id() {
+            let next_path = temp.join(format!("remote-{}/key", uuid::Uuid::new_v4()));
+            remote_identity = mini_tunnel_agent::Identity::load_or_create_at(next_path.clone())
+                .expect("remote identity ordered after local identity");
+            remote_identity_path = next_path;
+        }
+        let network_id = "candidate-refresh-integration";
+        let local_ipv4 = Ipv4Addr::new(10, 77, 0, 1);
+        let remote_ipv4 = Ipv4Addr::new(10, 77, 0, 2);
+        let local_endpoint =
+            mini_tunnel_agent::peer_endpoint(&local_identity, "127.0.0.1:0".parse().unwrap())
+                .expect("local UDP endpoint");
+        let remote_endpoint =
+            mini_tunnel_agent::peer_endpoint(&remote_identity, "127.0.0.1:0".parse().unwrap())
+                .expect("remote UDP endpoint");
+        let remote_device_id = remote_identity.device_id();
+        let remote_public_key = remote_identity.public_key();
+        let remote_udp_address = remote_endpoint.local_addr().expect("remote UDP address");
+        let stale_peer = PeerInfo {
+            device_id: remote_device_id.clone(),
+            assigned_ipv4: remote_ipv4.to_string(),
+            public_key: remote_identity.public_key_encoded(),
+            candidates: vec!["127.0.0.1:9".to_owned()],
+            ice_credentials: None,
+        };
+        let refreshed_peer = PeerInfo {
+            candidates: vec![remote_udp_address.to_string()],
+            ..stale_peer.clone()
+        };
+        let snapshot = std::sync::Arc::new(tokio::sync::RwLock::new(vec![stale_peer.clone()]));
+        let request_count = std::sync::Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock Coordinator");
+        let coordinator_address = listener.local_addr().expect("Coordinator address");
+        let coordinator_state = MutablePeerSnapshot {
+            peers: std::sync::Arc::clone(&snapshot),
+            requests: std::sync::Arc::clone(&request_count),
+        };
+        let coordinator_task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/v1/networks/candidate-refresh-integration/peers",
+                        axum::routing::post(mutable_peer_snapshot_handler),
+                    )
+                    .with_state(coordinator_state),
+            )
+            .await
+        });
+        let coordinator_url = format!("http://{coordinator_address}");
+
+        let relay_listener = mini_tunnel_agent::peer_tcp_listener("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("bind temporary reliable-path listener");
+        let relay_address = relay_listener.local_addr().unwrap();
+        let allowed = [(local_identity.device_id(), local_identity.public_key())];
+        let accept_reliable = mini_tunnel_agent::accept_tcp_peer_any(
+            &relay_listener,
+            network_id,
+            &remote_identity,
+            &allowed,
+        );
+        let connect_reliable = mini_tunnel_agent::connect_tcp_peer(
+            relay_address,
+            network_id,
+            &local_identity,
+            &remote_device_id,
+            remote_public_key,
+        );
+        let (reliable_remote, reliable_local) = tokio::join!(accept_reliable, connect_reliable);
+        let reliable_remote = std::sync::Arc::new(reliable_remote.unwrap().1);
+        let reliable_local = reliable_local.expect("initial authenticated reliable path");
+        let reliable_reader = {
+            let reliable_remote = std::sync::Arc::clone(&reliable_remote);
+            tokio::spawn(async move { while reliable_remote.recv_packet().await.is_ok() {} })
+        };
+
+        let remote_endpoint_for_accept = remote_endpoint.clone();
+        let remote_identity_path_for_accept = remote_identity_path.clone();
+        let expected_local_id = local_identity.device_id();
+        let expected_local_key = local_identity.public_key();
+        let direct_channel = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        let direct_channel_for_accept = std::sync::Arc::clone(&direct_channel);
+        let accept_direct = tokio::spawn(async move {
+            let remote_identity_for_accept =
+                mini_tunnel_agent::Identity::load_or_create_at(remote_identity_path_for_accept)
+                    .expect("reload remote identity for accept");
+            let accepted = mini_tunnel_agent::accept_peer(
+                &remote_endpoint_for_accept,
+                network_id,
+                &remote_identity_for_accept,
+                &expected_local_id,
+                expected_local_key,
+            )
+            .await
+            .expect("accept authenticated direct recovery");
+            *direct_channel_for_accept.write().await = Some(std::sync::Arc::new(accepted));
+        });
+        let (remote_packet_tx, mut remote_packet_rx) = tokio::sync::mpsc::channel(2);
+        let direct_remote_reader = {
+            let direct_channel = std::sync::Arc::clone(&direct_channel);
+            tokio::spawn(async move {
+                loop {
+                    let channel = direct_channel.read().await.clone();
+                    let Some(channel) = channel else {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        continue;
+                    };
+                    match channel.recv_packet().await {
+                        Ok(packet) if !packet.is_empty() => {
+                            if remote_packet_tx.send(packet).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+
+        let local_endpoint_for_probe = local_endpoint.clone();
+        let local_identity_for_probe = std::sync::Arc::clone(&local_identity);
+        let peer_for_probe = std::sync::Arc::clone(&snapshot);
+        let peer_id = stale_peer.device_id.clone();
+        let peer_key = remote_public_key;
+        let probe: mini_tunnel_agent::tunnel::PeerConnector = std::sync::Arc::new(move |_| {
+            let endpoint = local_endpoint_for_probe.clone();
+            let identity = std::sync::Arc::clone(&local_identity_for_probe);
+            let peer_snapshot = std::sync::Arc::clone(&peer_for_probe);
+            let peer_id = peer_id.clone();
+            Box::pin(async move {
+                let peer = peer_snapshot
+                    .read()
+                    .await
+                    .iter()
+                    .find(|peer| peer.device_id == peer_id)
+                    .cloned()
+                    .ok_or(mini_tunnel_agent::IdentityError::UnauthorizedPeer)?;
+                let candidates = candidates_for_path(&peer.candidates, false);
+                let (channel, _) = mini_tunnel_agent::connect_peer_candidates(
+                    &endpoint,
+                    &candidates,
+                    network_id,
+                    &identity,
+                    &peer.device_id,
+                    peer_key,
+                )
+                .await
+                .map_err(|error| mini_tunnel_agent::IdentityError::Transport(error.to_string()))?;
+                validate_udp_probe_with_timing(
+                    channel,
+                    false,
+                    Duration::from_millis(400),
+                    Duration::from_millis(20),
+                )
+                .await
+            })
+        });
+        let reconnect: mini_tunnel_agent::tunnel::PeerConnector = std::sync::Arc::new(|_| {
+            Box::pin(async {
+                Err(mini_tunnel_agent::IdentityError::Transport(
+                    "unexpected reconnect while reliable path remains active".to_owned(),
+                ))
+            })
+        });
+        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(2);
+        let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel(2);
+        let packet_io = std::sync::Arc::new(MembershipRefreshPacketIo {
+            outbound: tokio::sync::Mutex::new(outbound_rx),
+            inbound: inbound_tx,
+            local_ipv4,
+            mtu: 1500,
+        });
+        let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(vec![stale_peer.clone()]);
+        let (allowlist_tx, allowlist_rx) =
+            tokio::sync::watch::channel(vec![(stale_peer.device_id.clone(), remote_public_key)]);
+        let (updates_tx, updates_rx) = tokio::sync::mpsc::channel(8);
+        let pump_io = std::sync::Arc::clone(&packet_io);
+        let pump = tokio::spawn(async move {
+            mini_tunnel_agent::tunnel::pump_peer_mesh_dynamic(
+                &*pump_io,
+                vec![mini_tunnel_agent::tunnel::ReconnectingPeer {
+                    address: remote_ipv4,
+                    ipv6_address: None,
+                    channel: std::sync::Arc::new(reliable_local),
+                    connector: reconnect,
+                    probe: Some(probe),
+                    probe_cooldown: Duration::from_secs(3600),
+                }],
+                updates_rx,
+            )
+            .await
+        });
+        let registry: AcceptedPeerRegistry =
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let refresh = spawn_mesh_membership_refresh_with_period(
+            MeshMembershipRefresh {
+                coordinator_url: coordinator_url.clone(),
+                network_id: network_id.to_owned(),
+                identity: std::sync::Arc::clone(&local_identity),
+                endpoint: TunnelEndpoint {
+                    endpoint: local_endpoint.clone(),
+                    excluded_candidate_interfaces: std::sync::Arc::new(std::sync::RwLock::new(
+                        std::collections::HashSet::new(),
+                    )),
+                    ice: None,
+                },
+                relay_endpoints: RelayEndpoints::default(),
+                snapshot_tx,
+                allowlist_tx,
+                registry,
+                updates_tx,
+                initial_peers: vec![stale_peer.clone()],
+            },
+            Duration::from_millis(50),
+        );
+        let _snapshot_rx = snapshot_rx;
+        let _allowlist_rx = allowlist_rx;
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while request_count.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("membership refresher queried the mock Coordinator");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if mini_tunnel_agent::status::snapshot().iter().any(|status| {
+                    status.peer == remote_ipv4.to_string()
+                        && status.online
+                        && status.active_path == "TLS/TCP"
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("live mesh starts on authenticated reliable path");
+
+        *snapshot.write().await = vec![refreshed_peer];
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let before_probation = mini_tunnel_agent::status::snapshot()
+            .into_iter()
+            .find(|status| status.peer == remote_ipv4.to_string())
+            .expect("mesh status before direct probation");
+        assert!(before_probation.online);
+        assert_eq!(before_probation.active_path, "TLS/TCP");
+
+        let promoted = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Some(status) =
+                    mini_tunnel_agent::status::snapshot()
+                        .into_iter()
+                        .find(|status| {
+                            status.peer == remote_ipv4.to_string()
+                                && status.online
+                                && status.active_path == "QUIC/UDP"
+                        })
+                {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("candidate refresh should promote a healthy direct UDP path");
+        assert_eq!(
+            promoted.last_switch_reason.as_deref(),
+            Some("healthy_direct_probe")
+        );
+        assert!(request_count.load(Ordering::SeqCst) >= 2);
+
+        let outbound_packet = membership_test_packet(local_ipv4, remote_ipv4);
+        outbound_tx.send(outbound_packet.clone()).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), remote_packet_rx.recv())
+                .await
+                .unwrap(),
+            Some(outbound_packet)
+        );
+        let inbound_packet = membership_test_packet(remote_ipv4, local_ipv4);
+        direct_channel
+            .read()
+            .await
+            .as_ref()
+            .expect("accepted direct peer channel")
+            .send_packet(&inbound_packet)
+            .await
+            .expect("send reverse overlay packet");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), inbound_rx.recv())
+                .await
+                .unwrap(),
+            Some(inbound_packet)
+        );
+
+        refresh.abort();
+        pump.abort();
+        accept_direct.abort();
+        direct_remote_reader.abort();
+        reliable_reader.abort();
+        coordinator_task.abort();
+        local_endpoint.close(0_u32.into(), b"test complete");
+        remote_endpoint.close(0_u32.into(), b"test complete");
+        drop(reliable_remote);
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]
