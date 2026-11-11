@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -27,6 +28,13 @@ class VerifyPeerAttestationTests(unittest.TestCase):
             encoding="utf-8",
         )
         python.chmod(0o755)
+        self.isolated_path = self.root / "isolated-path"
+        self.isolated_path.mkdir()
+        for name in ("bash", "dirname", "mktemp", "rm", "tr"):
+            executable = shutil.which(name)
+            if executable is not None:
+                (self.isolated_path / name).symlink_to(executable)
+        (self.isolated_path / "python3").symlink_to(python)
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -46,7 +54,9 @@ class VerifyPeerAttestationTests(unittest.TestCase):
         if with_gh:
             self.add_fake_gh(exit_code)
         env = os.environ.copy()
-        env["PATH"] = os.pathsep.join((str(self.bin), "/usr/bin", "/bin"))
+        env["PATH"] = os.pathsep.join(
+            (str(self.bin), "/usr/bin", "/bin") if with_gh else (str(self.isolated_path),)
+        )
         env["ARGUMENTS_FILE"] = str(self.arguments_file)
         env["GITHUB_TOKEN"] = "private-token"
         env["GH_PROMPT_DISABLED"] = "caller-value"
