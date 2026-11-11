@@ -2,6 +2,13 @@
 
 Status: **public NAT/QoS matrix incomplete**. The loopback ICE mapping proxy verifies packet rewriting and session behavior, but it does not establish interoperability across public NATs. The VPS smoke test and the RouterOS/office fallback observation below are additional runtime evidence; neither completes a matrix case.
 
+### Current-main domestic NAT fallback (2026-11-12)
+
+- Tested the exact source commit `8d9731c01a61e14cfaa358d03c7cfcd3dc0063d2` from successful [CI run 43100395658](https://github.com/ilovn/mini-tunnel/actions/runs/43100395658). Both x86_64 and ARM64 CI artifacts passed SHA-256 sidecar and Sigstore provenance verification before use; the x86_64 binary SHA-256 was `c54d11fdd09136981e2f2ec5391cc083db3ead337f77f2a0452530d613eeee2c`. No remote build was performed.
+- On the Guangzhou x86_64 VPS and domestic NAT VPS `172.16.11.231`, fresh peers joined a temporary network. ICE nomination events appeared in both peer logs, but both status endpoints reported the selected path as authenticated `Relay/TLS`; this run does not prove a stable direct UDP path. Guangzhou's last reported switch reason was `quality_threshold`, but no impairment was injected, so this is not a controlled QoS result.
+- While both endpoints were online over Relay/TLS, overlay ping passed 60/60 in each direction with 0% loss. Mean RTT was 15.104 ms Guangzhou→NAT and 16.214 ms NAT→Guangzhou. Relay metrics during the sample showed 2 accepted connections, 1 paired session, 0 handshake failures, and 31,292 forwarded bytes. The UDP Relay session had no forwarded datagrams; the verified payload path was TCP Relay/TLS.
+- Both device memberships were revoked; the Coordinator snapshot then validated with one empty network, zero members, and zero invites. The peer TUN addresses/routes disappeared on both hosts, task listeners stopped, and the original default routes remained unchanged. Existing EasyTier, firewall, and persistent routes were not modified. This verifies usable current-main TCP Relay fallback on this domestic path, but not direct-path stability, TCP fallback specifically triggered by an induced UDP outage, QoS threshold behavior, or long-duration reliability.
+
 ### ICE credential-skew retry: staggered restart (2026-11-10)
 
 - Tested commit `f1b91f965a0069753968106daa454a7474d5757f` from successful [CI run 42777168889](https://github.com/ilovn/mini-tunnel/actions/runs/42777168889), all six jobs passed. The x86_64 and ARM64 release archives passed sidecar checksum and GitHub attestation checks for the exact repository, workflow, and source digest before transfer; both hosts ran those prebuilt artifacts.
