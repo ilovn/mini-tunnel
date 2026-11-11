@@ -814,7 +814,7 @@ pub async fn peer_endpoint_with_ice_and_stun(
     Ok((endpoint, mapped_address))
 }
 
-fn iced_endpoint_from_socket(
+pub(crate) fn iced_endpoint_from_socket(
     identity: &crate::Identity,
     socket: std::net::UdpSocket,
     queue_capacity: usize,

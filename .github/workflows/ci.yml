@@ -300,6 +300,7 @@ jobs:
           sudo "$test_binary" --exact tunnel::tests::privileged_linux_veth_mesh_promotes_reliable_session_to_direct_udp --ignored --nocapture
           command -v iptables
           sudo "$test_binary" --exact stun::tests::privileged_linux_snat_discovers_server_reflexive_address_on_same_socket --ignored --nocapture
+          sudo "$test_binary" --exact stun::tests::privileged_linux_dual_snat_authenticates_quic_peer_on_shared_socket --ignored --nocapture
 
       - name: Run privileged Windows Wintun packet round trip
         if: runner.os == 'Windows'

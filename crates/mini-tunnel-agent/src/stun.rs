@@ -1247,6 +1247,218 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires root privileges, iproute2, iptables, and network namespaces"]
+    async fn privileged_linux_dual_snat_authenticates_quic_peer_on_shared_socket() {
+        let topology = DualSnatTopology::create_with_destination_dependent_mappings(false);
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-dual-snat-quic-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let identity_a = crate::Identity::load_or_create_at(temp.join("a/device.key"))
+            .expect("create client A identity");
+        let identity_b = crate::Identity::load_or_create_at(temp.join("b/device.key"))
+            .expect("create client B identity");
+        let stun_server = UdpSocket::bind("198.18.0.254:3478")
+            .await
+            .expect("bind transit STUN server");
+        let stun_address = stun_server.local_addr().expect("STUN server address");
+        let responder = tokio::spawn(async move {
+            for _ in 0..2 {
+                let mut request = [0; HEADER_LEN];
+                let (length, source) = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    stun_server.recv_from(&mut request),
+                )
+                .await
+                .expect("both peers reach STUN")
+                .expect("receive STUN request");
+                assert_eq!(length, HEADER_LEN);
+                let transaction = request[8..20].try_into().expect("transaction ID");
+                stun_server
+                    .send_to(&mapped_response(source, transaction), source)
+                    .await
+                    .expect("send mapped response");
+            }
+        });
+        let socket_a = bind_udp_in_namespace(
+            &topology.client_a,
+            "0.0.0.0:0".parse().expect("client A bind address"),
+        );
+        let socket_b = bind_udp_in_namespace(
+            &topology.client_b,
+            "0.0.0.0:0".parse().expect("client B bind address"),
+        );
+        let port_a = socket_a.local_addr().expect("client A socket").port();
+        let port_b = socket_b.local_addr().expect("client B socket").port();
+        let (mapped_a, mapped_b) = tokio::try_join!(
+            discover_mapped_address(&socket_a, stun_address),
+            discover_mapped_address(&socket_b, stun_address),
+        )
+        .expect("discover NAT mappings on the future QUIC sockets");
+        responder.await.expect("join STUN responder");
+        assert_eq!(
+            mapped_a.ip(),
+            "198.18.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(
+            mapped_b.ip(),
+            "198.18.0.2".parse::<std::net::IpAddr>().unwrap()
+        );
+        let endpoint_a = crate::ice::iced_endpoint_from_socket(
+            &identity_a,
+            socket_a.into_std().expect("convert A socket"),
+            64,
+        )
+        .expect("create A shared ICE/QUIC endpoint");
+        let endpoint_b = crate::ice::iced_endpoint_from_socket(
+            &identity_b,
+            socket_b.into_std().expect("convert B socket"),
+            64,
+        )
+        .expect("create B shared ICE/QUIC endpoint");
+        let host_a: SocketAddr = format!("10.77.1.2:{port_a}").parse().unwrap();
+        let host_b: SocketAddr = format!("10.78.1.2:{port_b}").parse().unwrap();
+        let candidate = |address, related_address| crate::candidate::SignaledCandidate {
+            address,
+            transport: crate::candidate::CandidateTransport::Udp,
+            candidate_type: if related_address == address {
+                crate::candidate::CandidateType::Host
+            } else {
+                crate::candidate::CandidateType::ServerReflexive { related_address }
+            },
+        };
+        let candidates_a = [candidate(host_a, host_a), candidate(mapped_a, host_a)];
+        let candidates_b = [candidate(host_b, host_b), candidate(mapped_b, host_b)];
+        let credentials_a = crate::ice::generate_ice_credentials(1).unwrap();
+        let credentials_b = crate::ice::generate_ice_credentials(1).unwrap();
+        let (mut datagrams_a, _registration_a) = endpoint_a
+            .ice_router
+            .register_guarded(credentials_a.ufrag.clone(), credentials_b.ufrag.clone(), 64)
+            .expect("register A ICE session");
+        let (mut datagrams_b, _registration_b) = endpoint_b
+            .ice_router
+            .register_guarded(credentials_b.ufrag.clone(), credentials_a.ufrag.clone(), 64)
+            .expect("register B ICE session");
+        let mut driver_a = crate::ice::IceAgentDriver::for_peer_with_candidates_on_socket(
+            host_a,
+            &credentials_a,
+            &credentials_b,
+            &candidates_a,
+            &candidates_b,
+            true,
+            std::time::Instant::now(),
+        )
+        .expect("construct A ICE agent");
+        let mut driver_b = crate::ice::IceAgentDriver::for_peer_with_candidates_on_socket(
+            host_b,
+            &credentials_b,
+            &credentials_a,
+            &candidates_b,
+            &candidates_a,
+            false,
+            std::time::Instant::now(),
+        )
+        .expect("construct B ICE agent");
+        let (pair_a, pair_b) = tokio::join!(
+            driver_a.run_checks(
+                &endpoint_a.socket,
+                &endpoint_a.ice_router,
+                &credentials_a.ufrag,
+                &credentials_b.ufrag,
+                &mut datagrams_a,
+                Duration::from_secs(8)
+            ),
+            driver_b.run_checks(
+                &endpoint_b.socket,
+                &endpoint_b.ice_router,
+                &credentials_b.ufrag,
+                &credentials_a.ufrag,
+                &mut datagrams_b,
+                Duration::from_secs(8)
+            ),
+        );
+        assert_eq!(pair_a.expect("A nominates peer mapping").1, mapped_b);
+        assert_eq!(pair_b.expect("B nominates peer mapping").1, mapped_a);
+
+        let peer_a_id = identity_a.device_id();
+        let peer_a_key = identity_a.public_key();
+        let peer_b_id = identity_b.device_id();
+        let peer_b_key = identity_b.public_key();
+        let accept_endpoint = endpoint_b.endpoint.clone();
+        let identity_b_path = temp.join("b/device.key");
+        let accept = tokio::spawn(async move {
+            let identity_b =
+                crate::Identity::load_or_create_at(identity_b_path).expect("reload B identity");
+            crate::accept_peer(
+                &accept_endpoint,
+                "dual-snat-quic-test",
+                &identity_b,
+                &peer_a_id,
+                peer_a_key,
+            )
+            .await
+        });
+        let channel_a = crate::connect_peer(
+            &endpoint_a.endpoint,
+            mapped_b,
+            "dual-snat-quic-test",
+            &identity_a,
+            &peer_b_id,
+            peer_b_key,
+        )
+        .await
+        .expect("authenticate QUIC peer through dual SNAT");
+        let channel_b = accept
+            .await
+            .expect("join accept task")
+            .expect("accept QUIC");
+        assert_eq!(channel_a.transport_name(), "QUIC/UDP");
+        assert_eq!(channel_b.transport_name(), "QUIC/UDP");
+        let (received_tx, mut received_rx) = tokio::sync::mpsc::channel(8);
+        let responder_channel = channel_b.clone();
+        let response_task = tokio::spawn(async move {
+            while let Ok(packet) = responder_channel.recv_packet().await {
+                if received_tx.send(packet).await.is_err() {
+                    break;
+                }
+            }
+        });
+        channel_a
+            .probe_health(3, Duration::from_secs(2))
+            .await
+            .expect("authenticated path health probes succeed");
+        channel_a
+            .send_packet(b"dual-snat-a-to-b")
+            .await
+            .expect("send A to B");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), received_rx.recv())
+                .await
+                .expect("A-to-B packet deadline")
+                .unwrap(),
+            b"dual-snat-a-to-b"
+        );
+        channel_b
+            .send_packet(b"dual-snat-b-to-a")
+            .await
+            .expect("send B to A");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), channel_a.recv_packet())
+                .await
+                .expect("B-to-A packet deadline")
+                .unwrap(),
+            b"dual-snat-b-to-a"
+        );
+        channel_a.close();
+        channel_b.close();
+        response_task.abort();
+        endpoint_a.endpoint.close(0_u32.into(), b"test complete");
+        endpoint_b.endpoint.close(0_u32.into(), b"test complete");
+        std::fs::remove_dir_all(temp).expect("remove test identities");
+    }
+
+    #[cfg(target_os = "linux")]
     async fn run_dual_snat_ice_scenario(destination_dependent_mappings: bool) {
         let _topology = DualSnatTopology::create_with_destination_dependent_mappings(
             destination_dependent_mappings,
