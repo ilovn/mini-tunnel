@@ -8,11 +8,10 @@ The Coordinator and opaque Relay templates run as unprivileged server services; 
 
 For a bounded first-install acceptance procedure, including artifact checksums, startup/status checks, bidirectional overlay traffic, evidence capture, and rollback, see the [peer deployment acceptance runbook](../../docs/deployment-acceptance.md).
 
-From a checkout containing the script and unit template, run as root (or prefix with `sudo`):
+From a checkout containing the deployment scripts and unit template, run one command to download the prebuilt release and install/enroll the peer. Create the network and one-use invite on the Coordinator first; the invite file must already have mode `0600`:
 
 ```sh
-sudo deploy/install-peer.sh \
-  --binary ./mini-tunnel \
+deploy/quick-install-peer.sh --release latest --arch auto -- \
   --network-id 00000000-0000-0000-0000-000000000000 \
   --coordinator-url https://coordinator.example:8443 \
   --invite-token-file ./invite.token \
@@ -22,14 +21,18 @@ sudo deploy/install-peer.sh \
   --udp-relay-server relay.example:42003
 ```
 
-To obtain a published Linux binary directly on a peer, run the independent downloader without options to fetch the newest stable release:
+The wrapper downloads only an attested release artifact through `download-peer.sh`; it never builds on the peer. It then invokes `install-peer.sh`, using `sudo` only for installation when needed. Download options go before `--`; all remaining options are passed to the installer after `--`. For example, to install an exact successful CI commit before it has a published release:
 
 ```sh
-deploy/download-peer.sh
-sudo deploy/install-peer.sh --binary ./mini-tunnel-download/mini-tunnel ...
+export GITHUB_TOKEN # provide a read-only Actions token through your secret manager
+deploy/quick-install-peer.sh \
+  --commit <full-40-character-commit-sha> --arch x86_64 -- \
+  --network-id 00000000-0000-0000-0000-000000000000 \
+  --coordinator-url https://coordinator.example:8443 \
+  --invite-token-file ./invite.token --instance office
 ```
 
-Published release downloads do not require `GITHUB_TOKEN`. For reproducible deployment, pass `--release vX.Y.Z`. To validate a not-yet-released CI artifact, replace the release option with `--commit` (preferred) or `--run-id` and set `GITHUB_TOKEN`; set the token only as a process environment variable, and the script does not save it.
+The CI artifact mode requires `GITHUB_TOKEN` with Actions artifact read access; the token is only read from the process environment. Published release downloads do not require a token. For reproducibility, pass a fixed `--release vX.Y.Z`. The standalone `download-peer.sh` and `install-peer.sh` remain available when you want to inspect or verify the downloaded artifact before installing it.
 
 Omit either Relay option if that transport is not configured. For a private CA, add `--coordinator-ca ./coordinator-ca.pem`. Before installing, `--validate-only` checks the binary, UUID, endpoint syntax, invite-file type/permissions, and presence of the unit template without changing the machine. The installer copies the invite into `/var/lib/mini-tunnel` with mode `0600`, consumes it for enrollment, and removes the temporary copy. It does not delete the source invite file. It refuses to overwrite an existing peer instance config; use a new `--instance` for another network. After installation, inspect it with:
 
