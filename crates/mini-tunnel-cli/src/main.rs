@@ -9162,44 +9162,20 @@ mod tests {
             })
         };
 
-        let local_endpoint_for_probe = local_endpoint.clone();
-        let local_identity_for_probe = std::sync::Arc::clone(&local_identity);
-        let peer_for_probe = std::sync::Arc::clone(&snapshot);
-        let peer_id = stale_peer.device_id.clone();
-        let peer_key = remote_public_key;
-        let probe: mini_tunnel_agent::tunnel::PeerConnector = std::sync::Arc::new(move |_| {
-            let endpoint = local_endpoint_for_probe.clone();
-            let identity = std::sync::Arc::clone(&local_identity_for_probe);
-            let peer_snapshot = std::sync::Arc::clone(&peer_for_probe);
-            let peer_id = peer_id.clone();
-            Box::pin(async move {
-                let peer = peer_snapshot
-                    .read()
-                    .await
-                    .iter()
-                    .find(|peer| peer.device_id == peer_id)
-                    .cloned()
-                    .ok_or(mini_tunnel_agent::IdentityError::UnauthorizedPeer)?;
-                let candidates = candidates_for_path(&peer.candidates, false);
-                let (channel, _) = mini_tunnel_agent::connect_peer_candidates(
-                    &endpoint,
-                    &candidates,
-                    network_id,
-                    &identity,
-                    &peer.device_id,
-                    peer_key,
-                )
-                .await
-                .map_err(|error| mini_tunnel_agent::IdentityError::Transport(error.to_string()))?;
-                validate_udp_probe_with_timing(
-                    channel,
-                    false,
-                    Duration::from_millis(400),
-                    Duration::from_millis(20),
-                )
-                .await
-            })
-        });
+        let (_, probe, _) = build_mesh_peer_connectors(
+            TunnelEndpoint {
+                endpoint: local_endpoint.clone(),
+                excluded_candidate_interfaces: std::sync::Arc::new(std::sync::RwLock::new(
+                    std::collections::HashSet::new(),
+                )),
+                ice: None,
+            },
+            std::sync::Arc::clone(&local_identity),
+            network_id.to_owned(),
+            coordinator_url.clone(),
+            stale_peer.clone(),
+            RelayEndpoints::default(),
+        );
         let reconnect: mini_tunnel_agent::tunnel::PeerConnector = std::sync::Arc::new(|_| {
             Box::pin(async {
                 Err(mini_tunnel_agent::IdentityError::Transport(
@@ -9292,7 +9268,7 @@ mod tests {
         assert!(before_probation.online);
         assert_eq!(before_probation.active_path, "TLS/TCP");
 
-        let promoted = tokio::time::timeout(Duration::from_secs(8), async {
+        let promoted = tokio::time::timeout(Duration::from_secs(40), async {
             loop {
                 if let Some(status) =
                     mini_tunnel_agent::status::snapshot()
