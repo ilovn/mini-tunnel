@@ -1415,25 +1415,34 @@ mod tests {
             .expect("accept QUIC");
         assert_eq!(channel_a.transport_name(), "QUIC/UDP");
         assert_eq!(channel_b.transport_name(), "QUIC/UDP");
-        let (received_tx, mut received_rx) = tokio::sync::mpsc::channel(8);
-        let responder_channel = channel_b.clone();
+        let (stop_responder, stop_rx) = tokio::sync::oneshot::channel();
+        let (return_channel, channel_rx) = tokio::sync::oneshot::channel();
         let response_task = tokio::spawn(async move {
-            while let Ok(packet) = responder_channel.recv_packet().await {
-                if received_tx.send(packet).await.is_err() {
-                    break;
+            let mut channel_b = channel_b;
+            let mut stop_rx = stop_rx;
+            loop {
+                tokio::select! {
+                    packet = channel_b.recv_packet() => {
+                        if packet.is_err() { break; }
+                    }
+                    _ = &mut stop_rx => break,
                 }
             }
+            let _ = return_channel.send(channel_b);
         });
         channel_a
             .probe_health(3, Duration::from_secs(2))
             .await
             .expect("authenticated path health probes succeed");
+        let _ = stop_responder.send(());
+        let channel_b = channel_rx.await.expect("recover B channel after probe");
+        response_task.await.expect("join health responder");
         channel_a
             .send_packet(b"dual-snat-a-to-b")
             .await
             .expect("send A to B");
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), received_rx.recv())
+            tokio::time::timeout(Duration::from_secs(2), channel_b.recv_packet())
                 .await
                 .expect("A-to-B packet deadline")
                 .unwrap(),
@@ -1452,7 +1461,6 @@ mod tests {
         );
         channel_a.close();
         channel_b.close();
-        response_task.abort();
         endpoint_a.endpoint.close(0_u32.into(), b"test complete");
         endpoint_b.endpoint.close(0_u32.into(), b"test complete");
         std::fs::remove_dir_all(temp).expect("remove test identities");
