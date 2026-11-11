@@ -9048,21 +9048,53 @@ mod tests {
         let network_id = "candidate-refresh-integration";
         let local_ipv4 = Ipv4Addr::new(10, 77, 0, 1);
         let remote_ipv4 = Ipv4Addr::new(10, 77, 0, 2);
-        let local_endpoint =
-            mini_tunnel_agent::peer_endpoint(&local_identity, "127.0.0.1:0".parse().unwrap())
-                .expect("local UDP endpoint");
-        let remote_endpoint =
-            mini_tunnel_agent::peer_endpoint(&remote_identity, "127.0.0.1:0".parse().unwrap())
-                .expect("remote UDP endpoint");
+        let local_credentials =
+            mini_tunnel_agent::ice::generate_ice_credentials(1).expect("local ICE credentials");
+        let remote_credentials =
+            mini_tunnel_agent::ice::generate_ice_credentials(1).expect("remote ICE credentials");
+        let make_ice_endpoint =
+            |identity: &mini_tunnel_agent::Identity,
+             credentials: mini_tunnel_protocol::IceCredentials| {
+                let iced = mini_tunnel_agent::ice::peer_endpoint_with_ice(
+                    identity,
+                    "127.0.0.1:0".parse().unwrap(),
+                    16,
+                )
+                .expect("create ICE endpoint");
+                let address = iced.endpoint.local_addr().expect("ICE endpoint address");
+                let endpoint = TunnelEndpoint {
+                    endpoint: iced.endpoint,
+                    excluded_candidate_interfaces: std::sync::Arc::new(std::sync::RwLock::new(
+                        std::collections::HashSet::new(),
+                    )),
+                    ice: Some(TunnelIceState {
+                        credentials,
+                        socket: iced.socket,
+                        router: iced.ice_router,
+                        local_socket_addr: address,
+                        local_candidates: std::sync::Arc::new(tokio::sync::RwLock::new(vec![
+                            mini_tunnel_agent::candidate::SignaledCandidate {
+                                address,
+                                transport: mini_tunnel_agent::candidate::CandidateTransport::Udp,
+                                candidate_type: mini_tunnel_agent::candidate::CandidateType::Host,
+                            },
+                        ])),
+                    }),
+                };
+                (endpoint, address)
+            };
+        let (local_endpoint, local_udp_address) =
+            make_ice_endpoint(&local_identity, local_credentials.clone());
+        let (remote_endpoint, remote_udp_address) =
+            make_ice_endpoint(&remote_identity, remote_credentials.clone());
         let remote_device_id = remote_identity.device_id();
         let remote_public_key = remote_identity.public_key();
-        let remote_udp_address = remote_endpoint.local_addr().expect("remote UDP address");
         let stale_peer = PeerInfo {
             device_id: remote_device_id.clone(),
             assigned_ipv4: remote_ipv4.to_string(),
             public_key: remote_identity.public_key_encoded(),
             candidates: vec!["127.0.0.1:9".to_owned()],
-            ice_credentials: None,
+            ice_credentials: Some(remote_credentials.clone()),
         };
         let refreshed_peer = PeerInfo {
             candidates: vec![remote_udp_address.to_string()],
@@ -9119,24 +9151,48 @@ mod tests {
         };
 
         let remote_endpoint_for_accept = remote_endpoint.clone();
+        let remote_endpoint_for_ice = remote_endpoint.clone();
         let remote_identity_path_for_accept = remote_identity_path.clone();
+        let local_peer = PeerInfo {
+            device_id: local_identity.device_id(),
+            assigned_ipv4: local_ipv4.to_string(),
+            public_key: local_identity.public_key_encoded(),
+            candidates: vec![local_udp_address.to_string()],
+            ice_credentials: Some(local_credentials),
+        };
         let expected_local_id = local_identity.device_id();
         let expected_local_key = local_identity.public_key();
         let direct_channel = std::sync::Arc::new(tokio::sync::RwLock::new(None));
         let direct_channel_for_accept = std::sync::Arc::clone(&direct_channel);
+        let (start_direct_ice_tx, start_direct_ice_rx) = tokio::sync::oneshot::channel();
         let accept_direct = tokio::spawn(async move {
             let remote_identity_for_accept =
                 mini_tunnel_agent::Identity::load_or_create_at(remote_identity_path_for_accept)
                     .expect("reload remote identity for accept");
+            let select_direct = async {
+                start_direct_ice_rx
+                    .await
+                    .expect("start remote ICE checks after candidate refresh");
+                select_ice_peer_address(
+                    &remote_endpoint_for_ice,
+                    &local_peer,
+                    &remote_identity_for_accept,
+                )
+                .await
+            };
             let accepted = mini_tunnel_agent::accept_peer(
-                &remote_endpoint_for_accept,
+                &remote_endpoint_for_accept.endpoint,
                 network_id,
                 &remote_identity_for_accept,
                 &expected_local_id,
                 expected_local_key,
-            )
-            .await
-            .expect("accept authenticated direct recovery");
+            );
+            let (selected, accepted) = tokio::join!(select_direct, accepted);
+            let (selected_address, monitor) =
+                selected.expect("remote ICE selects the recovered local candidate");
+            assert_eq!(selected_address, local_udp_address);
+            let mut accepted = accepted.expect("accept authenticated direct recovery");
+            accepted.set_ice_consent_monitor(monitor);
             *direct_channel_for_accept.write().await = Some(std::sync::Arc::new(accepted));
         });
         let (remote_packet_tx, mut remote_packet_rx) = tokio::sync::mpsc::channel(2);
@@ -9163,13 +9219,7 @@ mod tests {
         };
 
         let (_, probe, _) = build_mesh_peer_connectors(
-            TunnelEndpoint {
-                endpoint: local_endpoint.clone(),
-                excluded_candidate_interfaces: std::sync::Arc::new(std::sync::RwLock::new(
-                    std::collections::HashSet::new(),
-                )),
-                ice: None,
-            },
+            local_endpoint.clone(),
             std::sync::Arc::clone(&local_identity),
             network_id.to_owned(),
             coordinator_url.clone(),
@@ -9218,13 +9268,7 @@ mod tests {
                 coordinator_url: coordinator_url.clone(),
                 network_id: network_id.to_owned(),
                 identity: std::sync::Arc::clone(&local_identity),
-                endpoint: TunnelEndpoint {
-                    endpoint: local_endpoint.clone(),
-                    excluded_candidate_interfaces: std::sync::Arc::new(std::sync::RwLock::new(
-                        std::collections::HashSet::new(),
-                    )),
-                    ice: None,
-                },
+                endpoint: local_endpoint.clone(),
                 relay_endpoints: RelayEndpoints::default(),
                 snapshot_tx,
                 allowlist_tx,
@@ -9260,6 +9304,9 @@ mod tests {
         .expect("live mesh starts on authenticated reliable path");
 
         *snapshot.write().await = vec![refreshed_peer];
+        start_direct_ice_tx
+            .send(())
+            .expect("start remote ICE checks after candidate refresh");
         tokio::time::sleep(Duration::from_millis(100)).await;
         let before_probation = mini_tunnel_agent::status::snapshot()
             .into_iter()
