@@ -1912,7 +1912,7 @@ mod tests {
         right: String,
         left_namespace: String,
         right_namespace: String,
-        loss_active: bool,
+        qdisc_active: bool,
     }
 
     #[cfg(target_os = "linux")]
@@ -1950,7 +1950,7 @@ mod tests {
                 right: right.clone(),
                 left_namespace: left_namespace.clone(),
                 right_namespace: right_namespace.clone(),
-                loss_active: false,
+                qdisc_active: false,
             };
             run(
                 "ip",
@@ -2025,10 +2025,10 @@ mod tests {
 
         fn drop_left_egress(&mut self) {
             Self::set_egress_loss(&self.left_namespace, &self.left);
-            self.loss_active = true;
+            self.qdisc_active = true;
         }
 
-        fn degrade_both_egress(&mut self) {
+        fn delay_both_egress(&mut self) {
             for (namespace, device) in [
                 (&self.left_namespace, &self.left),
                 (&self.right_namespace, &self.right),
@@ -2038,16 +2038,15 @@ mod tests {
                     "tc",
                     &[
                         "qdisc", "replace", "dev", device, "root", "netem", "delay", "200ms",
-                        "20ms", "loss", "10%",
                     ],
                 );
                 assert!(
                     output.status.success(),
-                    "tc QoS profile on {device} failed: {}",
+                    "tc delay-only profile on {device} failed: {}",
                     String::from_utf8_lossy(&output.stderr)
                 );
             }
-            self.loss_active = true;
+            self.qdisc_active = true;
         }
 
         fn reorder_both_egress(&mut self) {
@@ -2069,11 +2068,11 @@ mod tests {
                     String::from_utf8_lossy(&output.stderr)
                 );
             }
-            self.loss_active = true;
+            self.qdisc_active = true;
         }
 
         fn restore_both_egress(&mut self) {
-            if !self.loss_active {
+            if !self.qdisc_active {
                 return;
             }
             for (namespace, device) in [
@@ -2091,7 +2090,7 @@ mod tests {
                     String::from_utf8_lossy(&output.stderr)
                 );
             }
-            self.loss_active = false;
+            self.qdisc_active = false;
         }
 
         fn set_egress_loss(namespace: &str, device: &str) {
@@ -2110,7 +2109,7 @@ mod tests {
         }
 
         fn restore_left_egress(&mut self) {
-            if !self.loss_active {
+            if !self.qdisc_active {
                 return;
             }
             let output = Self::run_in_namespace(
@@ -2123,7 +2122,7 @@ mod tests {
                 "could not remove tc loss qdisc: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            self.loss_active = false;
+            self.qdisc_active = false;
         }
 
         fn qdisc_stats(&self) -> String {
@@ -2347,7 +2346,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires root privileges, iproute2, and tc netem"]
-    async fn privileged_linux_veth_degraded_udp_triggers_mesh_tcp_fallback() {
+    async fn privileged_linux_veth_high_rtt_triggers_mesh_tcp_fallback() {
         let (mut link, local_address, remote_address) = TestVethPair::create();
         let temp = std::env::temp_dir().join(format!(
             "mini-tunnel-veth-fallback-{}",
@@ -2454,7 +2453,10 @@ mod tests {
             local_ipv6: None,
             mtu: 1500,
         };
-        link.degrade_both_egress();
+        let missed_before_impairment = initial.health_snapshot().probes_missed;
+        link.delay_both_egress();
+        let delayed_qdisc = link.qdisc_stats();
+        assert!(delayed_qdisc.contains("delay 200ms"), "{delayed_qdisc}");
         let initial_for_diagnostics = Arc::clone(&initial);
         let pump = tokio::spawn(async move {
             pump_mesh_with_quality_interval(
@@ -2494,7 +2496,7 @@ mod tests {
                     .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
                     .unwrap_or_else(|error| error.to_string());
                 panic!(
-                    "mesh did not reconnect over TCP after degraded UDP QoS; health={health:?}, reliable_requested={}, local={}, remote={}, channel_remote={}, route={}, qdisc={}",
+                    "mesh did not reconnect over TCP after latency-only UDP degradation; health={health:?}, reliable_requested={}, local={}, remote={}, channel_remote={}, route={}, qdisc={}",
                     requested_reliable.load(Ordering::SeqCst),
                     endpoint_a.local_addr().expect("endpoint A address"),
                     endpoint_b.local_addr().expect("endpoint B address"),
@@ -2507,7 +2509,18 @@ mod tests {
         assert_eq!(accepted_id, a.device_id());
         assert!(
             requested_reliable.load(Ordering::SeqCst),
-            "loss-triggered fallback must filter unreliable UDP"
+            "RTT-triggered fallback must filter the degraded UDP path"
+        );
+        let impaired_health = initial_for_diagnostics.health_snapshot();
+        assert!(
+            impaired_health
+                .rtt
+                .is_some_and(|rtt| rtt > Duration::from_millis(350)),
+            "the fallback must be caused by RTT above the 350 ms policy threshold: {impaired_health:?}"
+        );
+        assert_eq!(
+            impaired_health.probes_missed, missed_before_impairment,
+            "the latency-only profile must not lose health probes"
         );
 
         tokio::time::timeout(Duration::from_secs(10), async {
