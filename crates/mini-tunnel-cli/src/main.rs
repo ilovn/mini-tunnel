@@ -1872,6 +1872,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     // starts retrying those peers, so their ufrag registrations and consent
                     // monitors cannot race a new checklist.
                     abort_and_drain_mesh_initial_attempts(&mut attempts).await;
+                    // Reverse ICE channels can still be in authenticated health
+                    // probation when the startup deadline expires. Their validation
+                    // tasks own consent monitors, so join them before retrying peers.
+                    drain_mesh_ice_validations(
+                        &mut ice_validations,
+                        &mut validating_peers,
+                        &mut connected,
+                        &mut initial_ice_validation_complete,
+                        &mut peer_connectors,
+                        &mut peer_probes,
+                    )
+                    .await;
                     collect_queued_mesh_ice_monitors(
                         &mut ice_monitor_rx,
                         &mut pending_ice_monitors,
@@ -3108,6 +3120,40 @@ async fn collect_queued_mesh_ice_monitors(
                 "stopping superseded queued ICE monitor after mesh startup"
             );
             previous.stop().await;
+        }
+    }
+}
+
+async fn drain_mesh_ice_validations(
+    validations: &mut tokio::task::JoinSet<(String, String, Option<ConnectedMeshPeer>)>,
+    validating_peers: &mut std::collections::HashSet<String>,
+    connected: &mut Vec<ConnectedMeshPeer>,
+    initial_ice_validation_complete: &mut std::collections::HashSet<String>,
+    peer_connectors: &mut std::collections::HashMap<
+        String,
+        mini_tunnel_agent::tunnel::PeerConnector,
+    >,
+    peer_probes: &mut std::collections::HashMap<String, mini_tunnel_agent::tunnel::PeerConnector>,
+) {
+    while let Some(result) = validations.join_next().await {
+        match result {
+            Ok((_, peer_id, Some(connection))) => {
+                validating_peers.remove(&peer_id);
+                println!(
+                    "Connected mesh peer {} at {}",
+                    connection.0.device_id, connection.2
+                );
+                install_mesh_peer_channel(connected, connection);
+                initial_ice_validation_complete.insert(peer_id.clone());
+                peer_connectors.remove(&peer_id);
+                peer_probes.remove(&peer_id);
+            }
+            Ok((_, peer_id, None)) => {
+                validating_peers.remove(&peer_id);
+            }
+            Err(error) => {
+                tracing::error!(%error, "mesh ICE path validation task failed during startup drain");
+            }
         }
     }
 }
@@ -9505,6 +9551,73 @@ mod tests {
         let (_datagrams, registration) = router
             .register_guarded(local_ufrag, remote_ufrag, 8)
             .expect("retry can register after the cancelled startup attempt is joined");
+        drop(registration);
+    }
+
+    #[tokio::test]
+    async fn startup_drains_incoming_ice_validation_before_peer_retry() {
+        let router = mini_tunnel_agent::ice::IceDatagramRouterHandle::default();
+        let local_ufrag = "incomingValidationLocal".to_owned();
+        let remote_ufrag = "incomingValidationRemote".to_owned();
+        let task_router = router.clone();
+        let task_local_ufrag = local_ufrag.clone();
+        let task_remote_ufrag = remote_ufrag.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut validations = tokio::task::JoinSet::new();
+        validations.spawn(async move {
+            let (_datagrams, _registration) = task_router
+                .register_guarded(task_local_ufrag, task_remote_ufrag, 8)
+                .expect("incoming validation registers its ICE session");
+            started_tx
+                .send(())
+                .expect("test is waiting for validation start");
+            let _ = release_rx.await;
+            ("local-device".to_owned(), "peer-a".to_owned(), None)
+        });
+        started_rx.await.expect("incoming validation task started");
+
+        assert!(
+            router
+                .register_guarded(local_ufrag.clone(), remote_ufrag.clone(), 8)
+                .is_err(),
+            "retry must not overlap an in-flight incoming validation"
+        );
+
+        let mut validating_peers = std::collections::HashSet::from(["peer-a".to_owned()]);
+        let mut connected = Vec::new();
+        let mut validation_complete = std::collections::HashSet::new();
+        let mut peer_connectors = std::collections::HashMap::new();
+        let mut peer_probes = std::collections::HashMap::new();
+        let drain = tokio::spawn(async move {
+            drain_mesh_ice_validations(
+                &mut validations,
+                &mut validating_peers,
+                &mut connected,
+                &mut validation_complete,
+                &mut peer_connectors,
+                &mut peer_probes,
+            )
+            .await;
+            (validating_peers, connected, validation_complete)
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !drain.is_finished(),
+            "startup drain waits for the in-flight validation task"
+        );
+        release_tx
+            .send(())
+            .expect("allow incoming validation to release its ICE session");
+        let (validating_peers, connected, validation_complete) =
+            drain.await.expect("join validation drain");
+        assert!(validating_peers.is_empty());
+        assert!(connected.is_empty());
+        assert!(validation_complete.is_empty());
+
+        let (_datagrams, registration) = router
+            .register_guarded(local_ufrag, remote_ufrag, 8)
+            .expect("membership retry can register after incoming validation is joined");
         drop(registration);
     }
 
