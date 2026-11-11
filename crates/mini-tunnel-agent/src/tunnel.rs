@@ -4288,6 +4288,218 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mesh_candidate_refresh_failure_keeps_reliable_path_until_later_udp_recovery() {
+        async fn tcp_pair(a: Arc<Identity>, b: Arc<Identity>) -> (PeerChannel, PeerChannel) {
+            let listener = peer_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let allowed = vec![(a.device_id(), a.public_key())];
+            let peer_id = b.device_id();
+            let accept = accept_tcp_peer_any(&listener, "mesh-candidate-refresh", &b, &allowed);
+            let connect = connect_tcp_peer(
+                address,
+                "mesh-candidate-refresh",
+                &a,
+                &peer_id,
+                b.public_key(),
+            );
+            let (accepted, connected) = tokio::join!(accept, connect);
+            (connected.unwrap(), accepted.unwrap().1)
+        }
+
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-candidate-refresh-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let a = Arc::new(Identity::load_or_create_at(temp.join("a/key")).unwrap());
+        let b = Arc::new(Identity::load_or_create_at(temp.join("b/key")).unwrap());
+        let (initial, remote_reliable) = tcp_pair(Arc::clone(&a), Arc::clone(&b)).await;
+        let endpoint_a =
+            peer_endpoint(&a, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+        let endpoint_b =
+            peer_endpoint(&b, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+        let remote_addr = endpoint_b.local_addr().unwrap();
+        let local_id = a.device_id();
+        let peer_id = b.device_id();
+        let local_key = a.public_key();
+        let peer_key = b.public_key();
+        let (accepted_tx, mut accepted_rx) = mpsc::channel(1);
+        let (direct_packet_tx, mut direct_packet_rx) = mpsc::channel(2);
+        let server_endpoint = endpoint_b.clone();
+        let server_identity = Arc::clone(&b);
+        let server_task = tokio::spawn(async move {
+            let remote = Arc::new(
+                accept_peer(
+                    &server_endpoint,
+                    "mesh-candidate-refresh",
+                    &server_identity,
+                    &local_id,
+                    local_key,
+                )
+                .await
+                .unwrap(),
+            );
+            accepted_tx.send(Arc::clone(&remote)).await.unwrap();
+            while let Ok(packet) = remote.recv_packet().await {
+                if !packet.is_empty() && direct_packet_tx.send(packet).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let failed_probe = Arc::new(tokio::sync::Notify::new());
+        let probe_endpoint = endpoint_a.clone();
+        let probe_identity = Arc::clone(&a);
+        let probe_calls_for_connector = Arc::clone(&probe_calls);
+        let failed_probe_for_connector = Arc::clone(&failed_probe);
+        let probe: PeerConnector = Arc::new(move |try_udp_relay| -> PeerConnectFuture {
+            assert!(try_udp_relay);
+            let attempt = probe_calls_for_connector.fetch_add(1, Ordering::Relaxed);
+            let endpoint = probe_endpoint.clone();
+            let identity = Arc::clone(&probe_identity);
+            let peer_id = peer_id.clone();
+            let failed_probe = Arc::clone(&failed_probe_for_connector);
+            Box::pin(async move {
+                if attempt == 0 {
+                    failed_probe.notify_one();
+                    return Err(IdentityError::Transport(
+                        "stale direct candidate was unreachable".to_owned(),
+                    ));
+                }
+                let channel = connect_peer(
+                    &endpoint,
+                    remote_addr,
+                    "mesh-candidate-refresh",
+                    &identity,
+                    &peer_id,
+                    peer_key,
+                )
+                .await?;
+                let rtt = channel.probe_health(3, Duration::from_secs(2)).await?;
+                if rtt > Duration::from_millis(350) {
+                    return Err(IdentityError::Transport(
+                        "direct probe RTT exceeded threshold".to_owned(),
+                    ));
+                }
+                Ok(channel)
+            })
+        });
+        let connector: PeerConnector = Arc::new(|_| -> PeerConnectFuture {
+            Box::pin(async {
+                Err(IdentityError::Transport(
+                    "reconnect path should not run during candidate recovery".to_owned(),
+                ))
+            })
+        });
+        let local_ip = Ipv4Addr::new(10, 254, 249, 1);
+        let peer_ip = Ipv4Addr::new(10, 254, 249, 2);
+        let (outbound_tx, outbound_rx) = mpsc::channel(4);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(4);
+        let io = Arc::new(MockPacketIo {
+            outbound: Mutex::new(outbound_rx),
+            inbound: inbound_tx,
+            local_ipv4: local_ip,
+            local_ipv6: None,
+            mtu: 1500,
+        });
+        let pump_io = Arc::clone(&io);
+        let (updates_tx, updates_rx) = mpsc::channel(4);
+        let pump = tokio::spawn(async move {
+            pump_peer_mesh_dynamic(
+                &*pump_io,
+                vec![ReconnectingPeer {
+                    address: peer_ip,
+                    ipv6_address: None,
+                    channel: Arc::new(initial),
+                    connector,
+                    probe: Some(probe),
+                    probe_cooldown: Duration::from_secs(3600),
+                }],
+                updates_rx,
+            )
+            .await
+        });
+
+        updates_tx
+            .send(MeshPeerUpdate::CandidatesChanged(peer_ip))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), failed_probe.notified())
+            .await
+            .expect("stale candidate recovery probe was attempted");
+        let before_retry_packet = packet(local_ip, peer_ip, 28);
+        outbound_tx.send(before_retry_packet.clone()).await.unwrap();
+        let delivered_over_reliable = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let packet = remote_reliable.recv_packet().await.unwrap();
+                if !packet.is_empty() {
+                    break packet;
+                }
+            }
+        })
+        .await
+        .expect("existing reliable path must carry traffic after stale candidate failure");
+        assert_eq!(delivered_over_reliable, before_retry_packet);
+        assert!(crate::status::snapshot().into_iter().any(|status| {
+            status.peer == peer_ip.to_string() && status.online && status.active_path == "TLS/TCP"
+        }));
+
+        updates_tx
+            .send(MeshPeerUpdate::CandidatesChanged(peer_ip))
+            .await
+            .unwrap();
+        let remote_direct = tokio::time::timeout(Duration::from_secs(5), accepted_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let promoted_status = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(status) = crate::status::snapshot().into_iter().find(|status| {
+                    status.peer == peer_ip.to_string()
+                        && status.online
+                        && status.active_path == "QUIC/UDP"
+                }) {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("healthy replacement path is promoted");
+        assert_eq!(
+            promoted_status.last_switch_reason.as_deref(),
+            Some("healthy_direct_probe")
+        );
+
+        let after_recovery_packet = packet(local_ip, peer_ip, 28);
+        outbound_tx
+            .send(after_recovery_packet.clone())
+            .await
+            .unwrap();
+        let delivered_over_udp = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let packet = direct_packet_rx.recv().await.unwrap();
+                if !packet.is_empty() {
+                    break packet;
+                }
+            }
+        })
+        .await
+        .expect("replacement direct path carries overlay traffic");
+        assert_eq!(delivered_over_udp, after_recovery_packet);
+        assert_eq!(probe_calls.load(Ordering::Relaxed), 2);
+
+        pump.abort();
+        server_task.abort();
+        remote_direct.close_async().await;
+        endpoint_a.close(0_u32.into(), b"test complete");
+        endpoint_b.close(0_u32.into(), b"test complete");
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
     async fn mesh_promotes_reliable_session_after_healthy_direct_udp_probe() {
         async fn tcp_pair(a: Arc<Identity>, b: Arc<Identity>) -> (PeerChannel, PeerChannel) {
             let listener = peer_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
