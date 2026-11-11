@@ -17,7 +17,7 @@ use std::{
     fs,
     io::{self, Read, Write},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -90,9 +90,10 @@ impl Identity {
 
     /// Load the stable local identity or create it with user-only Unix permissions.
     pub fn load_or_create() -> Result<Self, IdentityError> {
-        let dirs = directories::ProjectDirs::from("org", "ilovn", "mini-tunnel")
+        let path = identity_path()
+            .or_else(default_identity_path)
             .ok_or(IdentityError::NoConfigDirectory)?;
-        Self::load_or_create_at(dirs.config_dir().join("device.key"))
+        Self::load_or_create_at(path)
     }
 
     pub fn load_or_create_at(path: PathBuf) -> Result<Self, IdentityError> {
@@ -2422,6 +2423,18 @@ impl ReplayWindow {
 }
 
 #[must_use]
+pub fn identity_path() -> Option<PathBuf> {
+    let state_dir = std::env::var_os("MINI_TUNNEL_STATE_DIR")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    identity_path_for_state_dir(state_dir.as_deref())
+}
+
+fn identity_path_for_state_dir(state_dir: Option<&Path>) -> Option<PathBuf> {
+    state_dir.map(|root| root.join("device.key"))
+}
+
+#[must_use]
 pub fn default_identity_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("org", "ilovn", "mini-tunnel")
         .map(|dirs| dirs.config_dir().join("device.key"))
@@ -2430,6 +2443,16 @@ pub fn default_identity_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_state_directory_places_identity_in_root() {
+        let root = Path::new("/var/lib/mini-tunnel");
+        assert_eq!(
+            identity_path_for_state_dir(Some(root)),
+            Some(root.join("device.key"))
+        );
+        assert_eq!(identity_path_for_state_dir(None), None);
+    }
 
     #[test]
     fn quic_connection_errors_have_distinct_diagnostic_classes() {

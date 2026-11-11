@@ -129,6 +129,7 @@ join_env=(
   HOME=/var/lib/mini-tunnel
   XDG_CONFIG_HOME=/var/lib/mini-tunnel/.config
   XDG_DATA_HOME=/var/lib/mini-tunnel/.local/share
+  MINI_TUNNEL_STATE_DIR=/var/lib/mini-tunnel
   MINI_TUNNEL_COORDINATOR_URL="$coordinator_url"
 )
 [[ -z "$ca_runtime_path" ]] || join_env+=(MINI_TUNNEL_COORDINATOR_CA_CERT_FILE="$ca_runtime_path")
@@ -141,7 +142,7 @@ config_tmp=$(mktemp /etc/mini-tunnel/.peer-${instance}.env.XXXXXX)
 chmod 0600 "$config_tmp"
 {
   printf 'NETWORK_ID=%s\nBIND_ADDRESS=%s\nSTUN_SERVER=%s\n' "$network_id" "$bind_address" "$stun_server"
-  printf 'MINI_TUNNEL_COORDINATOR_URL=%s\nMINI_TUNNEL_STATUS_LISTEN=%s\nRUST_LOG=mini_tunnel_agent=info\n' "$coordinator_url" "$status_listen"
+  printf 'MINI_TUNNEL_COORDINATOR_URL=%s\nMINI_TUNNEL_STATE_DIR=/var/lib/mini-tunnel\nMINI_TUNNEL_STATUS_LISTEN=%s\nRUST_LOG=mini_tunnel_agent=info\n' "$coordinator_url" "$status_listen"
   [[ -z "$relay_server" ]] || printf 'MINI_TUNNEL_RELAY_SERVER=%s\n' "$relay_server"
   [[ -z "$udp_relay_server" ]] || printf 'MINI_TUNNEL_UDP_RELAY_SERVER=%s\n' "$udp_relay_server"
   [[ -z "$ca_runtime_path" ]] || printf 'MINI_TUNNEL_COORDINATOR_CA_CERT_FILE=%s\n' "$ca_runtime_path"

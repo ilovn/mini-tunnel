@@ -4,7 +4,7 @@ use std::{
     fs,
     io::{self, Read, Write},
     net::Ipv4Addr,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use ipnet::Ipv4Net;
@@ -132,9 +132,12 @@ impl MembershipStore {
     }
 
     pub fn for_current_user() -> Result<Self, MembershipError> {
-        let dirs = directories::ProjectDirs::from("org", "ilovn", "mini-tunnel")
-            .ok_or(MembershipError::NoConfigDirectory)?;
-        Ok(Self::new(dirs.config_dir().join("networks")))
+        let state_dir = std::env::var_os("MINI_TUNNEL_STATE_DIR")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+        Ok(Self::new(membership_root_for_state_dir(
+            state_dir.as_deref(),
+        )?))
     }
 
     pub fn save(&self, membership: &NetworkMembership) -> Result<(), MembershipError> {
@@ -217,6 +220,15 @@ impl MembershipStore {
     }
 }
 
+fn membership_root_for_state_dir(state_dir: Option<&Path>) -> Result<PathBuf, MembershipError> {
+    if let Some(root) = state_dir {
+        return Ok(root.join("networks"));
+    }
+    let dirs = directories::ProjectDirs::from("org", "ilovn", "mini-tunnel")
+        .ok_or(MembershipError::NoConfigDirectory)?;
+    Ok(dirs.config_dir().join("networks"))
+}
+
 fn open_membership_file(path: &std::path::Path) -> Result<fs::File, MembershipError> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
@@ -272,6 +284,53 @@ fn normalize_membership_open_error(error: io::Error) -> MembershipError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_directory_override_places_memberships_beneath_networks() {
+        let root = std::path::Path::new("/var/lib/mini-tunnel");
+        assert_eq!(
+            membership_root_for_state_dir(Some(root)).expect("state root"),
+            root.join("networks")
+        );
+        assert!(membership_root_for_state_dir(None).is_ok());
+    }
+
+    #[test]
+    fn state_directory_memberships_keep_private_atomic_storage() {
+        let state_root = std::env::temp_dir().join(format!("mini-tunnel-state-{}", Uuid::new_v4()));
+        let membership_root = membership_root_for_state_dir(Some(&state_root))
+            .expect("membership root beneath state directory");
+        let store = MembershipStore::new(membership_root.clone());
+        let membership = sample_membership();
+        store.save(&membership).expect("save membership");
+        assert_eq!(
+            store
+                .load(&membership.network_id, &membership.device_id)
+                .expect("load membership"),
+            membership
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&membership_root)
+                    .expect("membership root")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(membership_root.join(format!("{}.json", membership.network_id)))
+                    .expect("membership file")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(state_root).expect("remove state directory");
+    }
 
     fn sample_membership() -> NetworkMembership {
         NetworkMembership::new(

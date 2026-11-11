@@ -43,6 +43,10 @@ const DIRECT_PATH_PROMOTION_PROBATION: Duration = Duration::from_secs(31);
 #[derive(Debug, Parser)]
 #[command(name = "mini-tunnel", version, about = "A minimal peer-to-peer tunnel")]
 struct Cli {
+    /// Explicit root directory for device identity, memberships, and default Coordinator state.
+    #[arg(long, global = true, env = "MINI_TUNNEL_STATE_DIR", value_name = "DIR")]
+    state_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -593,15 +597,40 @@ async fn spawn_peer_status_server()
     }))
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    if let Some(state_dir) = state_dir_argument(&args) {
+        if state_dir.is_empty() {
+            eprintln!("error: --state-dir must not be empty");
+            return ExitCode::FAILURE;
+        }
+        // Set before Clap resolves subcommand defaults and before starting any threads.
+        unsafe {
+            std::env::set_var("MINI_TUNNEL_STATE_DIR", state_dir);
+        }
+    }
+
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .try_init();
-    if let Err(error) = run(Cli::parse()).await {
+
+    let cli = Cli::parse_from(args);
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("error: could not start async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if let Err(error) = runtime.block_on(run(cli)) {
         eprintln!("error: {error}");
         return ExitCode::FAILURE;
     }
@@ -732,9 +761,38 @@ async fn relay_metrics(State(relay): State<RelayMetricsState>) -> impl IntoRespo
 }
 
 fn default_coordinator_state_path() -> PathBuf {
+    let state_dir = std::env::var_os("MINI_TUNNEL_STATE_DIR")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    coordinator_state_path_for_state_dir(state_dir.as_deref())
+}
+
+fn coordinator_state_path_for_state_dir(state_dir: Option<&Path>) -> PathBuf {
+    if let Some(root) = state_dir {
+        return root.join("coordinator-state.json");
+    }
     directories::ProjectDirs::from("org", "ilovn", "mini-tunnel")
         .map(|dirs| dirs.data_local_dir().join("coordinator-state.json"))
         .unwrap_or_else(|| PathBuf::from("mini-tunnel-state.json"))
+}
+
+fn state_dir_argument(args: &[std::ffi::OsString]) -> Option<std::ffi::OsString> {
+    let mut args = args.iter().skip(1);
+    while let Some(argument) = args.next() {
+        if argument == "--" {
+            break;
+        }
+        if argument == "--state-dir" {
+            return args.next().cloned();
+        }
+        if let Some(value) = argument
+            .to_str()
+            .and_then(|argument| argument.strip_prefix("--state-dir="))
+        {
+            return Some(value.into());
+        }
+    }
+    None
 }
 
 fn decode_ticket_key(value: &str, source: &str) -> Result<[u8; 32], String> {
@@ -1076,7 +1134,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let identity = mini_tunnel_agent::Identity::load_or_create()?;
             println!("Device ID: {}", identity.device_id());
             println!("Public key: {}", identity.public_key_encoded());
-            if let Some(path) = mini_tunnel_agent::default_identity_path() {
+            if let Some(path) =
+                mini_tunnel_agent::identity_path().or_else(mini_tunnel_agent::default_identity_path)
+            {
                 println!("Private key: {}", path.display());
             }
         }
@@ -5756,6 +5816,57 @@ fn print_tunnel_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_dir_argument_is_found_before_clap_resolves_defaults() {
+        let before_subcommand = [
+            "mini-tunnel".into(),
+            "--state-dir".into(),
+            "/tmp/mt-state".into(),
+            "coordinator".into(),
+            "verify-state".into(),
+        ];
+        assert_eq!(
+            state_dir_argument(&before_subcommand),
+            Some(std::ffi::OsString::from("/tmp/mt-state"))
+        );
+
+        let after_subcommand = [
+            "mini-tunnel".into(),
+            "coordinator".into(),
+            "verify-state".into(),
+            "--state-dir=/tmp/mt-state".into(),
+        ];
+        assert_eq!(
+            state_dir_argument(&after_subcommand),
+            Some(std::ffi::OsString::from("/tmp/mt-state"))
+        );
+        let parsed = Cli::try_parse_from([
+            "mini-tunnel",
+            "coordinator",
+            "verify-state",
+            "--state-dir=/tmp/mt-state",
+        ])
+        .expect("global state-dir after nested subcommand");
+        assert_eq!(parsed.state_dir, Some(PathBuf::from("/tmp/mt-state")));
+        assert_eq!(
+            state_dir_argument(&["mini-tunnel".into(), "identity".into()]),
+            None
+        );
+    }
+
+    #[test]
+    fn coordinator_default_state_file_uses_explicit_state_root() {
+        let root = Path::new("/var/lib/mini-tunnel");
+        assert_eq!(
+            coordinator_state_path_for_state_dir(Some(root)),
+            root.join("coordinator-state.json")
+        );
+        let expected_default = directories::ProjectDirs::from("org", "ilovn", "mini-tunnel")
+            .map(|dirs| dirs.data_local_dir().join("coordinator-state.json"))
+            .unwrap_or_else(|| PathBuf::from("mini-tunnel-state.json"));
+        assert_eq!(coordinator_state_path_for_state_dir(None), expected_default);
+    }
 
     #[test]
     fn recovery_ice_probe_defers_to_full_path_probation() {
