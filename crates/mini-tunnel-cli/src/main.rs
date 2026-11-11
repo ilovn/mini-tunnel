@@ -1867,6 +1867,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             _ = tokio::time::sleep_until(startup_deadline), if first_peer_at.is_none() => break,
                         }
                     }
+                    // The startup deadline may leave peer attempts inside ICE checks or
+                    // fallback establishment. Finish cancellation before membership refresh
+                    // starts retrying those peers, so their ufrag registrations and consent
+                    // monitors cannot race a new checklist.
+                    abort_and_drain_mesh_initial_attempts(&mut attempts).await;
+                    collect_queued_mesh_ice_monitors(
+                        &mut ice_monitor_rx,
+                        &mut pending_ice_monitors,
+                    )
+                    .await;
                     for (device_id, (peer, mut channel, remote)) in
                         pending_accepted_channels.drain()
                     {
@@ -3047,6 +3057,54 @@ struct MeshPeerConnection {
     channel: mini_tunnel_agent::PeerChannel,
     remote: SocketAddr,
     nominated_ice_monitor: Option<(SocketAddr, mini_tunnel_agent::ice::IceConsentMonitor)>,
+}
+
+type MeshInitialConnectionAttempt = (
+    PeerInfo,
+    bool,
+    Result<MeshPeerConnection, mini_tunnel_agent::IdentityError>,
+);
+
+async fn abort_and_drain_mesh_initial_attempts(
+    attempts: &mut tokio::task::JoinSet<MeshInitialConnectionAttempt>,
+) {
+    attempts.abort_all();
+    while let Some(result) = attempts.join_next().await {
+        if let Ok((peer, _, Ok(mut connection))) = result {
+            if let Some((_, monitor)) = connection.nominated_ice_monitor.take() {
+                tracing::debug!(
+                    peer_id = %peer.device_id,
+                    reason = "startup_attempt_cancelled",
+                    "stopping nominated ICE monitor from a cancelled startup attempt"
+                );
+                monitor.stop().await;
+            }
+            connection.channel.close_async().await;
+        }
+    }
+}
+
+async fn collect_queued_mesh_ice_monitors(
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<(
+        String,
+        SocketAddr,
+        mini_tunnel_agent::ice::IceConsentMonitor,
+    )>,
+    pending: &mut std::collections::HashMap<
+        String,
+        (SocketAddr, mini_tunnel_agent::ice::IceConsentMonitor),
+    >,
+) {
+    while let Ok((peer_id, remote, monitor)) = receiver.try_recv() {
+        if let Some((_, previous)) = pending.insert(peer_id.clone(), (remote, monitor)) {
+            tracing::debug!(
+                peer_id,
+                reason = "startup_attempt_cancelled",
+                "stopping superseded queued ICE monitor after mesh startup"
+            );
+            previous.stop().await;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9406,6 +9464,76 @@ mod tests {
             startup_deadline,
             "when no peer connects, preserve the bounded startup deadline"
         );
+    }
+
+    #[tokio::test]
+    async fn mesh_startup_attempts_are_joined_before_ice_peer_retry() {
+        let router = mini_tunnel_agent::ice::IceDatagramRouterHandle::default();
+        let local_ufrag = "startupCancelLocal".to_owned();
+        let remote_ufrag = "startupCancelRemote".to_owned();
+        let mut attempts = tokio::task::JoinSet::<MeshInitialConnectionAttempt>::new();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task_router = router.clone();
+        let task_local_ufrag = local_ufrag.clone();
+        let task_remote_ufrag = remote_ufrag.clone();
+        attempts.spawn(async move {
+            let (_datagrams, _registration) = task_router
+                .register_guarded(task_local_ufrag, task_remote_ufrag, 8)
+                .expect("first startup attempt registers its ICE session");
+            started_tx
+                .send(())
+                .expect("test is waiting for registration");
+            std::future::pending::<MeshInitialConnectionAttempt>().await
+        });
+        started_rx
+            .await
+            .expect("startup attempt registered ICE session");
+
+        assert!(
+            router
+                .register_guarded(local_ufrag.clone(), remote_ufrag.clone(), 8)
+                .is_err(),
+            "a concurrent checklist for the same ufrag pair must be rejected"
+        );
+
+        abort_and_drain_mesh_initial_attempts(&mut attempts).await;
+        let (_datagrams, registration) = router
+            .register_guarded(local_ufrag, remote_ufrag, 8)
+            .expect("retry can register after the cancelled startup attempt is joined");
+        drop(registration);
+    }
+
+    #[tokio::test]
+    async fn queued_startup_ice_monitor_is_stopped_before_peer_retry() {
+        let router = mini_tunnel_agent::ice::IceDatagramRouterHandle::default();
+        let local_ufrag = "queuedMonitorLocal".to_owned();
+        let remote_ufrag = "queuedMonitorRemote".to_owned();
+        let (_datagrams, registration) = router
+            .register_guarded(local_ufrag.clone(), remote_ufrag.clone(), 8)
+            .expect("register ICE session owned by consent task");
+        let (monitor, mut cancelled, _) = mini_tunnel_agent::ice::IceConsentMonitor::new();
+        let task = tokio::spawn(async move {
+            let _registration = registration;
+            let _ = cancelled.changed().await;
+        });
+        monitor.set_task(task).await;
+
+        let remote = "127.0.0.1:42000".parse().unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        sender
+            .send(("peer-a".to_owned(), remote, monitor))
+            .expect("queue nominated monitor for startup dispatch");
+        let mut pending = std::collections::HashMap::new();
+        collect_queued_mesh_ice_monitors(&mut receiver, &mut pending).await;
+        let (_, monitor) = pending
+            .remove("peer-a")
+            .expect("queued monitor is retained for matching accepted peer");
+        monitor.stop().await;
+
+        let (_datagrams, registration) = router
+            .register_guarded(local_ufrag, remote_ufrag, 8)
+            .expect("retry can register after the queued consent monitor is stopped");
+        drop(registration);
     }
 
     #[test]
