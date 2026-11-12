@@ -1806,7 +1806,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                                     reason = "peer_path_already_connected",
                                                     "closing duplicate outbound mesh channel"
                                                 );
-                                                channel.close();
+                                                channel.close_async().await;
                                             } else {
                                                 let connector = peer_connectors.remove(&peer.device_id).expect("peer connector exists");
                                                 let probe = peer_probes.remove(&peer.device_id).expect("peer probe exists");
@@ -1833,7 +1833,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                                 reason = "outbound_path_lost_deterministic_election",
                                                 "closing non-elected outbound mesh channel"
                                             );
-                                            channel.close();
+                                            channel.close_async().await;
                                         }
                                     }
                                     Err(error) => eprintln!("Peer {} UDP probe unavailable: {error}", peer.device_id),
