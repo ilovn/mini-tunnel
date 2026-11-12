@@ -2571,6 +2571,15 @@ mod tests {
     }
 
     #[test]
+    fn relay_pair_window_covers_candidate_dial_budget_with_headroom() {
+        assert!(
+            mini_tunnel_relay::DEFAULT_PAIR_TIMEOUT
+                >= CANDIDATE_CONNECT_BUDGET + Duration::from_secs(5),
+            "relay pairing must stay open while the slower peer checks signed TCP candidates"
+        );
+    }
+
+    #[test]
     fn identity_is_stable_across_loads_and_private_file_is_created() {
         let dir =
             std::env::temp_dir().join(format!("mini-tunnel-identity-{}", uuid::Uuid::new_v4()));

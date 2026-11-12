@@ -41,7 +41,11 @@ const MAX_PENDING_SESSIONS: usize = 128;
 const MAX_USED_TICKETS: usize = 16_384;
 const MAX_SESSION_BYTES: u64 = 1024 * 1024 * 1024;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
-pub const DEFAULT_PAIR_TIMEOUT: Duration = Duration::from_secs(25);
+// The peer connector may spend up to 30 seconds checking advertised TCP candidates before
+// requesting a relay ticket. Keep the first authenticated relay connection pending long enough
+// for the slower peer to reach Relay, while leaving 5 seconds before Coordinator's 45-second
+// pairing-ticket expiry.
+pub const DEFAULT_PAIR_TIMEOUT: Duration = Duration::from_secs(40);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
 const MAX_TICKET_LIFETIME_MS: u64 = 120_000;
 const COPY_BUFFER_SIZE: usize = 16 * 1024;
@@ -807,6 +811,57 @@ mod tests {
         assert_eq!(stats.capacity_rejections_total, 0);
         assert_eq!(stats.handshake_failures_total, 0);
         assert_eq!(stats.bytes_forwarded_total, 51);
+        drop(stream_a);
+        drop(stream_b);
+        relay_task.abort();
+    }
+
+    #[tokio::test]
+    async fn default_pair_window_covers_a_slow_peer_candidate_sweep() {
+        let key = [12; 32];
+        let a = identity(6);
+        let b = identity(7);
+        let mut claims_a = claims(&a, &b, 22);
+        let mut claims_b = claims(&b, &a, 23);
+        let expires_at_ms = unix_time_ms().unwrap() + 90_000;
+        claims_a.expires_at_ms = expires_at_ms;
+        claims_b.expires_at_ms = expires_at_ms;
+        let ticket_a = issue_relay_ticket(&key, &claims_a).expect("ticket A");
+        let ticket_b = issue_relay_ticket(&key, &claims_b).expect("ticket B");
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind relay");
+        let address = listener.local_addr().expect("relay address");
+        let relay = RelayServer::new(RelayConfig::new(key));
+        let relay_task = {
+            let relay = relay.clone();
+            tokio::spawn(async move { relay.run(listener).await })
+        };
+
+        let mut stream_a = connect_and_authenticate(address, &ticket_a, &a).await;
+        // connect_peer_candidates has a 30-second total budget. Hold the first peer
+        // while the other side exhausts its advertised TCP candidates before using Relay.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let mut stream_b = connect_and_authenticate(address, &ticket_b, &b).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), stream_a.read_u8())
+                .await
+                .expect("A relay pair timeout")
+                .expect("A relay ready"),
+            RELAY_READY
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), stream_b.read_u8())
+                .await
+                .expect("B relay pair timeout")
+                .expect("B relay ready"),
+            RELAY_READY
+        );
+        stream_a.write_all(b"after-slow-candidates").await.unwrap();
+        let mut payload = [0; 21];
+        stream_b.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"after-slow-candidates");
+
         drop(stream_a);
         drop(stream_b);
         relay_task.abort();
