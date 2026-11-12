@@ -192,6 +192,26 @@ class AnalyzeSoakTests(unittest.TestCase):
         self.assertEqual(report["duplicate_samples"], 1)
         self.assertIn("duplicate_samples", report["failures"])
 
+    def test_rejects_non_finite_json_numbers_without_crashing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "non-finite.jsonl"
+            write_jsonl(
+                path,
+                [
+                    row(1, 0, probe={"sent": float("nan"), "received": 0}),
+                    {"event": "monitor_stopped", "elapsed_seconds": float("inf")},
+                ],
+            )
+            result = subprocess.run(
+                [sys.executable, str(TOOL), "--input", str(path)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("failed_probe_rounds", result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_allows_probe_tick_jitter_from_ten_second_sampler(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "probe-jitter.jsonl"

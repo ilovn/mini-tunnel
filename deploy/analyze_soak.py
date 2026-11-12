@@ -27,7 +27,8 @@ def parse_timestamp(value: Any) -> dt.datetime | None:
 
 def number(value: Any) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else None
     return None
 
 
@@ -138,7 +139,7 @@ def analyze_file(
         process = record.get("peer_process")
         if (
             not isinstance(process, dict)
-            or not isinstance(process.get("pid"), int)
+            or type(process.get("pid")) is not int
             or process["pid"] <= 0
         ):
             missing_process_samples += 1
@@ -160,7 +161,7 @@ def analyze_file(
         probe = record["probe"]
         sent = number(probe.get("sent"))
         received = number(probe.get("received"))
-        if sent is None or received is None or sent < 0 or received < 0 or received > sent:
+        if sent is None or received is None or sent <= 0 or received < 0 or received > sent:
             failed_probe_rounds += 1
             continue
         probe_sent += int(sent)
@@ -296,7 +297,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.probe_jitter_seconds is None:
         args.probe_jitter_seconds = args.sample_interval_seconds
     if (
-        args.sample_interval_seconds <= 0
+        any(
+            not math.isfinite(value)
+            for value in (
+                args.sample_interval_seconds,
+                args.max_sample_gap_seconds,
+                args.probe_interval_seconds,
+                args.probe_jitter_seconds,
+                args.max_probe_loss_percent,
+                args.minimum_duration_seconds,
+            )
+        )
+        or args.sample_interval_seconds <= 0
         or args.max_sample_gap_seconds < args.sample_interval_seconds
         or args.probe_interval_seconds <= 0
         or args.probe_jitter_seconds < 0
@@ -304,7 +316,7 @@ def main(argv: list[str] | None = None) -> int:
         or args.minimum_duration_seconds < 0
         or args.minimum_probe_rounds < 0
         or any(
-            value is not None and value <= 0
+            value is not None and (not math.isfinite(value) or value <= 0)
             for value in (args.max_rss_kib, args.max_fds, args.max_threads)
         )
     ):
