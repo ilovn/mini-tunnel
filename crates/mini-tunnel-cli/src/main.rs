@@ -1534,7 +1534,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     } else {
                                         // The smaller device owns the data session. This reverse
                                         // connection is only a simultaneous UDP hole-punch probe.
-                                        channel.close();
+                                        channel.close_async().await;
                                     }
                                 }
                             }
@@ -1628,7 +1628,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                                 remote,
                                                 &peer_connectors,
                                                 &peer_probes,
-                                            ) {
+                                            ).await {
                                                 start_mesh_ice_validation(
                                                     &mut ice_validations,
                                                     &mut validating_peers,
@@ -1637,7 +1637,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                                 );
                                             }
                                         } else {
-                                            channel.close();
+                                            channel.close_async().await;
                                         }
                                     } else if let Some((_, old)) = pending_ice_monitors.insert(peer_id, (nominated_remote, monitor)) {
                                         old.stop().await;
@@ -1665,7 +1665,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                                 reason = "direct_path_already_connected",
                                                 "closing duplicate accepted mesh channel"
                                             );
-                                            channel.close();
+                                            channel.close_async().await;
                                         } else if require_ice_consent && channel.transport_name() == "QUIC/UDP" {
                                             if let Some((nominated_remote, monitor)) = pending_ice_monitors.remove(&peer.device_id) {
                                                 if attach_nominated_ice_monitor(
@@ -1679,7 +1679,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                                         remote,
                                                         &peer_connectors,
                                                         &peer_probes,
-                                                    );
+                                                    )
+                                                    .await;
                                                     if let Some(connection) = connection {
                                                         start_mesh_ice_validation(
                                                             &mut ice_validations,
@@ -1695,7 +1696,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                                             reason = "superseded_pending_accepted_channel",
                                                             "closing superseded pending mesh channel"
                                                         );
-                                                        duplicate.close();
+                                                        duplicate.close_async().await;
                                                     }
                                                 }
                                             } else if let Some((_, duplicate, _)) = pending_accepted_channels.insert(peer.device_id.clone(), (peer, channel, remote)) {
@@ -1704,7 +1705,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                                     reason = "superseded_pending_accepted_channel",
                                                     "closing superseded pending mesh channel"
                                                 );
-                                                duplicate.close();
+                                                duplicate.close_async().await;
                                             }
                                         } else {
                                             println!("Connected mesh peer {} at {remote}", peer.device_id);
@@ -1768,7 +1769,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                                         accepted_remote,
                                                         &peer_connectors,
                                                         &peer_probes,
-                                                    );
+                                                    ).await;
                                                     if let Some(connection) = connection {
                                                         start_mesh_ice_validation(
                                                             &mut ice_validations,
@@ -1785,14 +1786,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                                         probe_has_ice_consent = channel.has_ice_consent_monitor(),
                                                         "discarding unmatched accepted ICE channel"
                                                     );
-                                                    accepted_channel.close();
+                                                    accepted_channel.close_async().await;
                                                     eprintln!("Peer {} direct ICE session had no consent monitor; waiting for reliable fallback", peer.device_id);
                                                 }
                                             } else if let Some(monitor) = channel.take_ice_consent_monitor() {
-                                                channel.close();
+                                                channel.close_async().await;
                                                 pending_ice_monitors.insert(peer.device_id.clone(), (remote, monitor));
                                             } else {
-                                                channel.close();
+                                                channel.close_async().await;
                                                 eprintln!("Peer {} direct ICE session had no consent monitor; waiting for reliable fallback", peer.device_id);
                                             }
                                         } else if mesh_channel_is_elected(
@@ -1848,7 +1849,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                                 "Connected mesh peer {} at {}",
                                                 connection.0.device_id, connection.2
                                             );
-                                            install_mesh_peer_channel(&mut connected, connection);
+                                            install_mesh_peer_channel(&mut connected, connection).await;
                                             initial_ice_validation_complete.insert(peer_id.clone());
                                             peer_connectors.remove(&peer_id);
                                             peer_probes.remove(&peer_id);
@@ -1903,12 +1904,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 remote,
                                 &mut peer_connectors,
                                 &mut peer_probes,
-                            ) {
+                            )
+                            .await
+                            {
                                 connected.push(connection);
                             }
                             continue;
                         }
-                        channel.close();
+                        channel.close_async().await;
                     }
                     for (_, (_, monitor)) in pending_ice_monitors.drain() {
                         monitor.stop().await;
@@ -1972,7 +1975,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                         reason,
                                         "closing accepted mesh channel that could not be dispatched"
                                     );
-                                    error.into_inner().close();
+                                    error.into_inner().close_async().await;
                                 }
                             } else {
                                 tracing::debug!(
@@ -1981,7 +1984,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     reason = "peer_accept_queue_missing",
                                     "closing accepted mesh channel without a peer dispatcher"
                                 );
-                                channel.close();
+                                channel.close_async().await;
                             }
                         }
                     });
@@ -2326,7 +2329,7 @@ async fn send_peer_diagnostic_and_wait_for_echo(
     if echoed != message {
         return Err("peer diagnostic echo did not match the sent message".into());
     }
-    channel.close();
+    channel.close_async().await;
     Ok(())
 }
 
@@ -2801,7 +2804,7 @@ async fn connect_tunnel_peer(
                 channel.has_ice_consent_monitor(),
             ) =>
         {
-            channel.close();
+            channel.close_async().await;
             Err(mini_tunnel_agent::CandidateConnectError::Unreachable(
                 "ICE-enabled UDP candidate was not nominated and has no consent monitor".into(),
             ))
@@ -3140,7 +3143,7 @@ async fn drain_mesh_ice_validations(
                     "Connected mesh peer {} at {}",
                     connection.0.device_id, connection.2
                 );
-                install_mesh_peer_channel(connected, connection);
+                install_mesh_peer_channel(connected, connection).await;
                 initial_ice_validation_complete.insert(peer_id.clone());
                 peer_connectors.remove(&peer_id);
                 peer_probes.remove(&peer_id);
@@ -3325,7 +3328,7 @@ async fn connect_mesh_peer(
                 channel.has_ice_consent_monitor(),
             ) =>
         {
-            channel.close();
+            channel.close_async().await;
             Err(mini_tunnel_agent::CandidateConnectError::Unreachable(
                 "ICE-enabled UDP candidate was not nominated and has no consent monitor".into(),
             ))
@@ -3429,7 +3432,7 @@ async fn attach_nominated_ice_monitor(
     }
 }
 
-fn clone_mesh_peer_channel(
+async fn clone_mesh_peer_channel(
     peer: PeerInfo,
     channel: mini_tunnel_agent::PeerChannel,
     remote: SocketAddr,
@@ -3437,11 +3440,11 @@ fn clone_mesh_peer_channel(
     probes: &std::collections::HashMap<String, mini_tunnel_agent::tunnel::PeerConnector>,
 ) -> Option<ConnectedMeshPeer> {
     let Some(connector) = connectors.get(&peer.device_id).cloned() else {
-        channel.close();
+        channel.close_async().await;
         return None;
     };
     let Some(probe) = probes.get(&peer.device_id).cloned() else {
-        channel.close();
+        channel.close_async().await;
         return None;
     };
     tracing::info!(
@@ -3453,7 +3456,7 @@ fn clone_mesh_peer_channel(
     Some((peer, channel, remote, connector, probe))
 }
 
-fn take_mesh_peer_channel(
+async fn take_mesh_peer_channel(
     peer: PeerInfo,
     channel: mini_tunnel_agent::PeerChannel,
     remote: SocketAddr,
@@ -3461,11 +3464,11 @@ fn take_mesh_peer_channel(
     probes: &mut std::collections::HashMap<String, mini_tunnel_agent::tunnel::PeerConnector>,
 ) -> Option<ConnectedMeshPeer> {
     let Some(connector) = connectors.remove(&peer.device_id) else {
-        channel.close();
+        channel.close_async().await;
         return None;
     };
     let Some(probe) = probes.remove(&peer.device_id) else {
-        channel.close();
+        channel.close_async().await;
         return None;
     };
     Some((peer, channel, remote, connector, probe))
@@ -3489,7 +3492,7 @@ fn start_mesh_ice_validation(
     });
 }
 
-fn install_mesh_peer_channel(
+async fn install_mesh_peer_channel(
     connected: &mut Vec<ConnectedMeshPeer>,
     (peer, channel, remote, connector, probe): ConnectedMeshPeer,
 ) {
@@ -3499,10 +3502,10 @@ fn install_mesh_peer_channel(
     {
         if channel.transport_name() == "QUIC/UDP" && existing.1.transport_name() != "QUIC/UDP" {
             let old = std::mem::replace(&mut existing.1, channel);
-            old.close();
+            old.close_async().await;
             existing.2 = remote;
         } else {
-            channel.close();
+            channel.close_async().await;
         }
     } else {
         connected.push((peer, channel, remote, connector, probe));
@@ -4191,7 +4194,7 @@ fn spawn_mesh_membership_refresh_with_period(
                                             peer,
                                         ) = error.0
                                     {
-                                        peer.channel.close();
+                                        peer.channel.close_async().await;
                                     }
                                     return;
                                 }
@@ -4306,7 +4309,7 @@ async fn validate_elected_mesh_ice_paths(
                         "elected ICE path failed initial health probation; switching to reliable path"
                     );
                     channel.stop_ice_consent_monitor().await;
-                    channel.close();
+                    channel.close_async().await;
                     match connector(true).await {
                         Ok(channel)
                             if matches!(channel.transport_name(), "TLS/TCP" | "Relay/TLS") =>
@@ -4316,7 +4319,7 @@ async fn validate_elected_mesh_ice_paths(
                         }
                         Ok(channel) => {
                             let path = channel.transport_name();
-                            channel.close();
+                            channel.close_async().await;
                             tracing::error!(
                                 peer_id = %peer_id,
                                 path,
@@ -4763,7 +4766,7 @@ async fn run_peer_mesh(
                     if routes.contains_key(&address)
                         || peer_ipv6.is_some_and(|ipv6| routes_v6.contains_key(&ipv6))
                     {
-                        peer.channel.close();
+                        peer.channel.close_async().await;
                         continue;
                     }
                     if manage_routes {
@@ -4771,7 +4774,7 @@ async fn run_peer_mesh(
                             Ok(route) => { routes.insert(address, route); }
                             Err(error) => {
                                 eprintln!("could not add route for dynamic mesh peer {address}: {error}");
-                                peer.channel.close();
+                                peer.channel.close_async().await;
                                 continue;
                             }
                         }
@@ -4783,7 +4786,7 @@ async fn run_peer_mesh(
                                         let _ = route.remove(&runner).await;
                                     }
                                     eprintln!("could not add IPv6 route for dynamic mesh peer {peer_ipv6}: {error}");
-                                    peer.channel.close();
+                                    peer.channel.close_async().await;
                                     continue;
                                 }
                             }
