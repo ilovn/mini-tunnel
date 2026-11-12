@@ -1729,7 +1729,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                             .contains(&peer.device_id)
                                             && connection.channel.transport_name() == "QUIC/UDP";
                                         if peer_already_connected || peer_direct_path_validating {
-                                            connection.channel.close();
+                                            connection.channel.close_async().await;
                                             if let Some((_, monitor)) = connection.nominated_ice_monitor.take() {
                                                 monitor.stop().await;
                                             }
@@ -3091,11 +3091,8 @@ async fn abort_and_drain_mesh_initial_attempts(
                 );
                 monitor.stop().await;
             }
-            // Successful ICE setup attaches its consent monitor directly to the
-            // channel and leaves nominated_ice_monitor empty. Stop it explicitly:
-            // PeerChannel::close_async closes transport but does not await monitor
-            // shutdown or release the monitor task's ufrag registration.
-            connection.channel.stop_ice_consent_monitor().await;
+            // Successful ICE setup attaches its consent monitor to the channel and
+            // leaves nominated_ice_monitor empty; close_async now awaits that driver.
             connection.channel.close_async().await;
         }
     }

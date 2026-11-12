@@ -571,7 +571,10 @@ impl PeerChannel {
         }
     }
 
-    /// Close this peer session, for example after a simultaneous-connect probe loses election.
+    /// Close the QUIC transport immediately, for example after losing connection election.
+    ///
+    /// This does not wait for an attached ICE consent monitor. Use [`Self::close_async`] when
+    /// the caller must wait for ICE session cleanup before retrying the same peer credentials.
     pub fn close(&self) {
         if let PeerTransport::Quic(connection) = &self.transport {
             tracing::debug!(
@@ -583,8 +586,11 @@ impl PeerChannel {
         }
     }
 
-    /// Close the peer transport, including the write half of a TLS/TCP session.
+    /// Stop and await ICE consent cleanup, then close the peer transport.
+    ///
+    /// For TLS/TCP this also shuts down the local write half.
     pub async fn close_async(&self) {
+        self.stop_ice_consent_monitor().await;
         self.close();
         if let PeerTransport::Tcp(transport) = &self.transport {
             let mut sender = transport.sender.lock().await;
@@ -2473,6 +2479,63 @@ mod tests {
             "version_mismatch"
         );
     }
+
+    #[tokio::test]
+    async fn close_async_waits_for_ice_monitor_and_releases_registration() {
+        let router = ice::IceDatagramRouterHandle::default();
+        let local_ufrag = "closeAsyncLocal".to_owned();
+        let remote_ufrag = "closeAsyncRemote".to_owned();
+        let (_datagrams, registration) = router
+            .register_guarded(local_ufrag.clone(), remote_ufrag.clone(), 8)
+            .expect("register ICE session owned by channel monitor");
+        let (monitor, mut cancelled, _) = ice::IceConsentMonitor::new();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (stop_requested_tx, stop_requested_rx) = tokio::sync::oneshot::channel();
+        let (allow_stop_tx, allow_stop_rx) = tokio::sync::oneshot::channel();
+        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _registration = registration;
+            started_tx.send(()).expect("test waits for monitor startup");
+            let _ = cancelled.changed().await;
+            stop_requested_tx
+                .send(())
+                .expect("test observes monitor stop request");
+            let _ = allow_stop_rx.await;
+            let _ = stopped_tx.send(());
+        });
+        monitor.set_task(task).await;
+
+        let (stream, _remote_stream) = tokio::io::duplex(1024);
+        let mut channel = new_tcp_channel(
+            Box::new(stream),
+            "127.0.0.1:42000".parse().expect("test remote address"),
+            "close-async-test",
+        );
+        channel.set_ice_consent_monitor(monitor);
+        started_rx.await.expect("monitor owns the ICE registration");
+
+        let close = tokio::spawn(async move { channel.close_async().await });
+        stop_requested_rx
+            .await
+            .expect("close_async signals its ICE monitor");
+        assert!(
+            !close.is_finished(),
+            "close_async must await monitor task completion before returning"
+        );
+        allow_stop_tx
+            .send(())
+            .expect("allow monitor to release its ICE registration");
+        close.await.expect("join asynchronous channel close");
+        stopped_rx
+            .await
+            .expect("monitor task stopped before close_async returned");
+
+        let (_datagrams, registration) = router
+            .register_guarded(local_ufrag, remote_ufrag, 8)
+            .expect("same ICE session can be registered after channel close completes");
+        drop(registration);
+    }
+
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
