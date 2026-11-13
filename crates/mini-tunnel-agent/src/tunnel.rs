@@ -2796,7 +2796,6 @@ mod tests {
 
         let reverse_packet = packet(peer_ip, local_ip, 36);
         recovered_remote
-            .channel
             .send_packet(&reverse_packet)
             .await
             .expect("prepared reliable channel should send the reverse overlay packet");
@@ -4271,7 +4270,7 @@ mod tests {
         };
 
         let (outbound_tx, outbound_rx) = mpsc::channel(2);
-        let (inbound_tx, _inbound_rx) = mpsc::channel(2);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(2);
         let io = MockPacketIo {
             outbound: Mutex::new(outbound_rx),
             inbound: inbound_tx,
@@ -4380,6 +4379,20 @@ mod tests {
         .expect("standby receive pump stopped")
         .expect("Relay channel failed while receiving the overlay packet");
         assert_eq!(forwarded, packet(local_ip, peer_ip, 28));
+
+        let reverse_packet = packet(peer_ip, local_ip, 36);
+        recovered_remote
+            .channel
+            .send_packet(&reverse_packet)
+            .await
+            .expect("prepared Relay channel should send the reverse overlay packet");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), inbound_rx.recv())
+                .await
+                .expect("reverse overlay packet did not reach the local tunnel writer")
+                .expect("local tunnel writer closed"),
+            reverse_packet
+        );
 
         pump.abort();
         recovered_remote.stop().await;
