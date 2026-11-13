@@ -4131,7 +4131,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mesh_prewarmed_relay_standby_survives_udp_failure_without_reconnect() {
+    async fn mesh_reconnects_relay_standby_after_restart_then_survives_udp_failure() {
         async fn relay_pair(
             relay_addr: SocketAddr,
             a: Arc<Identity>,
@@ -4139,7 +4139,7 @@ mod tests {
             ticket_key: [u8; 32],
             session_id: [u8; 16],
             ticket_sequence: u8,
-        ) -> (PeerChannel, PeerChannel) {
+        ) -> Result<(PeerChannel, PeerChannel), IdentityError> {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock after Unix epoch")
@@ -4182,7 +4182,7 @@ mod tests {
                 a.public_key(),
             );
             let (channel_a, channel_b) = tokio::join!(connect_a, connect_b);
-            (channel_a.unwrap(), channel_b.unwrap())
+            Ok((channel_a?, channel_b?))
         }
 
         let temp = std::env::temp_dir().join(format!(
@@ -4231,11 +4231,13 @@ mod tests {
         let local_ip = Ipv4Addr::new(10, 82, 0, 1);
         let peer_ip = Ipv4Addr::new(10, 82, 0, 2);
         let fallback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let standby_generation = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let remote_fallback = Arc::new(Mutex::new(None));
         let connector: PeerConnector = {
             let a = Arc::clone(&a);
             let b = Arc::clone(&b);
             let fallback_calls = Arc::clone(&fallback_calls);
+            let standby_generation = Arc::clone(&standby_generation);
             let remote_fallback = Arc::clone(&remote_fallback);
             Arc::new(move |force_reliable| -> PeerConnectFuture {
                 let a = Arc::clone(&a);
@@ -4243,6 +4245,7 @@ mod tests {
                 let relay_addr = relay_addr;
                 let ticket_key = ticket_key;
                 let fallback_calls = Arc::clone(&fallback_calls);
+                let standby_generation = Arc::clone(&standby_generation);
                 let remote_fallback = Arc::clone(&remote_fallback);
                 Box::pin(async move {
                     assert!(
@@ -4261,9 +4264,13 @@ mod tests {
                         session_id,
                         session_sequence.wrapping_mul(2),
                     )
-                    .await;
-                    *remote_fallback.lock().await =
-                        Some(MeshReceivePump::spawn(Arc::new(remote), peer_ip));
+                    .await?;
+                    let replacement = MeshReceivePump::spawn(Arc::new(remote), peer_ip);
+                    let previous = remote_fallback.lock().await.replace(replacement);
+                    if let Some(previous) = previous {
+                        previous.stop().await;
+                    }
+                    standby_generation.fetch_add(1, Ordering::SeqCst);
                     Ok(local)
                 })
             })
@@ -4339,6 +4346,66 @@ mod tests {
             status.peer == peer_ip.to_string() && status.online && status.active_path == "QUIC/UDP"
         }));
 
+        // Losing the Relay must discard the failed standby and retry pairing without disturbing
+        // the still-healthy direct path. Once Relay returns, the new standby should be reusable.
+        let failed_standby_calls = fallback_calls.load(Ordering::SeqCst);
+        relay_task.abort();
+        let _ = relay_task.await;
+        if let Some(standby) = remote_fallback.lock().await.as_ref() {
+            standby.channel.close_async().await;
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if fallback_calls.load(Ordering::SeqCst) > failed_standby_calls {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the mesh should retry the Relay standby after its connection is lost");
+        assert!(crate::status::snapshot().into_iter().any(|status| {
+            status.peer == peer_ip.to_string() && status.online && status.active_path == "QUIC/UDP"
+        }));
+        outbound_tx
+            .send(packet(local_ip, peer_ip, 29))
+            .await
+            .unwrap();
+        let direct_packet = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let packet = remote_initial.recv_packet().await.unwrap();
+                if !packet.is_empty() {
+                    break packet;
+                }
+            }
+        })
+        .await
+        .expect("direct UDP should remain usable while Relay is unavailable");
+        assert_eq!(direct_packet, packet(local_ip, peer_ip, 29));
+
+        let restarted_listener = tokio::net::TcpListener::bind(relay_addr).await.unwrap();
+        let restarted_server =
+            mini_tunnel_relay::RelayServer::new(mini_tunnel_relay::RelayConfig::new(ticket_key));
+        let restarted_task =
+            tokio::spawn(async move { restarted_server.run(restarted_listener).await });
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if standby_generation.load(Ordering::SeqCst) >= 2
+                    && remote_fallback
+                        .lock()
+                        .await
+                        .as_ref()
+                        .is_some_and(|standby| standby.channel.health_probe_requests_received() > 0)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the mesh should pair and health-check a replacement standby after Relay returns");
+        let calls_before_udp_failure = fallback_calls.load(Ordering::SeqCst);
+
         remote_initial.close_async().await;
         let switched = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
@@ -4355,7 +4422,10 @@ mod tests {
         })
         .await;
         switched.expect("transport failure should reuse the already prepared reliable path");
-        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fallback_calls.load(Ordering::SeqCst),
+            calls_before_udp_failure
+        );
 
         let recovered_remote = remote_fallback
             .lock()
@@ -4398,8 +4468,8 @@ mod tests {
         recovered_remote.stop().await;
         endpoint_a.close(0_u32.into(), b"test complete");
         endpoint_b.close(0_u32.into(), b"test complete");
-        relay_task.abort();
-        let _ = relay_task.await;
+        restarted_task.abort();
+        let _ = restarted_task.await;
         fs::remove_dir_all(temp).unwrap();
     }
 
