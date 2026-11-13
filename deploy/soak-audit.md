@@ -28,6 +28,13 @@ malformed records, sample gaps, missing scheduled probes, failed probe rounds, o
 packet loss above the configured threshold. A healthy path transition between
 `QUIC/UDP` and `Relay/TLS` is reported but is not itself a failure.
 
+When Relay metrics are present in the JSONL, the report summarizes active connection
+and session peaks, bytes forwarded, and the observed change in the handshake-failure
+counter. Any observed increase in `mini_tunnel_relay_handshake_failures_total` adds
+`relay_handshake_failures` to the failure list. Counter resets are handled by summing
+positive steps between adjacent samples; the first value is a baseline and is not
+counted as a new failure.
+
 Set `--max-rss-kib`, `--max-fds`, or `--max-threads` to enforce local resource ceilings.
 The report includes first/last values and min/max ranges even when no ceiling is set.
 It also lists consecutive offline sample intervals (start/end timestamps, sample counts,

@@ -24,6 +24,7 @@ def row(
     path: str = "QUIC/UDP",
     probe: dict[str, int] | None = None,
     status_error: str | None = None,
+    relay: dict[str, int] | None = None,
 ) -> dict[str, object]:
     result: dict[str, object] = {
         "timestamp_utc": (UTC + dt.timedelta(seconds=seconds)).isoformat(),
@@ -39,6 +40,7 @@ def row(
         "status_error": status_error,
         "probe": probe,
         "peer_process": {"pid": 123, "rss_kib": 2048, "threads": 3, "fds": 12},
+        "relay": relay,
     }
     return result
 
@@ -146,6 +148,100 @@ class AnalyzeSoakTests(unittest.TestCase):
                 },
             ],
         )
+
+    def test_reports_relay_metrics_and_fails_on_handshake_counter_increase(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "relay-failure.jsonl"
+            write_jsonl(
+                path,
+                [
+                    row(
+                        1,
+                        0,
+                        relay={
+                            "mini_tunnel_relay_active_connections": 0,
+                            "mini_tunnel_relay_active_sessions": 0,
+                            "mini_tunnel_relay_handshake_failures_total": 0,
+                            "mini_tunnel_relay_bytes_forwarded_total": 100,
+                        },
+                    ),
+                    row(
+                        2,
+                        10,
+                        relay={
+                            "mini_tunnel_relay_active_connections": 2,
+                            "mini_tunnel_relay_active_sessions": 1,
+                            "mini_tunnel_relay_handshake_failures_total": 1,
+                            "mini_tunnel_relay_bytes_forwarded_total": 150,
+                        },
+                    ),
+                    row(
+                        3,
+                        20,
+                        relay={
+                            "mini_tunnel_relay_active_connections": 0,
+                            "mini_tunnel_relay_active_sessions": 0,
+                            "mini_tunnel_relay_handshake_failures_total": 1,
+                            "mini_tunnel_relay_bytes_forwarded_total": 150,
+                        },
+                    ),
+                    {"event": "monitor_stopped", "elapsed_seconds": 30},
+                ],
+            )
+            report = self.analyze(path)
+        self.assertFalse(report["passed"])
+        self.assertIn("relay_handshake_failures", report["failures"])
+        self.assertEqual(
+            report["relay_metrics"],
+            {
+                "samples": 3,
+                "handshake_failures_first": 0,
+                "handshake_failures_last": 1,
+                "handshake_failures_increase": 1,
+                "active_connections_max": 2,
+                "active_sessions_max": 1,
+                "bytes_forwarded_increase": 50,
+            },
+        )
+
+    def test_relay_failure_counter_increase_survives_a_counter_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "relay-counter-reset.jsonl"
+            write_jsonl(
+                path,
+                [
+                    row(1, 0, relay={"mini_tunnel_relay_handshake_failures_total": 0}),
+                    row(2, 10, relay={"mini_tunnel_relay_handshake_failures_total": 1}),
+                    row(3, 20, relay={"mini_tunnel_relay_handshake_failures_total": 0}),
+                    row(4, 30, relay={"mini_tunnel_relay_handshake_failures_total": 2}),
+                    {"event": "monitor_stopped", "elapsed_seconds": 40},
+                ],
+            )
+            report = self.analyze(path)
+        self.assertEqual(report["relay_metrics"]["handshake_failures_increase"], 3)
+        self.assertIn("relay_handshake_failures", report["failures"])
+
+    def test_relay_metrics_are_counted_when_peer_process_sample_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "relay-with-missing-peer-process.jsonl"
+            missing_process = row(
+                1,
+                0,
+                relay={"mini_tunnel_relay_handshake_failures_total": 0},
+            )
+            missing_process.pop("peer_process")
+            write_jsonl(
+                path,
+                [
+                    missing_process,
+                    row(2, 10, relay={"mini_tunnel_relay_handshake_failures_total": 1}),
+                ],
+            )
+            report = self.analyze(path)
+        self.assertEqual(report["missing_process_samples"], 1)
+        self.assertEqual(report["relay_metrics"]["samples"], 2)
+        self.assertEqual(report["relay_metrics"]["handshake_failures_increase"], 1)
+        self.assertIn("relay_handshake_failures", report["failures"])
 
     def test_reports_consecutive_offline_intervals_without_peer_ids(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

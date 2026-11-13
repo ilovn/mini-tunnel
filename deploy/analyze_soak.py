@@ -115,6 +115,8 @@ def analyze_file(
     previous_paths: dict[str, str] = {}
     process_values: dict[str, list[float]] = defaultdict(list)
     missing_process_samples = 0
+    relay_values: dict[str, list[float]] = defaultdict(list)
+    relay_sample_count = 0
     for timestamp, record in timestamps:
         status_error = bool(record.get("status_error"))
         if status_error:
@@ -149,6 +151,18 @@ def analyze_file(
                 previous_paths[identity] = active_path
         if offline_count:
             offline_observations.append((timestamp, record["sample"], offline_count))
+        relay = record.get("relay")
+        if isinstance(relay, dict):
+            relay_sample_count += 1
+            for field in (
+                "mini_tunnel_relay_active_connections",
+                "mini_tunnel_relay_active_sessions",
+                "mini_tunnel_relay_handshake_failures_total",
+                "mini_tunnel_relay_bytes_forwarded_total",
+            ):
+                value = number(relay.get(field))
+                if value is not None and value >= 0:
+                    relay_values[field].append(value)
         process = record.get("peer_process")
         if (
             not isinstance(process, dict)
@@ -161,6 +175,33 @@ def analyze_file(
             value = number(process.get(field))
             if value is not None and math.isfinite(value) and value >= 0:
                 process_values[field].append(value)
+    def counter_increase(values: list[float]) -> float:
+        """Sum observed positive counter steps while tolerating process resets."""
+        return sum(max(0.0, right - left) for left, right in zip(values, values[1:]))
+
+    handshake_failures = relay_values[
+        "mini_tunnel_relay_handshake_failures_total"
+    ]
+    relay_handshake_failure_increase = counter_increase(handshake_failures)
+    relay_metrics = {
+        "samples": relay_sample_count,
+        "handshake_failures_first": handshake_failures[0]
+        if handshake_failures
+        else None,
+        "handshake_failures_last": handshake_failures[-1]
+        if handshake_failures
+        else None,
+        "handshake_failures_increase": relay_handshake_failure_increase,
+        "active_connections_max": max(
+            relay_values["mini_tunnel_relay_active_connections"], default=None
+        ),
+        "active_sessions_max": max(
+            relay_values["mini_tunnel_relay_active_sessions"], default=None
+        ),
+        "bytes_forwarded_increase": counter_increase(
+            relay_values["mini_tunnel_relay_bytes_forwarded_total"]
+        ),
+    }
 
     offline_intervals: list[dict[str, Any]] = []
     current_interval: dict[str, Any] | None = None
@@ -275,6 +316,8 @@ def analyze_file(
         failures.append("status_errors")
     if missing_process_samples:
         failures.append("missing_process_samples")
+    if relay_handshake_failure_increase > 0:
+        failures.append("relay_handshake_failures")
     if offline_peers:
         failures.append("offline_peer_samples")
     if gap_count:
@@ -328,6 +371,7 @@ def analyze_file(
         "observed_paths": sorted(observed_paths),
         "offline_intervals": offline_intervals,
         "peer_process_resources": resources,
+        "relay_metrics": relay_metrics,
         "failures": failures,
         "passed": not failures,
     }
