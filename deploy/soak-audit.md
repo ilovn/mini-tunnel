@@ -24,8 +24,14 @@ work only from its periodic sampling loop. Use zero when the monitor schedules p
 against a fixed cadence. For older monitor runs that rebase the next probe deadline
 on each sample, use a 10-second jitter allowance and a minimum of 140 rounds for a
 12-hour run. The run fails on offline peer samples, status errors,
-malformed records, sample gaps, missing scheduled probes, failed probe rounds, or
-packet loss above the configured threshold. A healthy path transition between
+malformed records, sample gaps, missing scheduled probes, invalid probe records, or
+packet loss above the configured threshold. `failed_probe_rounds` counts invalid probe
+records (missing, non-finite, or inconsistent sent/received counts); `probe_loss_rounds`
+reports valid probe rounds that lost one or more packets. The configured packet-loss
+threshold controls whether those valid losses fail the run, and defaults to strict zero
+loss. Sample sequence gaps fail the run; `nominal_sample_deficit` is informational because
+small clock/scheduler delays can produce fewer samples than the ideal interval estimate
+without missing sequence numbers or an excessive sample gap. A healthy path transition between
 `QUIC/UDP` and `Relay/TLS` is reported but is not itself a failure.
 
 When Relay metrics are present in the JSONL, the report summarizes active connection

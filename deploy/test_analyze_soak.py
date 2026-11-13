@@ -57,6 +57,7 @@ class AnalyzeSoakTests(unittest.TestCase):
         min_duration: float = 0,
         min_probes: int = 0,
         probe_jitter: float = 10,
+        max_probe_loss: float = 0,
     ):
         return analyze_file(
             path,
@@ -64,7 +65,7 @@ class AnalyzeSoakTests(unittest.TestCase):
             max_sample_gap_seconds=15,
             probe_interval_seconds=10,
             probe_jitter_seconds=probe_jitter,
-            max_probe_loss_percent=0,
+            max_probe_loss_percent=max_probe_loss,
             minimum_duration_seconds=min_duration,
             minimum_probe_rounds=min_probes,
         )
@@ -112,10 +113,49 @@ class AnalyzeSoakTests(unittest.TestCase):
         self.assertEqual(report["status_errors"], 1)
         self.assertIn("offline_peer_samples", report["failures"])
         self.assertIn("probe_packet_loss", report["failures"])
+        self.assertNotIn("failed_probe_rounds", report["failures"])
+        self.assertEqual(report["probe_loss_rounds"], 1)
         self.assertIn("missing_samples", report["failures"])
         self.assertIn("status_errors", report["failures"])
         self.assertNotIn("sensitive token", result.stdout)
         self.assertNotIn("private-peer-id", result.stdout)
+
+    def test_allows_sampler_clock_drift_without_missing_sequence_numbers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sampler-drift.jsonl"
+            rows = [
+                row(
+                    sample,
+                    (sample - 1) * 11.001,
+                    probe={"sent": 5, "received": 5},
+                )
+                for sample in range(1, 12)
+            ]
+            rows.append({"event": "monitor_stopped", "elapsed_seconds": 110.01})
+            write_jsonl(path, rows)
+            report = self.analyze(path, min_duration=100, min_probes=1)
+
+        self.assertTrue(report["passed"], report["failures"])
+        self.assertEqual(report["missing_samples"], 0)
+        self.assertEqual(report["sequence_gaps"], 0)
+        self.assertEqual(report["nominal_sample_deficit"], 1)
+
+    def test_honors_configured_probe_loss_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tolerated-probe-loss.jsonl"
+            write_jsonl(
+                path,
+                [
+                    row(1, 0, probe={"sent": 100, "received": 99}),
+                    {"event": "monitor_stopped", "elapsed_seconds": 1},
+                ],
+            )
+            report = self.analyze(path, min_probes=1, max_probe_loss=1.0)
+
+        self.assertTrue(report["passed"], report["failures"])
+        self.assertEqual(report["probe_loss_percent"], 1.0)
+        self.assertEqual(report["probe_loss_rounds"], 1)
+        self.assertEqual(report["failed_probe_rounds"], 0)
 
     def test_counts_path_transition_without_failing_healthy_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

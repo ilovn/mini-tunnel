@@ -253,6 +253,7 @@ def analyze_file(
     probe_sent = 0
     probe_received = 0
     failed_probe_rounds = 0
+    probe_loss_rounds = 0
     for _, record in probes:
         probe = record["probe"]
         sent = number(probe.get("sent"))
@@ -263,7 +264,7 @@ def analyze_file(
         probe_sent += int(sent)
         probe_received += int(received)
         if received < sent:
-            failed_probe_rounds += 1
+            probe_loss_rounds += 1
     probe_loss_percent = (
         (probe_sent - probe_received) * 100 / probe_sent if probe_sent else None
     )
@@ -286,13 +287,18 @@ def analyze_file(
         if sample_interval_seconds > 0 and timestamps
         else 0
     )
-    missing_samples = max(0, expected_samples - len(samples))
     sequence_gaps = sum(
         max(0, right - left - 1)
         for left, right in zip(sample_numbers, sample_numbers[1:])
     )
     if sample_numbers and sample_numbers[0] > 1:
         sequence_gaps += sample_numbers[0] - 1
+    # Timestamp-derived sample counts are only nominal: a periodic sampler's
+    # work and scheduler add small delays to each interval. Use explicit sample
+    # sequence numbers to detect missing records; max_sample_gap_seconds checks
+    # whether the observed cadence itself stopped for too long.
+    missing_samples = sequence_gaps
+    nominal_sample_deficit = max(0, expected_samples - len(samples))
 
     resources = {}
     for field, values in sorted(process_values.items()):
@@ -322,7 +328,7 @@ def analyze_file(
         failures.append("offline_peer_samples")
     if gap_count:
         failures.append("sample_gaps")
-    if missing_samples or sequence_gaps:
+    if missing_samples:
         failures.append("missing_samples")
     if duplicate_samples:
         failures.append("duplicate_samples")
@@ -344,6 +350,7 @@ def analyze_file(
         "samples": len(samples),
         "expected_samples": expected_samples,
         "missing_samples": missing_samples,
+        "nominal_sample_deficit": nominal_sample_deficit,
         "sequence_gaps": sequence_gaps,
         "duplicate_samples": duplicate_samples,
         "duration_seconds": round(duration, 3),
@@ -364,6 +371,7 @@ def analyze_file(
         "probe_loss_percent": round(probe_loss_percent, 3)
         if probe_loss_percent is not None
         else None,
+        "probe_loss_rounds": probe_loss_rounds,
         "failed_probe_rounds": failed_probe_rounds,
         "max_probe_gap_seconds": round(max_probe_gap, 3),
         "path_transitions": path_transitions,

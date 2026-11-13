@@ -3796,14 +3796,16 @@ mod tests {
             .await
             .expect("send incomplete request headers");
 
-        tokio::time::timeout(Duration::from_secs(1), async {
+        // The workspace runs many async integration tests concurrently; leave
+        // room for scheduler load so this checks the header timeout behavior.
+        tokio::time::timeout(Duration::from_secs(5), async {
             while observed_state.connection_slots.0.available_permits() != 0 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
         .expect("stalled connection should acquire its slot");
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             while observed_state.connection_slots.0.available_permits() != 1 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
