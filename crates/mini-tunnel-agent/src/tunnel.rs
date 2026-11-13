@@ -4133,23 +4133,57 @@ mod tests {
 
     #[tokio::test]
     async fn mesh_prewarmed_relay_standby_survives_udp_failure_without_reconnect() {
-        async fn tcp_pair(a: Arc<Identity>, b: Arc<Identity>) -> (PeerChannel, PeerChannel) {
-            let listener = peer_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
-                .await
-                .unwrap();
-            let address = listener.local_addr().unwrap();
-            let allowed = vec![(a.device_id(), a.public_key())];
-            let peer_id = b.device_id();
-            let accept = accept_tcp_peer_any(&listener, "mesh-non-ice-fallback", &b, &allowed);
-            let connect = connect_tcp_peer(
-                address,
+        async fn relay_pair(
+            relay_addr: SocketAddr,
+            a: Arc<Identity>,
+            b: Arc<Identity>,
+            ticket_key: [u8; 32],
+            session_id: [u8; 16],
+            ticket_sequence: u8,
+        ) -> (PeerChannel, PeerChannel) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_millis() as u64;
+            let make_ticket = |source: &Identity, target: &Identity, suffix: u8| {
+                let mut ticket_id = [0_u8; 16];
+                ticket_id[15] = ticket_sequence.wrapping_add(suffix);
+                mini_tunnel_protocol::issue_relay_ticket(
+                    &ticket_key,
+                    &mini_tunnel_protocol::RelayTicketClaims {
+                        version: mini_tunnel_protocol::RELAY_TICKET_VERSION,
+                        network_id: "mesh-non-ice-fallback".into(),
+                        source_device_id: source.device_id(),
+                        target_device_id: target.device_id(),
+                        session_id,
+                        ticket_id,
+                        expires_at_ms: now + 60_000,
+                    },
+                )
+                .expect("issue Relay test ticket")
+            };
+            let ticket_a = make_ticket(&a, &b, 0);
+            let ticket_b = make_ticket(&b, &a, 1);
+            let a_id = a.device_id();
+            let b_id = b.device_id();
+            let connect_a = crate::connect_relay_peer(
+                relay_addr,
+                &ticket_a,
                 "mesh-non-ice-fallback",
                 &a,
-                &peer_id,
+                &b_id,
                 b.public_key(),
             );
-            let (accepted, connected) = tokio::join!(accept, connect);
-            (connected.unwrap(), accepted.unwrap().1)
+            let connect_b = crate::connect_relay_peer(
+                relay_addr,
+                &ticket_b,
+                "mesh-non-ice-fallback",
+                &b,
+                &a_id,
+                a.public_key(),
+            );
+            let (channel_a, channel_b) = tokio::join!(connect_a, connect_b);
+            (channel_a.unwrap(), channel_b.unwrap())
         }
 
         let temp = std::env::temp_dir().join(format!(
@@ -4162,6 +4196,14 @@ mod tests {
             peer_endpoint(&a, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
         let endpoint_b =
             peer_endpoint(&b, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+        let ticket_key = [71_u8; 32];
+        let relay_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap();
+        let relay_server =
+            mini_tunnel_relay::RelayServer::new(mini_tunnel_relay::RelayConfig::new(ticket_key));
+        let relay_task = tokio::spawn(async move { relay_server.run(relay_listener).await });
         let network = "mesh-non-ice-fallback";
         let a_id = a.device_id();
         let a_key = a.public_key();
@@ -4199,6 +4241,8 @@ mod tests {
             Arc::new(move |force_reliable| -> PeerConnectFuture {
                 let a = Arc::clone(&a);
                 let b = Arc::clone(&b);
+                let relay_addr = relay_addr;
+                let ticket_key = ticket_key;
                 let fallback_calls = Arc::clone(&fallback_calls);
                 let remote_fallback = Arc::clone(&remote_fallback);
                 Box::pin(async move {
@@ -4207,7 +4251,18 @@ mod tests {
                         "early fallback must use a reliable candidate"
                     );
                     fallback_calls.fetch_add(1, Ordering::SeqCst);
-                    let (local, remote) = tcp_pair(a, b).await;
+                    let session_sequence = fallback_calls.load(Ordering::SeqCst) as u8;
+                    let mut session_id = [0_u8; 16];
+                    session_id[15] = 90_u8.wrapping_add(session_sequence);
+                    let (local, remote) = relay_pair(
+                        relay_addr,
+                        a,
+                        b,
+                        ticket_key,
+                        session_id,
+                        session_sequence.wrapping_mul(2),
+                    )
+                    .await;
                     *remote_fallback.lock().await =
                         Some(MeshReceivePump::spawn(Arc::new(remote), peer_ip));
                     Ok(local)
@@ -4291,7 +4346,7 @@ mod tests {
                 if crate::status::snapshot().into_iter().any(|status| {
                     status.peer == peer_ip.to_string()
                         && status.online
-                        && status.active_path == "TLS/TCP"
+                        && status.active_path == "Relay/TLS"
                         && status.last_switch_reason.as_deref() == Some("transport_failure")
                 }) {
                     break;
@@ -4330,6 +4385,8 @@ mod tests {
         recovered_remote.stop().await;
         endpoint_a.close(0_u32.into(), b"test complete");
         endpoint_b.close(0_u32.into(), b"test complete");
+        relay_task.abort();
+        let _ = relay_task.await;
         fs::remove_dir_all(temp).unwrap();
     }
 
