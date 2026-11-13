@@ -487,6 +487,7 @@ type MeshReceiveQueue =
 struct MeshReceivePump {
     channel: Arc<PeerChannel>,
     receiver: MeshReceiveQueue,
+    activity: tokio::sync::watch::Receiver<u64>,
     task: tokio::task::JoinHandle<()>,
     last_health_successes: u64,
     last_health_missed: u64,
@@ -496,27 +497,35 @@ struct MeshReceivePump {
 impl MeshReceivePump {
     fn spawn(channel: Arc<PeerChannel>, address: Ipv4Addr) -> Self {
         let (sender, receiver) = tokio::sync::mpsc::channel(MESH_RECEIVE_QUEUE_PER_PEER);
+        let (activity_sender, activity) = tokio::sync::watch::channel(0_u64);
         let task_channel = Arc::clone(&channel);
         let peer_key = address.to_string();
         let task = tokio::spawn(async move {
             loop {
                 match task_channel.recv_packet().await {
-                    Ok(packet) if packet.is_empty() => continue,
-                    Ok(packet) => match sender.try_send(Ok(packet)) {
-                        Ok(()) => {}
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            MESH_DROPPED_PACKETS.fetch_add(1, Ordering::Relaxed);
-                            crate::status::record_packet(
-                                &peer_key,
-                                crate::status::PacketCounter::Dropped,
-                            );
-                            tracing::debug!(
-                                peer_address = %peer_key,
-                                "dropping inbound packet because the peer receive queue is full"
-                            );
+                    Ok(packet) => {
+                        activity_sender.send_modify(|activity| {
+                            *activity = activity.wrapping_add(1);
+                        });
+                        if packet.is_empty() {
+                            continue;
                         }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
-                    },
+                        match sender.try_send(Ok(packet)) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                MESH_DROPPED_PACKETS.fetch_add(1, Ordering::Relaxed);
+                                crate::status::record_packet(
+                                    &peer_key,
+                                    crate::status::PacketCounter::Dropped,
+                                );
+                                tracing::debug!(
+                                    peer_address = %peer_key,
+                                    "dropping inbound packet because the peer receive queue is full"
+                                );
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                        }
+                    }
                     Err(error) => {
                         let _ = sender.send(Err(error)).await;
                         break;
@@ -528,6 +537,7 @@ impl MeshReceivePump {
         Self {
             channel,
             receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
+            activity,
             task,
             last_health_successes: health.probes_succeeded,
             last_health_missed: health.probes_missed,
@@ -544,17 +554,28 @@ impl MeshReceivePump {
 
 fn mesh_receive(
     active: Arc<PeerChannel>,
-    standby: Option<(Arc<PeerChannel>, MeshReceiveQueue)>,
+    standby: Option<(
+        Arc<PeerChannel>,
+        MeshReceiveQueue,
+        tokio::sync::watch::Receiver<u64>,
+    )>,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, IdentityError>> + Send>> {
-    if let Some((standby_channel, receiver)) = standby
+    if let Some((standby_channel, receiver, mut activity)) = standby
         && Arc::ptr_eq(&standby_channel, &active)
     {
         Box::pin(async move {
-            receiver.lock().await.recv().await.unwrap_or_else(|| {
-                Err(IdentityError::Transport(
-                    "peer receive pump stopped".to_owned(),
-                ))
-            })
+            tokio::select! {
+                packet = async { receiver.lock().await.recv().await } => packet.unwrap_or_else(|| {
+                    Err(IdentityError::Transport("peer receive pump stopped".to_owned()))
+                }),
+                changed = activity.changed() => {
+                    if changed.is_ok() {
+                        Ok(Vec::new())
+                    } else {
+                        Err(IdentityError::Transport("peer receive pump stopped".to_owned()))
+                    }
+                }
+            }
         })
     } else {
         Box::pin(async move { active.recv_packet().await })
@@ -971,9 +992,13 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         let mut last_received = tokio::time::Instant::now();
         let mut inbound = mesh_receive(
             Arc::clone(&active),
-            active_standby
-                .as_ref()
-                .map(|standby| (Arc::clone(&standby.channel), Arc::clone(&standby.receiver))),
+            active_standby.as_ref().map(|standby| {
+                (
+                    Arc::clone(&standby.channel),
+                    Arc::clone(&standby.receiver),
+                    standby.activity.clone(),
+                )
+            }),
         );
         let mut ice_consent_degraded = active.ice_consent_degraded_receiver();
         let mut last_ice_consent_degraded = false;
@@ -1032,7 +1057,11 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                             inbound = mesh_receive(
                                 Arc::clone(&active),
                                 active_standby.as_ref().map(|standby| {
-                                    (Arc::clone(&standby.channel), Arc::clone(&standby.receiver))
+                                    (
+                                        Arc::clone(&standby.channel),
+                                        Arc::clone(&standby.receiver),
+                                        standby.activity.clone(),
+                                    )
                                 }),
                             );
                             if !packet.is_empty()
@@ -3501,6 +3530,71 @@ mod tests {
         assert_eq!(
             next_direct_probe_cooldown(short_base, short_base, Duration::ZERO),
             Duration::from_millis(50)
+        );
+    }
+
+    #[tokio::test]
+    async fn mesh_receive_pump_forwards_authenticated_health_activity() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-mesh-receive-health-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let a = Arc::new(Identity::load_or_create_at(temp.join("a/key")).unwrap());
+        let b = Arc::new(Identity::load_or_create_at(temp.join("b/key")).unwrap());
+        let endpoint_a =
+            peer_endpoint(&a, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+        let endpoint_b =
+            peer_endpoint(&b, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+        let network = "mesh-receive-health";
+        let a_id = a.device_id();
+        let a_key = a.public_key();
+        let b_id = b.device_id();
+        let b_key = b.public_key();
+        let server_endpoint = endpoint_b.clone();
+        let server_identity = Arc::clone(&b);
+        let accept = tokio::spawn(async move {
+            accept_peer(&server_endpoint, network, &server_identity, &a_id, a_key).await
+        });
+        let local = Arc::new(
+            connect_peer(
+                &endpoint_a,
+                endpoint_b.local_addr().unwrap(),
+                network,
+                &a,
+                &b_id,
+                b_key,
+            )
+            .await
+            .unwrap(),
+        );
+        let remote = accept.await.unwrap().unwrap();
+        let standby = MeshReceivePump::spawn(Arc::clone(&local), Ipv4Addr::LOCALHOST);
+
+        remote.send_keepalive().await.unwrap();
+        let activity = tokio::time::timeout(
+            Duration::from_secs(1),
+            mesh_receive(
+                Arc::clone(&local),
+                Some((
+                    Arc::clone(&standby.channel),
+                    Arc::clone(&standby.receiver),
+                    standby.activity.clone(),
+                )),
+            ),
+        )
+        .await;
+        let health_was_forwarded =
+            activity.is_ok_and(|packet| packet.is_ok_and(|packet| packet.is_empty()));
+
+        standby.stop().await;
+        remote.close_async().await;
+        endpoint_a.close(0_u32.into(), b"test complete");
+        endpoint_b.close(0_u32.into(), b"test complete");
+        std::fs::remove_dir_all(temp).unwrap();
+
+        assert!(
+            health_was_forwarded,
+            "the mesh idle timer must observe authenticated health packets received by its pump"
         );
     }
 
