@@ -9216,6 +9216,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordinator_issued_relay_session_survives_coordinator_shutdown() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-coordinator-relay-outage-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let identity_a = mini_tunnel_agent::Identity::load_or_create_at(temp.join("a/device.key"))
+            .expect("create identity A");
+        let identity_b = mini_tunnel_agent::Identity::load_or_create_at(temp.join("b/device.key"))
+            .expect("create identity B");
+        let ticket_key = [83_u8; 32];
+
+        let coordinator_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Coordinator");
+        let coordinator_address = coordinator_listener.local_addr().unwrap();
+        let coordinator_app = mini_tunnel_coordinator::router_with_state(
+            mini_tunnel_coordinator::CoordinatorState::default().with_relay_ticket_key(ticket_key),
+        );
+        let coordinator_task = tokio::spawn(async move {
+            axum::serve(
+                coordinator_listener,
+                coordinator_app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        });
+        let coordinator_url = format!("http://{coordinator_address}");
+
+        let created: CreateNetworkResponse = post_json(
+            &coordinator_url,
+            "/v1/networks",
+            &CreateNetworkRequest {
+                name: "relay outage test".to_owned(),
+                cidr: "10.91.0.0/24".to_owned(),
+            },
+        )
+        .await
+        .expect("create test network");
+        let mut joined = Vec::new();
+        for identity in [&identity_a, &identity_b] {
+            let invite: CreateInviteResponse = post_json(
+                &coordinator_url,
+                &format!("/v1/networks/{}/invites", created.network_id),
+                &CreateInviteRequest {
+                    admin_token: created.admin_token.clone(),
+                },
+            )
+            .await
+            .expect("create one-time invite");
+            let device_id = identity.device_id();
+            let public_key = identity.public_key();
+            let request = JoinNetworkRequest {
+                invite_token: invite.invite_token.clone(),
+                device_id: device_id.clone(),
+                public_key: URL_SAFE_NO_PAD.encode(public_key),
+                signature: identity.sign(&join_signing_bytes(
+                    &created.network_id,
+                    &device_id,
+                    &public_key,
+                    &invite.invite_token,
+                )),
+            };
+            let response: JoinNetworkResponse = post_json(
+                &coordinator_url,
+                &format!("/v1/networks/{}/join", created.network_id),
+                &request,
+            )
+            .await
+            .expect("enroll peer");
+            joined.push(response);
+        }
+
+        let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Relay");
+        let relay_address = relay_listener.local_addr().unwrap();
+        let relay_server =
+            mini_tunnel_relay::RelayServer::new(mini_tunnel_relay::RelayConfig::new(ticket_key));
+        let relay_task = tokio::spawn(async move { relay_server.run(relay_listener).await });
+        let peer_a = PeerInfo {
+            device_id: joined[0].device_id.clone(),
+            assigned_ipv4: joined[0].assigned_ipv4.clone(),
+            public_key: identity_a.public_key_encoded(),
+            candidates: Vec::new(),
+            ice_credentials: None,
+        };
+        let peer_b = PeerInfo {
+            device_id: joined[1].device_id.clone(),
+            assigned_ipv4: joined[1].assigned_ipv4.clone(),
+            public_key: identity_b.public_key_encoded(),
+            candidates: Vec::new(),
+            ice_credentials: None,
+        };
+        let (channel_a, channel_b) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                connect_peer_via_relay(
+                    relay_address,
+                    &coordinator_url,
+                    &created.network_id,
+                    &identity_a,
+                    &peer_b,
+                ),
+                connect_peer_via_relay(
+                    relay_address,
+                    &coordinator_url,
+                    &created.network_id,
+                    &identity_b,
+                    &peer_a,
+                ),
+            )
+        })
+        .await
+        .expect("both peers obtain Coordinator tickets and pair through Relay");
+        let channel_a = channel_a.expect("peer A Relay connection");
+        let channel_b = channel_b.expect("peer B Relay connection");
+        assert_eq!(channel_a.transport_name(), "Relay/TLS");
+        assert_eq!(channel_b.transport_name(), "Relay/TLS");
+
+        coordinator_task.abort();
+        let _ = coordinator_task.await;
+        let a_to_b = b"overlay traffic while Coordinator is offline";
+        channel_a.send_packet(a_to_b).await.expect("send A to B");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), channel_b.recv_packet())
+                .await
+                .expect("Relay should forward without Coordinator")
+                .expect("receive from Relay"),
+            a_to_b
+        );
+        let b_to_a = b"reverse overlay traffic while Coordinator is offline";
+        channel_b.send_packet(b_to_a).await.expect("send B to A");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), channel_a.recv_packet())
+                .await
+                .expect("reverse Relay forwarding should not use Coordinator")
+                .expect("receive reverse packet from Relay"),
+            b_to_a
+        );
+
+        channel_a.close_async().await;
+        channel_b.close_async().await;
+        relay_task.abort();
+        let _ = relay_task.await;
+        std::fs::remove_dir_all(temp).expect("remove test identities");
+    }
+
+    #[tokio::test]
     async fn coordinator_candidate_refresh_dispatches_live_mesh_to_direct_udp() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
