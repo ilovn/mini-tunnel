@@ -30,6 +30,11 @@ packet loss above the configured threshold. A healthy path transition between
 
 Set `--max-rss-kib`, `--max-fds`, or `--max-threads` to enforce local resource ceilings.
 The report includes first/last values and min/max ranges even when no ceiling is set.
+It also lists consecutive offline sample intervals (start/end timestamps, sample counts,
+offline-peer counts, and the observed span between the first and last sample) and exact
+path-transition timestamps. These event details omit peer IDs; a one-sample offline
+interval has an observed span of zero because the report does not infer duration beyond
+the samples it received.
 
 The exit status is zero only when every input passes. Preserve the original JSONL
 privately; the report is suitable for sharing after checking that the supplied side

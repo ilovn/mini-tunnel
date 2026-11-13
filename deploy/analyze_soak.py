@@ -108,12 +108,14 @@ def analyze_file(
 
     status_errors = 0
     offline_peers = 0
+    offline_observations: list[tuple[dt.datetime, int, int]] = []
     path_transitions = 0
+    path_transition_events: list[dict[str, str]] = []
     observed_paths: set[str] = set()
     previous_paths: dict[str, str] = {}
     process_values: dict[str, list[float]] = defaultdict(list)
     missing_process_samples = 0
-    for _, record in timestamps:
+    for timestamp, record in timestamps:
         status_error = bool(record.get("status_error"))
         if status_error:
             status_errors += 1
@@ -122,6 +124,7 @@ def analyze_file(
             if not status_error:
                 status_errors += 1
             continue
+        offline_count = 0
         for peer in status:
             if not isinstance(peer, dict):
                 status_errors += 1
@@ -130,12 +133,22 @@ def analyze_file(
             identity = peer_id if isinstance(peer_id, str) else "<unknown-peer>"
             if peer.get("online") is not True:
                 offline_peers += 1
+                offline_count += 1
             active_path = peer.get("active_path")
             if isinstance(active_path, str) and active_path:
                 observed_paths.add(active_path)
                 if identity in previous_paths and previous_paths[identity] != active_path:
                     path_transitions += 1
+                    path_transition_events.append(
+                        {
+                            "timestamp_utc": timestamp.isoformat(),
+                            "from_path": previous_paths[identity],
+                            "to_path": active_path,
+                        }
+                    )
                 previous_paths[identity] = active_path
+        if offline_count:
+            offline_observations.append((timestamp, record["sample"], offline_count))
         process = record.get("peer_process")
         if (
             not isinstance(process, dict)
@@ -148,6 +161,48 @@ def analyze_file(
             value = number(process.get(field))
             if value is not None and math.isfinite(value) and value >= 0:
                 process_values[field].append(value)
+
+    offline_intervals: list[dict[str, Any]] = []
+    current_interval: dict[str, Any] | None = None
+    previous_offline_timestamp: dt.datetime | None = None
+    previous_offline_sample: int | None = None
+    for timestamp, sample_number, offline_count in offline_observations:
+        contiguous = (
+            current_interval is not None
+            and previous_offline_timestamp is not None
+            and previous_offline_sample is not None
+            and sample_number == previous_offline_sample + 1
+            and (timestamp - previous_offline_timestamp).total_seconds()
+            <= max_sample_gap_seconds
+        )
+        if not contiguous:
+            current_interval = {
+                "start_timestamp_utc": timestamp.isoformat(),
+                "end_timestamp_utc": timestamp.isoformat(),
+                "sample_count": 0,
+                "offline_peer_samples": 0,
+                "max_offline_peers": 0,
+                "observed_span_seconds": 0.0,
+            }
+            offline_intervals.append(current_interval)
+        assert current_interval is not None
+        current_interval["end_timestamp_utc"] = timestamp.isoformat()
+        current_interval["sample_count"] += 1
+        current_interval["offline_peer_samples"] += offline_count
+        current_interval["max_offline_peers"] = max(
+            current_interval["max_offline_peers"], offline_count
+        )
+        current_interval["observed_span_seconds"] = round(
+            (
+                timestamp
+                - dt.datetime.fromisoformat(
+                    current_interval["start_timestamp_utc"]
+                )
+            ).total_seconds(),
+            3,
+        )
+        previous_offline_timestamp = timestamp
+        previous_offline_sample = sample_number
 
     probes: list[tuple[dt.datetime, dict[str, Any]]] = [
         (timestamp, record)
@@ -269,7 +324,9 @@ def analyze_file(
         "failed_probe_rounds": failed_probe_rounds,
         "max_probe_gap_seconds": round(max_probe_gap, 3),
         "path_transitions": path_transitions,
+        "path_transition_events": path_transition_events,
         "observed_paths": sorted(observed_paths),
+        "offline_intervals": offline_intervals,
         "peer_process_resources": resources,
         "failures": failures,
         "passed": not failures,

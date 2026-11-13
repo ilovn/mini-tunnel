@@ -131,6 +131,86 @@ class AnalyzeSoakTests(unittest.TestCase):
         self.assertTrue(report["passed"])
         self.assertEqual(report["path_transitions"], 2)
         self.assertEqual(report["observed_paths"], ["QUIC/UDP", "Relay/TLS"])
+        self.assertEqual(
+            report["path_transition_events"],
+            [
+                {
+                    "timestamp_utc": (UTC + dt.timedelta(seconds=10)).isoformat(),
+                    "from_path": "QUIC/UDP",
+                    "to_path": "Relay/TLS",
+                },
+                {
+                    "timestamp_utc": (UTC + dt.timedelta(seconds=20)).isoformat(),
+                    "from_path": "Relay/TLS",
+                    "to_path": "QUIC/UDP",
+                },
+            ],
+        )
+
+    def test_reports_consecutive_offline_intervals_without_peer_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "offline-intervals.jsonl"
+            multiple_offline_peers = row(2, 10, online=False)
+            multiple_status = multiple_offline_peers["status"]
+            assert isinstance(multiple_status, list)
+            multiple_status.append(
+                {
+                    "peer": "another-private-peer-id",
+                    "online": False,
+                    "active_path": "QUIC/UDP",
+                }
+            )
+            write_jsonl(
+                path,
+                [
+                    row(1, 0),
+                    multiple_offline_peers,
+                    row(3, 20, online=False),
+                    row(4, 30, path="Relay/TLS"),
+                    row(5, 40, online=False),
+                    row(7, 60, online=False),
+                    row(8, 70, path="QUIC/UDP"),
+                    {"event": "monitor_stopped", "elapsed_seconds": 80},
+                ],
+            )
+            report = self.analyze(path, min_duration=80)
+            result = subprocess.run(
+                [sys.executable, str(TOOL), "--input", str(path)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(
+            report["offline_intervals"],
+            [
+                {
+                    "start_timestamp_utc": (UTC + dt.timedelta(seconds=10)).isoformat(),
+                    "end_timestamp_utc": (UTC + dt.timedelta(seconds=20)).isoformat(),
+                    "sample_count": 2,
+                    "offline_peer_samples": 3,
+                    "max_offline_peers": 2,
+                    "observed_span_seconds": 10.0,
+                },
+                {
+                    "start_timestamp_utc": (UTC + dt.timedelta(seconds=40)).isoformat(),
+                    "end_timestamp_utc": (UTC + dt.timedelta(seconds=40)).isoformat(),
+                    "sample_count": 1,
+                    "offline_peer_samples": 1,
+                    "max_offline_peers": 1,
+                    "observed_span_seconds": 0.0,
+                },
+                {
+                    "start_timestamp_utc": (UTC + dt.timedelta(seconds=60)).isoformat(),
+                    "end_timestamp_utc": (UTC + dt.timedelta(seconds=60)).isoformat(),
+                    "sample_count": 1,
+                    "offline_peer_samples": 1,
+                    "max_offline_peers": 1,
+                    "observed_span_seconds": 0.0,
+                },
+            ],
+        )
+        self.assertNotIn("private-peer-id", result.stdout)
+        self.assertNotIn("another-private-peer-id", result.stdout)
 
     def test_counts_malformed_and_non_object_lines(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
