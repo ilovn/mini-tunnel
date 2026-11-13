@@ -509,6 +509,9 @@ enum TunnelCommand {
         /// Enable experimental RFC 8445 checks for mesh peer sessions.
         #[arg(long)]
         ice: bool,
+        /// Keep one authenticated Relay/TLS standby per peer while UDP is healthy. Enable on both peers.
+        #[arg(long, env = "MINI_TUNNEL_RELAY_STANDBY")]
+        relay_standby: bool,
         /// Additional candidate address to publish; may be repeated.
         #[arg(long = "candidate")]
         candidates: Vec<String>,
@@ -595,6 +598,17 @@ async fn spawn_peer_status_server()
             tracing::error!(%error, "peer status listener stopped");
         }
     }))
+}
+
+fn validate_mesh_relay_standby(
+    enabled: bool,
+    relay_server: Option<SocketAddr>,
+) -> Result<(), &'static str> {
+    if enabled && relay_server.is_none() {
+        Err("--relay-standby requires --relay-server")
+    } else {
+        Ok(())
+    }
 }
 
 fn main() -> ExitCode {
@@ -1406,6 +1420,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     udp_relay_server,
                     stun_servers,
                     ice,
+                    relay_standby,
                     candidates,
                     network_id,
                     local_ipv4,
@@ -1414,6 +1429,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     manage_route,
                     coordinator_url,
                 } => {
+                    validate_mesh_relay_standby(relay_standby, relay_server)?;
                     let relay_endpoints = RelayEndpoints {
                         tcp: relay_server,
                         udp: udp_relay_server,
@@ -1999,10 +2015,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         registry,
                         updates_tx: mesh_updates_tx,
                         initial_peers: initially_connected,
+                        relay_standby,
                     });
-                    let result =
-                        run_peer_mesh(&tun, &network_id, connected, manage_route, mesh_updates_rx)
-                            .await;
+                    let result = run_peer_mesh(
+                        &tun,
+                        &network_id,
+                        connected,
+                        manage_route,
+                        relay_standby,
+                        mesh_updates_rx,
+                    )
+                    .await;
                     refresh.abort();
                     accepted_dispatcher.abort();
                     for task in accept_tasks {
@@ -2649,6 +2672,7 @@ async fn run_peer_tunnel(
             connector,
             probe: Some(probe),
             probe_cooldown: Duration::from_secs(60),
+            relay_standby: false,
         }],
         shutdown_rx,
     ));
@@ -4032,6 +4056,7 @@ struct MeshMembershipRefresh {
     registry: AcceptedPeerRegistry,
     updates_tx: tokio::sync::mpsc::Sender<mini_tunnel_agent::tunnel::MeshPeerUpdate>,
     initial_peers: Vec<PeerInfo>,
+    relay_standby: bool,
 }
 
 fn spawn_mesh_membership_refresh(config: MeshMembershipRefresh) -> tokio::task::JoinHandle<()> {
@@ -4053,6 +4078,7 @@ fn spawn_mesh_membership_refresh_with_period(
         registry,
         updates_tx,
         initial_peers,
+        relay_standby,
     } = config;
     tokio::spawn(async move {
         let mut known = initial_peers
@@ -4187,6 +4213,7 @@ fn spawn_mesh_membership_refresh_with_period(
                                             connector,
                                             probe,
                                             probe_cooldown: Duration::from_secs(60),
+                                            relay_standby,
                                         },
                                     );
                                     if let Err(error) = updates.send(update).await
@@ -4643,6 +4670,7 @@ async fn run_peer_mesh(
         mini_tunnel_agent::tunnel::PeerConnector,
     )>,
     manage_routes: bool,
+    relay_standby: bool,
     mut updates: tokio::sync::mpsc::Receiver<mini_tunnel_agent::tunnel::MeshPeerUpdate>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use mini_tunnel_agent::routing::{
@@ -4739,6 +4767,7 @@ async fn run_peer_mesh(
             connector,
             probe: Some(probe),
             probe_cooldown: Duration::from_secs(60),
+            relay_standby,
         });
     }
     println!(
@@ -8008,6 +8037,60 @@ mod tests {
     }
 
     #[test]
+    fn mesh_relay_standby_is_opt_in_and_requires_relay_server() {
+        let default_cli = Cli::try_parse_from([
+            "mini-tunnel",
+            "peer",
+            "tunnel",
+            "mesh",
+            "--network-id",
+            "office",
+        ])
+        .expect("default mesh command parses");
+        let Command::Peer {
+            command:
+                PeerCommand::Tunnel {
+                    command: TunnelCommand::Mesh { relay_standby, .. },
+                },
+        } = default_cli.command
+        else {
+            panic!("expected peer mesh command");
+        };
+        assert!(!relay_standby, "standby must be disabled by default");
+        assert!(validate_mesh_relay_standby(true, None).is_err());
+        assert!(validate_mesh_relay_standby(false, None).is_ok());
+
+        let standby_cli = Cli::try_parse_from([
+            "mini-tunnel",
+            "peer",
+            "tunnel",
+            "mesh",
+            "--network-id",
+            "office",
+            "--relay-server",
+            "127.0.0.1:42001",
+            "--relay-standby",
+        ])
+        .expect("explicit mesh standby command parses");
+        let Command::Peer {
+            command:
+                PeerCommand::Tunnel {
+                    command:
+                        TunnelCommand::Mesh {
+                            relay_standby,
+                            relay_server,
+                            ..
+                        },
+                },
+        } = standby_cli.command
+        else {
+            panic!("expected peer mesh command");
+        };
+        assert!(relay_standby);
+        assert_eq!(relay_server, Some("127.0.0.1:42001".parse().unwrap()));
+    }
+
+    #[test]
     fn ipv4_host_candidate_filter_is_usable_sorted_and_deduplicated() {
         let candidates = filtered_host_candidates(
             [
@@ -9365,6 +9448,7 @@ mod tests {
                     connector: reconnect,
                     probe: Some(probe),
                     probe_cooldown: Duration::from_secs(3600),
+                    relay_standby: false,
                 }],
                 updates_rx,
             )
@@ -9384,6 +9468,7 @@ mod tests {
                 registry,
                 updates_tx,
                 initial_peers: vec![stale_peer.clone()],
+                relay_standby: false,
             },
             Duration::from_millis(50),
         );

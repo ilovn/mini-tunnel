@@ -399,6 +399,9 @@ pub struct ReconnectingPeer {
     pub probe: Option<PeerConnector>,
     /// Cooldown between path probes. Production callers should use at least 60 seconds.
     pub probe_cooldown: Duration,
+    /// Keep one authenticated reliable standby while a UDP path is active.
+    /// Both endpoints must enable this to keep a pre-paired Relay channel ready.
+    pub relay_standby: bool,
 }
 
 /// Runtime membership changes consumed by the mesh packet pump.
@@ -416,6 +419,7 @@ struct MeshPeerRuntime {
     connector: Option<PeerConnector>,
     probe: Option<PeerConnector>,
     probe_cooldown: Duration,
+    relay_standby: bool,
     candidate_refresh: tokio::sync::mpsc::Sender<()>,
     pending_events: Arc<AtomicUsize>,
     outbound: tokio::sync::mpsc::Sender<QueuedMeshPacket>,
@@ -428,6 +432,7 @@ struct MeshPeerReceiver {
     connector: Option<PeerConnector>,
     probe: Option<PeerConnector>,
     probe_cooldown: Duration,
+    relay_standby: bool,
     candidate_refresh_rx: tokio::sync::mpsc::Receiver<()>,
     pending_events: Arc<AtomicUsize>,
     outbound_rx: tokio::sync::mpsc::Receiver<QueuedMeshPacket>,
@@ -442,6 +447,7 @@ fn new_mesh_peer_runtime(
     connector: Option<PeerConnector>,
     probe: Option<PeerConnector>,
     probe_cooldown: Duration,
+    relay_standby: bool,
 ) -> (
     MeshPeerRuntime,
     tokio::sync::mpsc::Receiver<QueuedMeshPacket>,
@@ -457,6 +463,7 @@ fn new_mesh_peer_runtime(
             connector,
             probe,
             probe_cooldown,
+            relay_standby,
             candidate_refresh,
             pending_events: Arc::new(AtomicUsize::new(0)),
             outbound,
@@ -469,6 +476,96 @@ fn new_mesh_peer_runtime(
 struct MeshReceiverTasks(HashMap<Ipv4Addr, tokio::task::JoinHandle<()>>);
 
 struct AbortOnDropTask(Option<tokio::task::JoinHandle<()>>);
+
+// At most eight authenticated peer packets wait for the tunnel writer per standby channel.
+const MESH_RECEIVE_QUEUE_PER_PEER: usize = MESH_OUTBOUND_QUEUE_PER_PEER;
+type MeshReceiveQueue =
+    Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Result<Vec<u8>, IdentityError>>>>;
+
+/// Owns the only receiver for a peer channel and keeps a small, bounded packet queue.
+/// Retaining this task across path promotion avoids canceling a partially-read TCP frame.
+struct MeshReceivePump {
+    channel: Arc<PeerChannel>,
+    receiver: MeshReceiveQueue,
+    task: tokio::task::JoinHandle<()>,
+    last_health_successes: u64,
+    last_health_missed: u64,
+    consecutive_misses: u8,
+}
+
+impl MeshReceivePump {
+    fn spawn(channel: Arc<PeerChannel>, address: Ipv4Addr) -> Self {
+        let (sender, receiver) = tokio::sync::mpsc::channel(MESH_RECEIVE_QUEUE_PER_PEER);
+        let task_channel = Arc::clone(&channel);
+        let peer_key = address.to_string();
+        let task = tokio::spawn(async move {
+            loop {
+                match task_channel.recv_packet().await {
+                    Ok(packet) if packet.is_empty() => continue,
+                    Ok(packet) => match sender.try_send(Ok(packet)) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            MESH_DROPPED_PACKETS.fetch_add(1, Ordering::Relaxed);
+                            crate::status::record_packet(
+                                &peer_key,
+                                crate::status::PacketCounter::Dropped,
+                            );
+                            tracing::debug!(
+                                peer_address = %peer_key,
+                                "dropping inbound packet because the peer receive queue is full"
+                            );
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                    },
+                    Err(error) => {
+                        let _ = sender.send(Err(error)).await;
+                        break;
+                    }
+                }
+            }
+        });
+        let health = channel.health_snapshot();
+        Self {
+            channel,
+            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
+            task,
+            last_health_successes: health.probes_succeeded,
+            last_health_missed: health.probes_missed,
+            consecutive_misses: 0,
+        }
+    }
+
+    async fn stop(mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+        self.channel.close_async().await;
+    }
+}
+
+fn mesh_receive(
+    active: Arc<PeerChannel>,
+    standby: Option<(Arc<PeerChannel>, MeshReceiveQueue)>,
+) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, IdentityError>> + Send>> {
+    if let Some((standby_channel, receiver)) = standby
+        && Arc::ptr_eq(&standby_channel, &active)
+    {
+        Box::pin(async move {
+            receiver.lock().await.recv().await.unwrap_or_else(|| {
+                Err(IdentityError::Transport(
+                    "peer receive pump stopped".to_owned(),
+                ))
+            })
+        })
+    } else {
+        Box::pin(async move { active.recv_packet().await })
+    }
+}
+
+impl Drop for MeshReceivePump {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
 
 impl AbortOnDropTask {
     fn abort(&self) {
@@ -527,7 +624,7 @@ fn spawn_reliable_fallback_task(
 async fn cancel_prepared_fallback(
     fallback_task: &mut Option<AbortOnDropTask>,
     fallback_rx: &mut tokio::sync::mpsc::Receiver<Result<PeerChannel, IdentityError>>,
-    ready_fallback: &mut Option<PeerChannel>,
+    ready_fallback: &mut Option<MeshReceivePump>,
 ) {
     if let Some(task) = fallback_task.take() {
         task.abort_and_wait().await;
@@ -538,7 +635,7 @@ async fn cancel_prepared_fallback(
         }
     }
     if let Some(candidate) = ready_fallback.take() {
-        candidate.close_async().await;
+        candidate.stop().await;
     }
 }
 
@@ -670,6 +767,7 @@ type MeshPeerInput = (
     Option<PeerConnector>,
     Option<PeerConnector>,
     Duration,
+    bool,
 );
 
 #[derive(Debug, Error)]
@@ -841,6 +939,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         connector,
         probe,
         probe_cooldown,
+        relay_standby,
         mut candidate_refresh_rx,
         pending_events,
         mut outbound_rx,
@@ -851,8 +950,17 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
     // Keep the previous nominated UDP session alive only as an ICE consent observer after
     // switching packet forwarding to a reliable path. The recovery probe cadence bounds it.
     let mut retired_ice_consent: Option<(Arc<PeerChannel>, u64, Instant)> = None;
+    let mut selected_standby: Option<MeshReceivePump> = None;
     loop {
         let active = Arc::clone(&*channel.read().await);
+        let mut active_standby = selected_standby.take();
+        if active_standby
+            .as_ref()
+            .is_some_and(|standby| !Arc::ptr_eq(&standby.channel, &active))
+            && let Some(stale) = active_standby.take()
+        {
+            stale.stop().await;
+        }
         let active_path_started_at = Instant::now();
         // Probe often enough to observe a sustained UDP loss window before the QUIC idle timeout.
         // User-configured shorter intervals remain respected for tests and constrained deployments.
@@ -861,7 +969,12 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         keepalive.tick().await;
         let mut last_received = tokio::time::Instant::now();
-        let mut inbound = Box::pin(active.recv_packet());
+        let mut inbound = mesh_receive(
+            Arc::clone(&active),
+            active_standby
+                .as_ref()
+                .map(|standby| (Arc::clone(&standby.channel), Arc::clone(&standby.receiver))),
+        );
         let mut ice_consent_degraded = active.ice_consent_degraded_receiver();
         let mut last_ice_consent_degraded = false;
         let mut quality = PathQualityTracker::default();
@@ -894,6 +1007,18 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         let (fallback_tx, mut fallback_rx) = tokio::sync::mpsc::channel(1);
         let mut fallback_task = None;
         let mut ready_fallback = None;
+        let mut next_standby = None;
+        if relay_standby
+            && is_udp_path(active.transport_name())
+            && let Some(connector) = connector.as_ref()
+        {
+            tracing::info!(peer_address = %address, path = active.transport_name(), "preparing opt-in reliable Relay standby");
+            fallback_task = Some(spawn_reliable_fallback_task(
+                connector,
+                address,
+                fallback_tx.clone(),
+            ));
+        }
         let outcome = loop {
             tokio::select! {
                 result = tokio::time::timeout_at(last_received + PEER_IDLE_TIMEOUT, &mut inbound) => {
@@ -904,7 +1029,12 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                     match result {
                         Ok(packet) => {
                             last_received = tokio::time::Instant::now();
-                            inbound = Box::pin(active.recv_packet());
+                            inbound = mesh_receive(
+                                Arc::clone(&active),
+                                active_standby.as_ref().map(|standby| {
+                                    (Arc::clone(&standby.channel), Arc::clone(&standby.receiver))
+                                }),
+                            );
                             if !packet.is_empty()
                                 && try_deliver_mesh_packet(&event_tx, address, packet, &pending_events)
                                     == MeshPacketDelivery::ReceiverClosed
@@ -967,7 +1097,9 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                                 fallback_tx.clone(),
                             ));
                         }
-                    } else if fallback_task.is_some() || ready_fallback.is_some() {
+                    } else if !relay_standby
+                        && (fallback_task.is_some() || ready_fallback.is_some())
+                    {
                         cancel_prepared_fallback(
                             &mut fallback_task,
                             &mut fallback_rx,
@@ -1066,6 +1198,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                     }
                     if quality.healthy_recovery_ready()
                         && !force_reliable
+                        && !relay_standby
                         && (fallback_task.is_some() || ready_fallback.is_some())
                     {
                         cancel_prepared_fallback(
@@ -1118,11 +1251,11 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                             ));
                         };
                         if let Some(candidate) = ready_fallback.take()
-                            && path_rank(candidate.transport_name())
+                            && path_rank(candidate.channel.transport_name())
                                 > path_rank(active.transport_name())
                         {
                             let previous_path = active.transport_name();
-                            let fallback_path = candidate.transport_name();
+                            let fallback_path = candidate.channel.transport_name();
                             tracing::info!(
                                 peer_address = %address,
                                 from_path = previous_path,
@@ -1137,7 +1270,8 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                                 &active,
                                 fallback_path,
                             );
-                            *channel.write().await = Arc::new(candidate);
+                            *channel.write().await = Arc::clone(&candidate.channel);
+                            next_standby = Some(candidate);
                             let health = channel.read().await.health_snapshot();
                             crate::status::update(
                                 address.to_string(), true, fallback_path,
@@ -1157,6 +1291,40 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                     }
                     if let Err(error) = active.send_keepalive().await {
                         break Err(error);
+                    }
+                    if relay_standby
+                        && let Some(standby) = ready_fallback.as_mut()
+                    {
+                        if let Err(error) = standby.channel.send_keepalive().await {
+                            tracing::warn!(peer_address = %address, %error, "reliable Relay standby probe send failed");
+                        }
+                        let health = standby.channel.health_snapshot();
+                        if health.probes_succeeded > standby.last_health_successes {
+                            standby.consecutive_misses = 0;
+                        } else if health.probes_missed > standby.last_health_missed {
+                            standby.consecutive_misses = standby.consecutive_misses.saturating_add(1);
+                        }
+                        standby.last_health_successes = health.probes_succeeded;
+                        standby.last_health_missed = health.probes_missed;
+                    }
+                    if ready_fallback.as_ref().is_some_and(|standby| {
+                        standby.task.is_finished()
+                            || (relay_standby && standby.consecutive_misses >= 2)
+                    })
+                    {
+                        if let Some(standby) = ready_fallback.take() {
+                            tracing::warn!(peer_address = %address, reason = "standby_unhealthy", "discarding unhealthy reliable Relay standby");
+                            standby.stop().await;
+                        }
+                        if fallback_task.is_none()
+                            && let Some(connector) = connector.as_ref()
+                        {
+                            fallback_task = Some(spawn_reliable_fallback_task(
+                                connector,
+                                address,
+                                fallback_tx.clone(),
+                            ));
+                        }
                     }
                 }
                 _ = probe_interval.tick(), if probe.is_some() && active.transport_name() != "QUIC/UDP" && probe_task.is_none() => {
@@ -1246,12 +1414,11 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                 result = fallback_rx.recv(), if fallback_task.is_some() => {
                     fallback_task = None;
                     match result {
-                        Some(Ok(candidate))
-                            if path_rank(candidate.transport_name()) > path_rank(active.transport_name()) =>
-                        {
-                            if force_reliable {
+                        Some(Ok(candidate)) => {
+                            let candidate = MeshReceivePump::spawn(Arc::new(candidate), address);
+                            if path_rank(candidate.channel.transport_name()) > path_rank(active.transport_name()) && force_reliable {
                                 let previous_path = active.transport_name();
-                                let fallback_path = candidate.transport_name();
+                                let fallback_path = candidate.channel.transport_name();
                                 tracing::info!(
                                     peer_address = %address,
                                     from_path = previous_path,
@@ -1266,7 +1433,8 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                                     &active,
                                     fallback_path,
                                 );
-                                *channel.write().await = Arc::new(candidate);
+                                *channel.write().await = Arc::clone(&candidate.channel);
+                                next_standby = Some(candidate);
                                 let health = channel.read().await.health_snapshot();
                                 crate::status::update(
                                     address.to_string(), true, fallback_path,
@@ -1276,16 +1444,19 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                                 );
                                 break Ok(());
                             }
+                            if path_rank(candidate.channel.transport_name()) > path_rank(active.transport_name()) {
                             tracing::debug!(
                                 peer_address = %address,
-                                path = candidate.transport_name(),
+                                path = candidate.channel.transport_name(),
                                 udp_degradation_age_ms = udp_degradation_started_at.map(|started: Instant| started.elapsed().as_millis() as u64),
                                 conservative_ice_disconnected_remaining_ms = udp_degradation_started_at.map(|started: Instant| conservative_ice_disconnected_remaining(started.elapsed()).as_millis() as u64),
                                 "reliable fallback is ready; retaining the active path until degradation"
                             );
                             ready_fallback = Some(candidate);
+                            } else {
+                                candidate.stop().await;
+                            }
                         }
-                        Some(Ok(candidate)) => candidate.close_async().await,
                         Some(Err(error)) if !force_reliable => {
                             fallback_cooldown_until = tokio::time::Instant::now()
                                 + Duration::from_secs(30);
@@ -1303,6 +1474,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                 }
             }
         };
+        drop(inbound);
         let pending_direct_probe = if matches!(&outcome, Err(IdentityError::Transport(_)))
             && active.transport_name() != "QUIC/UDP"
         {
@@ -1335,6 +1507,10 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                 if let Some(task) = fallback_task.take() {
                     task.abort();
                 }
+                if let Some(standby) = active_standby.take() {
+                    standby.stop().await;
+                }
+                selected_standby = next_standby.take();
                 if retired_ice_consent
                     .as_ref()
                     .is_some_and(|(retired, _, _)| Arc::ptr_eq(retired, &active))
@@ -1370,6 +1546,13 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                     health.probes_missed,
                     Some(promotion_reason),
                 );
+                if let Some(standby) = active_standby.take() {
+                    standby.stop().await;
+                }
+                if let Some(standby) = ready_fallback.take() {
+                    standby.stop().await;
+                }
+                selected_standby = None;
                 continue;
             }
             candidate.close_async().await;
@@ -1395,9 +1578,9 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
             }
         }
         if let Some(candidate) = ready_fallback.take() {
-            if path_rank(candidate.transport_name()) > path_rank(active.transport_name()) {
+            if path_rank(candidate.channel.transport_name()) > path_rank(active.transport_name()) {
                 discard_queued_mesh_packets(&mut outbound_rx, address);
-                let fallback_path = candidate.transport_name();
+                let fallback_path = candidate.channel.transport_name();
                 let switch_reason = mesh_path_failure_reason(quality.degraded, &failure);
                 tracing::info!(
                     peer_address = %address,
@@ -1411,7 +1594,11 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                 retired_ice_consent =
                     start_retired_ice_consent_observation(address, &active, fallback_path);
                 active.close_async().await;
-                *channel.write().await = Arc::new(candidate);
+                *channel.write().await = Arc::clone(&candidate.channel);
+                selected_standby = Some(candidate);
+                if let Some(standby) = active_standby.take() {
+                    standby.stop().await;
+                }
                 let recovered_health = channel.read().await.health_snapshot();
                 crate::status::update(
                     address.to_string(),
@@ -1424,7 +1611,10 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                 );
                 continue;
             }
-            candidate.close_async().await;
+            candidate.stop().await;
+        }
+        if let Some(standby) = active_standby.take() {
+            standby.stop().await;
         }
         active.stop_ice_consent_monitor().await;
         stop_retired_ice_consent_observation(
@@ -1584,6 +1774,7 @@ pub async fn pump_peer_mesh<T: TunnelPacketIo>(
                     None,
                     None,
                     Duration::from_secs(3600),
+                    false,
                 )
             })
             .collect(),
@@ -1608,6 +1799,7 @@ pub async fn pump_peer_mesh_reconnecting<T: TunnelPacketIo>(
                     Some(peer.connector),
                     peer.probe,
                     peer.probe_cooldown,
+                    peer.relay_standby,
                 )
             })
             .collect(),
@@ -1634,6 +1826,7 @@ pub async fn pump_peer_mesh_dynamic<T: TunnelPacketIo>(
                     Some(peer.connector),
                     peer.probe,
                     peer.probe_cooldown,
+                    peer.relay_standby,
                 )
             })
             .collect(),
@@ -1681,7 +1874,7 @@ async fn pump_mesh_with_quality_interval<T: TunnelPacketIo>(
     let mut outbound_receivers = HashMap::with_capacity(peers.len());
     let mut candidate_refresh_receivers = HashMap::with_capacity(peers.len());
     let mut ipv6_routes = HashMap::new();
-    for (address, ipv6_address, channel, connector, probe, probe_cooldown) in peers {
+    for (address, ipv6_address, channel, connector, probe, probe_cooldown, relay_standby) in peers {
         if let Some(ipv6_address) = ipv6_address
             && ipv6_routes.insert(ipv6_address, address).is_some()
         {
@@ -1694,6 +1887,7 @@ async fn pump_mesh_with_quality_interval<T: TunnelPacketIo>(
             connector,
             probe,
             probe_cooldown,
+            relay_standby,
         );
         if channels.insert(address, runtime).is_some() {
             return Err(PeerTunnelError::DuplicatePeerAddress);
@@ -1818,6 +2012,7 @@ async fn pump_mesh_with_quality_interval<T: TunnelPacketIo>(
                             Some(peer.connector),
                             peer.probe,
                             peer.probe_cooldown,
+                            peer.relay_standby,
                         );
                         receivers.insert(
                             address,
@@ -1882,6 +2077,7 @@ fn spawn_mesh_receiver(
         connector: runtime.connector.clone(),
         probe: runtime.probe.clone(),
         probe_cooldown: runtime.probe_cooldown,
+        relay_standby: runtime.relay_standby,
         candidate_refresh_rx,
         pending_events: Arc::clone(&runtime.pending_events),
         outbound_rx,
@@ -2445,7 +2641,7 @@ mod tests {
         let local_ip = Ipv4Addr::new(10, 0, 0, 1);
         let peer_ip = Ipv4Addr::new(10, 0, 0, 2);
         let (outbound_tx, outbound_rx) = mpsc::channel(2);
-        let (inbound_tx, _inbound_rx) = mpsc::channel(2);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(2);
         let packet_io = MockPacketIo {
             outbound: Mutex::new(outbound_rx),
             inbound: inbound_tx,
@@ -2468,6 +2664,7 @@ mod tests {
                     Some(connector),
                     None,
                     Duration::from_secs(3600),
+                    false,
                 )],
                 None,
                 Duration::from_millis(100),
@@ -2596,6 +2793,20 @@ mod tests {
         .await
         .expect("recovered TCP path did not forward the packet");
         assert_eq!(forwarded, packet(local_ip, peer_ip, 28));
+
+        let reverse_packet = packet(peer_ip, local_ip, 36);
+        recovered_remote
+            .channel
+            .send_packet(&reverse_packet)
+            .await
+            .expect("prepared reliable channel should send the reverse overlay packet");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), inbound_rx.recv())
+                .await
+                .expect("reverse overlay packet did not reach the local TUN writer")
+                .expect("local TUN writer closed"),
+            reverse_packet
+        );
 
         pump.abort();
         responder_task.abort();
@@ -3419,6 +3630,7 @@ mod tests {
                     Some(connector),
                     None,
                     Duration::from_secs(3600),
+                    false,
                 )],
                 None,
                 Duration::from_millis(100),
@@ -3698,6 +3910,7 @@ mod tests {
                     connector,
                     probe: None,
                     probe_cooldown: Duration::from_secs(3600),
+                    relay_standby: false,
                 }],
             )
             .await
@@ -3856,6 +4069,7 @@ mod tests {
                     connector: connect_a,
                     probe: None,
                     probe_cooldown: Duration::from_secs(3600),
+                    relay_standby: false,
                 }],
             )
             .await
@@ -3871,6 +4085,7 @@ mod tests {
                     connector: connect_b,
                     probe: None,
                     probe_cooldown: Duration::from_secs(3600),
+                    relay_standby: false,
                 }],
             )
             .await
@@ -3917,7 +4132,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mesh_reuses_prepared_reliable_fallback_after_non_ice_udp_failure() {
+    async fn mesh_prewarmed_relay_standby_survives_udp_failure_without_reconnect() {
         async fn tcp_pair(a: Arc<Identity>, b: Arc<Identity>) -> (PeerChannel, PeerChannel) {
             let listener = peer_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
                 .await
@@ -3972,6 +4187,8 @@ mod tests {
         let remote_initial = accept_udp.await.unwrap().unwrap();
         assert!(!initial.has_ice_consent_monitor());
 
+        let local_ip = Ipv4Addr::new(10, 82, 0, 1);
+        let peer_ip = Ipv4Addr::new(10, 82, 0, 2);
         let fallback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let remote_fallback = Arc::new(Mutex::new(None));
         let connector: PeerConnector = {
@@ -3991,14 +4208,13 @@ mod tests {
                     );
                     fallback_calls.fetch_add(1, Ordering::SeqCst);
                     let (local, remote) = tcp_pair(a, b).await;
-                    *remote_fallback.lock().await = Some(remote);
+                    *remote_fallback.lock().await =
+                        Some(MeshReceivePump::spawn(Arc::new(remote), peer_ip));
                     Ok(local)
                 })
             })
         };
 
-        let local_ip = Ipv4Addr::new(10, 82, 0, 1);
-        let peer_ip = Ipv4Addr::new(10, 82, 0, 2);
         let (outbound_tx, outbound_rx) = mpsc::channel(2);
         let (inbound_tx, _inbound_rx) = mpsc::channel(2);
         let io = MockPacketIo {
@@ -4008,7 +4224,6 @@ mod tests {
             local_ipv6: None,
             mtu: 1500,
         };
-        let health_channel = Arc::clone(&initial);
         let pump = tokio::spawn(async move {
             pump_mesh_with_quality_interval(
                 &io,
@@ -4019,6 +4234,7 @@ mod tests {
                     Some(connector),
                     None,
                     Duration::from_secs(3600),
+                    true,
                 )],
                 None,
                 Duration::from_millis(100),
@@ -4039,11 +4255,6 @@ mod tests {
         })
         .await
         .expect("mesh pump must publish the initial UDP path before health changes");
-        if let Ok(mut health) = health_channel.health.lock() {
-            health.probes_missed = health.probes_missed.saturating_add(1);
-            health.probes_succeeded = health.probes_succeeded.saturating_add(1);
-        }
-
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if remote_fallback.lock().await.is_some() {
@@ -4053,8 +4264,23 @@ mod tests {
             }
         })
         .await
-        .expect("a missed probe must prepare a reliable path even when another probe succeeds");
+        .expect("opt-in mesh should establish the paired Relay standby before UDP fails");
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if remote_fallback
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|standby| standby.channel.health_probe_requests_received() > 0)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("standby health pings must be received before the direct path is impaired");
         assert!(crate::status::snapshot().into_iter().any(|status| {
             status.peer == peer_ip.to_string() && status.online && status.active_path == "QUIC/UDP"
         }));
@@ -4082,19 +4308,26 @@ mod tests {
             .await
             .take()
             .expect("prepared remote reliable channel remains available");
+        assert_eq!(
+            recovered_remote.receiver.lock().await.capacity(),
+            MESH_RECEIVE_QUEUE_PER_PEER,
+            "standby receive buffering is bounded per peer"
+        );
         outbound_tx
             .send(packet(local_ip, peer_ip, 28))
             .await
             .unwrap();
-        let forwarded =
-            tokio::time::timeout(Duration::from_secs(3), recovered_remote.recv_packet())
-                .await
-                .expect("prepared reliable channel did not forward the overlay packet")
-                .unwrap();
+        let forwarded = tokio::time::timeout(Duration::from_secs(3), async {
+            recovered_remote.receiver.lock().await.recv().await
+        })
+        .await
+        .expect("prepared reliable channel did not forward the overlay packet")
+        .expect("standby receive pump stopped")
+        .expect("Relay channel failed while receiving the overlay packet");
         assert_eq!(forwarded, packet(local_ip, peer_ip, 28));
 
         pump.abort();
-        recovered_remote.close_async().await;
+        recovered_remote.stop().await;
         endpoint_a.close(0_u32.into(), b"test complete");
         endpoint_b.close(0_u32.into(), b"test complete");
         fs::remove_dir_all(temp).unwrap();
@@ -4211,6 +4444,7 @@ mod tests {
                     connector,
                     probe: None,
                     probe_cooldown: Duration::from_secs(3600),
+                    relay_standby: false,
                 }],
             )
             .await
@@ -4416,6 +4650,7 @@ mod tests {
                     connector,
                     probe: Some(probe),
                     probe_cooldown: Duration::from_secs(3600),
+                    relay_standby: false,
                 }],
                 updates_rx,
             )
@@ -4609,6 +4844,7 @@ mod tests {
                     connector,
                     probe: Some(probe),
                     probe_cooldown: Duration::from_secs(3600),
+                    relay_standby: false,
                 }],
                 updates_rx,
             )
@@ -4795,6 +5031,7 @@ mod tests {
                     connector,
                     probe: Some(probe),
                     probe_cooldown: Duration::from_millis(10),
+                    relay_standby: false,
                 }],
             )
             .await
@@ -5014,6 +5251,7 @@ mod tests {
                     connector: reconnect,
                     probe: Some(probe),
                     probe_cooldown: Duration::from_millis(25),
+                    relay_standby: false,
                 }],
             )
             .await
@@ -5232,6 +5470,7 @@ mod tests {
                         None,
                         None,
                         Duration::from_secs(3600),
+                        false,
                     ),
                     (
                         c_ip,
@@ -5240,6 +5479,7 @@ mod tests {
                         None,
                         None,
                         Duration::from_secs(3600),
+                        false,
                     ),
                 ],
                 None,
@@ -5404,6 +5644,7 @@ mod tests {
                 connector,
                 probe: None,
                 probe_cooldown: Duration::from_secs(3600),
+                relay_standby: false,
             }))
             .await
             .unwrap();
@@ -5499,6 +5740,7 @@ mod tests {
                     connector,
                     probe: None,
                     probe_cooldown: Duration::from_secs(3600),
+                    relay_standby: false,
                 }],
                 update_rx,
             )
