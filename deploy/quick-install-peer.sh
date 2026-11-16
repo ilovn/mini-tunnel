@@ -74,7 +74,12 @@ binary_dir="$temp_dir/download"
 binary="$binary_dir/mini-tunnel"
 [[ -f "$binary" && -x "$binary" ]] || die "download did not produce an executable mini-tunnel binary"
 
-if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+validate_only=false
+for argument in "${install_args[@]}"; do
+  [[ "$argument" != "--validate-only" ]] || validate_only=true
+done
+
+if [[ "$validate_only" == true || ${EUID:-$(id -u)} -eq 0 ]]; then
   "$script_dir/install-peer.sh" --binary "$binary" "${install_args[@]}"
 else
   command -v sudo >/dev/null || die "sudo is required to install the systemd peer service"

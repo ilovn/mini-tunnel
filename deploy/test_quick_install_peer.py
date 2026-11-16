@@ -22,6 +22,7 @@ class QuickInstallPeerTests(unittest.TestCase):
         shutil.copy2(SCRIPT, self.fake_deploy / SCRIPT.name)
         self.download_log = self.root / "download.json"
         self.install_log = self.root / "install.json"
+        self.sudo_log = self.root / "sudo.json"
         (self.fake_deploy / "download-peer.sh").write_text(
             """#!/usr/bin/env python3
 import json, os, pathlib, sys
@@ -52,7 +53,13 @@ pathlib.Path(os.environ["INSTALL_LOG"]).write_text(json.dumps(args))
         self.fake_bin = self.root / "bin"
         self.fake_bin.mkdir()
         sudo = self.fake_bin / "sudo"
-        sudo.write_text("#!/bin/sh\nexec \"$@\"\n", encoding="utf-8")
+        sudo.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, pathlib, sys\n"
+            "pathlib.Path(os.environ['SUDO_LOG']).write_text(json.dumps(sys.argv[1:]))\n"
+            "os.execvp(sys.argv[1], sys.argv[1:])\n",
+            encoding="utf-8",
+        )
         sudo.chmod(0o755)
 
     def tearDown(self) -> None:
@@ -63,6 +70,7 @@ pathlib.Path(os.environ["INSTALL_LOG"]).write_text(json.dumps(args))
         env["PATH"] = f"{self.fake_bin}{os.pathsep}{env['PATH']}"
         env["DOWNLOAD_LOG"] = str(self.download_log)
         env["INSTALL_LOG"] = str(self.install_log)
+        env["SUDO_LOG"] = str(self.sudo_log)
         env.update(extra_env)
         return subprocess.run(
             [str(self.fake_deploy / SCRIPT.name), *args],
@@ -113,7 +121,26 @@ pathlib.Path(os.environ["INSTALL_LOG"]).write_text(json.dumps(args))
                 "office",
             ],
         )
+        self.assertTrue(self.sudo_log.exists(), "install path is elevated")
         self.assertFalse(Path(install_args[1]).exists(), "temporary download is removed")
+
+    def test_validate_only_runs_preflight_without_sudo(self) -> None:
+        result = self.run_script(
+            "--run-id",
+            "12345",
+            "--",
+            "--network-id",
+            "00000000-0000-0000-0000-000000000000",
+            "--coordinator-url",
+            "https://coordinator.example",
+            "--invite-token-file",
+            "/tmp/invite.token",
+            "--validate-only",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        install_args = json.loads(self.install_log.read_text(encoding="utf-8"))
+        self.assertIn("--validate-only", install_args)
+        self.assertFalse(self.sudo_log.exists(), "read-only preflight should not require sudo")
 
     def test_failed_download_never_invokes_the_installer_or_prints_token(self) -> None:
         result = self.run_script(
