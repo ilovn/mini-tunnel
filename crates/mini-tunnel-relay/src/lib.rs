@@ -16,7 +16,7 @@ use std::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -222,6 +222,13 @@ struct PendingConnection {
     stream: TcpStream,
     _connection_permit: OwnedSemaphorePermit,
     _source_permit: SourceConnectionPermit,
+}
+
+enum RelaySessionEnd {
+    ServerShutdown,
+    PeerClosed,
+    ForwardError(io::Error),
+    SessionTimeout,
 }
 
 impl RelayServer {
@@ -528,7 +535,17 @@ async fn pair_session(
         first.stream.write_u8(RELAY_READY),
         second.stream.write_u8(RELAY_READY),
     );
-    if ready.is_ok() {
+    if let Err(error) = ready {
+        tracing::warn!(
+            network_id = %key.network_id,
+            first_device_id = %key.first_device_id,
+            second_device_id = %key.second_device_id,
+            reason = "ready_write_error",
+            error = %error,
+            "relay session closed before forwarding started"
+        );
+    } else {
+        let started_at = Instant::now();
         let total_bytes = AtomicU64::new(0);
         let copy = async {
             let (mut first_reader, mut first_writer) = tokio::io::split(&mut first.stream);
@@ -550,9 +567,56 @@ async fn pair_session(
                 ),
             )
         };
-        tokio::select! {
-            _ = wait_for_shutdown(&mut shutdown) => {},
-            _ = tokio::time::timeout(Duration::from_secs(24 * 60 * 60), copy) => {},
+        let end = tokio::select! {
+            _ = wait_for_shutdown(&mut shutdown) => RelaySessionEnd::ServerShutdown,
+            result = tokio::time::timeout(Duration::from_secs(24 * 60 * 60), copy) => {
+                match result {
+                    Ok(Ok(_)) => RelaySessionEnd::PeerClosed,
+                    Ok(Err(error)) => RelaySessionEnd::ForwardError(error),
+                    Err(_) => RelaySessionEnd::SessionTimeout,
+                }
+            }
+        };
+        let elapsed_ms = started_at.elapsed().as_millis() as u64;
+        let bytes_forwarded = total_bytes.load(Ordering::Relaxed);
+        match end {
+            RelaySessionEnd::ServerShutdown => tracing::info!(
+                network_id = %key.network_id,
+                first_device_id = %key.first_device_id,
+                second_device_id = %key.second_device_id,
+                reason = "server_shutdown",
+                elapsed_ms,
+                bytes_forwarded,
+                "relay session ended"
+            ),
+            RelaySessionEnd::PeerClosed => tracing::info!(
+                network_id = %key.network_id,
+                first_device_id = %key.first_device_id,
+                second_device_id = %key.second_device_id,
+                reason = "peer_closed",
+                elapsed_ms,
+                bytes_forwarded,
+                "relay session ended"
+            ),
+            RelaySessionEnd::ForwardError(error) => tracing::warn!(
+                network_id = %key.network_id,
+                first_device_id = %key.first_device_id,
+                second_device_id = %key.second_device_id,
+                reason = "forward_error",
+                error = %error,
+                elapsed_ms,
+                bytes_forwarded,
+                "relay session ended"
+            ),
+            RelaySessionEnd::SessionTimeout => tracing::warn!(
+                network_id = %key.network_id,
+                first_device_id = %key.first_device_id,
+                second_device_id = %key.second_device_id,
+                reason = "session_timeout",
+                elapsed_ms,
+                bytes_forwarded,
+                "relay session ended"
+            ),
         }
     }
     remove_session(&inner, &key, generation).await;

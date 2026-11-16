@@ -11,3 +11,4 @@ getrandom.workspace = true
 mini-tunnel-protocol = { path = "../mini-tunnel-protocol" }
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
