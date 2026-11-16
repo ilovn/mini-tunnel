@@ -15,6 +15,10 @@ from upgrade_peer import UpgradeConfig, UpgradeError, upgrade
 
 
 class UpgradePeerTests(unittest.TestCase):
+    def test_default_upgrade_lock_uses_private_runtime_directory(self) -> None:
+        config = UpgradeConfig(instance="office", binary=Path("/tmp/candidate"))
+        self.assertEqual(config.lock_dir, Path("/run/mini-tunnel"))
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="mini-tunnel-upgrade-test-")
         self.root = Path(self.temp.name)

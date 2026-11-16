@@ -38,7 +38,7 @@ class UpgradeConfig:
     config_dir: Path = Path("/etc/mini-tunnel")
     backup_dir: Path = Path("/usr/local/lib/mini-tunnel/backups")
     staging_dir: Path = Path("/usr/local/lib/mini-tunnel/upgrade-staging")
-    lock_dir: Path = Path("/run/lock")
+    lock_dir: Path = Path("/run/mini-tunnel")
     health_timeout_seconds: float = 30.0
     poll_interval_seconds: float = 1.0
     require_root_ownership: bool = True
