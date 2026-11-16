@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="mini-tunnel 配置向导：选择 Coordinator、填写网络参数，生成安全的一键部署脚本。"
+    />
+    <meta name="theme-color" content="#f7f8fa" />
+    <title>mini-tunnel · 私有网络，几步接通</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script type="module" src="./app.mjs"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#top" aria-label="mini-tunnel 首页"
+        ><span class="brand-mark"><i></i><i></i><i></i></span
+        ><span>mini-tunnel</span></a
+      >
+      <nav aria-label="主导航">
+        <a href="#how">工作方式</a><a href="#platforms">平台支持</a
+        ><a
+          class="github-link"
+          href="https://github.com/ilovn/mini-tunnel"
+          target="_blank"
+          rel="noreferrer"
+          >GitHub ↗</a
+        >
+      </nav>
+    </header>
+    <main id="top">
+      <section class="hero">
+        <div class="hero-copy">
+          <div class="eyebrow">
+            <span class="live-dot"></span> OPEN-SOURCE · SELF-HOSTED
+          </div>
+          <h1>把设备，接进<br /><em>同一个私有网络。</em></h1>
+          <p class="hero-lead">
+            填好 Coordinator
+            和网络信息，生成专属部署脚本。连接优先直连，网络不通时自动走可靠中继。
+          </p>
+          <div class="hero-points">
+            <span><b>01</b> 选择控制端</span><span><b>02</b> 调整部署参数</span
+            ><span><b>03</b> 运行脚本入网</span>
+          </div>
+        </div>
+        <div class="hero-art" aria-label="设备通过隧道连入私有网络的示意图">
+          <div class="orbit orbit-one"></div>
+          <div class="orbit orbit-two"></div>
+          <div class="node node-laptop">
+            <span>⌘</span><small>DEVICE A</small>
+          </div>
+          <div class="node node-router">
+            <span class="router-icon">⌁</span><small>COORDINATOR</small>
+          </div>
+          <div class="node node-server">
+            <span>▤</span><small>DEVICE B</small>
+          </div>
+          <div class="route route-left"><i></i><i></i><i></i></div>
+          <div class="route route-right"><i></i><i></i><i></i></div>
+          <div class="net-label">
+            <span></span> ENCRYPTED MESH <small>QUIC · TLS FALLBACK</small>
+          </div>
+        </div>
+      </section>
+
+      <section class="builder" id="builder">
+        <div class="builder-heading">
+          <div>
+            <div class="eyebrow">DEPLOYMENT WIZARD</div>
+            <h2>配置一台隧道节点</h2>
+            <p>邀请 token 只在目标服务器运行脚本时输入，不会进入生成内容。</p>
+          </div>
+          <div class="step-badge">
+            <strong>1—3</strong><span>约 2 分钟</span>
+          </div>
+        </div>
+        <div class="wizard-grid">
+          <form id="config-form" novalidate>
+            <fieldset class="choice-field">
+              <legend>Coordinator 接入方式</legend>
+              <label class="choice"
+                ><input
+                  type="radio"
+                  name="coordinatorMode"
+                  value="existing"
+                  checked
+                /><span class="choice-card"
+                  ><b>接入已有 Coordinator</b
+                  ><small>已有网络和管理员发放的一次性邀请</small></span
+                ></label
+              >
+              <label class="choice"
+                ><input
+                  type="radio"
+                  name="coordinatorMode"
+                  value="custom"
+                /><span class="choice-card"
+                  ><b>使用自定义地址</b
+                  ><small>填写自建或私有部署的 Coordinator</small></span
+                ></label
+              >
+            </fieldset>
+            <div class="fields-two">
+              <label class="field full"
+                ><span>Coordinator URL <sup>*</sup></span
+                ><input
+                  id="coordinatorUrl"
+                  autocomplete="url"
+                  value="https://coordinator.example.com"
+                  placeholder="https://coordinator.example.com"
+                  required /><small id="coordinator-help"
+                  >填写管理员提供的 Coordinator 地址。</small
+                ><span class="error" data-error="coordinatorUrl"></span
+              ></label>
+              <label class="field full"
+                ><span>网络 ID <sup>*</sup></span
+                ><input
+                  id="networkId"
+                  spellcheck="false"
+                  value=""
+                  placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                  required /><small>由 Coordinator 管理员创建网络后提供。</small
+                ><span class="error" data-error="networkId"></span
+              ></label>
+              <label class="field"
+                ><span>节点名称</span
+                ><input id="instance" value="my-device" maxlength="48" /><small
+                  >在本机标识此隧道实例</small
+                ><span class="error" data-error="instance"></span
+              ></label>
+              <label class="field"
+                ><span>目标系统</span
+                ><select id="platform">
+                  <option value="ubuntu">Ubuntu / Debian · systemd</option>
+                  <option value="systemd">其他 systemd Linux</option></select
+                ><small>需要 systemd 247+ 和 TUN 设备</small></label
+              >
+              <label class="field"
+                ><span>处理器架构</span
+                ><select id="arch">
+                  <option value="auto">自动检测</option>
+                  <option value="x86_64">x86_64</option>
+                  <option value="aarch64">ARM64 / aarch64</option></select
+                ><small>使用 CI 预构建、校验签名的二进制</small
+                ><span class="error" data-error="arch"></span
+              ></label>
+              <label class="field"
+                ><span>发行版本</span
+                ><select id="versionMode">
+                  <option value="latest">最新稳定版</option>
+                  <option value="release">固定版本</option></select
+                ><small>固定版本便于重复部署</small></label
+              >
+              <label class="field hidden" id="release-field"
+                ><span>版本号</span
+                ><input id="release" placeholder="v1.2.3" /><span
+                  class="error"
+                  data-error="release"
+                ></span
+              ></label>
+              <details class="advanced full">
+                <summary>
+                  高级网络选项 <span>STUN、中继与私有证书</span>
+                </summary>
+                <div class="fields-two advanced-fields">
+                  <label class="field"
+                    ><span>STUN 地址</span
+                    ><input id="stunServer" value="111.206.174.2:3478" /><small
+                      >用于发现 NAT 映射，可调整</small
+                    ><span class="error" data-error="stunServer"></span
+                  ></label>
+                  <label class="field"
+                    ><span>TCP 中继地址</span
+                    ><input
+                      id="relayServer"
+                      placeholder="可选，例如 relay.example.com:42001" /><small
+                      >用于可靠 TCP/TLS 回退</small
+                    ><span class="error" data-error="relayServer"></span
+                  ></label>
+                  <label class="field"
+                    ><span>UDP 中继地址</span
+                    ><input
+                      id="udpRelayServer"
+                      placeholder="可选，例如 relay.example.com:42003" /><small
+                      >可选；需在服务端启用 UDP Relay</small
+                    ><span class="error" data-error="udpRelayServer"></span
+                  ></label>
+                  <label class="field"
+                    ><span>Coordinator CA 文件路径</span
+                    ><input
+                      id="coordinatorCa"
+                      placeholder="可选，例如 /etc/mini-tunnel/coordinator-ca.pem" /><small
+                      >目标服务器上已存在的 PEM 文件路径</small
+                    ><span class="error" data-error="coordinatorCa"></span
+                  ></label>
+                </div>
+              </details>
+            </div>
+            <div class="form-bottom">
+              <p>
+                <span class="lock-icon">▣</span> 邀请 token
+                不会发送到网站，也不会保存在浏览器。
+              </p>
+              <button type="submit" class="primary-button">
+                生成部署脚本 <span>→</span>
+              </button>
+            </div>
+          </form>
+          <aside class="preview-card">
+            <div class="preview-top">
+              <span><i></i> SCRIPT PREVIEW</span
+              ><span class="preview-lang">BASH</span>
+            </div>
+            <div class="preview-body" id="preview">
+              <span class="code-muted"># 先填写 Coordinator 与网络 ID</span
+              ><br /><span class="code-purple">mini-tunnel</span>
+              <span class="code-blue">peer setup</span><br /><span
+                class="code-muted"
+                ># token 在运行时安全输入</span
+              >
+            </div>
+            <div class="preview-footer">
+              <span class="shield">◇</span
+              ><span>签名验证 · 安全安装 · systemd 托管</span>
+            </div>
+          </aside>
+        </div>
+        <div id="result" class="result hidden" role="status" aria-live="polite">
+          <div class="result-title">
+            <span class="success-mark">✓</span>
+            <div>
+              <b>部署脚本已生成</b
+              ><small>下载到目标 Linux 服务器后按说明运行。</small>
+            </div>
+          </div>
+          <div class="result-actions">
+            <button id="copy-button" class="secondary-button">复制脚本</button
+            ><button id="download-button" class="primary-button">
+              下载 .sh <span>↓</span>
+            </button>
+          </div>
+          <pre id="script-output" tabindex="0"></pre>
+          <p class="result-note">
+            运行前请检查脚本内容。目标机需安装 git、GitHub
+            CLI（gh）、curl、Python 3、tar 和 gzip。
+          </p>
+        </div>
+      </section>
+
+      <section class="how" id="how">
+        <div class="section-kicker">HOW IT WORKS</div>
+        <h2>从配置到连通，三步完成</h2>
+        <div class="steps">
+          <article>
+            <span>01</span>
+            <h3>接入 Coordinator</h3>
+            <p>
+              使用已有 Coordinator 地址与网络
+              ID。管理员创建网络后，通过安全渠道提供一次性邀请。
+            </p>
+          </article>
+          <article>
+            <span>02</span>
+            <h3>生成部署脚本</h3>
+            <p>
+              配置 Linux
+              发行版、架构和可选中继。浏览器本地生成脚本，不上传配置。
+            </p>
+          </article>
+          <article>
+            <span>03</span>
+            <h3>在目标机运行</h3>
+            <p>
+              脚本下载已签名的预构建版本并核对来源，随后加入网络、创建 systemd
+              服务。
+            </p>
+          </article>
+        </div>
+      </section>
+
+      <section class="platforms" id="platforms">
+        <div>
+          <div class="section-kicker">PLATFORM SUPPORT</div>
+          <h2>按真实可用的平台生成</h2>
+          <p>
+            生成器只开放当前具备预构建安装链路的平台，避免给出无法执行的安装命令。
+          </p>
+        </div>
+        <div class="platform-list">
+          <div class="platform-row">
+            <span class="platform-icon linux">L</span>
+            <div>
+              <b>Ubuntu / Debian</b><small>systemd · x86_64 / ARM64</small>
+            </div>
+            <span class="status-pill ready">可一键部署</span>
+          </div>
+          <div class="platform-row">
+            <span class="platform-icon linux">L</span>
+            <div>
+              <b>其他 systemd Linux</b
+              ><small>需要兼容 systemd 247+、TUN 和 glibc</small>
+            </div>
+            <span class="status-pill ready">可生成脚本</span>
+          </div>
+          <div class="platform-row muted-row">
+            <span class="platform-icon apple">⌘</span>
+            <div>
+              <b>macOS</b><small>支持隧道客户端；官方一键安装包尚未提供</small>
+            </div>
+            <span class="status-pill planned">后续接入</span>
+          </div>
+          <div class="platform-row muted-row">
+            <span class="platform-icon windows">⊞</span>
+            <div>
+              <b>Windows</b
+              ><small>支持隧道客户端；官方一键安装包尚未提供</small>
+            </div>
+            <span class="status-pill planned">后续接入</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="notice">
+        <span>i</span>
+        <p>
+          <b>需要网络管理员提供：</b>Coordinator HTTPS 地址、网络
+          ID，以及一个尚未使用的一次性邀请。此向导只部署 peer，不会创建
+          Coordinator、网络或邀请，也不会修改云防火墙规则。
+        </p>
+        <a
+          href="https://github.com/ilovn/mini-tunnel/blob/main/deploy/systemd/README.md"
+          target="_blank"
+          rel="noreferrer"
+          >阅读部署文档 ↗</a
+        >
+      </section>
+    </main>
+    <footer>
+      <a class="brand" href="#top"
+        ><span class="brand-mark"><i></i><i></i><i></i></span
+        ><span>mini-tunnel</span></a
+      ><span>开源 · 自托管 · 端到端加密</span><span>© 2026 mini-tunnel</span>
+    </footer>
+  </body>
+</html>
