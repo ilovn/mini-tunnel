@@ -554,6 +554,8 @@ async fn pair_session(
                 copy_session_bytes(
                     &mut first_reader,
                     &mut second_writer,
+                    &key.first_device_id,
+                    &key.second_device_id,
                     &total_bytes,
                     inner.config.max_session_bytes,
                     &inner.bytes_forwarded_total,
@@ -561,6 +563,8 @@ async fn pair_session(
                 copy_session_bytes(
                     &mut second_reader,
                     &mut first_writer,
+                    &key.second_device_id,
+                    &key.first_device_id,
                     &total_bytes,
                     inner.config.max_session_bytes,
                     &inner.bytes_forwarded_total,
@@ -633,6 +637,8 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
 async fn copy_session_bytes<R, W>(
     reader: &mut R,
     writer: &mut W,
+    source_device_id: &str,
+    target_device_id: &str,
     total_bytes: &AtomicU64,
     max_bytes: u64,
     total_forwarded_bytes: &AtomicU64,
@@ -651,6 +657,13 @@ where
         let read_limit = remaining.min(buffer.len() as u64) as usize;
         let length = tokio::io::AsyncReadExt::read(reader, &mut buffer[..read_limit]).await?;
         if length == 0 {
+            tracing::info!(
+                source_device_id = %source_device_id,
+                target_device_id = %target_device_id,
+                bytes_forwarded = copied,
+                reason = "peer_stream_eof",
+                "relay forwarding direction reached EOF"
+            );
             tokio::io::AsyncWriteExt::shutdown(writer).await?;
             return Ok(copied);
         }
