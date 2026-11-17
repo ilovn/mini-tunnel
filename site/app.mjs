@@ -19,6 +19,7 @@ const ids = [
   "relayServer",
   "udpRelayServer",
   "coordinatorCa",
+  "githubMirrorPrefix",
 ];
 const config = () => ({
   ...Object.fromEntries(ids.map((id) => [id, $(id).value.trim()])),

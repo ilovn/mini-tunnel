@@ -138,6 +138,28 @@ export function validateConfig(config) {
   }
   if (config.stunServer && !validEndpoint(config.stunServer))
     errors.stunServer = "请输入主机名或 IP 加有效端口（1–65535）";
+  if (config.githubMirrorPrefix) {
+    let mirror;
+    try {
+      mirror = new URL(config.githubMirrorPrefix);
+    } catch {
+      errors.githubMirrorPrefix = "请输入 HTTPS GitHub 镜像前缀";
+    }
+    if (
+      mirror &&
+      (mirror.protocol !== "https:" ||
+        !mirror.hostname ||
+        mirror.username ||
+        mirror.password ||
+        mirror.search ||
+        mirror.hash ||
+        /[\s\u0000-\u001f\u007f]/.test(config.githubMirrorPrefix) ||
+        mirror.href !== config.githubMirrorPrefix ||
+        !config.githubMirrorPrefix.endsWith("/https://github.com/"))
+    )
+      errors.githubMirrorPrefix =
+        "镜像前缀需以 /https://github.com/ 结尾，且不能包含账号、参数或片段";
+  }
   if (
     config.coordinatorCa &&
     (!config.coordinatorCa.startsWith("/") ||
@@ -179,6 +201,7 @@ export function generateScript(config) {
   const shellArgs = args
     .map((arg) => (arg === '"$invite_file"' ? '"$invite_file"' : sh(arg)))
     .join(" \\\n  ");
+  const mirrorPrefix = config.githubMirrorPrefix || "";
   return `#!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -195,6 +218,10 @@ for command in git gh curl python3 tar gzip; do
 done
 command -v systemctl >/dev/null 2>&1 || { echo 'This installer requires Linux with systemd.' >&2; exit 1; }
 [[ -c /dev/net/tun ]] || { echo '/dev/net/tun is unavailable; enable TUN on this host.' >&2; exit 1; }
+gh attestation verify --help >/dev/null 2>&1 || {
+  echo "GitHub CLI (gh) must support 'attestation verify'; upgrade gh and retry." >&2
+  exit 1
+}
 
 umask 077
 tmp_dir=$(mktemp -d "\${TMPDIR:-/tmp}/mini-tunnel-setup.XXXXXX")
@@ -208,7 +235,14 @@ printf '%s' "$invite_token" > "$invite_file"
 unset invite_token
 chmod 0600 "$invite_file"
 
-git clone --quiet --depth 1 https://github.com/ilovn/mini-tunnel.git "$tmp_dir/mini-tunnel"
+github_mirror_prefix=${sh(mirrorPrefix)}
+if [[ -n "$github_mirror_prefix" ]]; then
+  export MINI_TUNNEL_GITHUB_MIRROR_PREFIX="$github_mirror_prefix"
+  repository_url="\${github_mirror_prefix}ilovn/mini-tunnel.git"
+else
+  repository_url=https://github.com/ilovn/mini-tunnel.git
+fi
+git clone --quiet --depth 1 "$repository_url" "$tmp_dir/mini-tunnel"
 cd "$tmp_dir/mini-tunnel"
 ./deploy/quick-install-peer.sh \\
   ${shellArgs}

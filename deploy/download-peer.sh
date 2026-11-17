@@ -25,6 +25,10 @@ downloads require authentication. The token is read only from the environment
 and is never written to disk or output. A recent GitHub CLI (gh) with artifact
 attestation support is required to verify the archive's Sigstore provenance
 against the repository, workflow, source ref, and source commit before use.
+
+For restricted networks, set MINI_TUNNEL_GITHUB_MIRROR_PREFIX to an HTTPS
+proxy prefix ending in /https://github.com/. GitHub API requests still use
+api.github.com directly; release asset downloads use the configured mirror.
 EOF
 }
 
@@ -82,12 +86,21 @@ case "$architecture" in
   *) die "architecture must be auto, x86_64, or aarch64" ;;
 esac
 [[ -n "$output_dir" ]] || die "output directory must not be empty"
+github_mirror_prefix=${MINI_TUNNEL_GITHUB_MIRROR_PREFIX:-}
+if [[ -n "$github_mirror_prefix" ]]; then
+  [[ "$github_mirror_prefix" == https://*/https://github.com/ &&
+    "$github_mirror_prefix" != *[[:space:]]* &&
+    "$github_mirror_prefix" != *'?'* &&
+    "$github_mirror_prefix" != *'#'* &&
+    "$github_mirror_prefix" != *'@'* ]] || die "MINI_TUNNEL_GITHUB_MIRROR_PREFIX must be an HTTPS proxy prefix ending in /https://github.com/"
+fi
 
 command -v curl >/dev/null || die "curl is required"
 command -v python3 >/dev/null || die "python3 is required for safe archive handling"
 command -v tar >/dev/null || die "tar is required"
 command -v gzip >/dev/null || die "gzip is required"
 command -v gh >/dev/null || die "GitHub CLI (gh) is required to verify Sigstore provenance"
+gh attestation verify --help >/dev/null 2>&1 || die "GitHub CLI (gh) must support 'attestation verify'; upgrade gh and retry"
 
 case "$(uname -s)" in
   Linux|Darwin) ;;
@@ -250,6 +263,12 @@ PY
   checksum_path="$temp_dir/$artifact_name.tar.gz.sha256"
   archive_url=$(asset_field "$archive_asset" browser_download_url)
   checksum_url=$(asset_field "$checksum_asset" browser_download_url)
+  if [[ -n "$github_mirror_prefix" ]]; then
+    [[ "$archive_url" == https://github.com/* ]] || die "GitHub returned an unsupported release asset URL"
+    [[ "$checksum_url" == https://github.com/* ]] || die "GitHub returned an unsupported checksum URL"
+    archive_url="${github_mirror_prefix}${archive_url#https://github.com/}"
+    checksum_url="${github_mirror_prefix}${checksum_url#https://github.com/}"
+  fi
   printf 'Downloading release archive...\n' >&2
   curl --silent --show-error --fail --location --retry 3 --retry-delay 2 \
     --connect-timeout 15 --max-time 600 \

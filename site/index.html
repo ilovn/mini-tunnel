@@ -217,7 +217,7 @@
               ></label>
               <details class="advanced full">
                 <summary>
-                  高级网络选项 <span>STUN、中继与私有证书</span>
+                  高级选项 <span>STUN、中继、私有证书与下载镜像</span>
                 </summary>
                 <div class="fields-two advanced-fields">
                   <label class="field"
@@ -249,6 +249,14 @@
                       placeholder="可选，例如 /etc/mini-tunnel/coordinator-ca.pem" /><small
                       >目标服务器上已存在的 PEM 文件路径</small
                     ><span class="error" data-error="coordinatorCa"></span
+                  ></label>
+                  <label class="field full"
+                    ><span>GitHub 下载镜像前缀</span
+                    ><input
+                      id="githubMirrorPrefix"
+                      placeholder="可选，例如 https://ghproxy.net/https://github.com/" /><small
+                      >目标机无法直连 GitHub 时填写；仍需能访问 api.github.com。镜像需支持 Git 仓库克隆与 Release 下载。</small
+                    ><span class="error" data-error="githubMirrorPrefix"></span
                   ></label>
                 </div>
               </details>
@@ -298,8 +306,8 @@
           </div>
           <pre id="script-output" tabindex="0"></pre>
           <p class="result-note">
-            运行前请检查脚本内容。目标机需安装 git、GitHub
-            CLI（gh）、curl、Python 3、tar 和 gzip。
+            运行前请检查脚本内容。目标机需安装 git、支持 attestation verify
+            的 GitHub CLI（gh）、curl、Python 3、tar 和 gzip。
           </p>
         </div>
       </section>

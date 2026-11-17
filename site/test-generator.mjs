@@ -20,6 +20,7 @@ const base = {
   relayServer: "relay.example.net:42001",
   udpRelayServer: "",
   coordinatorCa: "",
+  githubMirrorPrefix: "",
 };
 assert.deepEqual(validateConfig(base), {});
 assert.match(generateScript(base), /'--arch'[\s\\]+\s+'x86_64'/);
@@ -29,6 +30,7 @@ assert.match(
   /'--invite-token-file'[\s\\]+\s+"\$invite_file"/,
 );
 assert.doesNotMatch(generateScript(base), /test-invite-secret/);
+assert.match(generateScript(base), /gh attestation verify --help/);
 assert.equal(
   spawnSync("bash", ["-n"], { input: generateScript(base), encoding: "utf8" })
     .status,
@@ -41,6 +43,33 @@ assert.match(
 assert.match(
   generateScript({ ...base, versionMode: "release", release: "v1.2.3" }),
   /'v1\.2\.3'/,
+);
+const mirrored = {
+  ...base,
+  githubMirrorPrefix: "https://ghproxy.net/https://github.com/",
+};
+assert.deepEqual(validateConfig(mirrored), {});
+assert.match(generateScript(mirrored), /MINI_TUNNEL_GITHUB_MIRROR_PREFIX/);
+assert.match(generateScript(mirrored), /\$\{github_mirror_prefix\}ilovn\/mini-tunnel\.git/);
+assert.match(generateScript(mirrored), /'https:\/\/ghproxy\.net\/https:\/\/github\.com\/'/);
+assert.equal(
+  spawnSync("bash", ["-n"], {
+    input: generateScript(mirrored),
+    encoding: "utf8",
+  }).status,
+  0,
+);
+assert.ok(
+  validateConfig({ ...base, githubMirrorPrefix: "http://ghproxy.net/https://github.com/" })
+    .githubMirrorPrefix,
+);
+assert.ok(
+  validateConfig({ ...base, githubMirrorPrefix: "https://ghproxy.net/" })
+    .githubMirrorPrefix,
+);
+assert.ok(
+  validateConfig({ ...base, githubMirrorPrefix: "https://user@ghproxy.net/https://github.com/" })
+    .githubMirrorPrefix,
 );
 assert.ok(
   validateConfig({ ...base, versionMode: "release", release: "1.2.3" }).release,

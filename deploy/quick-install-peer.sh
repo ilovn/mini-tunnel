@@ -22,7 +22,9 @@ Peer install options are forwarded to deploy/install-peer.sh, for example:
 The script downloads a prebuilt artifact only. It does not compile binaries,
 create networks, or issue invites. CI artifact mode requires GITHUB_TOKEN in the
 environment; the token is not put in arguments or written to disk. A recent
-GitHub CLI (gh) is required to verify the binary's Sigstore provenance.
+GitHub CLI (gh) with `attestation verify` support is required to verify the
+binary's Sigstore provenance. Set MINI_TUNNEL_GITHUB_MIRROR_PREFIX to an HTTPS
+proxy prefix ending in /https://github.com/ when direct release downloads fail.
 EOF
 }
 
