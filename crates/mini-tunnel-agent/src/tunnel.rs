@@ -4440,13 +4440,65 @@ mod tests {
             status.peer == peer_ip.to_string() && status.online && status.active_path == "QUIC/UDP"
         }));
 
-        // Losing the Relay must discard the failed standby and retry pairing without disturbing
-        // the still-healthy direct path. Once Relay returns, the new standby should be reusable.
+        // A half-closed standby must be replaced even while Relay and direct UDP stay available.
+        let initial_calls = fallback_calls.load(Ordering::SeqCst);
+        let initial_generation = standby_generation.load(Ordering::SeqCst);
+        let first_standby = Arc::clone(
+            &remote_fallback
+                .lock()
+                .await
+                .as_ref()
+                .expect("first standby exists")
+                .channel,
+        );
+        first_standby.close_async().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if fallback_calls.load(Ordering::SeqCst) > initial_calls
+                    && standby_generation.load(Ordering::SeqCst) > initial_generation
+                    && remote_fallback
+                        .lock()
+                        .await
+                        .as_ref()
+                        .is_some_and(|standby| standby.channel.health_probe_requests_received() > 0)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a half-closed standby should be replaced while Relay remains available");
+        assert!(crate::status::snapshot().into_iter().any(|status| {
+            status.peer == peer_ip.to_string() && status.online && status.active_path == "QUIC/UDP"
+        }));
+        outbound_tx
+            .send(packet(local_ip, peer_ip, 27))
+            .await
+            .unwrap();
+        let direct_packet = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let packet = remote_initial.recv_packet().await.unwrap();
+                if !packet.is_empty() {
+                    break packet;
+                }
+            }
+        })
+        .await
+        .expect("direct UDP should remain usable while replacing the standby");
+        assert_eq!(direct_packet, packet(local_ip, peer_ip, 27));
+
+        // A full Relay outage must still discard the replacement and retry pairing.
         let failed_standby_calls = fallback_calls.load(Ordering::SeqCst);
         relay_task.abort();
         let _ = relay_task.await;
-        if let Some(standby) = remote_fallback.lock().await.as_ref() {
-            standby.channel.close_async().await;
+        let replacement_standby = remote_fallback
+            .lock()
+            .await
+            .as_ref()
+            .map(|standby| Arc::clone(&standby.channel));
+        if let Some(standby) = replacement_standby {
+            standby.close_async().await;
         }
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -4484,7 +4536,7 @@ mod tests {
             tokio::spawn(async move { restarted_server.run(restarted_listener).await });
         tokio::time::timeout(Duration::from_secs(8), async {
             loop {
-                if standby_generation.load(Ordering::SeqCst) >= 2
+                if standby_generation.load(Ordering::SeqCst) >= initial_generation + 2
                     && remote_fallback
                         .lock()
                         .await

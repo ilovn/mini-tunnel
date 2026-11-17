@@ -4097,9 +4097,13 @@ fn spawn_mesh_membership_refresh_with_period(
         let mut pending = std::collections::HashMap::<String, tokio::task::JoinHandle<()>>::new();
         let mut refresh = tokio::time::interval(period);
         refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut refresh_attempt = 0_u64;
 
         loop {
             refresh.tick().await;
+            refresh_attempt = refresh_attempt.saturating_add(1);
+            let refresh_started = Instant::now();
+            tracing::debug!(refresh_attempt, "mesh membership snapshot refresh started");
             let discovered = tokio::time::timeout(
                 Duration::from_secs(8),
                 discover_peers(&coordinator_url, &network_id, &identity),
@@ -4122,15 +4126,31 @@ fn spawn_mesh_membership_refresh_with_period(
                     {
                         return;
                     }
+                    tracing::warn!(
+                        refresh_attempt,
+                        elapsed_ms = refresh_started.elapsed().as_millis() as u64,
+                        "mesh membership snapshot refresh failed"
+                    );
                     eprintln!("mesh membership refresh failed; keeping current peers: {error}");
                     continue;
                 }
                 Err(_) => {
+                    tracing::warn!(
+                        refresh_attempt,
+                        elapsed_ms = refresh_started.elapsed().as_millis() as u64,
+                        "mesh membership snapshot refresh timed out"
+                    );
                     eprintln!("mesh membership refresh timed out; keeping current peers");
                     continue;
                 }
             };
             if peers.len() > mini_tunnel_protocol::MAX_NETWORK_MEMBERS {
+                tracing::warn!(
+                    refresh_attempt,
+                    peer_count = peers.len(),
+                    elapsed_ms = refresh_started.elapsed().as_millis() as u64,
+                    "mesh membership snapshot exceeded the local peer limit"
+                );
                 eprintln!("mesh membership snapshot exceeds the local peer limit; ignoring it");
                 continue;
             }
@@ -4141,12 +4161,26 @@ fn spawn_mesh_membership_refresh_with_period(
                 })
                 .collect::<Result<Vec<_>, _>>();
             let Ok(allowed) = allowed else {
+                tracing::warn!(
+                    refresh_attempt,
+                    elapsed_ms = refresh_started.elapsed().as_millis() as u64,
+                    "mesh membership snapshot contains an invalid peer key"
+                );
                 eprintln!("mesh membership snapshot contains an invalid peer key; ignoring it");
                 continue;
             };
 
             let (removed, added) = mesh_membership_diff(&known, &peers);
             let candidates_changed = mesh_candidate_changes(&known, &peers);
+            tracing::debug!(
+                refresh_attempt,
+                peer_count = peers.len(),
+                added_peers = added.len(),
+                removed_peers = removed.len(),
+                candidate_changes = candidates_changed.len(),
+                elapsed_ms = refresh_started.elapsed().as_millis() as u64,
+                "mesh membership snapshot refresh succeeded"
+            );
             let next = peers
                 .iter()
                 .map(|peer| (peer.device_id.clone(), peer.clone()))
