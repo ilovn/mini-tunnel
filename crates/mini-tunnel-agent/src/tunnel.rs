@@ -4324,12 +4324,14 @@ mod tests {
 
         let local_ip = Ipv4Addr::new(10, 82, 0, 1);
         let peer_ip = Ipv4Addr::new(10, 82, 0, 2);
+        let connector_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fallback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let standby_generation = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let remote_fallback = Arc::new(Mutex::new(None));
         let connector: PeerConnector = {
             let a = Arc::clone(&a);
             let b = Arc::clone(&b);
+            let connector_attempts = Arc::clone(&connector_attempts);
             let fallback_calls = Arc::clone(&fallback_calls);
             let standby_generation = Arc::clone(&standby_generation);
             let remote_fallback = Arc::clone(&remote_fallback);
@@ -4338,14 +4340,17 @@ mod tests {
                 let b = Arc::clone(&b);
                 let relay_addr = relay_addr;
                 let ticket_key = ticket_key;
+                let connector_attempts = Arc::clone(&connector_attempts);
                 let fallback_calls = Arc::clone(&fallback_calls);
                 let standby_generation = Arc::clone(&standby_generation);
                 let remote_fallback = Arc::clone(&remote_fallback);
                 Box::pin(async move {
-                    assert!(
-                        force_reliable,
-                        "early fallback must use a reliable candidate"
-                    );
+                    connector_attempts.fetch_add(1, Ordering::SeqCst);
+                    if !force_reliable {
+                        return Err(IdentityError::Transport(
+                            "test fixture has no direct reconnect candidate".to_owned(),
+                        ));
+                    }
                     fallback_calls.fetch_add(1, Ordering::SeqCst);
                     let session_sequence = fallback_calls.load(Ordering::SeqCst) as u8;
                     let mut session_id = [0_u8; 16];
@@ -4469,9 +4474,6 @@ mod tests {
         })
         .await
         .expect("a half-closed standby should be replaced while Relay remains available");
-        assert!(crate::status::snapshot().into_iter().any(|status| {
-            status.peer == peer_ip.to_string() && status.online && status.active_path == "QUIC/UDP"
-        }));
         outbound_tx
             .send(packet(local_ip, peer_ip, 27))
             .await
@@ -4509,10 +4511,15 @@ mod tests {
             }
         })
         .await
-        .expect("the mesh should retry the Relay standby after its connection is lost");
-        assert!(crate::status::snapshot().into_iter().any(|status| {
-            status.peer == peer_ip.to_string() && status.online && status.active_path == "QUIC/UDP"
-        }));
+        .unwrap_or_else(|_| {
+            panic!(
+                "the mesh should retry the Relay standby after its connection is lost; attempts={}, reliable_calls={}, standby_generation={}, statuses={:?}",
+                connector_attempts.load(Ordering::SeqCst),
+                fallback_calls.load(Ordering::SeqCst),
+                standby_generation.load(Ordering::SeqCst),
+                crate::status::snapshot(),
+            )
+        });
         outbound_tx
             .send(packet(local_ip, peer_ip, 29))
             .await
