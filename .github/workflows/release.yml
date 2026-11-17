@@ -151,7 +151,7 @@ jobs:
             ./dist/mini-tunnel.exe --version
             ./dist/mini-tunnel.exe --help >/dev/null
             powershell -NoProfile -Command "Compress-Archive -Path 'dist/mini-tunnel.exe' -DestinationPath '$ARCHIVE'"
-            powershell -NoProfile -Command "(Get-FileHash -Algorithm SHA256 '$ARCHIVE').Hash.ToLower() + '  $ARCHIVE' | Set-Content -Encoding ascii '$ARCHIVE.sha256'"
+            powershell -NoProfile -Command '$hash = (Get-FileHash -Algorithm SHA256 $env:ARCHIVE).Hash.ToLower(); [IO.File]::WriteAllText("$env:ARCHIVE.sha256", "$hash  $env:ARCHIVE`n", [Text.Encoding]::ASCII)'
           else
             install -m 0755 "target/$RUST_TARGET/release/mini-tunnel" dist/mini-tunnel
             dist/mini-tunnel --version
@@ -193,7 +193,7 @@ jobs:
       - name: Download release staging artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          pattern: release-linux-*
+          pattern: release-*
           merge-multiple: true
           path: staging
 
