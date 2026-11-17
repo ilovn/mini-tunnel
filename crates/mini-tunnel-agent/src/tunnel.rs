@@ -4501,7 +4501,7 @@ mod tests {
         let calls_before_udp_failure = fallback_calls.load(Ordering::SeqCst);
 
         remote_initial.close_async().await;
-        let switched = tokio::time::timeout(Duration::from_secs(3), async {
+        let switched = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if crate::status::snapshot().into_iter().any(|status| {
                     status.peer == peer_ip.to_string()

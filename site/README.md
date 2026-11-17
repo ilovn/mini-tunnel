@@ -14,6 +14,6 @@ For hosts that cannot reach GitHub directly, open **高级选项** and set a Git
 
 Use **生成 UUID** when creating a new network. The adjacent **创建新网络** panel builds a CLI command that sends this same ID to a Coordinator running the new `--network-id` API. Both the CLI and Coordinator must support the flag. Run that command, then create a one-use invite with the returned admin token. The same ID remains in the peer deployment form. Existing Coordinator networks should keep using their assigned ID.
 
-The tunnel client also has macOS and Windows support, but this repository does not publish the matching official prebuilt artifacts or one-click service installers yet; the wizard labels those platforms as not available.
+The tunnel client also has macOS and Windows support, but the current stable release does not publish matching prebuilt artifacts. The release workflow is being extended for macOS Intel/Apple Silicon and Windows x64/ARM64 command-line archives. These archives do not provide signed/notarized installers or managed system services, so the wizard continues to mark those platforms as unavailable until release artifacts and platform-specific setup flows are verified.
 
 Run generator checks with `node site/test-generator.mjs`.

@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -105,10 +106,81 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  desktop-release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: mini-tunnel-macos-x86_64.tar.gz
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            archive: mini-tunnel-macos-aarch64.tar.gz
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            archive: mini-tunnel-windows-x86_64.zip
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            archive: mini-tunnel-windows-aarch64.zip
+    name: Desktop ${{ matrix.target }} release
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    env:
+      ARCHIVE: ${{ matrix.archive }}
+      RUST_TARGET: ${{ matrix.target }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Build and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --bin mini-tunnel --target "$RUST_TARGET"
+          mkdir dist
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            cp "target/$RUST_TARGET/release/mini-tunnel.exe" dist/mini-tunnel.exe
+            ./dist/mini-tunnel.exe --version
+            ./dist/mini-tunnel.exe --help >/dev/null
+            powershell -NoProfile -Command "Compress-Archive -Path 'dist/mini-tunnel.exe' -DestinationPath '$ARCHIVE'"
+            powershell -NoProfile -Command "(Get-FileHash -Algorithm SHA256 '$ARCHIVE').Hash.ToLower() + '  $ARCHIVE' | Set-Content -Encoding ascii '$ARCHIVE.sha256'"
+          else
+            install -m 0755 "target/$RUST_TARGET/release/mini-tunnel" dist/mini-tunnel
+            dist/mini-tunnel --version
+            dist/mini-tunnel --help >/dev/null
+            tar -C dist -czf "$ARCHIVE" mini-tunnel
+            shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+          fi
+
+      - name: Attest desktop release archive
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ env.ARCHIVE }}
+
+      - name: Upload desktop staging artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+          if-no-files-found: error
+          retention-days: 1
+
   publish:
     name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
     needs:
       - linux-release
+      - desktop-release
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -127,14 +199,18 @@ jobs:
 
       - name: Verify release staging artifacts
         env:
-          EXPECTED_NAMES: mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz.sha256 mini-tunnel-linux-aarch64-ubuntu22.04.tar.gz mini-tunnel-linux-aarch64-ubuntu22.04.tar.gz.sha256
+          EXPECTED_NAMES: mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz.sha256 mini-tunnel-linux-aarch64-ubuntu22.04.tar.gz mini-tunnel-linux-aarch64-ubuntu22.04.tar.gz.sha256 mini-tunnel-macos-x86_64.tar.gz mini-tunnel-macos-x86_64.tar.gz.sha256 mini-tunnel-macos-aarch64.tar.gz mini-tunnel-macos-aarch64.tar.gz.sha256 mini-tunnel-windows-x86_64.zip mini-tunnel-windows-x86_64.zip.sha256 mini-tunnel-windows-aarch64.zip mini-tunnel-windows-aarch64.zip.sha256
         run: |
           set -euo pipefail
           actual_names="$(find staging -type f -printf '%f\n' | sort)"
           expected_names="$(printf '%s\n' $EXPECTED_NAMES | sort)"
           diff -u <(printf '%s\n' "$expected_names") <(printf '%s\n' "$actual_names")
-          for archive in staging/*.tar.gz; do
+          for archive in staging/mini-tunnel-linux-*.tar.gz staging/mini-tunnel-macos-*.tar.gz; do
             test "$(tar -tzf "$archive")" = mini-tunnel
+          done
+          for archive in staging/mini-tunnel-windows-*.zip; do
+            unzip -tq "$archive"
+            test "$(unzip -Z1 "$archive")" = mini-tunnel.exe
           done
           (
             cd staging
