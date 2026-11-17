@@ -189,6 +189,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       TAG: ${{ github.ref_name }}
+      EXPECTED_RELEASE_ASSETS: mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz mini-tunnel-linux-x86_64-ubuntu20.04.tar.gz.sha256 mini-tunnel-linux-aarch64-ubuntu22.04.tar.gz mini-tunnel-linux-aarch64-ubuntu22.04.tar.gz.sha256 mini-tunnel-macos-x86_64.tar.gz mini-tunnel-macos-x86_64.tar.gz.sha256 mini-tunnel-macos-aarch64.tar.gz mini-tunnel-macos-aarch64.tar.gz.sha256 mini-tunnel-windows-x86_64.zip mini-tunnel-windows-x86_64.zip.sha256 mini-tunnel-windows-aarch64.zip mini-tunnel-windows-aarch64.zip.sha256 SHA256SUMS
     steps:
       - name: Download release staging artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
@@ -222,11 +223,18 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" --clobber staging/*.tar.gz staging/*.sha256 staging/SHA256SUMS
+            gh release upload "$TAG" --clobber staging/*.tar.gz staging/*.zip staging/*.sha256 staging/SHA256SUMS
           else
             gh release create "$TAG" \
               --verify-tag \
               --generate-notes \
               --title "$TAG" \
-              staging/*.tar.gz staging/*.sha256 staging/SHA256SUMS
+              staging/*.tar.gz staging/*.zip staging/*.sha256 staging/SHA256SUMS
           fi
+
+      - name: Verify published release asset set
+        run: |
+          set -euo pipefail
+          actual_names="$(gh release view "$TAG" --json assets --jq '.assets[].name' | sort)"
+          expected_names="$(printf '%s\n' $EXPECTED_RELEASE_ASSETS | sort)"
+          diff -u <(printf '%s\n' "$expected_names") <(printf '%s\n' "$actual_names")

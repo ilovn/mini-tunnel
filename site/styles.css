@@ -818,6 +818,20 @@ legend,
   color: #89938c;
   font-size: 9px;
 }
+.platform-downloads {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 7px;
+  font-size: 9px;
+}
+.platform-downloads a {
+  color: var(--green);
+  text-decoration: none;
+}
+.platform-downloads a:hover {
+  text-decoration: underline;
+}
 .status-pill {
   padding: 5px 8px;
   border-radius: 20px;

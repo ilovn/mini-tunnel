@@ -348,7 +348,7 @@
           <div class="section-kicker">PLATFORM SUPPORT</div>
           <h2>按真实可用的平台生成</h2>
           <p>
-            一键部署目前面向 Linux。其他平台需要使用对应版本的命令行程序，并自行配置隧道权限与系统服务。
+            Linux 提供一键部署。macOS 与 Windows 可下载命令行程序；平台服务安装器尚未提供。
           </p>
         </div>
         <div class="platform-list">
@@ -367,20 +367,28 @@
             </div>
             <span class="status-pill ready">可生成脚本</span>
           </div>
-          <div class="platform-row muted-row">
+          <div class="platform-row">
             <span class="platform-icon apple">⌘</span>
             <div>
-              <b>macOS</b><small>当前正式版暂无预构建包；命令行包计划支持 Intel 与 Apple Silicon</small>
+              <b>macOS</b><small>命令行包 · 未公证 · 尚无一键服务安装器</small>
+              <div class="platform-downloads">
+                <a href="https://github.com/ilovn/mini-tunnel/releases/latest/download/mini-tunnel-macos-x86_64.tar.gz">Intel 下载</a>
+                <a href="https://github.com/ilovn/mini-tunnel/releases/latest/download/mini-tunnel-macos-aarch64.tar.gz">Apple Silicon 下载</a>
+              </div>
             </div>
-            <span class="status-pill planned">尚未发布</span>
+            <span class="status-pill ready">已发布</span>
           </div>
-          <div class="platform-row muted-row">
+          <div class="platform-row">
             <span class="platform-icon windows">⊞</span>
             <div>
               <b>Windows</b
-              ><small>当前正式版暂无预构建包；命令行包计划支持 x64 与 ARM64</small>
+              ><small>命令行包 · 未签名 · 尚无一键服务安装器</small>
+              <div class="platform-downloads">
+                <a href="https://github.com/ilovn/mini-tunnel/releases/latest/download/mini-tunnel-windows-x86_64.zip">x64 下载</a>
+                <a href="https://github.com/ilovn/mini-tunnel/releases/latest/download/mini-tunnel-windows-aarch64.zip">ARM64 下载</a>
+              </div>
             </div>
-            <span class="status-pill planned">尚未发布</span>
+            <span class="status-pill ready">已发布</span>
           </div>
         </div>
       </section>

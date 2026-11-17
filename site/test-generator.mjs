@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import {
   generateNetworkCreateCommand,
   generateNetworkId,
@@ -137,4 +138,14 @@ assert.equal(
   spawnSync("bash", ["-n"], { input: createCommand, encoding: "utf8" }).status,
   0,
 );
+const siteHtml = await readFile(new URL("./index.html", import.meta.url), "utf8");
+for (const archive of [
+  "mini-tunnel-macos-x86_64.tar.gz",
+  "mini-tunnel-macos-aarch64.tar.gz",
+  "mini-tunnel-windows-x86_64.zip",
+  "mini-tunnel-windows-aarch64.zip",
+]) {
+  assert.ok(siteHtml.includes(`/releases/latest/download/${archive}`), archive);
+}
+assert.match(siteHtml, /尚无一键服务安装器/);
 console.log("site generator tests passed");
