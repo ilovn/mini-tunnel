@@ -7,6 +7,97 @@ const validEndpoint = (value) =>
   Number(value.slice(value.lastIndexOf(":") + 1)) > 0 &&
   Number(value.slice(value.lastIndexOf(":") + 1)) <= 65535;
 
+export function generateNetworkId(randomSource = globalThis.crypto) {
+  if (typeof randomSource?.randomUUID === "function")
+    return randomSource.randomUUID();
+  const bytes = randomSource.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, "0"));
+  return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10).join("")}`;
+}
+
+export function validateNetworkSetup({
+  networkId,
+  coordinatorUrl,
+  name,
+  cidr,
+  coordinatorCa = "",
+}) {
+  const errors = {};
+  let parsed;
+  try {
+    parsed = new URL(coordinatorUrl);
+  } catch {
+    errors.coordinatorUrl = "请输入有效的 Coordinator URL";
+  }
+  if (parsed && !["https:", "http:"].includes(parsed.protocol))
+    errors.coordinatorUrl = "Coordinator URL 必须使用 HTTP 或 HTTPS";
+  if (
+    parsed &&
+    parsed.protocol === "http:" &&
+    !["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)
+  )
+    errors.coordinatorUrl = "远程 Coordinator 必须使用 HTTPS";
+  if (
+    parsed &&
+    (parsed.username || parsed.password || parsed.search || parsed.hash)
+  )
+    errors.coordinatorUrl = "URL 不应包含账号密码、查询参数或片段";
+  if (!UUID.test(networkId || ""))
+    errors.networkId = "请先生成有效的 UUID 网络 ID";
+  if (
+    !name ||
+    new TextEncoder().encode(name).length > 64 ||
+    /[\u0000-\u001f\u007f]/.test(name)
+  )
+    errors.name = "网络名称需为 1–64 字节，且不能含控制字符";
+  if (!isPrivateNetworkCidr(cidr))
+    errors.cidr = "请输入 RFC1918 私网网段，掩码范围 /16–/30";
+  if (
+    coordinatorCa &&
+    (!coordinatorCa.startsWith("/") ||
+      !/^[a-zA-Z0-9_./-]+$/.test(coordinatorCa))
+  )
+    errors.coordinatorCa = "请输入目标机器上的绝对 CA 文件路径";
+  return errors;
+}
+
+function isPrivateNetworkCidr(cidr) {
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/.exec(
+    cidr || "",
+  );
+  if (!match) return false;
+  const octets = match.slice(1, 5).map(Number);
+  const prefix = Number(match[5]);
+  if (octets.some((part) => part > 255) || prefix < 16 || prefix > 30)
+    return false;
+  const privateAddress =
+    octets[0] === 10 ||
+    (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
+    (octets[0] === 192 && octets[1] === 168);
+  const address =
+    (((octets[0] * 256 + octets[1]) * 256 + octets[2]) * 256 + octets[3]) >>> 0;
+  const mask = (0xffffffff << (32 - prefix)) >>> 0;
+  return privateAddress && (address & mask) >>> 0 === address;
+}
+
+export function generateNetworkCreateCommand(config) {
+  const errors = validateNetworkSetup(config);
+  if (Object.keys(errors).length) throw new Error("请先修正网络创建参数");
+  const parts = [];
+  if (config.coordinatorCa)
+    parts.push(
+      `MINI_TUNNEL_COORDINATOR_CA_CERT_FILE=${sh(config.coordinatorCa)}`,
+    );
+  parts.push("mini-tunnel network create");
+  parts.push(`--name ${sh(config.name)}`);
+  parts.push(`--cidr ${sh(config.cidr)}`);
+  parts.push(`--network-id ${sh(config.networkId)}`);
+  parts.push(`--coordinator-url ${sh(config.coordinatorUrl)}`);
+  return parts.join(" \\\n  ");
+}
+
 export function validateConfig(config) {
   const errors = {};
   let parsed;

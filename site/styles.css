@@ -419,6 +419,94 @@ legend,
 .field input::placeholder {
   color: #a7b0aa;
 }
+.id-input-row {
+  display: flex;
+  gap: 8px;
+}
+.id-input-row input {
+  min-width: 0;
+  flex: 1;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.inline-button {
+  flex: none;
+  border: 1px solid #d4e3d7;
+  border-radius: 8px;
+  padding: 0 11px;
+  background: #f1f8f2;
+  color: var(--green);
+  font: 600 10px var(--sans);
+  cursor: pointer;
+}
+.inline-button:hover {
+  background: #e5f2e8;
+}
+.network-create {
+  padding: 14px 0 0;
+  border-top: 1px solid #edf0ed;
+}
+.network-create summary {
+  cursor: pointer;
+  color: #3a4940;
+  font-size: 11px;
+  font-weight: 700;
+  list-style: none;
+}
+.network-create summary::-webkit-details-marker {
+  display: none;
+}
+.network-create summary::after {
+  content: "+";
+  float: right;
+  color: var(--green);
+}
+.network-create[open] summary::after {
+  content: "−";
+}
+.network-create summary span {
+  margin-left: 8px;
+  color: #939e96;
+  font-size: 9px;
+  font-weight: 400;
+}
+.network-create-fields {
+  margin-top: 15px;
+}
+.network-command {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.network-command b,
+.network-command small {
+  display: block;
+}
+.network-command b {
+  font-size: 10px;
+}
+.network-command small {
+  margin-top: 4px;
+  color: #879289;
+  font-size: 9px;
+  line-height: 1.5;
+}
+.network-command-output {
+  overflow-x: auto;
+  margin: 0;
+  padding: 12px;
+  border-radius: 8px;
+  background: #19231e;
+  color: #d8e5dc;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 9px/1.65 var(--mono);
+}
+.secondary-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
 .field small {
   font-size: 9px;
   color: #919b94;

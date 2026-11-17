@@ -380,6 +380,9 @@ pub enum ControlMessage {
 pub struct CreateNetworkRequest {
     pub name: String,
     pub cidr: String,
+    /// Optional client-selected UUID. Older clients omit this field and let the Coordinator assign it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -509,6 +512,16 @@ pub enum ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_network_request_accepts_legacy_shape_and_omits_absent_id() {
+        let legacy: CreateNetworkRequest =
+            serde_json::from_str(r#"{"name":"office","cidr":"10.77.0.0/24"}"#)
+                .expect("legacy request remains valid");
+        assert_eq!(legacy.network_id, None);
+        let encoded = serde_json::to_value(legacy).expect("request serializes");
+        assert!(encoded.get("network_id").is_none());
+    }
 
     #[test]
     fn overlay_ipv6_addresses_are_stable_unique_ula_members() {

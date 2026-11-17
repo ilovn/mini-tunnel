@@ -108,22 +108,77 @@
                 ><input
                   id="coordinatorUrl"
                   autocomplete="url"
-                  value="https://coordinator.example.com"
+                  value=""
                   placeholder="https://coordinator.example.com"
                   required /><small id="coordinator-help"
                   >填写管理员提供的 Coordinator 地址。</small
                 ><span class="error" data-error="coordinatorUrl"></span
               ></label>
               <label class="field full"
-                ><span>网络 ID <sup>*</sup></span
-                ><input
-                  id="networkId"
-                  spellcheck="false"
-                  value=""
-                  placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-                  required /><small>由 Coordinator 管理员创建网络后提供。</small
+                ><span>网络 ID <sup>*</sup></span>
+                <div class="id-input-row">
+                  <input
+                    id="networkId"
+                    spellcheck="false"
+                    value=""
+                    placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                    required
+                  /><button
+                    type="button"
+                    id="generate-id-button"
+                    class="inline-button"
+                  >
+                    生成 UUID
+                  </button>
+                </div>
+                <small
+                  >已有网络填管理员提供的
+                  ID；新建网络可在此生成并使用下方命令创建。</small
                 ><span class="error" data-error="networkId"></span
               ></label>
+              <details class="network-create full">
+                <summary>
+                  创建新网络
+                  <span>生成 ID 后，复制 CLI 命令在任意管理机执行</span>
+                </summary>
+                <div class="fields-two network-create-fields">
+                  <label class="field"
+                    ><span>网络名称</span
+                    ><input
+                      id="networkName"
+                      value="my-network"
+                      maxlength="64" /><span
+                      class="error"
+                      data-error="name"
+                    ></span
+                  ></label>
+                  <label class="field"
+                    ><span>IPv4 网段</span
+                    ><input id="networkCidr" value="10.77.0.0/24" /><small
+                      >RFC1918 私网，掩码 /16–/30</small
+                    ><span class="error" data-error="cidr"></span
+                  ></label>
+                  <div class="network-command full">
+                    <div>
+                      <b>网络创建命令</b
+                      ><small
+                        >需要支持 --network-id 的 mini-tunnel CLI；创建后管理员
+                        token 仅显示一次。</small
+                      >
+                    </div>
+                    <button
+                      type="button"
+                      id="copy-network-command"
+                      class="secondary-button"
+                    >
+                      复制命令
+                    </button>
+                  </div>
+                  <pre id="network-command" class="network-command-output full">
+先生成网络 UUID 并填写 Coordinator 地址</pre
+                  >
+                </div>
+              </details>
               <label class="field"
                 ><span>节点名称</span
                 ><input id="instance" value="my-device" maxlength="48" /><small

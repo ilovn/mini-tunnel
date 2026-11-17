@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { generateScript, validateConfig } from "./generator.mjs";
+import {
+  generateNetworkCreateCommand,
+  generateNetworkId,
+  generateScript,
+  validateConfig,
+  validateNetworkSetup,
+} from "./generator.mjs";
 
 const base = {
   coordinatorUrl: "https://coord.example.net:8443",
@@ -44,6 +50,7 @@ assert.equal(
     .coordinatorUrl,
   "远程 Coordinator 必须使用 HTTPS",
 );
+assert.ok(validateConfig({ ...base, coordinatorUrl: "" }).coordinatorUrl);
 assert.ok(
   validateConfig({
     ...base,
@@ -65,4 +72,40 @@ assert.ok(
   validateConfig({ ...base, coordinatorCa: "relative/ca.pem" }).coordinatorCa,
 );
 assert.throws(() => generateScript({ ...base, networkId: "x" }), /修正配置/);
+
+const generatedId = generateNetworkId({
+  getRandomValues(bytes) {
+    bytes.fill(0);
+    return bytes;
+  },
+});
+assert.equal(generatedId, "00000000-0000-4000-8000-000000000000");
+const networkSetup = {
+  networkId: generatedId,
+  coordinatorUrl: base.coordinatorUrl,
+  name: "office mesh",
+  cidr: "10.77.0.0/24",
+};
+assert.deepEqual(validateNetworkSetup(networkSetup), {});
+assert.ok(
+  validateNetworkSetup({ ...networkSetup, coordinatorUrl: "" }).coordinatorUrl,
+);
+const createCommand = generateNetworkCreateCommand(networkSetup);
+assert.match(
+  createCommand,
+  /--network-id '00000000-0000-4000-8000-000000000000'/,
+);
+assert.match(createCommand, /--cidr '10\.77\.0\.0\/24'/);
+assert.ok(validateNetworkSetup({ ...networkSetup, cidr: "8.8.8.0/24" }).cidr);
+assert.ok(validateNetworkSetup({ ...networkSetup, cidr: "10.77.0.1/24" }).cidr);
+assert.ok(validateNetworkSetup({ ...networkSetup, cidr: "10.77.0.0/31" }).cidr);
+const quotedNameCommand = generateNetworkCreateCommand({
+  ...networkSetup,
+  name: "lab'; touch /tmp/unexpected",
+});
+assert.match(quotedNameCommand, /'lab'\\''; touch \/tmp\/unexpected'/);
+assert.equal(
+  spawnSync("bash", ["-n"], { input: createCommand, encoding: "utf8" }).status,
+  0,
+);
 console.log("site generator tests passed");

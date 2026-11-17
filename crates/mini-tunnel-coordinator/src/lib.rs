@@ -938,10 +938,22 @@ impl CoordinatorState {
         {
             return Err(ApiError::Conflict("cidr overlaps an existing network"));
         }
-        let network_id = loop {
-            let id = Uuid::new_v4();
-            if !store.networks.contains_key(&id) && ipv6_prefix_available(&store, id) {
-                break id;
+        let network_id = if let Some(network_id) = request.network_id {
+            if store.networks.contains_key(&network_id) {
+                return Err(ApiError::Conflict("network ID already exists"));
+            }
+            if !ipv6_prefix_available(&store, network_id) {
+                return Err(ApiError::Conflict(
+                    "network ID produces an IPv6 prefix already in use",
+                ));
+            }
+            network_id
+        } else {
+            loop {
+                let id = Uuid::new_v4();
+                if !store.networks.contains_key(&id) && ipv6_prefix_available(&store, id) {
+                    break id;
+                }
             }
         };
         let previous = store.clone();
@@ -4445,6 +4457,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_network_accepts_requested_id_and_rejects_duplicates() {
+        let state = CoordinatorState::default();
+        let requested_id = Uuid::new_v4();
+        let created = state
+            .create_network(CreateNetworkRequest {
+                name: "requested id".to_owned(),
+                cidr: "10.86.0.0/24".to_owned(),
+                network_id: Some(requested_id),
+            })
+            .await
+            .expect("requested ID is accepted");
+        assert_eq!(created.network_id, requested_id.to_string());
+
+        let duplicate = state
+            .create_network(CreateNetworkRequest {
+                name: "duplicate id".to_owned(),
+                cidr: "10.87.0.0/24".to_owned(),
+                network_id: Some(requested_id),
+            })
+            .await
+            .expect_err("an existing ID must not be reused");
+        assert!(matches!(
+            duplicate,
+            ApiError::Conflict("network ID already exists")
+        ));
+    }
+
+    #[tokio::test]
     async fn metrics_are_loopback_only_and_report_basic_service_totals() {
         let state = CoordinatorState {
             request_limiter: RequestRateLimiter::new(1, Duration::from_secs(60)),
@@ -4610,6 +4650,7 @@ mod tests {
         CreateNetworkRequest {
             name: name.to_owned(),
             cidr: cidr.to_owned(),
+            network_id: None,
         }
     }
 
