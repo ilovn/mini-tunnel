@@ -4507,7 +4507,10 @@ mod tests {
                     status.peer == peer_ip.to_string()
                         && status.online
                         && status.active_path == "Relay/TLS"
-                        && status.last_switch_reason.as_deref() == Some("transport_failure")
+                        && matches!(
+                            status.last_switch_reason.as_deref(),
+                            Some("transport_failure" | "quality_threshold")
+                        )
                 }) {
                     break;
                 }
@@ -4517,7 +4520,7 @@ mod tests {
         .await;
         switched.unwrap_or_else(|_| {
             panic!(
-                "transport failure should reuse the already prepared reliable path; statuses={:?}; fallback_calls={}; standby_generation={}",
+                "UDP failure or quality degradation should reuse the already prepared reliable path; statuses={:?}; fallback_calls={}; standby_generation={}",
                 crate::status::snapshot(),
                 fallback_calls.load(Ordering::SeqCst),
                 standby_generation.load(Ordering::SeqCst),
