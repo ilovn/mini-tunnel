@@ -1831,7 +1831,7 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
 name = "mini-tunnel"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "axum-server",
@@ -1860,7 +1860,7 @@ dependencies = [
 
 [[package]]
 name = "mini-tunnel-agent"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -1893,7 +1893,7 @@ dependencies = [
 
 [[package]]
 name = "mini-tunnel-coordinator"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "axum-server",
@@ -1924,7 +1924,7 @@ dependencies = [
 
 [[package]]
 name = "mini-tunnel-protocol"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.23.1",
  "hmac 0.13.0",
@@ -1937,7 +1937,7 @@ dependencies = [
 
 [[package]]
 name = "mini-tunnel-relay"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.4.3",
