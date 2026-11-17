@@ -108,6 +108,14 @@ class VerifyPeerAttestationTests(unittest.TestCase):
         self.assertIn(b"--deny-self-hosted-runners", args)
         self.assertIn(b"--bundle", args)
 
+    def test_manual_release_workflow_can_verify_main_branch_artifacts(self) -> None:
+        result = self.run_helper("release.yml", "refs/heads/main")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.arguments_file.read_bytes().split(b"\0")[:-1]
+        self.assertIn(b"ilovn/mini-tunnel/.github/workflows/release.yml", args)
+        self.assertIn(b"refs/heads/main", args)
+        self.assertIn(COMMIT.encode(), args)
+
     def _bundle_arg(self) -> bytes:
         args = self.arguments_file.read_bytes().split(b"\0")[:-1]
         return args[args.index(b"--bundle") + 1]
@@ -115,7 +123,7 @@ class VerifyPeerAttestationTests(unittest.TestCase):
     def test_rejects_unknown_workflow_or_unapproved_source_ref(self) -> None:
         for workflow, source_ref in (
             ("ci.yml", "refs/heads/attacker"),
-            ("release.yml", "refs/heads/main"),
+            ("release.yml", "refs/heads/attacker"),
             ("other.yml", "refs/tags/v1.2.3"),
         ):
             with self.subTest(workflow=workflow, source_ref=source_ref):

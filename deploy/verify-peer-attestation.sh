@@ -19,6 +19,7 @@ source_commit=$5
 
 case "$workflow:$source_ref" in
   ci.yml:refs/heads/main) ;;
+  release.yml:refs/heads/main) ;;
   release.yml:refs/tags/v[A-Za-z0-9._/-]*) ;;
   *) die "workflow and source ref are not an approved peer build identity" ;;
 esac

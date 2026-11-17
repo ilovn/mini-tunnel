@@ -4515,7 +4515,14 @@ mod tests {
             }
         })
         .await;
-        switched.expect("transport failure should reuse the already prepared reliable path");
+        switched.unwrap_or_else(|_| {
+            panic!(
+                "transport failure should reuse the already prepared reliable path; statuses={:?}; fallback_calls={}; standby_generation={}",
+                crate::status::snapshot(),
+                fallback_calls.load(Ordering::SeqCst),
+                standby_generation.load(Ordering::SeqCst),
+            )
+        });
         assert_eq!(
             fallback_calls.load(Ordering::SeqCst),
             calls_before_udp_failure
