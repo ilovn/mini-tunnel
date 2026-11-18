@@ -29,6 +29,7 @@ const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DIRECT_PROBE_HANDOFF_GRACE: Duration = Duration::from_secs(2);
 const DIRECT_PROBE_BACKOFF_MAX: Duration = Duration::from_secs(300);
 const DIRECT_PROBE_BACKOFF_RESET_AFTER: Duration = Duration::from_secs(60);
+const DIRECT_PROBE_RENDEZVOUS_INTERVAL: Duration = Duration::from_secs(30);
 const IMMEDIATE_DIRECT_PROBE_DELAY: Duration = Duration::from_millis(1);
 
 fn mesh_event_queue_capacity(peer_count: usize) -> usize {
@@ -334,6 +335,30 @@ fn next_direct_probe_cooldown(
 
 fn direct_probe_interval(cooldown: Duration) -> tokio::time::Interval {
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + cooldown, cooldown);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
+
+fn next_direct_probe_rendezvous_delay(now: SystemTime, period: Duration) -> Duration {
+    let period_nanos = period.as_nanos();
+    assert!(period_nanos > 0, "rendezvous period must be non-zero");
+    let now_nanos = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let remainder = now_nanos % period_nanos;
+    let delay_nanos = if remainder == 0 {
+        period_nanos
+    } else {
+        period_nanos - remainder
+    };
+    Duration::from_nanos(delay_nanos as u64)
+}
+
+fn coordinated_direct_probe_interval(now: SystemTime) -> tokio::time::Interval {
+    let delay = next_direct_probe_rendezvous_delay(now, DIRECT_PROBE_RENDEZVOUS_INTERVAL);
+    let start = tokio::time::Instant::now() + delay;
+    let mut interval = tokio::time::interval_at(start, DIRECT_PROBE_RENDEZVOUS_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval
 }
@@ -1420,23 +1445,32 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                     };
                     if recovery_failed {
                         let previous_probe_cooldown = recovery_probe_cooldown;
+                        let next_probe_delay;
                         if candidate_refresh_pending {
                             candidate_refresh_pending = false;
                             recovery_probe_cooldown = probe_cooldown;
-                            probe_interval = direct_probe_interval(IMMEDIATE_DIRECT_PROBE_DELAY);
+                            next_probe_delay = IMMEDIATE_DIRECT_PROBE_DELAY;
+                            probe_interval = direct_probe_interval(next_probe_delay);
                         } else {
                             recovery_probe_cooldown = next_direct_probe_cooldown(
                                 recovery_probe_cooldown,
                                 probe_cooldown,
                                 Duration::ZERO,
                             );
-                            probe_interval = direct_probe_interval(recovery_probe_cooldown);
+                            let now = SystemTime::now();
+                            next_probe_delay = next_direct_probe_rendezvous_delay(
+                                now,
+                                DIRECT_PROBE_RENDEZVOUS_INTERVAL,
+                            );
+                            probe_interval = coordinated_direct_probe_interval(now);
                         }
                         tracing::debug!(
                             peer_address = %address,
                             previous_probe_cooldown_ms = previous_probe_cooldown.as_millis() as u64,
                             next_probe_cooldown_ms = recovery_probe_cooldown.as_millis() as u64,
-                            "updated direct UDP recovery probe cooldown after unsuccessful probe"
+                            next_probe_delay_ms = next_probe_delay.as_millis() as u64,
+                            rendezvous_interval_ms = DIRECT_PROBE_RENDEZVOUS_INTERVAL.as_millis() as u64,
+                            "scheduled the next direct UDP recovery probe after an unsuccessful probe"
                         );
                     }
                 }
@@ -3530,6 +3564,24 @@ mod tests {
         assert_eq!(
             next_direct_probe_cooldown(short_base, short_base, Duration::ZERO),
             Duration::from_millis(50)
+        );
+    }
+
+    #[test]
+    fn failed_direct_probes_align_to_the_same_utc_rendezvous() {
+        let period = DIRECT_PROBE_RENDEZVOUS_INTERVAL;
+        let first_now = UNIX_EPOCH + Duration::from_millis(100_250);
+        let second_now = UNIX_EPOCH + Duration::from_millis(105_500);
+        let first_delay = next_direct_probe_rendezvous_delay(first_now, period);
+        let second_delay = next_direct_probe_rendezvous_delay(second_now, period);
+
+        assert_eq!(first_now + first_delay, second_now + second_delay);
+        assert_eq!(first_delay, Duration::from_millis(19_750));
+        assert_eq!(second_delay, Duration::from_millis(14_500));
+        assert_eq!(
+            next_direct_probe_rendezvous_delay(UNIX_EPOCH + period, period),
+            period,
+            "a probe landing on a slot boundary schedules the following full slot"
         );
     }
 
