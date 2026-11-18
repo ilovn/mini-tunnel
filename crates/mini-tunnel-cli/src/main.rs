@@ -7835,7 +7835,10 @@ mod tests {
             device_id: peer_identity.device_id(),
             assigned_ipv4: "10.77.0.2".to_owned(),
             public_key: peer_identity.public_key_encoded(),
-            candidates: vec![peer_address.to_string()],
+            // Model an expired NAT mapping: the coordinator still has the old
+            // server-reflexive endpoint until the recovery connector refreshes
+            // the signed peer snapshot.
+            candidates: vec!["192.0.2.1:3478".to_owned()],
             ice_credentials: Some(old_credentials),
         };
         let current_peer = PeerInfo {
@@ -7880,6 +7883,10 @@ mod tests {
             startup_peer.ice_credentials,
             Some(fresh_credentials.clone()),
             "a failed initial checklist must refresh a stale peer snapshot before falling back"
+        );
+        assert_eq!(
+            startup_peer.candidates, current_peer.candidates,
+            "a failed checklist must replace an expired NAT mapping before the next attempt"
         );
 
         let refreshed =
