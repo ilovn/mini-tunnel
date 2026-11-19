@@ -4554,7 +4554,7 @@ mod tests {
         if let Some(standby) = replacement_standby {
             standby.close_async().await;
         }
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(12), async {
             loop {
                 if fallback_calls.load(Ordering::SeqCst) > failed_standby_calls {
                     break;

@@ -2,6 +2,14 @@
 
 Status: **public NAT/QoS matrix incomplete**. The loopback ICE mapping proxy verifies packet rewriting and session behavior, but it does not establish interoperability across public NATs. The VPS smoke test and the RouterOS/office fallback observation below are additional runtime evidence; neither completes a matrix case.
 
+### Current-source Docker NAT to public peer ICE validation (2026-11-19)
+
+- Tested the attestation-verified x86_64 archive from successful [CI run 44249200722](https://github.com/ilovn/mini-tunnel/actions/runs/44249200722), built from `16f0095938033fba208657866f2e91f7a7887968`. The Docker NAT peer bound candidate gathering to physical `eth0`; Guangzhou provided the public Coordinator, Relay, and peer. Existing Docker EasyTier remained running and unchanged.
+- The first staggered launch did not complete ICE and is excluded. After restarting only the test peers concurrently, both nominated one authenticated QUIC/UDP candidate pair. During the following five-minute sample, each endpoint had 30 status samples, zero errors/offline samples, and ten five-packet bidirectional probe rounds with 50/50 replies per side. Both reported direct QUIC/UDP for 29/30 samples; the initial Relay sample recovered to direct after `healthy_direct_probe`. Final status was online/direct, 14 ms RTT, and 0% reported loss.
+- Aggregate-only physical-interface counters for 300 seconds: Guangzhou `eth0` peer-port UDP 2,586 outbound / 2,574 inbound and STUN 46 / 24; Docker `eth0` peer-port UDP 2,574 / 2,586 and STUN 10 / 10. No payload or endpoint-address capture was retained. Peak peer RSS was 17,280 KiB on Guangzhou and 18,656 KiB on Docker.
+- Both memberships were revoked; task peers, Coordinator, Relay, listeners, TUNs, and remote task directories were removed. Original routes and interfaces remained, including Docker EasyTier PID 175432 and `tun0`; no firewall, NAT, QoS, RouterOS, or persistent route settings changed. Private raw evidence is retained locally in the Harness task directory, not committed.
+- This demonstrates one current-source single-NAT-to-public-peer direct ICE success. It does not validate direct connectivity between two independently NATed peers, QoS-triggered fallback, or a broader NAT matrix. The two-NAT case still needs upstream UDP mapping to the RouterOS container or a different inbound-UDP-reachable NAT endpoint.
+
 ### Current-source 12-hour domestic NAT soak (2026-11-18)
 
 - Tested exact commit `16f0095938033fba208657866f2e91f7a7887968` using x86_64 and ARM64 artifacts from [successful CI run 44249200722](https://github.com/ilovn/mini-tunnel/actions/runs/44249200722). Endpoint binaries came from CI; neither endpoint built from source. The topology was the Guangzhou x86_64 VPS and the USB-backed RouterOS Debian ARM64 container.
