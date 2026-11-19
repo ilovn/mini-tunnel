@@ -552,6 +552,12 @@ impl MeshReceivePump {
                         }
                     }
                     Err(error) => {
+                        tracing::warn!(
+                            peer_address = %peer_key,
+                            path = task_channel.transport_name(),
+                            %error,
+                            "peer receive pump stopped after transport receive failure"
+                        );
                         let _ = sender.send(Err(error)).await;
                         break;
                     }
