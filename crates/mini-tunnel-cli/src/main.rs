@@ -2461,6 +2461,7 @@ async fn shutdown_signal() -> std::io::Result<()> {
     }
 }
 
+#[cfg(any(not(windows), test))]
 async fn select_shutdown_signal<C, T>(ctrl_c: C, terminate: T) -> std::io::Result<()>
 where
     C: Future<Output = std::io::Result<()>>,

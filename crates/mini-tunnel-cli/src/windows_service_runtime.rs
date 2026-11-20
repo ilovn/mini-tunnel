@@ -145,7 +145,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None,
     ))?;
     if let Ok(mut slot) = status_handle_slot.lock() {
-        *slot = Some(status_handle.clone());
+        *slot = Some(status_handle);
     }
 
     let result = run_configured_peer(&status_handle);
