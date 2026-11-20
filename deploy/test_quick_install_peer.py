@@ -48,6 +48,15 @@ pathlib.Path(os.environ["INSTALL_LOG"]).write_text(json.dumps(args))
 """,
             encoding="utf-8",
         )
+        (self.fake_deploy / "install-peer-macos.sh").write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "binary = pathlib.Path(args[args.index('--binary') + 1])\n"
+            "assert binary.is_file() and os.access(binary, os.X_OK)\n"
+            "pathlib.Path(os.environ['INSTALL_LOG']).write_text(json.dumps(args))\n",
+            encoding="utf-8",
+        )
         for path in self.fake_deploy.iterdir():
             path.chmod(0o755)
         self.fake_bin = self.root / "bin"
@@ -103,7 +112,7 @@ pathlib.Path(os.environ["INSTALL_LOG"]).write_text(json.dumps(args))
         self.assertEqual(download_args[0], "--output-dir")
         self.assertEqual(
             download_args[2:],
-            ["--repo", "ilovn/mini-tunnel", "--arch", "aarch64", "--commit", "0" * 40],
+            ["--repo", "ilovn/mini-tunnel", "--arch", "aarch64", "--commit", "0" * 40, "--platform", "linux"],
         )
         install_args = json.loads(self.install_log.read_text(encoding="utf-8"))
         self.assertEqual(install_args[0], "--binary")
@@ -161,6 +170,21 @@ pathlib.Path(os.environ["INSTALL_LOG"]).write_text(json.dumps(args))
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.download_log.exists())
         self.assertFalse(self.install_log.exists())
+
+    def test_macos_platform_uses_macos_artifact_and_launchdaemon_installer(self) -> None:
+        result = self.run_script(
+            "--platform", "macos", "--arch", "aarch64", "--release", "v1.2.3",
+            "--", "--network-id", "00000000-0000-0000-0000-000000000000",
+            "--coordinator-url", "https://coordinator.example",
+            "--invite-token-file", "/tmp/invite.token",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        download_args = json.loads(self.download_log.read_text(encoding="utf-8"))
+        self.assertIn("--platform", download_args)
+        self.assertEqual(download_args[download_args.index("--platform") + 1], "macos")
+        install_args = json.loads(self.install_log.read_text(encoding="utf-8"))
+        self.assertEqual(install_args[0], "--binary")
+        self.assertTrue(self.sudo_log.exists(), "macOS service install is elevated")
 
 
 if __name__ == "__main__":

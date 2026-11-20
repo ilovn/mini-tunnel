@@ -3,15 +3,15 @@ set -Eeuo pipefail
 
 usage() {
   cat <<'EOF'
-Download a mini-tunnel Linux peer binary from GitHub.
+Download a mini-tunnel Linux or macOS peer binary from GitHub.
 
 Usage:
   deploy/download-peer.sh [--output-dir ./mini-tunnel-download] \
-    [--arch auto|x86_64|aarch64] [--release vX.Y.Z] \
+    [--platform auto|linux|macos] [--arch auto|x86_64|aarch64] [--release vX.Y.Z] \
     [--repo owner/name] [--force]
 
   deploy/download-peer.sh [--output-dir ./mini-tunnel-download] \
-    [--arch auto|x86_64|aarch64] [--commit <full-sha>|--run-id <id>] \
+    [--platform auto|linux|macos] [--arch auto|x86_64|aarch64] [--commit <full-sha>|--run-id <id>] \
     [--repo owner/name] [--force]
 
 With no source option, fetch the newest stable published GitHub Release asset
@@ -44,6 +44,7 @@ usage_error() {
 
 repository=ilovn/mini-tunnel
 architecture=auto
+platform=auto
 commit=
 run_id=
 artifact_id=
@@ -57,6 +58,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 while (($#)); do
   case "$1" in
     --repo) (($# >= 2)) || usage_error "--repo needs a value"; repository=$2; shift 2 ;;
+    --platform) (($# >= 2)) || usage_error "--platform needs a value"; platform=$2; shift 2 ;;
     --arch) (($# >= 2)) || usage_error "--arch needs a value"; architecture=$2; shift 2 ;;
     --commit) (($# >= 2)) || usage_error "--commit needs a value"; commit=$2; shift 2 ;;
     --run-id) (($# >= 2)) || usage_error "--run-id needs a value"; run_id=$2; shift 2 ;;
@@ -72,6 +74,17 @@ done
 [[ -z "$run_id" || "$run_id" =~ ^[0-9]+$ ]] || die "run ID must be numeric"
 [[ -z "$commit" || "$commit" =~ ^[0-9a-fA-F]{40}$ ]] || die "commit must be a full 40-character SHA-1"
 [[ -z "$release" || "$release" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || die "invalid release tag: $release"
+case "$platform" in
+  auto)
+    case "$(uname -s)" in
+      Linux) platform=linux ;;
+      Darwin) platform=macos ;;
+      *) die "unsupported host operating system: $(uname -s)" ;;
+    esac
+    ;;
+  linux|macos) ;;
+  *) die "platform must be auto, linux, or macos" ;;
+esac
 selected=0
 [[ -n "$release" ]] && selected=$((selected + 1))
 [[ -n "$commit" ]] && selected=$((selected + 1))
@@ -79,6 +92,9 @@ selected=0
 ((selected <= 1)) || die "use only one of --release, --commit, or --run-id"
 if [[ -z "$release" && -z "$commit" && -z "$run_id" ]]; then
   release=latest
+fi
+if [[ "$platform" == macos && ( -n "$commit" || -n "$run_id" ) ]]; then
+  die "CI artifacts are not published for macOS; use a published release"
 fi
 [[ -n "$release" || -n "${GITHUB_TOKEN:-}" ]] || die "GITHUB_TOKEN is required for the CI artifact mode"
 case "$architecture" in
@@ -116,10 +132,7 @@ if [[ "$architecture" == auto ]]; then
   esac
 fi
 
-case "$architecture" in
-  x86_64) artifact_name="mini-tunnel-linux-x86_64-ubuntu20.04" ;;
-  aarch64) artifact_name="mini-tunnel-linux-aarch64-ubuntu22.04" ;;
-esac
+artifact_name=$(python3 "$script_dir/release_artifact.py" "$platform" "$architecture") || die "unsupported platform and architecture"
 
 api_base=https://api.github.com
 auth_header=()
@@ -463,7 +476,7 @@ with zipfile.ZipFile(source) as archive:
     for member in members:
         if member.is_dir() or member.file_size > maximum_member_bytes:
             raise ValueError(f"unsafe or oversized ZIP member: {member.filename}")
-        if member.filename == archive_members[0] and not member.filename.startswith("mini-tunnel-linux-"):
+        if member.filename == archive_members[0] and not member.filename.startswith(("mini-tunnel-linux-", "mini-tunnel-macos-")):
             raise ValueError(f"unexpected archive name: {member.filename}")
         target = destination / member.filename
         with archive.open(member) as input_file, target.open("xb") as output_file:

@@ -189,8 +189,9 @@
                 ><span>目标系统</span
                 ><select id="platform">
                   <option value="ubuntu">Ubuntu / Debian · systemd</option>
-                  <option value="systemd">其他 systemd Linux</option></select
-                ><small>需要 systemd 247+ 和 TUN 设备</small></label
+                  <option value="systemd">其他 systemd Linux</option>
+                  <option value="macos">macOS · LaunchDaemon</option></select
+                ><small id="platform-help">需要 systemd 247+ 和 TUN 设备</small></label
               >
               <label class="field"
                 ><span>处理器架构</span
@@ -198,7 +199,7 @@
                   <option value="auto">自动检测</option>
                   <option value="x86_64">x86_64</option>
                   <option value="aarch64">ARM64 / aarch64</option></select
-                ><small>使用 CI 预构建、校验签名的二进制</small
+                ><small>使用已发布、校验来源的预构建二进制</small
                 ><span class="error" data-error="arch"></span
               ></label>
               <label class="field"
@@ -286,7 +287,7 @@
             </div>
             <div class="preview-footer">
               <span class="shield">◇</span
-              ><span>签名验证 · 安全安装 · systemd 托管</span>
+              ><span id="platform-badge">签名验证 · 安全安装 · systemd 托管</span>
             </div>
           </aside>
         </div>
@@ -295,7 +296,7 @@
             <span class="success-mark">✓</span>
             <div>
               <b>部署脚本已生成</b
-              ><small>下载到目标 Linux 服务器后按说明运行。</small>
+              ><small id="result-platform-help">下载到目标 Linux 服务器后按说明运行。</small>
             </div>
           </div>
           <div class="result-actions">
@@ -305,7 +306,7 @@
             </button>
           </div>
           <pre id="script-output" tabindex="0"></pre>
-          <p class="result-note">
+          <p id="result-prerequisites" class="result-note">
             运行前请检查脚本内容。目标机需安装 git、支持 attestation verify
             的 GitHub CLI（gh）、curl、Python 3、tar 和 gzip。
           </p>
@@ -328,8 +329,7 @@
             <span>02</span>
             <h3>生成部署脚本</h3>
             <p>
-              配置 Linux
-              发行版、架构和可选中继。浏览器本地生成脚本，不上传配置。
+              配置目标平台、架构和可选中继。浏览器本地生成脚本，不上传配置。
             </p>
           </article>
           <article>
@@ -337,7 +337,7 @@
             <h3>在目标机运行</h3>
             <p>
               脚本下载已签名的预构建版本并核对来源，随后加入网络、创建 systemd
-              服务。
+              服务或 macOS LaunchDaemon。
             </p>
           </article>
         </div>
@@ -348,7 +348,7 @@
           <div class="section-kicker">PLATFORM SUPPORT</div>
           <h2>按真实可用的平台生成</h2>
           <p>
-            Linux 提供一键部署。macOS 与 Windows 可下载命令行程序；平台服务安装器尚未提供。
+            Linux 和 macOS 提供一键服务部署。Windows 可下载命令行程序；Windows 服务安装器尚未提供。
           </p>
         </div>
         <div class="platform-list">
@@ -370,7 +370,7 @@
           <div class="platform-row">
             <span class="platform-icon apple">⌘</span>
             <div>
-              <b>macOS</b><small>命令行包 · 未公证 · 尚无一键服务安装器</small>
+              <b>macOS</b><small>LaunchDaemon · x86_64 / Apple Silicon · 未公证</small>
               <div class="platform-downloads">
                 <a href="https://github.com/ilovn/mini-tunnel/releases/latest/download/mini-tunnel-macos-x86_64.tar.gz">Intel 下载</a>
                 <a href="https://github.com/ilovn/mini-tunnel/releases/latest/download/mini-tunnel-macos-aarch64.tar.gz">Apple Silicon 下载</a>
@@ -401,6 +401,7 @@
           Coordinator、网络或邀请，也不会修改云防火墙规则。
         </p>
         <a
+          id="platform-doc-link"
           href="https://github.com/ilovn/mini-tunnel/blob/main/deploy/systemd/README.md"
           target="_blank"
           rel="noreferrer"

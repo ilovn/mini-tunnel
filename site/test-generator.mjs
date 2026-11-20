@@ -10,6 +10,7 @@ import {
 } from "./generator.mjs";
 
 const base = {
+  platform: "ubuntu",
   coordinatorUrl: "https://coord.example.net:8443",
   coordinatorMode: "existing",
   networkId: "81af0d3b-be18-4b8f-976e-2b2a37ddfbc9",
@@ -32,6 +33,7 @@ assert.match(
 );
 assert.doesNotMatch(generateScript(base), /test-invite-secret/);
 assert.match(generateScript(base), /gh attestation verify --help/);
+assert.match(generateScript(base), /'--platform' 'linux'/);
 assert.equal(
   spawnSync("bash", ["-n"], { input: generateScript(base), encoding: "utf8" })
     .status,
@@ -44,6 +46,17 @@ assert.match(
 assert.match(
   generateScript({ ...base, versionMode: "release", release: "v1.2.3" }),
   /'v1\.2\.3'/,
+);
+const macos = { ...base, platform: "macos", arch: "auto" };
+assert.deepEqual(validateConfig(macos), {});
+const macosScript = generateScript(macos);
+assert.match(macosScript, /macOS LaunchDaemon peer installer/);
+assert.match(macosScript, /'--platform' 'macos'/);
+assert.match(macosScript, /launchctl/);
+assert.doesNotMatch(macosScript, /systemctl|\/dev\/net\/tun/);
+assert.equal(
+  spawnSync("bash", ["-n"], { input: macosScript, encoding: "utf8" }).status,
+  0,
 );
 const mirrored = {
   ...base,

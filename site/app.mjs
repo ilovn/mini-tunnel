@@ -9,6 +9,7 @@ import {
 const $ = (id) => document.getElementById(id);
 const form = $("config-form");
 const ids = [
+  "platform",
   "coordinatorUrl",
   "networkId",
   "instance",
@@ -38,13 +39,33 @@ const renderErrors = (errors) => {
 };
 const updatePreview = () => {
   const value = config();
+  const isMacOS = value.platform === "macos";
+  $("platform-help").textContent = isMacOS
+    ? "需要 macOS、管理员权限和 TUN 支持"
+    : "需要 systemd 247+ 和 TUN 设备";
+  $("platform-badge").textContent = isMacOS
+    ? "签名验证 · 安全安装 · LaunchDaemon 托管"
+    : "签名验证 · 安全安装 · systemd 托管";
+  $("result-platform-help").textContent = isMacOS
+    ? "下载到目标 macOS 设备后，以管理员权限运行。"
+    : "下载到目标 Linux 服务器后按说明运行。";
+  $("result-prerequisites").textContent = isMacOS
+    ? "运行前请检查脚本。目标 Mac 需安装 git、支持 attestation verify 的 GitHub CLI（gh）、curl、Python 3、tar 和 gzip，并需管理员权限。"
+    : "运行前请检查脚本。目标 Linux 需安装 git、支持 attestation verify 的 GitHub CLI（gh）、curl、Python 3、tar 和 gzip，并启用 systemd 与 TUN。";
+  const documentation = $("platform-doc-link");
+  documentation.href = isMacOS
+    ? "https://github.com/ilovn/mini-tunnel/blob/main/deploy/macos/README.md"
+    : "https://github.com/ilovn/mini-tunnel/blob/main/deploy/systemd/README.md";
+  documentation.textContent = isMacOS ? "阅读 macOS 部署文档 ↗" : "阅读 Linux 部署文档 ↗";
   $("release-field").classList.toggle(
     "hidden",
     value.versionMode !== "release",
   );
   const ready = !Object.keys(validateConfig(value)).length;
+  const targetPlatform = value.platform === "macos" ? "macos" : "linux";
   $("preview").innerHTML = ready
-    ? '<span class="code-muted"># 预构建版本 · 自动验签</span><br><span class="code-purple">quick-install-peer.sh</span> <span class="code-blue">--release</span> ' +
+    ? '<span class="code-muted"># 预构建版本 · 自动验签</span><br><span class="code-purple">quick-install-peer.sh</span> <span class="code-blue">--platform</span> ' +
+      targetPlatform + ' <span class="code-blue">--release</span> ' +
       (value.versionMode === "release" ? escapeHtml(value.release) : "latest") +
       '<br><span class="code-muted"># 邀请 token 运行时输入</span>'
     : '<span class="code-muted"># 填写 Coordinator 与网络 ID</span><br><span class="code-purple">mini-tunnel</span> <span class="code-blue">peer setup</span><br><span class="code-muted"># token 在运行时安全输入</span>';
@@ -133,7 +154,7 @@ $("download-button").addEventListener("click", () => {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
-  anchor.download = `mini-tunnel-${$("instance").value.trim()}.sh`;
+  anchor.download = `mini-tunnel-${$("platform").value}-${$("instance").value.trim()}.sh`;
   anchor.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 });

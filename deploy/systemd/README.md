@@ -1,5 +1,7 @@
 # Linux systemd deployment templates
 
+For the native macOS LaunchDaemon installer, see [`../macos/README.md`](../macos/README.md).
+
 The Coordinator and opaque Relay templates run as unprivileged server services; the separate peer template grants only the TUN/route privileges required by a client mesh. All templates require systemd 247 or newer for the complete sandbox profile. They do not configure a firewall, TLS proxy, certificate renewal, or secret distribution. Review those choices for your host before enabling the units.
 
 ## Quick install for a Linux peer
