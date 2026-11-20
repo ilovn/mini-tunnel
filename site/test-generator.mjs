@@ -23,6 +23,7 @@ const base = {
   udpRelayServer: "",
   coordinatorCa: "",
   githubMirrorPrefix: "",
+  statusListen: "127.0.0.1:42003",
 };
 assert.deepEqual(validateConfig(base), {});
 assert.match(generateScript(base), /'--arch'[\s\\]+\s+'x86_64'/);
@@ -58,6 +59,22 @@ assert.equal(
   spawnSync("bash", ["-n"], { input: macosScript, encoding: "utf8" }).status,
   0,
 );
+const windows = { ...base, platform: "windows", arch: "auto" };
+assert.deepEqual(validateConfig(windows), {});
+const windowsScript = generateScript(windows);
+assert.match(windowsScript, /Windows Service Control Manager/);
+assert.match(windowsScript, /Set-PrivateDirectoryAcl \$TempDir/);
+assert.match(windowsScript, /gh attestation verify/);
+assert.match(windowsScript, /windows-service-host --help/);
+assert.match(windowsScript, /does not contain the SCM service host yet/);
+assert.match(windowsScript, /New-Service/);
+assert.match(windowsScript, /wintun\/bin\/arm64\/wintun\.dll/);
+assert.match(windowsScript, /Read-Host -Prompt 'Paste one-use invite token \(input hidden\)' -AsSecureString/);
+assert.match(windowsScript, /MINI_TUNNEL_COORDINATOR_CA_CERT_FILE = \$sourceCaPath/);
+assert.doesNotMatch(windowsScript, /test-invite-secret|\$Rejoin/);
+assert.ok(validateConfig({ ...windows, statusListen: "0.0.0.0:42003" }).statusListen);
+assert.ok(validateConfig({ ...windows, coordinatorCa: "/etc/ssl/ca.pem" }).coordinatorCa);
+assert.deepEqual(validateConfig({ ...windows, coordinatorCa: "C:\\certs\\coord.pem" }), {});
 const mirrored = {
   ...base,
   githubMirrorPrefix: "https://ghproxy.net/https://github.com/",
@@ -160,5 +177,6 @@ for (const archive of [
 ]) {
   assert.ok(siteHtml.includes(`/releases/latest/download/${archive}`), archive);
 }
-assert.match(siteHtml, /尚无一键服务安装器/);
+assert.match(siteHtml, /Windows · Service Control Manager/);
+assert.match(siteHtml, /Beta · 待新版发行/);
 console.log("site generator tests passed");

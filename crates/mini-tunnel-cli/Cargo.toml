@@ -31,6 +31,10 @@ if-addrs.workspace = true
 ipnet.workspace = true
 libc.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8.1"
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
+
 [dev-dependencies]
 axum-server.workspace = true
 rcgen.workspace = true

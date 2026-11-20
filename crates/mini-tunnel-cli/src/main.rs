@@ -29,6 +29,9 @@ use mini_tunnel_protocol::{
 use serde::Deserialize;
 use uuid::Uuid;
 
+#[cfg(windows)]
+mod windows_service_runtime;
+
 const PEER_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(5);
 const COORDINATOR_HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
 const ICE_PATH_PROMOTION_PROBATION: Duration = Duration::from_secs(31);
@@ -75,6 +78,14 @@ enum Command {
     Peer {
         #[command(subcommand)]
         command: PeerCommand,
+    },
+    /// Internal entry point used by the Windows Service Control Manager.
+    #[command(hide = true)]
+    WindowsServiceHost {
+        #[arg(long)]
+        service_name: String,
+        #[arg(long)]
+        config: PathBuf,
     },
 }
 
@@ -636,6 +647,15 @@ fn main() -> ExitCode {
         .try_init();
 
     let cli = Cli::parse_from(args);
+
+    #[cfg(windows)]
+    if let Command::WindowsServiceHost {
+        service_name,
+        config,
+    } = &cli.command
+    {
+        return windows_service_runtime::start(service_name, config);
+    }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -2144,6 +2164,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 );
             }
         },
+        Command::WindowsServiceHost { .. } => {
+            return Err("Windows Service Control Manager host is only available on Windows".into());
+        }
         Command::Network { command } => match command {
             NetworkCommand::Create {
                 name,
@@ -2420,7 +2443,15 @@ async fn shutdown_signal() -> std::io::Result<()> {
         };
         select_shutdown_signal(tokio::signal::ctrl_c(), terminate_received).await
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        if windows_service_runtime::is_service_context() {
+            windows_service_runtime::shutdown_signal().await
+        } else {
+            tokio::signal::ctrl_c().await
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         select_shutdown_signal(
             tokio::signal::ctrl_c(),

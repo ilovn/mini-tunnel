@@ -841,6 +841,10 @@ legend,
   background: #e9f5ec;
   color: #3b8058;
 }
+.beta {
+  background: #fff2d8;
+  color: #8c641a;
+}
 .planned {
   background: #eff1ef;
   color: #939b95;

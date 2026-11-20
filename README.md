@@ -33,7 +33,7 @@ gh attestation verify mini-tunnel-linux-aarch64-ubuntu22.04.tar.gz \
 sha256sum --check mini-tunnel-linux-aarch64-ubuntu22.04.tar.gz.sha256
 ```
 
-Release [v0.3.0](https://github.com/ilovn/mini-tunnel/releases/tag/v0.3.0) includes macOS Intel/Apple Silicon and Windows x64/ARM64 command-line archives. The macOS release archives can now be installed as a managed LaunchDaemon through the setup wizard; they are not Apple-notarized. Windows remains CLI-only and has no one-click service installer.
+Release [v0.3.0](https://github.com/ilovn/mini-tunnel/releases/tag/v0.3.0) includes macOS Intel/Apple Silicon and Windows x64/ARM64 command-line archives. The macOS release archives can now be installed as a managed LaunchDaemon through the setup wizard; they are not Apple-notarized. A Windows SCM installer is being added; the setup site labels it Beta and refuses releases that lack the service-host command. It becomes installable after a new Windows release is published. Windows binaries are not Authenticode-signed.
 
 Start the coordinator:
 

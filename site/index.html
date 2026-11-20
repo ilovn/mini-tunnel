@@ -190,7 +190,8 @@
                 ><select id="platform">
                   <option value="ubuntu">Ubuntu / Debian · systemd</option>
                   <option value="systemd">其他 systemd Linux</option>
-                  <option value="macos">macOS · LaunchDaemon</option></select
+                  <option value="macos">macOS · LaunchDaemon</option>
+                  <option value="windows">Windows · Service Control Manager</option></select
                 ><small id="platform-help">需要 systemd 247+ 和 TUN 设备</small></label
               >
               <label class="field"
@@ -228,6 +229,12 @@
                     ><span class="error" data-error="stunServer"></span
                   ></label>
                   <label class="field"
+                    ><span>本机状态监听</span
+                    ><input id="statusListen" value="127.0.0.1:42003" /><small
+                      >仅监听本机；多实例请使用不同端口</small
+                    ><span class="error" data-error="statusListen"></span
+                  ></label>
+                  <label class="field"
                     ><span>TCP 中继地址</span
                     ><input
                       id="relayServer"
@@ -247,7 +254,7 @@
                     ><span>Coordinator CA 文件路径</span
                     ><input
                       id="coordinatorCa"
-                      placeholder="可选，例如 /etc/mini-tunnel/coordinator-ca.pem" /><small
+                      placeholder="可选，例如 /etc/mini-tunnel/coordinator-ca.pem" /><small id="coordinator-ca-help"
                       >目标服务器上已存在的 PEM 文件路径</small
                     ><span class="error" data-error="coordinatorCa"></span
                   ></label>
@@ -275,7 +282,7 @@
           <aside class="preview-card">
             <div class="preview-top">
               <span><i></i> SCRIPT PREVIEW</span
-              ><span class="preview-lang">BASH</span>
+              ><span class="preview-lang" id="preview-lang">BASH</span>
             </div>
             <div class="preview-body" id="preview">
               <span class="code-muted"># 先填写 Coordinator 与网络 ID</span
@@ -302,7 +309,7 @@
           <div class="result-actions">
             <button id="copy-button" class="secondary-button">复制脚本</button
             ><button id="download-button" class="primary-button">
-              下载 .sh <span>↓</span>
+              下载脚本 <span>↓</span>
             </button>
           </div>
           <pre id="script-output" tabindex="0"></pre>
@@ -348,7 +355,7 @@
           <div class="section-kicker">PLATFORM SUPPORT</div>
           <h2>按真实可用的平台生成</h2>
           <p>
-            Linux 和 macOS 提供一键服务部署。Windows 可下载命令行程序；Windows 服务安装器尚未提供。
+            Linux 和 macOS 提供一键服务部署；Windows x64 / ARM64 服务安装器为 Beta，需使用包含 SCM 服务入口的新版本发行包。
           </p>
         </div>
         <div class="platform-list">
@@ -382,13 +389,13 @@
             <span class="platform-icon windows">⊞</span>
             <div>
               <b>Windows</b
-              ><small>命令行包 · 未签名 · 尚无一键服务安装器</small>
+              ><small>Beta · SCM 服务 · x64 / ARM64 · Wintun 校验 · 未 Authenticode 签名</small>
               <div class="platform-downloads">
                 <a href="https://github.com/ilovn/mini-tunnel/releases/latest/download/mini-tunnel-windows-x86_64.zip">x64 下载</a>
                 <a href="https://github.com/ilovn/mini-tunnel/releases/latest/download/mini-tunnel-windows-aarch64.zip">ARM64 下载</a>
               </div>
             </div>
-            <span class="status-pill ready">已发布</span>
+            <span class="status-pill beta">Beta · 待新版发行</span>
           </div>
         </div>
       </section>

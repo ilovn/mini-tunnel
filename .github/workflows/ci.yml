@@ -223,6 +223,19 @@ jobs:
       - name: Check formatting
         run: cargo +stable fmt --all -- --check
 
+      - name: Parse generated Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'mini-tunnel-windows-test.ps1'
+          node --input-type=module -e 'import { writeFileSync } from "node:fs"; import { generateScript } from "./site/generator.mjs"; writeFileSync(process.env.RUNNER_TEMP + "/mini-tunnel-windows-test.ps1", generateScript({ platform: "windows", coordinatorUrl: "https://coord.example.net:8443", coordinatorMode: "existing", networkId: "81af0d3b-be18-4b8f-976e-2b2a37ddfbc9", instance: "ci", arch: "auto", versionMode: "latest", release: "", stunServer: "111.206.174.2:3478", statusListen: "127.0.0.1:42003", relayServer: "", udpRelayServer: "", coordinatorCa: "", githubMirrorPrefix: "" }))'
+          if ($LASTEXITCODE -ne 0) { throw 'Could not generate Windows installer for parsing.' }
+          $tokens = $null
+          $parseErrors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile($installer, [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count -gt 0) { $parseErrors | Format-List | Out-String | Write-Error }
+
       - name: Check systemd service sandbox settings
         if: runner.os == 'Linux'
         run: python3 deploy/systemd/check_units.py
@@ -319,6 +332,8 @@ jobs:
           Expand-Archive -Path $archive -DestinationPath $extract -Force
           $dll = Join-Path $extract 'wintun\bin\amd64\wintun.dll'
           if (-not (Test-Path $dll)) { throw "Official x64 Wintun DLL missing: $dll" }
+          $armDll = Join-Path $extract 'wintun\bin\arm64\wintun.dll'
+          if (-not (Test-Path $armDll)) { throw "Official ARM64 Wintun DLL missing: $armDll" }
 
           $buildMessages = Join-Path $env:RUNNER_TEMP 'mini-tunnel-agent-test-build.jsonl'
           cargo +stable test -p mini-tunnel-agent --lib --no-run --message-format=json | Out-File -FilePath $buildMessages -Encoding utf8

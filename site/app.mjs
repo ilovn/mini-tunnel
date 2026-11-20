@@ -17,6 +17,7 @@ const ids = [
   "versionMode",
   "release",
   "stunServer",
+  "statusListen",
   "relayServer",
   "udpRelayServer",
   "coordinatorCa",
@@ -40,33 +41,57 @@ const renderErrors = (errors) => {
 const updatePreview = () => {
   const value = config();
   const isMacOS = value.platform === "macos";
+  const isWindows = value.platform === "windows";
   $("platform-help").textContent = isMacOS
     ? "需要 macOS、管理员权限和 TUN 支持"
-    : "需要 systemd 247+ 和 TUN 设备";
+    : isWindows
+      ? "需要 Windows 10+、管理员 PowerShell 和 Wintun"
+      : "需要 systemd 247+ 和 TUN 设备";
+  $("coordinatorCa").placeholder = isWindows
+    ? "可选，例如 C:\\mini-tunnel\\coordinator-ca.pem"
+    : "可选，例如 /etc/mini-tunnel/coordinator-ca.pem";
+  $("coordinator-ca-help").textContent = isWindows
+    ? "目标 Windows 主机上已存在的 PEM 文件路径（盘符绝对路径）"
+    : "目标服务器上已存在的 PEM 文件路径";
   $("platform-badge").textContent = isMacOS
     ? "签名验证 · 安全安装 · LaunchDaemon 托管"
-    : "签名验证 · 安全安装 · systemd 托管";
+    : isWindows
+      ? "来源验签 · Wintun 校验 · Windows SCM Beta"
+      : "签名验证 · 安全安装 · systemd 托管";
   $("result-platform-help").textContent = isMacOS
     ? "下载到目标 macOS 设备后，以管理员权限运行。"
-    : "下载到目标 Linux 服务器后按说明运行。";
+    : isWindows
+      ? "下载 PowerShell 脚本，在管理员终端检查后运行。"
+      : "下载到目标 Linux 服务器后按说明运行。";
   $("result-prerequisites").textContent = isMacOS
     ? "运行前请检查脚本。目标 Mac 需安装 git、支持 attestation verify 的 GitHub CLI（gh）、curl、Python 3、tar 和 gzip，并需管理员权限。"
-    : "运行前请检查脚本。目标 Linux 需安装 git、支持 attestation verify 的 GitHub CLI（gh）、curl、Python 3、tar 和 gzip，并启用 systemd 与 TUN。";
+    : isWindows
+      ? "需要管理员 PowerShell 5.1+、支持 attestation verify 的 GitHub CLI（gh），并能访问 GitHub API 与 Wintun 官方下载站。脚本不安装编译器或 Rust。"
+      : "运行前请检查脚本。目标 Linux 需安装 git、支持 attestation verify 的 GitHub CLI（gh）、curl、Python 3、tar 和 gzip，并启用 systemd 与 TUN。";
   const documentation = $("platform-doc-link");
   documentation.href = isMacOS
     ? "https://github.com/ilovn/mini-tunnel/blob/main/deploy/macos/README.md"
-    : "https://github.com/ilovn/mini-tunnel/blob/main/deploy/systemd/README.md";
-  documentation.textContent = isMacOS ? "阅读 macOS 部署文档 ↗" : "阅读 Linux 部署文档 ↗";
+    : isWindows
+      ? "https://github.com/ilovn/mini-tunnel/blob/main/deploy/windows/README.md"
+      : "https://github.com/ilovn/mini-tunnel/blob/main/deploy/systemd/README.md";
+  documentation.textContent = isMacOS
+    ? "阅读 macOS 部署文档 ↗"
+    : isWindows
+      ? "阅读 Windows 部署文档 ↗"
+      : "阅读 Linux 部署文档 ↗";
   $("release-field").classList.toggle(
     "hidden",
     value.versionMode !== "release",
   );
   const ready = !Object.keys(validateConfig(value)).length;
-  const targetPlatform = value.platform === "macos" ? "macos" : "linux";
+  const targetPlatform = isWindows ? "Windows PowerShell" : "quick-install-peer.sh";
+  $("preview-lang").textContent = isWindows ? "POWERSHELL" : "BASH";
   $("preview").innerHTML = ready
-    ? '<span class="code-muted"># 预构建版本 · 自动验签</span><br><span class="code-purple">quick-install-peer.sh</span> <span class="code-blue">--platform</span> ' +
-      targetPlatform + ' <span class="code-blue">--release</span> ' +
-      (value.versionMode === "release" ? escapeHtml(value.release) : "latest") +
+    ? '<span class="code-muted"># 预构建版本 · 自动验签</span><br><span class="code-purple">' + targetPlatform +
+      (isWindows
+        ? ' -File .\\mini-tunnel-' + escapeHtml(value.instance) + '.ps1'
+        : ' --platform ' + (isMacOS ? "macos" : "linux") + ' --release ' +
+          (value.versionMode === "release" ? escapeHtml(value.release) : "latest")) +
       '<br><span class="code-muted"># 邀请 token 运行时输入</span>'
     : '<span class="code-muted"># 填写 Coordinator 与网络 ID</span><br><span class="code-purple">mini-tunnel</span> <span class="code-blue">peer setup</span><br><span class="code-muted"># token 在运行时安全输入</span>';
 };
@@ -149,12 +174,13 @@ $("copy-button").addEventListener("click", async () => {
 });
 $("download-button").addEventListener("click", () => {
   const blob = new Blob([$("script-output").textContent], {
-    type: "text/x-shellscript;charset=utf-8",
+    type: $("platform").value === "windows" ? "text/plain;charset=utf-8" : "text/x-shellscript;charset=utf-8",
   });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
-  anchor.download = `mini-tunnel-${$("platform").value}-${$("instance").value.trim()}.sh`;
+  const extension = $("platform").value === "windows" ? "ps1" : "sh";
+  anchor.download = `mini-tunnel-${$("platform").value}-${$("instance").value.trim()}.${extension}`;
   anchor.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 });
