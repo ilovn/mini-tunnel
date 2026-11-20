@@ -1,12 +1,14 @@
 use std::{
     fs::File,
-    future::Future,
     io::{self, Read},
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::ExitCode,
     time::{Duration, Instant},
 };
+
+#[cfg(any(not(windows), test))]
+use std::future::Future;
 
 use axum::{
     Router,

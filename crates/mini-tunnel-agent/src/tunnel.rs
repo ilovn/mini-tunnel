@@ -4455,7 +4455,9 @@ mod tests {
                     true,
                 )],
                 None,
-                Duration::from_millis(100),
+                // This test covers standby lifecycle, not quality-threshold timing. Keep a
+                // realistic probe interval so parallel tests do not spuriously degrade UDP.
+                Duration::from_secs(1),
             )
             .await
         });
@@ -4515,7 +4517,7 @@ mod tests {
                 .channel,
         );
         first_standby.close_async().await;
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 if fallback_calls.load(Ordering::SeqCst) > initial_calls
                     && standby_generation.load(Ordering::SeqCst) > initial_generation
