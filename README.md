@@ -1,6 +1,6 @@
 # mini-tunnel
 
-A minimal, peer-to-peer virtual network tunnel. The design baseline is in [`docs/architecture.md`](docs/architecture.md). The [setup wizard](https://ilovn.github.io/mini-tunnel/) generates Linux peer deployment scripts and links the current desktop command-line downloads.
+A minimal, peer-to-peer virtual network tunnel. The design baseline is in [`docs/architecture.md`](docs/architecture.md). The [setup wizard](https://ilovn.github.io/mini-tunnel/) generates Linux systemd and macOS LaunchDaemon peer installers and links the current desktop command-line downloads.
 
 ## Current status
 
@@ -33,7 +33,7 @@ gh attestation verify mini-tunnel-linux-aarch64-ubuntu22.04.tar.gz \
 sha256sum --check mini-tunnel-linux-aarch64-ubuntu22.04.tar.gz.sha256
 ```
 
-Release [v0.3.0](https://github.com/ilovn/mini-tunnel/releases/tag/v0.3.0) includes macOS Intel/Apple Silicon and Windows x64/ARM64 command-line archives. They are not code-signed/notarized and do not include one-click system service installers; the web wizard's one-click setup currently targets Linux systemd.
+Release [v0.3.0](https://github.com/ilovn/mini-tunnel/releases/tag/v0.3.0) includes macOS Intel/Apple Silicon and Windows x64/ARM64 command-line archives. The macOS release archives can now be installed as a managed LaunchDaemon through the setup wizard; they are not Apple-notarized. Windows remains CLI-only and has no one-click service installer.
 
 Start the coordinator:
 
