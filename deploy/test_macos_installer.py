@@ -135,6 +135,12 @@ class MacOSInstallerTests(unittest.TestCase):
 
             (fake_bin / "id").write_text("#!/bin/sh\necho 0\n", encoding="utf-8")
             (fake_bin / "id").chmod(0o755)
+            (fake_bin / "uname").write_text("#!/bin/sh\necho Darwin\n", encoding="utf-8")
+            (fake_bin / "uname").chmod(0o755)
+            (fake_bin / "stat").write_text("#!/bin/sh\necho 600\n", encoding="utf-8")
+            (fake_bin / "stat").chmod(0o755)
+            (fake_bin / "plutil").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (fake_bin / "plutil").chmod(0o755)
             (fake_bin / "install").write_text(
                 "#!/usr/bin/env python3\n"
                 "import json, os, pathlib, shutil, sys\n"
