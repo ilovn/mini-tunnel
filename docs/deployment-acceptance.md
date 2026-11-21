@@ -144,6 +144,14 @@ sudo systemctl disable --now mini-tunnel-peer@office.service
 
 Revoke the member on the Coordinator so the invite/device identity cannot be reused. Keep `/etc/mini-tunnel/peer-office.env` and `/var/lib/mini-tunnel` until the evidence review is complete. Remove instance-specific files only after confirming no other instance shares them. If the Coordinator or Relay was also part of the test, restore its exact prior configuration and verify unrelated services remain active.
 
+## Windows SCM and Linux peer field check (2026-11-21)
+
+A temporary Windows 10 x64 VM and Guangzhou Ubuntu x86_64 VPS were joined to an isolated test network using prebuilt CI binaries. The generated Windows installer copy was adapted to use the already attestation-verified local CI archive and a protected invite input; this exercised enrollment, private Coordinator CA, Wintun, SCM install/status/restart/uninstall, but was not an unmodified production download test.
+
+After recovery, both peers reported `online=true` on `Relay/QUIC/UDP`, 0% loss, zero drops/rejections, and 15–18 ms RTT. A Windows-originated TCP echo through the overlay returned `echo:final-e2e-check`; both sides reported 10 packets sent and received. The bounded restart wait script timed out at 180 seconds before a later status and TCP check confirmed recovery, so this run does not establish a restart recovery bound or pass the bounded-retry criterion above.
+
+The temporary services, identities, listeners, TUN interface, Wintun adapter and uploaded files were removed. Existing Guangzhou interfaces `tun0`/`tun1` (`10.126.126.x`) and user services were left untouched. The public `v0.3.0` Windows archive predates `windows-service-host`; the unmodified production installer must be revalidated after a compatible release is published. No release or tag was created for this test.
+
 ## Boundary
 
 This runbook proves one installation and one peer pair on the tested network at one point in time. It does not prove cross-region NAT interoperability, sustained QoS behavior, UDP-to-TCP fallback, Relay recovery, production throughput, or multi-peer scaling. Record those scenarios separately with the existing controlled-impairment procedures.
