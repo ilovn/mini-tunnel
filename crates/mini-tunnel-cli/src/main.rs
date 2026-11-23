@@ -3269,6 +3269,108 @@ impl IceProbeValidation {
     }
 }
 
+const RELIABLE_RELAY_RACE_DELAY: Duration = Duration::from_millis(250);
+const DIRECT_RELAY_RACE_DELAY: Duration = Duration::from_secs(5);
+
+#[derive(Debug)]
+enum MeshConnectAttemptError {
+    UnauthorizedPeer,
+    Failed(String),
+}
+
+impl std::fmt::Display for MeshConnectAttemptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnauthorizedPeer => f.write_str("peer identity is unauthorized"),
+            Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+async fn race_mesh_connect_attempts<T, First, Second>(
+    first: First,
+    second: Second,
+) -> Result<T, MeshConnectAttemptError>
+where
+    First: Future<Output = Result<T, MeshConnectAttemptError>>,
+    Second: Future<Output = Result<T, MeshConnectAttemptError>>,
+{
+    tokio::pin!(first);
+    tokio::pin!(second);
+    let mut first_error = None;
+    let mut second_error = None;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut first, if first_error.is_none() => match result {
+                Ok(value) => return Ok(value),
+                Err(MeshConnectAttemptError::UnauthorizedPeer) => {
+                    return Err(MeshConnectAttemptError::UnauthorizedPeer);
+                }
+                Err(error) => first_error = Some(error.to_string()),
+            },
+            result = &mut second, if second_error.is_none() => match result {
+                Ok(value) => return Ok(value),
+                Err(MeshConnectAttemptError::UnauthorizedPeer) => {
+                    return Err(MeshConnectAttemptError::UnauthorizedPeer);
+                }
+                Err(error) => second_error = Some(error.to_string()),
+            },
+        }
+        if let (Some(first), Some(second)) = (&first_error, &second_error) {
+            return Err(MeshConnectAttemptError::Failed(format!(
+                "both connection attempts failed: {first}; {second}"
+            )));
+        }
+    }
+}
+
+async fn connect_mesh_via_relays(
+    relay_endpoints: RelayEndpoints,
+    reliable_only: bool,
+    coordinator_url: &str,
+    network_id: &str,
+    identity: &mini_tunnel_agent::Identity,
+    peer: &PeerInfo,
+) -> Result<mini_tunnel_agent::PeerChannel, MeshConnectAttemptError> {
+    let tcp = relay_endpoints.tcp;
+    let udp = (!reliable_only).then_some(relay_endpoints.udp).flatten();
+    let udp_attempt = async {
+        let relay = udp.ok_or_else(|| {
+            MeshConnectAttemptError::Failed("UDP Relay is not configured".to_owned())
+        })?;
+        connect_peer_via_udp_relay(relay, coordinator_url, network_id, identity, peer)
+            .await
+            .map_err(|error| match error {
+                mini_tunnel_agent::IdentityError::UnauthorizedPeer => {
+                    MeshConnectAttemptError::UnauthorizedPeer
+                }
+                error => MeshConnectAttemptError::Failed(format!("UDP Relay: {error}")),
+            })
+    };
+    let tcp_attempt = async {
+        let relay = tcp.ok_or_else(|| {
+            MeshConnectAttemptError::Failed("TCP Relay is not configured".to_owned())
+        })?;
+        connect_peer_via_relay(relay, coordinator_url, network_id, identity, peer)
+            .await
+            .map_err(|error| match error {
+                mini_tunnel_agent::IdentityError::UnauthorizedPeer => {
+                    MeshConnectAttemptError::UnauthorizedPeer
+                }
+                error => MeshConnectAttemptError::Failed(format!("TCP Relay: {error}")),
+            })
+    };
+    match (udp, tcp) {
+        (Some(_), Some(_)) => race_mesh_connect_attempts(udp_attempt, tcp_attempt).await,
+        (Some(_), None) => udp_attempt.await,
+        (None, Some(_)) => tcp_attempt.await,
+        (None, None) => Err(MeshConnectAttemptError::Failed(
+            "no usable Relay endpoint is configured".to_owned(),
+        )),
+    }
+}
+
 async fn connect_mesh_peer(
     endpoint: &TunnelEndpoint,
     network_id: &str,
@@ -3378,99 +3480,91 @@ async fn connect_mesh_peer(
         }
     }
     let candidates = candidates_for_path(&peer.candidates, options.reliable_only);
-    let direct_result = mini_tunnel_agent::connect_peer_candidates(
-        &endpoint.endpoint,
-        &candidates,
-        network_id,
-        identity,
-        &peer.device_id,
-        peer_key,
-    )
-    .await;
-    let direct_result = match direct_result {
-        Ok((channel, _remote))
-            if reject_unnominated_ice_udp_channel(
-                endpoint.ice.is_some(),
-                channel.transport_name(),
-                channel.has_ice_consent_monitor(),
-            ) =>
-        {
-            channel.close_async().await;
-            Err(mini_tunnel_agent::CandidateConnectError::Unreachable(
-                "ICE-enabled UDP candidate was not nominated and has no consent monitor".into(),
-            ))
-        }
-        result => result,
-    };
-    match direct_result {
-        Ok((mut channel, remote)) => {
-            if let Some((nominated_remote, monitor)) = nominated_ice_monitor.take() {
-                if channel.transport_name() == "QUIC/UDP" && remote == nominated_remote {
-                    channel.set_ice_consent_monitor(monitor);
-                } else {
-                    nominated_ice_monitor = Some((nominated_remote, monitor));
-                }
-            }
-            Ok(MeshPeerConnection {
-                channel,
-                remote,
-                nominated_ice_monitor,
-            })
-        }
-        Err(direct_error) => {
-            if matches!(
-                direct_error,
-                mini_tunnel_agent::CandidateConnectError::UnauthorizedPeer
-            ) {
-                return Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer);
-            }
-            let channel = if !options.reliable_only
-                && let Some(relay) = relay_endpoints.udp
+    let direct_attempt = async {
+        let result = mini_tunnel_agent::connect_peer_candidates(
+            &endpoint.endpoint,
+            &candidates,
+            network_id,
+            identity,
+            &peer.device_id,
+            peer_key,
+        )
+        .await;
+        let result = match result {
+            Ok((channel, _remote))
+                if reject_unnominated_ice_udp_channel(
+                    endpoint.ice.is_some(),
+                    channel.transport_name(),
+                    channel.has_ice_consent_monitor(),
+                ) =>
             {
-                match connect_peer_via_udp_relay(
-                    relay,
-                    coordinator_url,
-                    network_id,
-                    identity,
-                    &peer,
-                )
-                .await
-                {
-                    Ok(channel) => channel,
-                    Err(udp_error) => {
-                        tracing::warn!(peer_id = %peer.device_id, %udp_error, "UDP relay failed; trying TCP relay");
-                        if let Some(relay) = relay_endpoints.tcp {
-                            connect_peer_via_relay(
-                                relay,
-                                coordinator_url,
-                                network_id,
-                                identity,
-                                &peer,
-                            )
-                            .await?
-                        } else {
-                            return Err(udp_error);
-                        }
-                    }
-                }
-            } else if let Some(relay) = relay_endpoints.tcp {
-                connect_peer_via_relay(relay, coordinator_url, network_id, identity, &peer).await?
+                channel.close_async().await;
+                Err(mini_tunnel_agent::CandidateConnectError::Unreachable(
+                    "ICE-enabled UDP candidate was not nominated and has no consent monitor".into(),
+                ))
+            }
+            result => result,
+        };
+        result.map_err(|error| match error {
+            mini_tunnel_agent::CandidateConnectError::UnauthorizedPeer => {
+                MeshConnectAttemptError::UnauthorizedPeer
+            }
+            error => MeshConnectAttemptError::Failed(format!("direct candidates: {error}")),
+        })
+    };
+    let relay_attempt = async {
+        let relay_available = relay_endpoints.tcp.is_some()
+            || (!options.reliable_only && relay_endpoints.udp.is_some());
+        if relay_available {
+            tokio::time::sleep(if options.reliable_only {
+                RELIABLE_RELAY_RACE_DELAY
             } else {
+                DIRECT_RELAY_RACE_DELAY
+            })
+            .await;
+        }
+        connect_mesh_via_relays(
+            relay_endpoints,
+            options.reliable_only,
+            coordinator_url,
+            network_id,
+            identity,
+            &peer,
+        )
+        .await
+        .map(|channel| {
+            let remote = channel.remote_address();
+            (channel, remote)
+        })
+    };
+    let (mut channel, remote) =
+        match race_mesh_connect_attempts(direct_attempt, relay_attempt).await {
+            Ok(connection) => connection,
+            Err(MeshConnectAttemptError::UnauthorizedPeer) => {
                 if let Some((_, monitor)) = nominated_ice_monitor.take() {
                     monitor.stop().await;
                 }
-                return Err(mini_tunnel_agent::IdentityError::Transport(
-                    direct_error.to_string(),
-                ));
-            };
-            let remote = channel.remote_address();
-            Ok(MeshPeerConnection {
-                channel,
-                remote,
-                nominated_ice_monitor,
-            })
+                return Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer);
+            }
+            Err(MeshConnectAttemptError::Failed(error)) => {
+                if let Some((_, monitor)) = nominated_ice_monitor.take() {
+                    monitor.stop().await;
+                }
+                return Err(mini_tunnel_agent::IdentityError::Transport(error));
+            }
+        };
+    if let Some((nominated_remote, monitor)) = nominated_ice_monitor.take() {
+        if channel.transport_name() == "QUIC/UDP" && remote == nominated_remote {
+            channel.set_ice_consent_monitor(monitor);
+        } else {
+            nominated_ice_monitor = Some((nominated_remote, monitor));
         }
     }
+    Ok(MeshPeerConnection {
+        channel,
+        remote,
+        nominated_ice_monitor,
+    })
 }
 
 fn transfer_peer_ice_consent_monitor(
@@ -6068,6 +6162,48 @@ fn print_tunnel_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn relay_race_uses_tcp_when_udp_pairing_stalls() {
+        let udp = async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Err(MeshConnectAttemptError::Failed(
+                "UDP Relay timed out".to_owned(),
+            ))
+        };
+        let tcp = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok("TCP Relay")
+        };
+        let selected = tokio::time::timeout(
+            Duration::from_millis(200),
+            race_mesh_connect_attempts(udp, tcp),
+        )
+        .await
+        .expect("a stalled UDP Relay must not delay TCP fallback")
+        .expect("TCP Relay connects");
+        assert_eq!(selected, "TCP Relay");
+    }
+
+    #[tokio::test]
+    async fn relay_race_prefers_udp_when_both_paths_are_ready() {
+        let udp = async { Ok("UDP Relay") };
+        let tcp = async { Ok("TCP Relay") };
+        let selected = race_mesh_connect_attempts(udp, tcp)
+            .await
+            .expect("a relay path connects");
+        assert_eq!(selected, "UDP Relay");
+    }
+
+    #[tokio::test]
+    async fn direct_candidate_race_wins_when_direct_and_relay_are_ready() {
+        let direct = async { Ok("direct") };
+        let relay = async { Ok("relay") };
+        let selected = race_mesh_connect_attempts(direct, relay)
+            .await
+            .expect("a connection path succeeds");
+        assert_eq!(selected, "direct");
+    }
 
     #[test]
     fn network_create_accepts_a_site_generated_uuid() {
