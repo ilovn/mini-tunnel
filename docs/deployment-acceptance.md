@@ -152,6 +152,16 @@ After recovery, both peers reported `online=true` on `Relay/QUIC/UDP`, 0% loss, 
 
 The temporary services, identities, listeners, TUN interface, Wintun adapter and uploaded files were removed. Existing Guangzhou interfaces `tun0`/`tun1` (`10.126.126.x`) and user services were left untouched. The public `v0.3.0` Windows archive predates `windows-service-host`; the unmodified production installer must be revalidated after a compatible release is published. No release or tag was created for this test.
 
+## Windows SCM restart recovery retest (2026-11-24)
+
+The Windows x64 and Linux x86_64 archives came from successful [release staging workflow 45224241695](https://github.com/ilovn/mini-tunnel/actions/runs/45224241695), source commit `7bfb83decb872df219b5317e83cb584acc10b3a1`. SHA-256 sidecars and GitHub attestations were verified for the release workflow, `refs/heads/main`, and that exact source digest. Neither test host built the executable. The generated Windows installer was used with an adaptation to accept the locally verified CI archive; this was not a test of downloading an already published GitHub Release asset.
+
+Two SCM restart trials ran on an isolated overlay. Before each restart, Windows-to-Guangzhou overlay TCP echo passed 20/20. The first restarted service became Running in 0.588 seconds and the first echo returned 15.308 seconds after restart; the second became Running in 0.604 seconds and the first echo returned in 9.485 seconds. Both recovered sessions then passed 20 consecutive one-second echo probes. Coordinator health returned `ok` and the existing Relay reported an active session. Logs show the surviving peer detecting Relay EOF, nominating direct QUIC/UDP, then selecting Relay/TLS after measured quality degradation. These two trials meet the 30-second first-echo recovery target on this Windows VM and Guangzhou path.
+
+The new unit regression covers refusing a prepared fallback whose receive task has exited. Neither post-fix field trial logged the stale-fallback discard branch; the live trials validate recovery timing and quality fallback but do not replace that deterministic regression or a broader NAT/QoS matrix.
+
+Both temporary members were revoked. The Windows service, state/install directories, Wintun adapter, route, and uploaded test files were removed. Guangzhou test units, overlay address/route, echo listener, binary, state, invite, and temporary files were removed. Existing production Coordinator, Relay, EasyTier, iWAN, and routes were preserved. The public Coordinator has no network-delete endpoint, so the isolated test network remains empty after revocation. Sanitized timestamped logs are in the ignored Harness evidence directory `.harness/tasks/bugfix-34cddfa282/evidence/windows-restart-20261124-patched/`.
+
 ## Boundary
 
 This runbook proves one installation and one peer pair on the tested network at one point in time. It does not prove cross-region NAT interoperability, sustained QoS behavior, UDP-to-TCP fallback, Relay recovery, production throughput, or multi-peer scaling. Record those scenarios separately with the existing controlled-impairment procedures.
