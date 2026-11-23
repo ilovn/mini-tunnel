@@ -1390,13 +1390,26 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                         standby.last_health_successes = health.probes_succeeded;
                         standby.last_health_missed = health.probes_missed;
                     }
-                    if ready_fallback.as_ref().is_some_and(|standby| {
-                        standby.task.is_finished()
-                            || (relay_standby && standby.consecutive_misses >= 2)
-                    })
-                    {
+                    let standby_discard_reason = ready_fallback.as_ref().and_then(|standby| {
+                        relay_standby_discard_reason(
+                            standby.task.is_finished(),
+                            relay_standby,
+                            standby.consecutive_misses,
+                        )
+                    });
+                    if let Some(reason) = standby_discard_reason {
                         if let Some(standby) = ready_fallback.take() {
-                            tracing::warn!(peer_address = %address, reason = "standby_unhealthy", "discarding unhealthy reliable Relay standby");
+                            let health = standby.channel.health_snapshot();
+                            tracing::warn!(
+                                peer_address = %address,
+                                path = standby.channel.transport_name(),
+                                reason,
+                                consecutive_probe_misses = standby.consecutive_misses,
+                                probes_succeeded = health.probes_succeeded,
+                                probes_missed = health.probes_missed,
+                                rtt_ms = health.rtt.map(|rtt| rtt.as_millis() as u64),
+                                "discarding unhealthy reliable Relay standby"
+                            );
                             standby.stop().await;
                         }
                         if fallback_task.is_none()
@@ -1828,6 +1841,20 @@ fn path_rank(transport: &str) -> u8 {
         "TLS/TCP" => 2,
         "Relay/TLS" => 3,
         _ => u8::MAX,
+    }
+}
+
+fn relay_standby_discard_reason(
+    receive_task_finished: bool,
+    relay_standby: bool,
+    consecutive_misses: u8,
+) -> Option<&'static str> {
+    if receive_task_finished {
+        Some("receive_task_finished")
+    } else if relay_standby && consecutive_misses >= 2 {
+        Some("consecutive_probe_misses")
+    } else {
+        None
     }
 }
 
@@ -3230,6 +3257,25 @@ mod tests {
         assert!(path_rank("QUIC/UDP") < path_rank("Relay/QUIC/UDP"));
         assert!(path_rank("Relay/QUIC/UDP") < path_rank("TLS/TCP"));
         assert!(path_rank("TLS/TCP") < path_rank("Relay/TLS"));
+    }
+
+    #[test]
+    fn relay_standby_discard_reason_distinguishes_receive_end_from_probe_misses() {
+        assert_eq!(
+            relay_standby_discard_reason(true, true, 2),
+            Some("receive_task_finished"),
+            "a finished receive task is the primary discard cause"
+        );
+        assert_eq!(
+            relay_standby_discard_reason(false, true, 2),
+            Some("consecutive_probe_misses")
+        );
+        assert_eq!(relay_standby_discard_reason(false, true, 1), None);
+        assert_eq!(
+            relay_standby_discard_reason(false, false, 2),
+            None,
+            "probe-miss discard policy applies only to Relay standbys"
+        );
     }
 
     #[test]

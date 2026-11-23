@@ -139,6 +139,8 @@ TCP fallback 的帧格式：`u32_be frame_length | encrypted_packet`，最大 fr
 
 服务端不可用影响：已建立 P2P 正常继续至租约到期；新 peer 发现和认证失败；既有 relay 会话按 ticket 租期继续或到期断开。Coordinator 做多副本和数据库备份；relay 故障需客户端切换备用区域。发布采用兼容的协议版本协商、先服务端后客户端的滚动升级；保留一个旧版本窗口。
 
+Mesh 将可靠 Relay 通道作为待命路径时，丢弃日志通过 `reason` 区分接收任务结束（`receive_task_finished`）和连续两次健康探测未通过（`consecutive_probe_misses`），同时记录路径、累计成功/失败探测数、连续漏探测数及 RTT，便于将对端关闭与探测退化分开诊断。该字段只改进可观测性，不改变重连或路径选择策略。
+
 Coordinator 现可使用 PostgreSQL 作为多实例共享事实源：网络、邀请、成员/IPv4 租约、候选、短期 ICE 凭证和 relay ticket 配对均在数据库事务中读取或更新；JSON 快照继续用于单进程部署与显式迁移/回滚。应用启动只校验 schema，不自动执行 DDL；由独立 owner 凭据运行迁移，服务进程使用受限 DML 角色。当前实现用单一数据库事务锁保护既有内存领域逻辑，跨实例写入正确但会串行化，适合 MVP 高可用部署，不承诺随副本线性扩展写吞吐。数据库故障时 API/health readiness fail closed，不回退到空状态。
 
 ## 10. 技术模块建议
