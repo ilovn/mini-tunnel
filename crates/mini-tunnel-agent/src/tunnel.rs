@@ -691,6 +691,27 @@ async fn cancel_prepared_fallback(
     }
 }
 
+async fn take_live_ready_fallback(
+    ready_fallback: &mut Option<MeshReceivePump>,
+    address: Ipv4Addr,
+) -> Option<MeshReceivePump> {
+    if ready_fallback
+        .as_ref()
+        .is_some_and(|candidate| candidate.task.is_finished())
+    {
+        if let Some(candidate) = ready_fallback.take() {
+            tracing::warn!(
+                peer_address = %address,
+                path = candidate.channel.transport_name(),
+                "discarding a closed prepared reliable fallback"
+            );
+            candidate.stop().await;
+        }
+        return None;
+    }
+    ready_fallback.take()
+}
+
 async fn wait_for_ice_consent_state_change(
     receiver: &mut Option<tokio::sync::watch::Receiver<bool>>,
     last_state: &mut bool,
@@ -1310,7 +1331,9 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                                 "peer path quality degraded".to_owned(),
                             ));
                         };
-                        if let Some(candidate) = ready_fallback.take()
+                        let prepared_fallback =
+                            take_live_ready_fallback(&mut ready_fallback, address).await;
+                        if let Some(candidate) = prepared_fallback
                             && path_rank(candidate.channel.transport_name())
                                 > path_rank(active.transport_name())
                         {
@@ -1646,7 +1669,8 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                 );
             }
         }
-        if let Some(candidate) = ready_fallback.take() {
+        let prepared_fallback = take_live_ready_fallback(&mut ready_fallback, address).await;
+        if let Some(candidate) = prepared_fallback {
             if path_rank(candidate.channel.transport_name()) > path_rank(active.transport_name()) {
                 discard_queued_mesh_packets(&mut outbound_rx, address);
                 let fallback_path = candidate.channel.transport_name();
@@ -3654,6 +3678,71 @@ mod tests {
             health_was_forwarded,
             "the mesh idle timer must observe authenticated health packets received by its pump"
         );
+    }
+
+    #[tokio::test]
+    async fn mesh_discards_closed_ready_fallback_before_quality_switch() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-mesh-closed-fallback-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let a = Arc::new(Identity::load_or_create_at(temp.join("a/key")).unwrap());
+        let b = Arc::new(Identity::load_or_create_at(temp.join("b/key")).unwrap());
+        let endpoint_a =
+            peer_endpoint(&a, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+        let endpoint_b =
+            peer_endpoint(&b, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+        let network = "mesh-closed-fallback";
+        let a_id = a.device_id();
+        let a_key = a.public_key();
+        let b_id = b.device_id();
+        let b_key = b.public_key();
+        let server_endpoint = endpoint_b.clone();
+        let server_identity = Arc::clone(&b);
+        let accept = tokio::spawn(async move {
+            accept_peer(&server_endpoint, network, &server_identity, &a_id, a_key).await
+        });
+        let local = Arc::new(
+            connect_peer(
+                &endpoint_a,
+                endpoint_b.local_addr().unwrap(),
+                network,
+                &a,
+                &b_id,
+                b_key,
+            )
+            .await
+            .unwrap(),
+        );
+        let remote = accept.await.unwrap().unwrap();
+        let mut ready_fallback = Some(MeshReceivePump::spawn(
+            Arc::clone(&local),
+            Ipv4Addr::LOCALHOST,
+        ));
+        remote.close_async().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !ready_fallback
+                .as_ref()
+                .expect("prepared fallback exists")
+                .task
+                .is_finished()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("closed relay receive pump must stop before switching");
+
+        let selected = take_live_ready_fallback(&mut ready_fallback, Ipv4Addr::LOCALHOST).await;
+        assert!(
+            selected.is_none(),
+            "a closed Relay standby must not be promoted"
+        );
+        assert!(ready_fallback.is_none());
+
+        endpoint_a.close(0_u32.into(), b"test complete");
+        endpoint_b.close(0_u32.into(), b"test complete");
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
