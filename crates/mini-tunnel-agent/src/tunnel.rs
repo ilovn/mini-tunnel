@@ -5719,6 +5719,11 @@ mod tests {
         let a = Arc::new(Identity::load_or_create_at(temp.join("a/key")).unwrap());
         let b = Arc::new(Identity::load_or_create_at(temp.join("b/key")).unwrap());
         let (initial, remote_initial) = tcp_pair(Arc::clone(&a), Arc::clone(&b)).await;
+        let remote_initial = Arc::new(remote_initial);
+        let remote_initial_reader_channel = Arc::clone(&remote_initial);
+        let remote_initial_reader = tokio::spawn(async move {
+            while remote_initial_reader_channel.recv_packet().await.is_ok() {}
+        });
         let endpoint_a =
             peer_endpoint_in_namespace(&a, local_address, &link.left_namespace).unwrap();
         let endpoint_b =
@@ -5839,6 +5844,20 @@ mod tests {
             .await
             .expect("direct UDP health probes did not complete")
             .expect("join direct UDP accept task");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while remote.health_probe_requests_received() < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("remote direct candidate completed its local health probes");
+        assert!(
+            remote
+                .as_ref()
+                .negotiate_direct_path_promotion(Duration::from_secs(3))
+                .await,
+            "remote peer coordinates promotion over the reliable channel"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
         outbound_tx
             .send(packet(local_ip, peer_ip, 28))
@@ -5852,6 +5871,7 @@ mod tests {
 
         pump.abort();
         remote.close_async().await;
+        remote_initial_reader.abort();
         remote_initial.close_async().await;
         endpoint_a.close(0_u32.into(), b"veth promotion test complete");
         endpoint_b.close(0_u32.into(), b"veth promotion test complete");
