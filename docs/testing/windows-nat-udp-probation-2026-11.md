@@ -46,6 +46,24 @@ This run verifies the Windows peer on VMware NAT, direct Windows-to-Hong Kong UD
 
 For a conclusive retest, first establish and record a nominated Windows↔Guangzhou pair, then capture per-probe debug logs while applying a narrowly scoped, automatically reverted loss interval to that pair. Keep the same verified CI artifacts and cleanup checks.
 
+## Retest on main `c72a255`
+
+Date: 2026-11-27 (China Standard Time). Release staging workflow run: `45886332907`; Linux x86_64 and Windows x86_64 build jobs succeeded and the publish job was skipped. SHA-256 sidecars matched, and `deploy/verify-peer-attestation.sh` verified both Sigstore attestations against `.github/workflows/release.yml`, `refs/heads/main`, and source `c72a255d5b881d316abafca6279e6fdf1eae15ed`.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Linux x86_64 archive | `1b31cd3c8f6540d4135ed7ba1f021ea6affbe54cfd6a21119278ef3262656260` |
+| Windows x86_64 archive | `9f87d1a8fed8a21e510d352462003438481dbe0fe959c534ef8d9f5d47585228` |
+| Extracted Linux executable | `603cfe499f22759354d6129d538c278b565eea1d3dbf8dfb1dec445e1547e6e8` |
+| Extracted Windows executable | `1ff19ae398943d881e90b9e632a6a428eeb1f02a31082c9fc8f3ecc290614182` |
+| Wintun x64 DLL | `e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce` |
+
+This isolated two-peer retest paired Guangzhou with Windows 10 behind VMware NAT (`192.168.196.130`, gateway `192.168.196.2`). The Windows public egress observed before the run was `151.242.172.39`; `YunShuService` was stopped. Both endpoints used attested CI artifacts; neither built source locally. Guangzhou nominated the Windows UDP candidate and its initial authenticated health probes passed, but five-second probation ended at 4 successes / 5 misses with `timed_out_probe_attempts=0`. The direct path was rejected and both peer status snapshots showed `Relay/QUIC/UDP`. No firewall impairment was applied. Overlay ping then passed 5/5 Guangzhou→Windows and 3/3 Windows→Guangzhou, both with 0% loss, over the Relay path.
+
+This confirms that the Windows peer joins and carries overlay traffic through Relay after an unstable direct UDP candidate. It does not establish a stable direct Windows↔Guangzhou path or exercise controlled loss, a nonzero timeout counter, or recovery from Relay to direct UDP. Private raw peer/service logs and Relay metrics are retained under `.harness/tasks/complex-fe2e6b84e9/evidence/private/retest-c72/` and are not committed.
+
+Cleanup revoked both test memberships and released `10.244.218.1` and `.2`. The temporary Windows peer process, scheduled task, route, interface, status listener, and `C:\ProgramData\MiniTunnel\R27` directory were removed. The temporary Guangzhou services and `/tmp/mini-tunnel-windows-retest-20261127` directory were removed; no test route, listener, or process remained. Guangzhou default route stayed via `10.0.20.1`; production Relay PID `17770` retained TCP `42001`, UDP `42003`, and metrics `42002`; existing `tun0`, `tun1`, and `iwan0` remained. Windows default route stayed via `192.168.196.2`; `YunShuService` remained stopped (Automatic), and `YunShu Service Task Scheduler` remained disabled. No firewall rule/table was installed or changed.
+
 ## Retest on main `68d62ac`
 
 Date: 2026-11-27 (China Standard Time). Release staging workflow run: `45883051511`; the publish job was skipped because this was a branch build. Both artifacts were built from `68d62ac408f089fe6c0223811b66ebb3c3ae3249`. SHA-256 sidecars matched and `deploy/verify-peer-attestation.sh` passed against `.github/workflows/release.yml` and `refs/heads/main`.
