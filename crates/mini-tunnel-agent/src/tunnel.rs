@@ -5852,8 +5852,7 @@ mod tests {
         .await
         .expect("remote direct candidate completed its local health probes");
         assert!(
-            remote
-                .as_ref()
+            remote_initial
                 .negotiate_direct_path_promotion(Duration::from_secs(3))
                 .await,
             "remote peer coordinates promotion over the reliable channel"
