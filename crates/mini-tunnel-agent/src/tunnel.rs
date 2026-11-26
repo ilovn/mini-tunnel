@@ -1601,7 +1601,9 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
             }
         };
         drop(inbound);
-        let pending_direct_probe = if matches!(&outcome, Err(IdentityError::Transport(_)))
+        let pending_direct_probe = if outcome
+            .as_ref()
+            .is_err_and(IdentityError::is_transport_failure)
             && active.transport_name() != "QUIC/UDP"
         {
             if let Some(task) = probe_task.take() {
@@ -1684,7 +1686,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
             candidate.close_async().await;
         }
         let health = active.health_snapshot();
-        if is_udp_path(active.transport_name()) && matches!(&failure, IdentityError::Transport(_)) {
+        if is_udp_path(active.transport_name()) && failure.is_transport_failure() {
             force_reliable = true;
             if !recovery_backoff_applied {
                 let previous_probe_cooldown = recovery_probe_cooldown;
@@ -3313,6 +3315,10 @@ mod tests {
                 false,
                 &IdentityError::Transport("peer transport failed: closed".to_owned())
             ),
+            "transport_failure"
+        );
+        assert_eq!(
+            mesh_path_failure_reason(false, &IdentityError::CandidateProbeTimeout),
             "transport_failure"
         );
         assert_eq!(

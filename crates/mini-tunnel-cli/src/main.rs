@@ -4799,8 +4799,10 @@ async fn probe_candidate_probation_once(
 }
 
 fn is_candidate_probation_timeout(error: &mini_tunnel_agent::IdentityError) -> bool {
-    matches!(error, mini_tunnel_agent::IdentityError::Transport(message)
-        if message == "candidate path probe timed out")
+    matches!(
+        error,
+        mini_tunnel_agent::IdentityError::CandidateProbeTimeout
+    )
 }
 
 fn udp_probation_loss_is_acceptable(
@@ -6436,13 +6438,14 @@ mod tests {
 
     #[test]
     fn candidate_probation_timeout_is_a_counted_miss_not_a_fatal_error() {
-        let timeout = mini_tunnel_agent::IdentityError::Transport(
-            "candidate path probe timed out".to_owned(),
-        );
+        let timeout = mini_tunnel_agent::IdentityError::CandidateProbeTimeout;
         assert!(is_candidate_probation_timeout(&timeout));
+        assert!(timeout.is_transport_failure());
+        assert_eq!(timeout.to_string(), "candidate path probe timed out");
         let other_error =
             mini_tunnel_agent::IdentityError::Transport("connection reset".to_owned());
         assert!(!is_candidate_probation_timeout(&other_error));
+        assert!(other_error.is_transport_failure());
     }
 
     async fn delayed_healthz() -> impl IntoResponse {

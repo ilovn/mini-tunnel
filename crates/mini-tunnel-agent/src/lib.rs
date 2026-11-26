@@ -55,8 +55,18 @@ pub enum IdentityError {
     UnauthorizedPeer,
     #[error("peer sent an invalid, oversized, or replayed frame")]
     InvalidFrame,
+    #[error("candidate path probe timed out")]
+    CandidateProbeTimeout,
     #[error("peer transport failed: {0}")]
     Transport(String),
+}
+
+impl IdentityError {
+    /// Whether the error represents a failed transport operation.
+    #[must_use]
+    pub fn is_transport_failure(&self) -> bool {
+        matches!(self, Self::CandidateProbeTimeout | Self::Transport(_))
+    }
 }
 
 #[derive(Debug, Error)]
@@ -826,15 +836,13 @@ impl PeerChannel {
                             continue;
                         }
                         _ = tokio::time::sleep_until(deadline) => {
-                            return Err(IdentityError::Transport("candidate path probe timed out".to_owned()));
+                            return Err(IdentityError::CandidateProbeTimeout);
                         }
                     }
                 } else {
                     tokio::time::timeout_at(deadline, self.recv_packet_from_transport())
                         .await
-                        .map_err(|_| {
-                            IdentityError::Transport("candidate path probe timed out".to_owned())
-                        })??
+                        .map_err(|_| IdentityError::CandidateProbeTimeout)??
                 };
                 if !packet.is_empty() {
                     self.pending_probe_packets
