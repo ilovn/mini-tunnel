@@ -8,6 +8,12 @@ Status: **public NAT/QoS matrix incomplete**. The loopback ICE mapping proxy ver
 - Guangzhou then rejected the direct QUIC/UDP candidate after five-second probation at 4 successes / 5 missed health probes. The structured `timed_out_probe_attempts` count was 0; this run does not demonstrate the timeout-specific handler. Both peers remained online over Relay/TLS at about 320 ms RTT and 0% reported loss. Bidirectional overlay ICMP passed 10/10 in each direction. A later direct recovery attempt failed with `connection lost`; no impairment was applied.
 - Temporary members and services were removed, routes/TUNs and test listeners cleared, and Guangzhou's production Relay/default route remained unchanged. See the [full report](testing/guangzhou-hongkong-ice-probation-2026-11.md) for artifact hashes and cleanup details.
 
+### Guangzhou–domestic NAT controlled UDP fallback and coordinated direct recovery (2026-11-27)
+
+- With current attested CI artifacts, direct ICE/QUIC was established between Guangzhou and the domestic NAT Ubuntu peer. A narrowly scoped temporary UDP drop moved both peers online to Relay/TLS; bidirectional overlay probes passed 15/15 with 0% loss.
+- After the rule was removed, both peers later completed authenticated probation and coordinated promotion back to QUIC/UDP. Post-recovery probes passed 60/60 each way with 0% loss. The reliable path remained online while direct recovery retried.
+- Direct recovery took several minutes under the current exponential probe backoff, which grows to five minutes. This route confirms eventual recovery but leaves recovery latency as follow-up work. All temporary test resources were removed; Guangzhou production Relay and routes remained unchanged. See the [full report](testing/direct-recovery-domestic-nat-2026-11.md) for provenance and cleanup evidence.
+
 ### Windows VM egress follow-up (2026-11-27)
 
 - With `YunShuService` stopped, the Windows VMware NAT guest still reported public egress `151.243.38.115`, the Hong Kong VPS address. Its default route remained through VMware gateway `192.168.196.2`; traceroute showed further private hops. The forwarding device or service is not identified, so this run cannot be counted as an independent ordinary Windows NAT sample. See the [Windows probation report](testing/windows-nat-udp-probation-2026-11.md).
