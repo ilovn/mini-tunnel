@@ -27,10 +27,7 @@ const EARLY_FALLBACK_MISSES: u64 = 1;
 const HEALTH_PROBE_INTERVAL: Duration = Duration::from_millis(400);
 const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DIRECT_PROBE_HANDOFF_GRACE: Duration = Duration::from_secs(2);
-const DIRECT_PROBE_BACKOFF_MAX: Duration = Duration::from_secs(300);
-const DIRECT_PROBE_BACKOFF_RESET_AFTER: Duration = Duration::from_secs(60);
-const DIRECT_PROBE_RENDEZVOUS_INTERVAL: Duration = Duration::from_secs(30);
-const IMMEDIATE_DIRECT_PROBE_DELAY: Duration = Duration::from_millis(1);
+const DIRECT_PROBE_RENDEZVOUS_INTERVAL: Duration = Duration::from_secs(60);
 
 fn mesh_event_queue_capacity(peer_count: usize) -> usize {
     peer_count
@@ -341,50 +338,48 @@ fn path_quality_loss_is_acceptable_with_policy(
             <= u128::from(policy.max_loss_percent) * u128::from(total)
 }
 
-fn next_direct_probe_cooldown(
-    current: Duration,
-    base: Duration,
-    active_direct_stability: Duration,
-) -> Duration {
-    if active_direct_stability >= DIRECT_PROBE_BACKOFF_RESET_AFTER {
-        return base;
-    }
-    current
-        .saturating_mul(2)
-        .min(base.max(DIRECT_PROBE_BACKOFF_MAX))
-}
-
-fn direct_probe_interval(cooldown: Duration) -> tokio::time::Interval {
-    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + cooldown, cooldown);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    interval
-}
-
-fn next_direct_probe_rendezvous_delay_after(
-    now: SystemTime,
-    period: Duration,
-    minimum_delay: Duration,
-) -> Duration {
+fn next_direct_probe_rendezvous_delay(now: SystemTime, period: Duration) -> Duration {
     let period_nanos = period.as_nanos();
     assert!(period_nanos > 0, "rendezvous period must be non-zero");
     let now_nanos = now
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let earliest_nanos = now_nanos.saturating_add(minimum_delay.as_nanos());
-    let remainder = earliest_nanos % period_nanos;
+    let remainder = now_nanos % period_nanos;
     let delay_nanos = if remainder == 0 {
-        if minimum_delay.is_zero() {
-            period_nanos
-        } else {
-            minimum_delay.as_nanos()
-        }
+        period_nanos
     } else {
-        earliest_nanos
-            .saturating_add(period_nanos - remainder)
-            .saturating_sub(now_nanos)
+        period_nanos - remainder
     };
     Duration::from_nanos(delay_nanos as u64)
+}
+
+fn coordinated_direct_probe_interval(now: SystemTime, period: Duration) -> tokio::time::Interval {
+    let delay = next_direct_probe_rendezvous_delay(now, period);
+    let start = tokio::time::Instant::now() + delay;
+    let mut interval = tokio::time::interval_at(start, period);
+    // Keep all peers on the same UTC cadence even when one probe runs past a tick.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
+}
+
+fn immediate_direct_probe_interval() -> tokio::time::Interval {
+    let start = tokio::time::Instant::now() + Duration::from_millis(1);
+    let mut interval = tokio::time::interval_at(start, Duration::from_secs(3600));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
+
+fn mesh_probe_rendezvous_interval(peers: &[MeshPeerInput]) -> Duration {
+    common_probe_rendezvous_interval(peers.iter().map(|peer| peer.4.as_ref().map(|_| peer.5)))
+}
+
+fn common_probe_rendezvous_interval(hints: impl Iterator<Item = Option<Duration>>) -> Duration {
+    hints
+        .flatten()
+        .map(|hint| hint.clamp(Duration::from_millis(1), DIRECT_PROBE_RENDEZVOUS_INTERVAL))
+        .min()
+        .unwrap_or(DIRECT_PROBE_RENDEZVOUS_INTERVAL)
 }
 
 #[derive(Default)]
@@ -446,7 +441,8 @@ pub struct ReconnectingPeer {
     pub connector: PeerConnector,
     /// Authenticated candidate probe used to migrate a healthy reliable session back to UDP.
     pub probe: Option<PeerConnector>,
-    /// Cooldown between path probes. Production callers should use at least 60 seconds.
+    /// Desired maximum delay between authenticated direct probes. The mesh chooses one common
+    /// cadence from its peers (the shortest hint, capped at 60 seconds) for ICE rendezvous.
     pub probe_cooldown: Duration,
     /// Keep one authenticated reliable standby while a UDP path is active.
     /// Both endpoints must enable this to keep a pre-paired Relay channel ready.
@@ -467,7 +463,7 @@ struct MeshPeerRuntime {
     channel: Arc<tokio::sync::RwLock<Arc<PeerChannel>>>,
     connector: Option<PeerConnector>,
     probe: Option<PeerConnector>,
-    probe_cooldown: Duration,
+    probe_rendezvous_interval: Duration,
     relay_standby: bool,
     candidate_refresh: tokio::sync::mpsc::Sender<()>,
     pending_events: Arc<AtomicUsize>,
@@ -480,7 +476,7 @@ struct MeshPeerReceiver {
     channel: Arc<tokio::sync::RwLock<Arc<PeerChannel>>>,
     connector: Option<PeerConnector>,
     probe: Option<PeerConnector>,
-    probe_cooldown: Duration,
+    probe_rendezvous_interval: Duration,
     relay_standby: bool,
     candidate_refresh_rx: tokio::sync::mpsc::Receiver<()>,
     pending_events: Arc<AtomicUsize>,
@@ -495,7 +491,7 @@ fn new_mesh_peer_runtime(
     channel: Arc<PeerChannel>,
     connector: Option<PeerConnector>,
     probe: Option<PeerConnector>,
-    probe_cooldown: Duration,
+    probe_rendezvous_interval: Duration,
     relay_standby: bool,
 ) -> (
     MeshPeerRuntime,
@@ -511,7 +507,7 @@ fn new_mesh_peer_runtime(
             channel: Arc::new(tokio::sync::RwLock::new(channel)),
             connector,
             probe,
-            probe_cooldown,
+            probe_rendezvous_interval,
             relay_standby,
             candidate_refresh,
             pending_events: Arc::new(AtomicUsize::new(0)),
@@ -1035,7 +1031,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         channel,
         connector,
         probe,
-        probe_cooldown,
+        probe_rendezvous_interval,
         relay_standby,
         mut candidate_refresh_rx,
         pending_events,
@@ -1043,7 +1039,6 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         event_tx,
         quality_interval,
     } = receiver;
-    let mut recovery_probe_cooldown = probe_cooldown;
     // Keep the previous nominated UDP session alive only as an ICE consent observer after
     // switching packet forwarding to a reliable path. The recovery probe cadence bounds it.
     let mut retired_ice_consent: Option<(Arc<PeerChannel>, u64, Instant)> = None;
@@ -1058,7 +1053,6 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         {
             stale.stop().await;
         }
-        let active_path_started_at = Instant::now();
         // Probe often enough to observe a sustained UDP loss window before the QUIC idle timeout.
         // User-configured shorter intervals remain respected for tests and constrained deployments.
         let mut keepalive =
@@ -1096,12 +1090,12 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
             None,
         );
         let mut force_reliable = false;
-        let mut recovery_backoff_applied = false;
         let mut retired_consent_failure = retired_ice_consent
             .as_ref()
             .and_then(|(peer, _, _)| peer.ice_consent_failure_receiver());
         let mut observe_retired_consent = retired_consent_failure.is_some();
-        let mut probe_interval = direct_probe_interval(recovery_probe_cooldown);
+        let mut probe_interval =
+            coordinated_direct_probe_interval(SystemTime::now(), probe_rendezvous_interval);
         let mut candidate_refresh_pending = false;
         let (probe_tx, mut probe_rx) = tokio::sync::mpsc::channel(1);
         let mut probe_task = None;
@@ -1228,16 +1222,20 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                 }
                 refresh = candidate_refresh_rx.recv(), if probe.is_some() && active.transport_name() != "QUIC/UDP" => {
                     if refresh.is_some() {
-                        recovery_probe_cooldown = probe_cooldown;
                         if probe_task.is_some() {
                             candidate_refresh_pending = true;
                         } else {
-                            probe_interval = direct_probe_interval(IMMEDIATE_DIRECT_PROBE_DELAY);
+                            probe_interval = immediate_direct_probe_interval();
                         }
+                        let next_probe_delay = next_direct_probe_rendezvous_delay(
+                            SystemTime::now(),
+                            probe_rendezvous_interval,
+                        );
                         tracing::debug!(
                             peer_address = %address,
                             active_path = active.transport_name(),
-                            next_probe_cooldown_ms = recovery_probe_cooldown.as_millis() as u64,
+                            next_probe_delay_ms = next_probe_delay.as_millis() as u64,
+                            rendezvous_interval_ms = probe_rendezvous_interval.as_millis() as u64,
                             "peer candidates changed; scheduling an authenticated direct recovery probe"
                         );
                     }
@@ -1314,22 +1312,6 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                         .await;
                     }
                     if is_udp_path(active.transport_name()) && quality_degraded && !force_reliable {
-                        let previous_probe_cooldown = recovery_probe_cooldown;
-                        let direct_path_stability = active_path_started_at.elapsed();
-                        recovery_probe_cooldown = next_direct_probe_cooldown(
-                            recovery_probe_cooldown,
-                            probe_cooldown,
-                            direct_path_stability,
-                        );
-                        probe_interval = direct_probe_interval(recovery_probe_cooldown);
-                        recovery_backoff_applied = true;
-                        tracing::debug!(
-                            peer_address = %address,
-                            previous_probe_cooldown_ms = previous_probe_cooldown.as_millis() as u64,
-                            next_probe_cooldown_ms = recovery_probe_cooldown.as_millis() as u64,
-                            direct_path_stability_ms = direct_path_stability.as_millis() as u64,
-                            "updated direct UDP recovery probe cooldown after quality fallback"
-                        );
                         let degradation_age = udp_degradation_started_at.map(|started| started.elapsed());
                         let disconnected_deadline_remaining = degradation_age
                             .map(conservative_ice_disconnected_remaining);
@@ -1528,40 +1510,21 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                         }
                     };
                     if recovery_failed {
-                        let previous_probe_cooldown = recovery_probe_cooldown;
-                        let next_probe_delay;
                         if candidate_refresh_pending {
                             candidate_refresh_pending = false;
-                            recovery_probe_cooldown = probe_cooldown;
-                            next_probe_delay = IMMEDIATE_DIRECT_PROBE_DELAY;
-                            probe_interval = direct_probe_interval(next_probe_delay);
+                            probe_interval = immediate_direct_probe_interval();
                         } else {
-                            recovery_probe_cooldown = next_direct_probe_cooldown(
-                                recovery_probe_cooldown,
-                                probe_cooldown,
-                                Duration::ZERO,
-                            );
-                            let now = SystemTime::now();
-                            next_probe_delay = next_direct_probe_rendezvous_delay_after(
-                                now,
-                                DIRECT_PROBE_RENDEZVOUS_INTERVAL,
-                                recovery_probe_cooldown,
-                            );
-                            let start = tokio::time::Instant::now() + next_probe_delay;
-                            let mut interval = tokio::time::interval_at(
-                                start,
-                                DIRECT_PROBE_RENDEZVOUS_INTERVAL,
-                            );
-                            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                            probe_interval = interval;
+                            probe_interval = coordinated_direct_probe_interval(SystemTime::now(), probe_rendezvous_interval);
                         }
+                        let next_probe_delay = next_direct_probe_rendezvous_delay(
+                            SystemTime::now(),
+                            probe_rendezvous_interval,
+                        );
                         tracing::debug!(
                             peer_address = %address,
-                            previous_probe_cooldown_ms = previous_probe_cooldown.as_millis() as u64,
-                            next_probe_cooldown_ms = recovery_probe_cooldown.as_millis() as u64,
                             next_probe_delay_ms = next_probe_delay.as_millis() as u64,
-                            rendezvous_interval_ms = DIRECT_PROBE_RENDEZVOUS_INTERVAL.as_millis() as u64,
-                            "scheduled the next direct UDP recovery probe after an unsuccessful probe"
+                            rendezvous_interval_ms = probe_rendezvous_interval.as_millis() as u64,
+                            "retaining the shared direct UDP recovery schedule after an unsuccessful probe"
                         );
                     }
                 }
@@ -1695,22 +1658,6 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
         let health = active.health_snapshot();
         if is_udp_path(active.transport_name()) && failure.is_transport_failure() {
             force_reliable = true;
-            if !recovery_backoff_applied {
-                let previous_probe_cooldown = recovery_probe_cooldown;
-                let direct_path_stability = active_path_started_at.elapsed();
-                recovery_probe_cooldown = next_direct_probe_cooldown(
-                    recovery_probe_cooldown,
-                    probe_cooldown,
-                    direct_path_stability,
-                );
-                tracing::debug!(
-                    peer_address = %address,
-                    previous_probe_cooldown_ms = previous_probe_cooldown.as_millis() as u64,
-                    next_probe_cooldown_ms = recovery_probe_cooldown.as_millis() as u64,
-                    direct_path_stability_ms = direct_path_stability.as_millis() as u64,
-                    "updated direct UDP recovery probe cooldown after transport failure"
-                );
-            }
         }
         let prepared_fallback = take_live_ready_fallback(&mut ready_fallback, address).await;
         if let Some(candidate) = prepared_fallback {
@@ -2019,12 +1966,16 @@ async fn pump_mesh_with_quality_interval<T: TunnelPacketIo>(
     if peers.is_empty() && updates.is_none() {
         return Err(PeerTunnelError::NoPeers);
     }
+    // All peers in this mesh use one UTC cadence so simultaneous ICE checks rendezvous,
+    // regardless of each peer's previous failure history.
+    let probe_rendezvous_interval = mesh_probe_rendezvous_interval(&peers);
     let outbound_budget = Arc::new(tokio::sync::Semaphore::new(MESH_OUTBOUND_QUEUE_GLOBAL));
     let mut channels = HashMap::with_capacity(peers.len());
     let mut outbound_receivers = HashMap::with_capacity(peers.len());
     let mut candidate_refresh_receivers = HashMap::with_capacity(peers.len());
     let mut ipv6_routes = HashMap::new();
-    for (address, ipv6_address, channel, connector, probe, probe_cooldown, relay_standby) in peers {
+    for (address, ipv6_address, channel, connector, probe, _probe_cooldown, relay_standby) in peers
+    {
         if let Some(ipv6_address) = ipv6_address
             && ipv6_routes.insert(ipv6_address, address).is_some()
         {
@@ -2036,7 +1987,7 @@ async fn pump_mesh_with_quality_interval<T: TunnelPacketIo>(
             channel,
             connector,
             probe,
-            probe_cooldown,
+            probe_rendezvous_interval,
             relay_standby,
         );
         if channels.insert(address, runtime).is_some() {
@@ -2161,7 +2112,7 @@ async fn pump_mesh_with_quality_interval<T: TunnelPacketIo>(
                             peer.channel,
                             Some(peer.connector),
                             peer.probe,
-                            peer.probe_cooldown,
+                            probe_rendezvous_interval,
                             peer.relay_standby,
                         );
                         receivers.insert(
@@ -2226,7 +2177,7 @@ fn spawn_mesh_receiver(
         channel: Arc::clone(&runtime.channel),
         connector: runtime.connector.clone(),
         probe: runtime.probe.clone(),
-        probe_cooldown: runtime.probe_cooldown,
+        probe_rendezvous_interval: runtime.probe_rendezvous_interval,
         relay_standby: runtime.relay_standby,
         candidate_refresh_rx,
         pending_events: Arc::clone(&runtime.pending_events),
@@ -3654,77 +3605,58 @@ mod tests {
     }
 
     #[test]
-    fn direct_probe_failures_use_bounded_exponential_backoff() {
-        let base = Duration::from_secs(60);
-        let mut cooldown = base;
-        for expected_seconds in [120, 240, 300, 300] {
-            cooldown = next_direct_probe_cooldown(cooldown, base, Duration::ZERO);
-            assert_eq!(cooldown, Duration::from_secs(expected_seconds));
-        }
-    }
-
-    #[test]
-    fn stable_direct_path_resets_recovery_probe_backoff_to_base() {
-        let base = Duration::from_secs(60);
-        assert_eq!(
-            next_direct_probe_cooldown(
-                Duration::from_secs(300),
-                base,
-                DIRECT_PROBE_BACKOFF_RESET_AFTER,
-            ),
-            base
-        );
-    }
-
-    #[test]
-    fn recovery_probe_backoff_preserves_caller_cooldowns() {
-        let long_base = Duration::from_secs(3600);
-        assert_eq!(
-            next_direct_probe_cooldown(long_base, long_base, Duration::ZERO),
-            long_base
-        );
-
-        let short_base = Duration::from_millis(25);
-        assert_eq!(
-            next_direct_probe_cooldown(short_base, short_base, Duration::ZERO),
-            Duration::from_millis(50)
-        );
-    }
-
-    #[test]
     fn failed_direct_probes_align_to_the_same_utc_rendezvous() {
         let period = DIRECT_PROBE_RENDEZVOUS_INTERVAL;
-        let first_now = UNIX_EPOCH + Duration::from_millis(100_250);
-        let second_now = UNIX_EPOCH + Duration::from_millis(105_500);
-        let first_delay =
-            next_direct_probe_rendezvous_delay_after(first_now, period, Duration::ZERO);
-        let second_delay =
-            next_direct_probe_rendezvous_delay_after(second_now, period, Duration::ZERO);
+        let first_failure = UNIX_EPOCH + Duration::from_millis(119_999);
+        let second_failure = UNIX_EPOCH + Duration::from_millis(120_001);
+        let first_delay = next_direct_probe_rendezvous_delay(first_failure, period);
+        let second_delay = next_direct_probe_rendezvous_delay(second_failure, period);
+        let first_slot = first_failure + first_delay;
+        let second_slot = second_failure + second_delay;
 
-        assert_eq!(first_now + first_delay, second_now + second_delay);
-        assert_eq!(first_delay, Duration::from_millis(19_750));
-        assert_eq!(second_delay, Duration::from_millis(14_500));
+        assert_eq!(first_slot, UNIX_EPOCH + Duration::from_secs(120));
+        assert_eq!(second_slot, UNIX_EPOCH + Duration::from_secs(180));
+        assert_eq!(first_slot + period, second_slot);
         assert_eq!(
-            next_direct_probe_rendezvous_delay_after(UNIX_EPOCH + period, period, Duration::ZERO),
+            next_direct_probe_rendezvous_delay(UNIX_EPOCH + period, period),
             period,
             "a probe landing on a slot boundary schedules the following full slot"
         );
     }
 
     #[test]
-    fn failed_direct_probes_respect_backoff_before_shared_rendezvous() {
+    fn direct_recovery_schedule_does_not_depend_on_local_retry_cooldown() {
         let period = DIRECT_PROBE_RENDEZVOUS_INTERVAL;
-        let first_now = UNIX_EPOCH + Duration::from_millis(100_250);
-        let second_now = UNIX_EPOCH + Duration::from_millis(105_500);
-        let cooldown = Duration::from_secs(120);
-        let first_delay = next_direct_probe_rendezvous_delay_after(first_now, period, cooldown);
-        let second_delay = next_direct_probe_rendezvous_delay_after(second_now, period, cooldown);
+        let peer_a_failure = UNIX_EPOCH + Duration::from_millis(601_234);
+        let peer_b_failure = UNIX_EPOCH + Duration::from_millis(718_901);
+        let peer_a_slot =
+            peer_a_failure + next_direct_probe_rendezvous_delay(peer_a_failure, period);
+        let peer_b_slot =
+            peer_b_failure + next_direct_probe_rendezvous_delay(peer_b_failure, period);
 
-        assert!(first_delay >= cooldown);
-        assert!(second_delay >= cooldown);
-        assert_eq!(first_now + first_delay, second_now + second_delay);
-        assert_eq!(first_delay, Duration::from_millis(139_750));
-        assert_eq!(second_delay, Duration::from_millis(134_500));
+        assert!(peer_a_slot <= peer_b_slot);
+        let separation = peer_b_slot.duration_since(peer_a_slot).unwrap();
+        assert!(separation == Duration::ZERO || separation == period);
+        assert!(peer_b_slot <= peer_a_slot + period);
+    }
+
+    #[test]
+    fn mesh_uses_one_probe_cadence_for_all_direct_peers() {
+        assert_eq!(
+            common_probe_rendezvous_interval(
+                [
+                    Some(Duration::from_secs(240)),
+                    None,
+                    Some(Duration::from_millis(10))
+                ]
+                .into_iter()
+            ),
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            common_probe_rendezvous_interval([Some(Duration::ZERO)].into_iter()),
+            Duration::from_millis(1)
+        );
     }
 
     #[tokio::test]
