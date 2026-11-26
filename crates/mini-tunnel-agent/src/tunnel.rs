@@ -360,28 +360,31 @@ fn direct_probe_interval(cooldown: Duration) -> tokio::time::Interval {
     interval
 }
 
-fn next_direct_probe_rendezvous_delay(now: SystemTime, period: Duration) -> Duration {
+fn next_direct_probe_rendezvous_delay_after(
+    now: SystemTime,
+    period: Duration,
+    minimum_delay: Duration,
+) -> Duration {
     let period_nanos = period.as_nanos();
     assert!(period_nanos > 0, "rendezvous period must be non-zero");
     let now_nanos = now
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let remainder = now_nanos % period_nanos;
+    let earliest_nanos = now_nanos.saturating_add(minimum_delay.as_nanos());
+    let remainder = earliest_nanos % period_nanos;
     let delay_nanos = if remainder == 0 {
-        period_nanos
+        if minimum_delay.is_zero() {
+            period_nanos
+        } else {
+            minimum_delay.as_nanos()
+        }
     } else {
-        period_nanos - remainder
+        earliest_nanos
+            .saturating_add(period_nanos - remainder)
+            .saturating_sub(now_nanos)
     };
     Duration::from_nanos(delay_nanos as u64)
-}
-
-fn coordinated_direct_probe_interval(now: SystemTime) -> tokio::time::Interval {
-    let delay = next_direct_probe_rendezvous_delay(now, DIRECT_PROBE_RENDEZVOUS_INTERVAL);
-    let start = tokio::time::Instant::now() + delay;
-    let mut interval = tokio::time::interval_at(start, DIRECT_PROBE_RENDEZVOUS_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    interval
 }
 
 #[derive(Default)]
@@ -1539,11 +1542,18 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                                 Duration::ZERO,
                             );
                             let now = SystemTime::now();
-                            next_probe_delay = next_direct_probe_rendezvous_delay(
+                            next_probe_delay = next_direct_probe_rendezvous_delay_after(
                                 now,
                                 DIRECT_PROBE_RENDEZVOUS_INTERVAL,
+                                recovery_probe_cooldown,
                             );
-                            probe_interval = coordinated_direct_probe_interval(now);
+                            let start = tokio::time::Instant::now() + next_probe_delay;
+                            let mut interval = tokio::time::interval_at(
+                                start,
+                                DIRECT_PROBE_RENDEZVOUS_INTERVAL,
+                            );
+                            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                            probe_interval = interval;
                         }
                         tracing::debug!(
                             peer_address = %address,
@@ -3686,17 +3696,35 @@ mod tests {
         let period = DIRECT_PROBE_RENDEZVOUS_INTERVAL;
         let first_now = UNIX_EPOCH + Duration::from_millis(100_250);
         let second_now = UNIX_EPOCH + Duration::from_millis(105_500);
-        let first_delay = next_direct_probe_rendezvous_delay(first_now, period);
-        let second_delay = next_direct_probe_rendezvous_delay(second_now, period);
+        let first_delay =
+            next_direct_probe_rendezvous_delay_after(first_now, period, Duration::ZERO);
+        let second_delay =
+            next_direct_probe_rendezvous_delay_after(second_now, period, Duration::ZERO);
 
         assert_eq!(first_now + first_delay, second_now + second_delay);
         assert_eq!(first_delay, Duration::from_millis(19_750));
         assert_eq!(second_delay, Duration::from_millis(14_500));
         assert_eq!(
-            next_direct_probe_rendezvous_delay(UNIX_EPOCH + period, period),
+            next_direct_probe_rendezvous_delay_after(UNIX_EPOCH + period, period, Duration::ZERO),
             period,
             "a probe landing on a slot boundary schedules the following full slot"
         );
+    }
+
+    #[test]
+    fn failed_direct_probes_respect_backoff_before_shared_rendezvous() {
+        let period = DIRECT_PROBE_RENDEZVOUS_INTERVAL;
+        let first_now = UNIX_EPOCH + Duration::from_millis(100_250);
+        let second_now = UNIX_EPOCH + Duration::from_millis(105_500);
+        let cooldown = Duration::from_secs(120);
+        let first_delay = next_direct_probe_rendezvous_delay_after(first_now, period, cooldown);
+        let second_delay = next_direct_probe_rendezvous_delay_after(second_now, period, cooldown);
+
+        assert!(first_delay >= cooldown);
+        assert!(second_delay >= cooldown);
+        assert_eq!(first_now + first_delay, second_now + second_delay);
+        assert_eq!(first_delay, Duration::from_millis(139_750));
+        assert_eq!(second_delay, Duration::from_millis(134_500));
     }
 
     #[tokio::test]
