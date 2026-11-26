@@ -12,7 +12,7 @@ Status: **public NAT/QoS matrix incomplete**. The loopback ICE mapping proxy ver
 
 - With current attested CI artifacts, direct ICE/QUIC was established between Guangzhou and the domestic NAT Ubuntu peer. A narrowly scoped temporary UDP drop moved both peers online to Relay/TLS; bidirectional overlay probes passed 15/15 with 0% loss.
 - After the rule was removed, both peers later completed authenticated probation and coordinated promotion back to QUIC/UDP. Post-recovery probes passed 60/60 each way with 0% loss. The reliable path remained online while direct recovery retried.
-- Direct recovery took several minutes under the current exponential probe backoff, which grows to five minutes. This route confirms eventual recovery but leaves recovery latency as follow-up work. All temporary test resources were removed; Guangzhou production Relay and routes remained unchanged. See the [full report](testing/direct-recovery-domestic-nat-2026-11.md) for provenance and cleanup evidence.
+- Direct recovery took several minutes with multiple failed ICE/probation attempts. The internal cooldown state reached 300 seconds, while probes aligned to 30-second rendezvous intervals; this run does not isolate one cause for the delay. It confirms eventual recovery and leaves recovery latency as follow-up work. All temporary test resources were removed; Guangzhou production Relay and routes remained unchanged. See the [full report](testing/direct-recovery-domestic-nat-2026-11.md) for provenance and cleanup evidence.
 
 ### Windows VM egress follow-up (2026-11-27)
 

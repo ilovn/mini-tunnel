@@ -24,7 +24,7 @@ Both peers enabled ICE and a prepared TCP Relay standby. After direct UDP was st
 - Recovery: after the rule was removed, both peer processes stayed online over Relay while ICE recovery retried. They later nominated a direct pair, completed authenticated UDP probation, and each logged promotion to `QUIC/UDP` with reason `healthy_direct_probe`. Both status endpoints reported online, 0% loss, and zero drops/rejections.
 - Post-recovery: overlay ping passed 20/20 and then 60/60 in each direction, all with 0% loss. Mean RTT in the 60-packet samples was about 12 ms. The prepared Relay standby remained available; the Relay recorded zero handshake failures.
 
-Direct recovery took several minutes and multiple failed ICE attempts because the current retry backoff grows to five minutes. The reliable Relay path carried traffic throughout that interval. The test proves eventual fallback and coordinated direct recovery for this one topology; the recovery delay should be measured and improved before claiming fast recovery across other NATs.
+Direct recovery took several minutes and included multiple failed ICE attempts and UDP health probation. Logs show the internal recovery cooldown state grew to 300 seconds, while subsequent probes were aligned to 30-second UTC rendezvous intervals; this run does not isolate the cooldown as the sole cause of the observed delay. The reliable Relay path carried traffic throughout. Follow-up work should inspect retry timing and candidate freshness to reduce recovery time. This test proves eventual fallback and coordinated direct recovery for this one topology, not fast recovery across other NATs.
 
 ## Cleanup
 
