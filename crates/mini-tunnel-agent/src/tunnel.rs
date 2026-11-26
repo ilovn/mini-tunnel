@@ -320,6 +320,27 @@ fn path_quality_rtt_is_acceptable_with_policy(rtt: Duration, policy: PathQuality
     rtt <= policy.max_rtt
 }
 
+/// Whether an authenticated candidate's measured probe loss stays within the active path policy.
+#[must_use]
+pub fn path_quality_loss_is_acceptable(probes_succeeded: u64, probes_missed: u64) -> bool {
+    path_quality_loss_is_acceptable_with_policy(
+        probes_succeeded,
+        probes_missed,
+        *path_quality_policy(),
+    )
+}
+
+fn path_quality_loss_is_acceptable_with_policy(
+    probes_succeeded: u64,
+    probes_missed: u64,
+    policy: PathQualityPolicy,
+) -> bool {
+    let total = probes_succeeded.saturating_add(probes_missed);
+    total > 0
+        && u128::from(probes_missed) * 100
+            <= u128::from(policy.max_loss_percent) * u128::from(total)
+}
+
 fn next_direct_probe_cooldown(
     current: Duration,
     base: Duration,
@@ -3531,6 +3552,20 @@ mod tests {
         snapshot.probes_succeeded += 2;
         snapshot.probes_missed += 1;
         assert!(tracker.observe(snapshot));
+    }
+
+    #[test]
+    fn candidate_probation_loss_uses_the_configured_loss_boundary() {
+        let policy = PathQualityPolicy {
+            max_rtt: Duration::from_millis(350),
+            max_loss_percent: 20,
+            bad_windows: 2,
+        };
+        assert!(path_quality_loss_is_acceptable_with_policy(4, 1, policy));
+        assert!(path_quality_loss_is_acceptable_with_policy(7, 1, policy));
+        assert!(!path_quality_loss_is_acceptable_with_policy(3, 1, policy));
+        assert!(!path_quality_loss_is_acceptable_with_policy(7, 2, policy));
+        assert!(!path_quality_loss_is_acceptable_with_policy(0, 0, policy));
     }
 
     #[test]

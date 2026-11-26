@@ -4621,6 +4621,7 @@ async fn validate_udp_probe_with_context(
         rtt_ms = rtt.as_millis() as u64,
         "UDP candidate initial authenticated health probes passed"
     );
+    let health_before_probation = channel.health_snapshot();
     if !mini_tunnel_agent::tunnel::path_quality_rtt_is_acceptable(rtt) {
         tracing::warn!(
             peer_id = peer_id.unwrap_or("test"),
@@ -4648,6 +4649,7 @@ async fn validate_udp_probe_with_context(
         let deadline = tokio::time::Instant::now() + consent_window;
         let mut health_probes = tokio::time::interval(health_interval);
         health_probes.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut timed_out_probe_attempts = 0_u64;
         health_probes.tick().await;
         loop {
             tokio::select! {
@@ -4664,8 +4666,12 @@ async fn validate_udp_probe_with_context(
                 }
                 _ = tokio::time::sleep_until(deadline) => break,
                 _ = health_probes.tick() => {
-                    let rtt = match channel.probe_health(1, Duration::from_secs(2)).await {
-                        Ok(rtt) => rtt,
+                    let rtt = match probe_candidate_probation_once(channel, peer_id).await {
+                        Ok(Some(rtt)) => rtt,
+                        Ok(None) => {
+                            timed_out_probe_attempts = timed_out_probe_attempts.saturating_add(1);
+                            continue;
+                        }
                         Err(error) => {
                             tracing::warn!(
                                 peer_id = peer_id.unwrap_or("test"),
@@ -4692,17 +4698,35 @@ async fn validate_udp_probe_with_context(
                 }
             }
         }
+        if !udp_probation_loss_is_acceptable(
+            health_before_probation,
+            channel.health_snapshot(),
+            timed_out_probe_attempts,
+        ) {
+            return Err(probation_loss_threshold_error(
+                channel,
+                peer_id,
+                health_before_probation,
+                timed_out_probe_attempts,
+                "ice_probation_loss_threshold",
+            ));
+        }
     } else {
         let deadline = tokio::time::Instant::now() + consent_window;
         let mut health_probes = tokio::time::interval(health_interval);
         health_probes.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut timed_out_probe_attempts = 0_u64;
         health_probes.tick().await;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => break,
                 _ = health_probes.tick() => {
-                    let rtt = match channel.probe_health(1, Duration::from_secs(2)).await {
-                        Ok(rtt) => rtt,
+                    let rtt = match probe_candidate_probation_once(channel, peer_id).await {
+                        Ok(Some(rtt)) => rtt,
+                        Ok(None) => {
+                            timed_out_probe_attempts = timed_out_probe_attempts.saturating_add(1);
+                            continue;
+                        }
                         Err(error) => {
                             tracing::warn!(
                                 peer_id = peer_id.unwrap_or("test"),
@@ -4729,6 +4753,19 @@ async fn validate_udp_probe_with_context(
                 }
             }
         }
+        if !udp_probation_loss_is_acceptable(
+            health_before_probation,
+            channel.health_snapshot(),
+            timed_out_probe_attempts,
+        ) {
+            return Err(probation_loss_threshold_error(
+                channel,
+                peer_id,
+                health_before_probation,
+                timed_out_probe_attempts,
+                "probation_loss_threshold",
+            ));
+        }
     }
     tracing::info!(
         peer_id = peer_id.unwrap_or("test"),
@@ -4738,6 +4775,71 @@ async fn validate_udp_probe_with_context(
         "UDP candidate health validation passed"
     );
     Ok(())
+}
+
+async fn probe_candidate_probation_once(
+    channel: &mini_tunnel_agent::PeerChannel,
+    peer_id: Option<&str>,
+) -> Result<Option<Duration>, mini_tunnel_agent::IdentityError> {
+    match channel
+        .probe_health(1, mini_tunnel_agent::HEALTH_PROBE_TIMEOUT)
+        .await
+    {
+        Ok(rtt) => Ok(Some(rtt)),
+        Err(error) if is_candidate_probation_timeout(&error) => {
+            tracing::debug!(
+                peer_id = peer_id.unwrap_or("test"),
+                path = channel.transport_name(),
+                "UDP candidate probation probe timed out; counting it toward the loss threshold"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_candidate_probation_timeout(error: &mini_tunnel_agent::IdentityError) -> bool {
+    matches!(error, mini_tunnel_agent::IdentityError::Transport(message)
+        if message == "candidate path probe timed out")
+}
+
+fn udp_probation_loss_is_acceptable(
+    before: mini_tunnel_agent::PeerHealthSnapshot,
+    after: mini_tunnel_agent::PeerHealthSnapshot,
+    timed_out_probe_attempts: u64,
+) -> bool {
+    let probes_succeeded = after
+        .probes_succeeded
+        .saturating_sub(before.probes_succeeded);
+    let observed_misses = after.probes_missed.saturating_sub(before.probes_missed);
+    let probes_missed = observed_misses.max(timed_out_probe_attempts);
+    mini_tunnel_agent::tunnel::path_quality_loss_is_acceptable(probes_succeeded, probes_missed)
+}
+
+fn probation_loss_threshold_error(
+    channel: &mini_tunnel_agent::PeerChannel,
+    peer_id: Option<&str>,
+    before: mini_tunnel_agent::PeerHealthSnapshot,
+    timed_out_probe_attempts: u64,
+    stage: &'static str,
+) -> mini_tunnel_agent::IdentityError {
+    let after = channel.health_snapshot();
+    let probes_succeeded = after
+        .probes_succeeded
+        .saturating_sub(before.probes_succeeded);
+    let observed_misses = after.probes_missed.saturating_sub(before.probes_missed);
+    let probes_missed = observed_misses.max(timed_out_probe_attempts);
+    tracing::warn!(
+        peer_id = peer_id.unwrap_or("test"),
+        path = channel.transport_name(),
+        stage,
+        probes_succeeded,
+        probes_missed,
+        "UDP candidate loss exceeded configured probation threshold"
+    );
+    mini_tunnel_agent::IdentityError::Transport(
+        "UDP candidate packet loss exceeded the configured probation threshold".to_owned(),
+    )
 }
 
 fn candidates_for_path(candidates: &[String], reliable_only: bool) -> Vec<String> {
@@ -6284,6 +6386,62 @@ mod tests {
     fn recovery_ice_probe_defers_to_full_path_probation() {
         assert!(IceProbeValidation::InitialConnection.needs_initial_probation());
         assert!(!IceProbeValidation::Recovery.needs_initial_probation());
+    }
+
+    #[test]
+    fn candidate_probation_tolerates_transient_loss_but_rejects_loss_above_policy() {
+        let before = mini_tunnel_agent::PeerHealthSnapshot {
+            rtt: None,
+            probes_succeeded: 0,
+            probes_missed: 0,
+        };
+        assert!(udp_probation_loss_is_acceptable(
+            before,
+            mini_tunnel_agent::PeerHealthSnapshot {
+                rtt: None,
+                probes_succeeded: 7,
+                probes_missed: 0,
+            },
+            1,
+        ));
+        assert!(udp_probation_loss_is_acceptable(
+            before,
+            mini_tunnel_agent::PeerHealthSnapshot {
+                rtt: None,
+                probes_succeeded: 4,
+                probes_missed: 1,
+            },
+            0,
+        ));
+        assert!(!udp_probation_loss_is_acceptable(
+            before,
+            mini_tunnel_agent::PeerHealthSnapshot {
+                rtt: None,
+                probes_succeeded: 3,
+                probes_missed: 0,
+            },
+            1,
+        ));
+        assert!(!udp_probation_loss_is_acceptable(
+            before,
+            mini_tunnel_agent::PeerHealthSnapshot {
+                rtt: None,
+                probes_succeeded: 7,
+                probes_missed: 2,
+            },
+            1,
+        ));
+    }
+
+    #[test]
+    fn candidate_probation_timeout_is_a_counted_miss_not_a_fatal_error() {
+        let timeout = mini_tunnel_agent::IdentityError::Transport(
+            "candidate path probe timed out".to_owned(),
+        );
+        assert!(is_candidate_probation_timeout(&timeout));
+        let other_error =
+            mini_tunnel_agent::IdentityError::Transport("connection reset".to_owned());
+        assert!(!is_candidate_probation_timeout(&other_error));
     }
 
     async fn delayed_healthz() -> impl IntoResponse {
