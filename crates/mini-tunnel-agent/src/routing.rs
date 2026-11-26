@@ -95,13 +95,41 @@ impl RouteRunner for SystemRouteRunner {
         command: &'a RouteCommand,
     ) -> Pin<Box<dyn Future<Output = io::Result<Output>> + Send + 'a>> {
         Box::pin(async move {
-            tokio::process::Command::new(&command.program)
-                .args(&command.args)
-                .kill_on_drop(true)
-                .output()
-                .await
+            let mut process = tokio::process::Command::new(&command.program);
+            process.args(&command.args).kill_on_drop(true);
+            #[cfg(unix)]
+            if is_route_delete(command) {
+                use std::os::unix::process::CommandExt;
+
+                // SAFETY: The hook only calls async-signal-safe `sigaction` in the
+                // post-fork child. Ignoring shutdown signals lets this short,
+                // bounded delete finish after systemd signals the whole cgroup.
+                unsafe {
+                    process.as_std_mut().pre_exec(|| {
+                        let mut action: libc::sigaction = std::mem::zeroed();
+                        action.sa_sigaction = libc::SIG_IGN;
+                        action.sa_flags = 0;
+                        for signal in [libc::SIGINT, libc::SIGTERM] {
+                            // SAFETY: `action` is initialized with SIG_IGN and an empty
+                            // signal mask; `sigaction` is async-signal-safe here.
+                            if libc::sigaction(signal, &action, std::ptr::null_mut()) == -1 {
+                                return Err(io::Error::last_os_error());
+                            }
+                        }
+                        Ok(())
+                    });
+                }
+            }
+            process.output().await
         })
     }
+}
+
+fn is_route_delete(command: &RouteCommand) -> bool {
+    command.args.windows(2).any(|pair| {
+        (pair[0] == "route" && (pair[1] == "del" || pair[1] == "delete"))
+            || (pair[0] == "-n" && pair[1] == "delete")
+    })
 }
 
 /// A lease exists only after this process successfully added the route.
@@ -614,6 +642,51 @@ mod tests {
                 timeout
             } if timeout == Duration::from_millis(10)
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn system_route_runner_ignores_sigint_for_route_deletion() {
+        let command = RouteCommand {
+            program: "/bin/sh".into(),
+            args: ["-c", "kill -INT $$; exit 0", "route", "del"]
+                .map(OsString::from)
+                .to_vec(),
+        };
+
+        let output = SystemRouteRunner.run(&command).await.expect("run helper");
+
+        assert!(output.status.success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn system_route_runner_ignores_sigterm_for_route_deletion() {
+        let command = RouteCommand {
+            program: "/bin/sh".into(),
+            args: ["-c", "kill -TERM $$; exit 0", "route", "delete"]
+                .map(OsString::from)
+                .to_vec(),
+        };
+
+        let output = SystemRouteRunner.run(&command).await.expect("run helper");
+
+        assert!(output.status.success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn system_route_runner_preserves_signals_for_route_installation() {
+        let command = RouteCommand {
+            program: "/bin/sh".into(),
+            args: ["-c", "kill -TERM $$; exit 0", "route", "add"]
+                .map(OsString::from)
+                .to_vec(),
+        };
+
+        let output = SystemRouteRunner.run(&command).await.expect("run helper");
+
+        assert!(!output.status.success());
     }
 
     #[test]
