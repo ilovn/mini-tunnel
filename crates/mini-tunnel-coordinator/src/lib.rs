@@ -3791,8 +3791,33 @@ mod tests {
             async move {
                 let _ = shutdown_receiver.await;
             },
-            Duration::from_millis(30),
+            Duration::from_secs(1),
         ));
+
+        let ready_client = reqwest::Client::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(response) = ready_client
+                    .get(format!("http://{address}/healthz"))
+                    .header(reqwest::header::CONNECTION, "close")
+                    .send()
+                    .await
+                    && response.status() == StatusCode::OK
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Coordinator accept loop should serve a health request");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while observed_state.connection_slots.0.available_permits() != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("readiness request should release its connection slot");
 
         let mut stalled_client = None;
         for _ in 0..40 {
