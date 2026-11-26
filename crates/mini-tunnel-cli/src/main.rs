@@ -4835,6 +4835,7 @@ fn probation_loss_threshold_error(
         stage,
         probes_succeeded,
         probes_missed,
+        timed_out_probe_attempts,
         "UDP candidate loss exceeded configured probation threshold"
     );
     mini_tunnel_agent::IdentityError::Transport(
