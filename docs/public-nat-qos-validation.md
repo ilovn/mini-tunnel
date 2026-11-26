@@ -2,6 +2,16 @@
 
 Status: **public NAT/QoS matrix incomplete**. The loopback ICE mapping proxy verifies packet rewriting and session behavior, but it does not establish interoperability across public NATs. The VPS, domestic NAT, Windows, and cross-border runs below are individual topology samples; they do not complete the broader NAT/QoS matrix.
 
+### Guangzhou–Hong Kong ICE probation retest (2026-11-27)
+
+- Used Linux x86_64 binaries from the attested Release staging run `45886332907` (source `c72a255d5b881d316abafca6279e6fdf1eae15ed`); neither VPS compiled source. Both peers nominated the direct ICE pair and Guangzhou's initial authenticated health probes passed.
+- Guangzhou then rejected the direct QUIC/UDP candidate after five-second probation at 4 successes / 5 missed health probes. The structured `timed_out_probe_attempts` count was 0; this run does not demonstrate the timeout-specific handler. Both peers remained online over Relay/TLS at about 320 ms RTT and 0% reported loss. Bidirectional overlay ICMP passed 10/10 in each direction. A later direct recovery attempt failed with `connection lost`; no impairment was applied.
+- Temporary members and services were removed, routes/TUNs and test listeners cleared, and Guangzhou's production Relay/default route remained unchanged. See the [full report](testing/guangzhou-hongkong-ice-probation-2026-11.md) for artifact hashes and cleanup details.
+
+### Windows VM egress follow-up (2026-11-27)
+
+- With `YunShuService` stopped, the Windows VMware NAT guest still reported public egress `151.243.38.115`, the Hong Kong VPS address. Its default route remained through VMware gateway `192.168.196.2`; traceroute showed further private hops. The forwarding device or service is not identified, so this run cannot be counted as an independent ordinary Windows NAT sample. See the [Windows probation report](testing/windows-nat-udp-probation-2026-11.md).
+
 ### Guangzhou–Hong Kong controlled UDP fallback and direct recovery (2026-11-23 UTC)
 
 - Used the attested x86_64 artifact from successful [CI run 45258853452](https://github.com/ilovn/mini-tunnel/actions/runs/45258853452), built from 9413a06a985dd208f6f4c9b40d9bea3743a338f5. The archive sidecar and Sigstore attestation matched that source; current main has no code changes since the build. Neither endpoint compiled source.
