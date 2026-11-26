@@ -9909,6 +9909,7 @@ mod tests {
         let expected_local_key = local_identity.public_key();
         let direct_channel = std::sync::Arc::new(tokio::sync::RwLock::new(None));
         let direct_channel_for_accept = std::sync::Arc::clone(&direct_channel);
+        let reliable_for_peer_readiness = std::sync::Arc::clone(&reliable_remote);
         let (start_direct_ice_tx, start_direct_ice_rx) = tokio::sync::oneshot::channel();
         let accept_direct = tokio::spawn(async move {
             let remote_identity_for_accept =
@@ -9938,7 +9939,17 @@ mod tests {
             assert_eq!(selected_address, local_udp_address);
             let mut accepted = accepted.expect("accept authenticated direct recovery");
             accepted.set_ice_consent_monitor(monitor);
-            *direct_channel_for_accept.write().await = Some(std::sync::Arc::new(accepted));
+            let accepted = validate_udp_probe(accepted, true, &expected_local_id)
+                .await
+                .expect("remote direct candidate completes health and ICE consent probation");
+            let accepted = std::sync::Arc::new(accepted);
+            *direct_channel_for_accept.write().await = Some(std::sync::Arc::clone(&accepted));
+            assert!(
+                reliable_for_peer_readiness
+                    .negotiate_direct_path_promotion(Duration::from_secs(3))
+                    .await,
+                "remote peer confirms the candidate over the existing reliable channel"
+            );
         });
         let (remote_packet_tx, mut remote_packet_rx) = tokio::sync::mpsc::channel(2);
         let direct_remote_reader = {

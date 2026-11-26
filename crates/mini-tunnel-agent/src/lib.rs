@@ -347,12 +347,18 @@ pub struct PeerChannel {
     fragments: Mutex<FragmentReassembler>,
     pending_probe_packets: Mutex<PendingProbePackets>,
     health: Mutex<PeerHealth>,
+    path_promotion: Mutex<PathPromotionState>,
+    path_promotion_changed: tokio::sync::Notify,
     ice_consent: Option<ice::IceConsentMonitor>,
     _relay_endpoint: Option<Endpoint>,
 }
 
 const HEALTH_PING: u8 = 0xf0;
 const HEALTH_PONG: u8 = 0xf1;
+const PATH_CONTROL_PREFIX: [u8; 8] = *b"MT-PATH1";
+const PATH_PROMOTION_OFFER: u8 = 1;
+const PATH_PROMOTION_ACK: u8 = 2;
+const PATH_PROMOTION_OFFER_TTL: Duration = Duration::from_secs(3);
 pub const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -369,6 +375,13 @@ struct PeerHealth {
     probes_succeeded: u64,
     probes_missed: u64,
     probe_requests_received: u64,
+}
+
+#[derive(Default)]
+struct PathPromotionState {
+    local_ready: bool,
+    pending_remote_offers: VecDeque<(u64, Instant)>,
+    acknowledged_offers: std::collections::HashSet<u64>,
 }
 
 #[derive(Default)]
@@ -500,6 +513,73 @@ impl FragmentReassembler {
 }
 
 impl PeerChannel {
+    /// Coordinate direct-path promotion over the currently active authenticated channel.
+    /// Both peers must have completed their own direct-path probation before either switches.
+    pub async fn negotiate_direct_path_promotion(&self, timeout: Duration) -> bool {
+        if timeout.is_zero() || timeout > Duration::from_secs(10) {
+            return false;
+        }
+        let mut nonce_bytes = [0_u8; 8];
+        if getrandom::fill(&mut nonce_bytes).is_err() {
+            return false;
+        }
+        let nonce = u64::from_be_bytes(nonce_bytes);
+        let pending_acks = {
+            let Ok(mut state) = self.path_promotion.lock() else {
+                return false;
+            };
+            let now = Instant::now();
+            state.pending_remote_offers.retain(|(_, received_at)| {
+                now.duration_since(*received_at) < PATH_PROMOTION_OFFER_TTL
+            });
+            state.local_ready = true;
+            state
+                .pending_remote_offers
+                .drain(..)
+                .map(|(offer, _)| offer)
+                .collect::<Vec<_>>()
+        };
+        let mut offer = [0_u8; 17];
+        offer[..8].copy_from_slice(&PATH_CONTROL_PREFIX);
+        offer[8] = PATH_PROMOTION_OFFER;
+        offer[9..].copy_from_slice(&nonce_bytes);
+        let mut sent = self.send_packet(&offer).await.is_ok();
+        for remote_nonce in pending_acks {
+            sent &= self.send_path_promotion_ack(remote_nonce).await.is_ok();
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        let result = if sent {
+            loop {
+                let notified = self.path_promotion_changed.notified();
+                let acknowledged = self
+                    .path_promotion
+                    .lock()
+                    .is_ok_and(|mut state| state.acknowledged_offers.remove(&nonce));
+                if acknowledged {
+                    break true;
+                }
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                    break false;
+                }
+            }
+        } else {
+            false
+        };
+        if let Ok(mut state) = self.path_promotion.lock() {
+            state.local_ready = false;
+            state.acknowledged_offers.remove(&nonce);
+        }
+        result
+    }
+
+    async fn send_path_promotion_ack(&self, nonce: u64) -> Result<(), IdentityError> {
+        let mut ack = [0_u8; 17];
+        ack[..8].copy_from_slice(&PATH_CONTROL_PREFIX);
+        ack[8] = PATH_PROMOTION_ACK;
+        ack[9..].copy_from_slice(&nonce.to_be_bytes());
+        self.send_packet(&ack).await
+    }
+
     pub(crate) fn retain_relay_endpoint(&mut self, endpoint: Endpoint) {
         self._relay_endpoint = Some(endpoint);
     }
@@ -916,6 +996,48 @@ impl PeerChannel {
                 }
                 None => decoded.payload.to_vec(),
             };
+            if payload.len() == 17 && payload[..8] == PATH_CONTROL_PREFIX {
+                let nonce = u64::from_be_bytes(
+                    payload[9..17]
+                        .try_into()
+                        .map_err(|_| IdentityError::InvalidFrame)?,
+                );
+                match payload[8] {
+                    PATH_PROMOTION_OFFER => {
+                        let ack_now = if let Ok(mut state) = self.path_promotion.lock() {
+                            let now = Instant::now();
+                            state.pending_remote_offers.retain(|(_, received_at)| {
+                                now.duration_since(*received_at) < PATH_PROMOTION_OFFER_TTL
+                            });
+                            if state.local_ready {
+                                true
+                            } else {
+                                if state.pending_remote_offers.len() >= 8 {
+                                    state.pending_remote_offers.pop_front();
+                                }
+                                state.pending_remote_offers.push_back((nonce, now));
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if ack_now {
+                            self.send_path_promotion_ack(nonce).await?;
+                        }
+                    }
+                    PATH_PROMOTION_ACK => {
+                        if let Ok(mut state) = self.path_promotion.lock() {
+                            if state.acknowledged_offers.len() >= 8 {
+                                state.acknowledged_offers.clear();
+                            }
+                            state.acknowledged_offers.insert(nonce);
+                        }
+                        self.path_promotion_changed.notify_one();
+                    }
+                    _ => return Err(IdentityError::InvalidFrame),
+                }
+                return Ok(Vec::new());
+            }
             if payload.len() == 9 && matches!(payload[0], HEALTH_PING | HEALTH_PONG) {
                 let nonce = u64::from_be_bytes(
                     payload[1..9]
@@ -1960,6 +2082,8 @@ fn new_channel(connection: Connection, network_id: &str) -> PeerChannel {
         fragments: Mutex::new(FragmentReassembler::default()),
         pending_probe_packets: Mutex::new(PendingProbePackets::default()),
         health: Mutex::new(PeerHealth::default()),
+        path_promotion: Mutex::new(PathPromotionState::default()),
+        path_promotion_changed: tokio::sync::Notify::new(),
         ice_consent: None,
         _relay_endpoint: None,
     }
@@ -1988,6 +2112,8 @@ fn new_tcp_channel(
         fragments: Mutex::new(FragmentReassembler::default()),
         pending_probe_packets: Mutex::new(PendingProbePackets::default()),
         health: Mutex::new(PeerHealth::default()),
+        path_promotion: Mutex::new(PathPromotionState::default()),
+        path_promotion_changed: tokio::sync::Notify::new(),
         ice_consent: None,
         _relay_endpoint: None,
     }
@@ -2864,6 +2990,53 @@ mod tests {
         endpoint_a.close(0_u32.into(), b"test complete");
         endpoint_b.close(0_u32.into(), b"test complete");
         fs::remove_dir_all(temp).expect("remove test identities");
+    }
+
+    #[tokio::test]
+    async fn direct_path_promotion_requires_and_accepts_peer_readiness() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-path-promotion-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let a =
+            std::sync::Arc::new(Identity::load_or_create_at(temp.join("a/device.key")).unwrap());
+        let b =
+            std::sync::Arc::new(Identity::load_or_create_at(temp.join("b/device.key")).unwrap());
+        let listener = peer_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .unwrap();
+        let allowed = vec![(a.device_id(), a.public_key())];
+        let accept = accept_tcp_peer_any(&listener, "path-promotion", &b, &allowed);
+        let b_id = b.device_id();
+        let connect = connect_tcp_peer(
+            listener.local_addr().unwrap(),
+            "path-promotion",
+            &a,
+            &b_id,
+            b.public_key(),
+        );
+        let (accepted, connected) = tokio::join!(accept, connect);
+        let channel_a = std::sync::Arc::new(connected.unwrap());
+        let channel_b = std::sync::Arc::new(accepted.unwrap().1);
+        let reader_a = std::sync::Arc::clone(&channel_a);
+        let reader_b = std::sync::Arc::clone(&channel_b);
+        let task_a = tokio::spawn(async move { while reader_a.recv_packet().await.is_ok() {} });
+        let task_b = tokio::spawn(async move { while reader_b.recv_packet().await.is_ok() {} });
+        let (ready_a, ready_b) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                channel_a.negotiate_direct_path_promotion(Duration::from_secs(1)),
+                channel_b.negotiate_direct_path_promotion(Duration::from_secs(1))
+            )
+        })
+        .await
+        .expect("promotion negotiation completes");
+        assert!(
+            ready_a && ready_b,
+            "both locally healthy peers confirm promotion"
+        );
+        task_a.abort();
+        task_b.abort();
+        fs::remove_dir_all(temp).unwrap();
     }
 
     #[tokio::test]
