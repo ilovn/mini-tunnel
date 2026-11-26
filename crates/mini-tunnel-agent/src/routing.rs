@@ -125,6 +125,7 @@ impl RouteRunner for SystemRouteRunner {
     }
 }
 
+#[cfg(unix)]
 fn is_route_delete(command: &RouteCommand) -> bool {
     command.args.windows(2).any(|pair| {
         (pair[0] == "route" && (pair[1] == "del" || pair[1] == "delete"))
