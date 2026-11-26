@@ -45,3 +45,21 @@ The Windows status and Guangzhou peer logs showed the tunnel remained online ove
 This run verifies the Windows peer on VMware NAT, direct Windows-to-Hong Kong UDP, stable Windows-to-Guangzhou Relay fallback, and safe fallback when a separate direct UDP path has high loss. It does **not** meet the specific acceptance criterion for direct Windows↔Guangzhou ICE or capture of a probation probe timeout followed by later samples. The timeout-handling change remains covered by workspace tests, but field validation of that exact regression is still pending.
 
 For a conclusive retest, first establish and record a nominated Windows↔Guangzhou pair, then capture per-probe debug logs while applying a narrowly scoped, automatically reverted loss interval to that pair. Keep the same verified CI artifacts and cleanup checks.
+
+## Retest on main `68d62ac`
+
+Date: 2026-11-27 (China Standard Time). Release staging workflow run: `45883051511`; the publish job was skipped because this was a branch build. Both artifacts were built from `68d62ac408f089fe6c0223811b66ebb3c3ae3249`. SHA-256 sidecars matched and `deploy/verify-peer-attestation.sh` passed against `.github/workflows/release.yml` and `refs/heads/main`.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Linux x86_64 archive | `231c6fa717d8afedfaf681fd3792503697cea20b57ee0e53483325f58e51a76f` |
+| Windows x86_64 archive | `6ccb0e81779438db4e5a1c35427b817bebd592bf683b027af150c77fc7fd510e` |
+| Extracted Linux executable | `de237a4d0ec4f59148c7e2fee3b9f293a40c50fdb9e68733ec0db93ae7afd4e7` |
+| Extracted Windows executable | `bc9c8ae90e8830664913e395a797321a6264e912afa2cf82f2b55379d8232b82` |
+| Wintun x64 DLL | `e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce` |
+
+This isolated two-peer run used a temporary Coordinator/Relay on Guangzhou and UDP/42000 for the peer. Windows VMware NAT and Guangzhou both nominated the direct ICE pair. Windows accepted 15 STUN datagrams and Guangzhou accepted 17. Guangzhou logged three successful authenticated initial health probes, then ended its five-second probation at 5 successes / 6 misses and rejected the direct path. Windows independently logged that QUIC setup lost the connection, then closed the elected path with 0 successful and 0 missed probation probes. Both peers remained online through Relay; their final status snapshots had zero overlay packets sent or received. Thus the new port produced ICE nomination, but not a stable direct data path or successful overlay transfer.
+
+The available raw logs do not include a per-probe `timeout` event or prove that an individual timeout was counted by the intended handler. No packet impairment was applied because a stable direct baseline and overlay transfer were prerequisites. The timeout-specific field criterion remains open.
+
+Cleanup evidence: both test members were revoked and their `10.244.37.1`/`.2` leases released. The test Coordinator, Relay, and peer services and `/tmp/mini-tunnel-fe2e6b84e9` were removed. Windows FE2 tasks, routes, adapter, process, test files, and staging directory were absent. Windows default route remained on `Ethernet0` via `192.168.196.2`; `YunShuService` remained stopped (Automatic), and its scheduled task remained disabled. Guangzhou default route remained via `10.0.20.1`; production Relay PID `17770` retained TCP `42001`, UDP `42003`, and loopback metrics `42002`. No test ports or `tun2` remained; existing `tun0` and `tun1` were preserved. Private raw logs remain local and are not committed.
