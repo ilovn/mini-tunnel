@@ -161,6 +161,7 @@ fn prune_expired_state(state: &mut State, now: tokio::time::Instant, now_ms: u64
     }
 }
 
+#[derive(Clone)]
 struct Pending {
     claims: RelayTicketClaims,
     public_key: [u8; 32],
@@ -539,7 +540,7 @@ impl UdpRelayServer {
             socket.send_to(&response, source).await?;
             return Ok(true);
         }
-        let Some(pending) = state.pending.remove(&source) else {
+        let Some(pending) = state.pending.get(&source).cloned() else {
             return Ok(self.reject(DropReason::Authentication));
         };
         let public_key: [u8; 32] = packet[10 + ticket_length..10 + ticket_length + 32]
@@ -591,6 +592,14 @@ impl UdpRelayServer {
         {
             return Ok(self.reject(DropReason::Capacity));
         }
+        if state
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| session.endpoints[target_index].is_some())
+        {
+            return Ok(self.reject(DropReason::Authentication));
+        }
+        state.pending.remove(&source);
         let session = state.sessions.entry(session_id).or_insert_with(|| Session {
             expires_at_ms: claims.expires_at_ms,
             created_at: now,
@@ -598,9 +607,6 @@ impl UdpRelayServer {
             bytes_forwarded: 0,
             endpoints: [None, None],
         });
-        if session.endpoints[target_index].is_some() {
-            return Ok(self.reject(DropReason::Authentication));
-        }
         session.expires_at_ms = session.expires_at_ms.min(claims.expires_at_ms);
         session.endpoints[target_index] = Some(source);
         let ready_endpoints = if session.endpoints.iter().all(Option::is_some) {
@@ -1212,6 +1218,89 @@ mod tests {
             .expect("alice ready");
         assert_eq!(&response[..8], READY);
         assert_eq!(&response[8..length], &[9; 16]);
+        relay.shutdown();
+        runner.await.expect("relay task");
+    }
+
+    #[tokio::test]
+    async fn invalid_udp_proof_does_not_consume_pending_challenge() {
+        let key = [46; 32];
+        let alice = identity(31);
+        let bob = identity(32);
+        let intruder = identity(33);
+        let alice_ticket = ticket(&key, &alice, &bob, 34, 1_000);
+        let bob_ticket = ticket(&key, &bob, &alice, 35, 1_000);
+        let relay = UdpRelayServer::new(UdpRelayConfig::new(key));
+        let relay_socket = UdpSocket::bind("127.0.0.1:0").await.expect("relay socket");
+        let relay_address = relay_socket.local_addr().expect("relay address");
+        let runner = {
+            let relay = relay.clone();
+            tokio::spawn(async move { relay.run(relay_socket).await.expect("run relay") })
+        };
+
+        let alice_socket = UdpSocket::bind("127.0.0.1:0").await.expect("alice socket");
+        let hello =
+            udp_relay_hello(&alice_ticket, &alice.verifying_key().to_bytes()).expect("hello");
+        alice_socket
+            .send_to(&hello, relay_address)
+            .await
+            .expect("send hello");
+        let mut response = [0; 64];
+        let (length, _) = timeout(
+            Duration::from_secs(1),
+            alice_socket.recv_from(&mut response),
+        )
+        .await
+        .expect("challenge timeout")
+        .expect("challenge");
+        assert_eq!(&response[..8], CHALLENGE);
+        let challenge: [u8; 32] = response[8..length].try_into().expect("challenge bytes");
+
+        let invalid_proof =
+            udp_relay_proof(&alice_ticket, &challenge, &intruder).expect("intruder proof");
+        alice_socket
+            .send_to(&invalid_proof, relay_address)
+            .await
+            .expect("send invalid proof");
+        timeout(Duration::from_secs(1), async {
+            while relay.stats().await.authentication_rejections_total != 1 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("invalid proof rejection timeout");
+        assert_eq!(relay.stats().await.pending_authentications, 1);
+
+        let valid_proof = udp_relay_proof(&alice_ticket, &challenge, &alice).expect("valid proof");
+        alice_socket
+            .send_to(&valid_proof, relay_address)
+            .await
+            .expect("send valid proof");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let stats = relay.stats().await;
+                if stats.active_sessions == 1 && stats.pending_authentications == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("valid proof retry timeout");
+
+        let bob_socket = UdpSocket::bind("127.0.0.1:0").await.expect("bob socket");
+        authenticate(&bob_socket, relay_address, &bob_ticket, &bob).await;
+        let (length, _) = timeout(
+            Duration::from_secs(1),
+            alice_socket.recv_from(&mut response),
+        )
+        .await
+        .expect("alice ready timeout")
+        .expect("alice ready");
+        assert_eq!(&response[..8], READY);
+        assert_eq!(&response[8..length], &[9; 16]);
+        assert_eq!(relay.stats().await.authentication_rejections_total, 1);
+
         relay.shutdown();
         runner.await.expect("relay task");
     }
