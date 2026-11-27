@@ -39,6 +39,12 @@ const COORDINATOR_HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
 // Recovery peers already have a reliable path and enter direct probing on a shared cadence.
 // Bound only candidate dialing; keep the longer authenticated probation after a channel connects.
 const DIRECT_RECOVERY_DIAL_TIMEOUT: Duration = Duration::from_secs(12);
+// ICE credentials and NAT candidates are useful only after both sides know about the new peer.
+// A 30-second mesh poll can outlive the initial ICE checklist and leave the two peers probing
+// at different times, so keep membership discovery within the bounded ICE startup retry window.
+const MESH_MEMBERSHIP_REFRESH_PERIOD: Duration = Duration::from_secs(5);
+const MESH_MEMBERSHIP_REFRESH_TIMEOUT: Duration = Duration::from_secs(8);
+const ICE_INITIAL_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 const ICE_PATH_PROMOTION_PROBATION: Duration = Duration::from_secs(31);
 const ICE_INITIAL_PATH_PROBATION: Duration = Duration::from_secs(5);
 const INITIAL_ICE_SNAPSHOT_REFRESH_RETRIES: usize = 3;
@@ -3003,7 +3009,7 @@ async fn select_ice_peer_address(
     peer: &PeerInfo,
     identity: &mini_tunnel_agent::Identity,
 ) -> Option<(SocketAddr, mini_tunnel_agent::ice::IceConsentMonitor)> {
-    select_ice_peer_address_with_timeout(endpoint, peer, identity, Duration::from_secs(5)).await
+    select_ice_peer_address_with_timeout(endpoint, peer, identity, ICE_INITIAL_CHECK_TIMEOUT).await
 }
 
 async fn select_ice_peer_address_with_timeout(
@@ -4307,7 +4313,7 @@ struct MeshMembershipRefresh {
 }
 
 fn spawn_mesh_membership_refresh(config: MeshMembershipRefresh) -> tokio::task::JoinHandle<()> {
-    spawn_mesh_membership_refresh_with_period(config, Duration::from_secs(30))
+    spawn_mesh_membership_refresh_with_period(config, MESH_MEMBERSHIP_REFRESH_PERIOD)
 }
 
 fn spawn_mesh_membership_refresh_with_period(
@@ -4343,7 +4349,7 @@ fn spawn_mesh_membership_refresh_with_period(
             let refresh_started = Instant::now();
             tracing::debug!(refresh_attempt, "mesh membership snapshot refresh started");
             let discovered = tokio::time::timeout(
-                Duration::from_secs(8),
+                MESH_MEMBERSHIP_REFRESH_TIMEOUT,
                 discover_peers(&coordinator_url, &network_id, &identity),
             )
             .await;
@@ -6397,6 +6403,16 @@ fn print_tunnel_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mesh_membership_refresh_completes_within_initial_ice_retry_window() {
+        let initial_retry_window =
+            ICE_INITIAL_CHECK_TIMEOUT * (INITIAL_ICE_SNAPSHOT_REFRESH_RETRIES as u32 + 1);
+        assert!(
+            MESH_MEMBERSHIP_REFRESH_PERIOD + MESH_MEMBERSHIP_REFRESH_TIMEOUT < initial_retry_window,
+            "new peer discovery must complete before the initial ICE retries are exhausted"
+        );
+    }
 
     #[test]
     fn windows_tun_interface_name_is_stable_and_bounded_by_process_id() {
