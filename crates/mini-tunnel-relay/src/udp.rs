@@ -127,6 +127,7 @@ struct State {
     accepted_proofs: HashMap<[u8; 16], AcceptedProof>,
     sessions: HashMap<[u8; 16], Session>,
     auth_rate_limits: HashMap<IpAddr, AuthRateLimit>,
+    overflow_auth_rate_limit: Option<AuthRateLimit>,
 }
 
 fn prune_expired_state(state: &mut State, now: tokio::time::Instant, now_ms: u64) {
@@ -149,6 +150,15 @@ fn prune_expired_state(state: &mut State, now: tokio::time::Instant, now_ms: u64
     state.auth_rate_limits.retain(|_, bucket| {
         now.saturating_duration_since(bucket.last_seen) < AUTH_RATE_IDLE_TIMEOUT
     });
+    if state
+        .overflow_auth_rate_limit
+        .as_ref()
+        .is_some_and(|bucket| {
+            now.saturating_duration_since(bucket.last_seen) >= AUTH_RATE_IDLE_TIMEOUT
+        })
+    {
+        state.overflow_auth_rate_limit = None;
+    }
 }
 
 struct Pending {
@@ -645,36 +655,58 @@ fn allow_auth_attempt_with_rate(
     state
         .auth_rate_limits
         .retain(|_, bucket| now.duration_since(bucket.last_seen) < AUTH_RATE_IDLE_TIMEOUT);
+    if state
+        .overflow_auth_rate_limit
+        .as_ref()
+        .is_some_and(|bucket| now.duration_since(bucket.last_seen) >= AUTH_RATE_IDLE_TIMEOUT)
+    {
+        state.overflow_auth_rate_limit = None;
+    }
     let source_ip = normalize_ip(source_ip);
     let capacity_milli = burst.saturating_mul(AUTH_RATE_TOKEN_MILLI);
     if let Some(bucket) = state.auth_rate_limits.get_mut(&source_ip) {
-        let elapsed_ms = now.duration_since(bucket.last_refill).as_millis();
-        let refill_milli = elapsed_ms
-            .saturating_mul(u128::from(per_second))
-            .min(u128::from(capacity_milli)) as u32;
-        bucket.tokens_milli = bucket
-            .tokens_milli
-            .saturating_add(refill_milli)
-            .min(capacity_milli);
-        bucket.last_refill = now;
-        bucket.last_seen = now;
-        if bucket.tokens_milli < AUTH_RATE_TOKEN_MILLI {
-            return false;
-        }
-        bucket.tokens_milli -= AUTH_RATE_TOKEN_MILLI;
-        return true;
+        return consume_auth_rate_token(bucket, now, capacity_milli, per_second);
     }
     if state.auth_rate_limits.len() >= MAX_AUTH_RATE_SOURCES {
+        let bucket = state
+            .overflow_auth_rate_limit
+            .get_or_insert_with(|| new_auth_rate_limit(now, capacity_milli));
+        return consume_auth_rate_token(bucket, now, capacity_milli, per_second);
+    }
+    let mut bucket = new_auth_rate_limit(now, capacity_milli);
+    let allowed = consume_auth_rate_token(&mut bucket, now, capacity_milli, per_second);
+    state.auth_rate_limits.insert(source_ip, bucket);
+    allowed
+}
+
+fn new_auth_rate_limit(now: tokio::time::Instant, capacity_milli: u32) -> AuthRateLimit {
+    AuthRateLimit {
+        tokens_milli: capacity_milli,
+        last_refill: now,
+        last_seen: now,
+    }
+}
+
+fn consume_auth_rate_token(
+    bucket: &mut AuthRateLimit,
+    now: tokio::time::Instant,
+    capacity_milli: u32,
+    per_second: u32,
+) -> bool {
+    let elapsed_ms = now.duration_since(bucket.last_refill).as_millis();
+    let refill_milli = elapsed_ms
+        .saturating_mul(u128::from(per_second))
+        .min(u128::from(capacity_milli)) as u32;
+    bucket.tokens_milli = bucket
+        .tokens_milli
+        .saturating_add(refill_milli)
+        .min(capacity_milli);
+    bucket.last_refill = now;
+    bucket.last_seen = now;
+    if bucket.tokens_milli < AUTH_RATE_TOKEN_MILLI {
         return false;
     }
-    state.auth_rate_limits.insert(
-        source_ip,
-        AuthRateLimit {
-            tokens_milli: (burst - 1) * AUTH_RATE_TOKEN_MILLI,
-            last_refill: now,
-            last_seen: now,
-        },
-    );
+    bucket.tokens_milli -= AUTH_RATE_TOKEN_MILLI;
     true
 }
 
@@ -1052,12 +1084,22 @@ mod tests {
         }
         assert_eq!(state.auth_rate_limits.len(), MAX_AUTH_RATE_SOURCES);
         let new_ip = IpAddr::V4(std::net::Ipv4Addr::from(u32::MAX));
-        assert!(!allow_auth_attempt(&mut state, new_ip, now));
+        assert!(allow_auth_attempt(&mut state, new_ip, now));
+        assert_eq!(state.auth_rate_limits.len(), MAX_AUTH_RATE_SOURCES);
+        assert!(state.overflow_auth_rate_limit.is_some());
+
+        for index in 0..AUTH_RATE_BURST - 1 {
+            let overflow_ip = IpAddr::V4(std::net::Ipv4Addr::from(0xffff_0000 + index));
+            assert!(allow_auth_attempt(&mut state, overflow_ip, now));
+        }
+        let overflow_ip = IpAddr::V4(std::net::Ipv4Addr::from(0xffff_ffff - 1));
+        assert!(!allow_auth_attempt(&mut state, overflow_ip, now));
         assert_eq!(state.auth_rate_limits.len(), MAX_AUTH_RATE_SOURCES);
 
         now += AUTH_RATE_IDLE_TIMEOUT;
         assert!(allow_auth_attempt(&mut state, new_ip, now));
         assert_eq!(state.auth_rate_limits.len(), 1);
+        assert!(state.overflow_auth_rate_limit.is_none());
     }
 
     fn ticket(
