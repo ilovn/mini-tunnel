@@ -4,6 +4,51 @@ rule_files:
 evaluation_interval: 1m
 
 tests:
+  - name: alerts when relay is healthy but classified metrics are absent
+    interval: 1m
+    input_series:
+      - series: 'up{job="mini-tunnel-relay",instance="relay.internal:42002"}'
+        values: '1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: MiniTunnelRelayClassificationMetricsMissing
+        exp_alerts:
+          - exp_labels:
+              job: mini-tunnel-relay
+              instance: relay.internal:42002
+              severity: warning
+              alertname: MiniTunnelRelayClassificationMetricsMissing
+            exp_annotations:
+              summary: mini-tunnel Relay does not expose classified handshake metrics
+              description: The Relay scrape is healthy but failure-class counters are absent, so public listener noise cannot be separated from pairing or server failures. Upgrade the Relay before relying on classification-based availability alerts.
+              runbook: deploy/systemd/README.md#monitoring-and-alerts
+
+  - name: stays quiet when all relay classification metrics exist
+    interval: 1m
+    input_series:
+      - series: 'up{job="mini-tunnel-relay",instance="relay.internal:42002"}'
+        values: '1 1 1 1 1 1 1 1 1'
+      - series: 'mini_tunnel_relay_malformed_protocol_failures_total{job="mini-tunnel-relay",instance="relay.internal:42002"}'
+        values: '0 0 0 0 0 0 0 0 0'
+      - series: 'mini_tunnel_relay_ticket_rejections_total{job="mini-tunnel-relay",instance="relay.internal:42002"}'
+        values: '0 0 0 0 0 0 0 0 0'
+      - series: 'mini_tunnel_relay_identity_rejections_total{job="mini-tunnel-relay",instance="relay.internal:42002"}'
+        values: '0 0 0 0 0 0 0 0 0'
+      - series: 'mini_tunnel_relay_pairing_rejections_total{job="mini-tunnel-relay",instance="relay.internal:42002"}'
+        values: '0 0 0 0 0 0 0 0 0'
+      - series: 'mini_tunnel_relay_handshake_timeouts_total{job="mini-tunnel-relay",instance="relay.internal:42002"}'
+        values: '0 0 0 0 0 0 0 0 0'
+      - series: 'mini_tunnel_relay_client_disconnects_total{job="mini-tunnel-relay",instance="relay.internal:42002"}'
+        values: '0 0 0 0 0 0 0 0 0'
+      - series: 'mini_tunnel_relay_io_failures_total{job="mini-tunnel-relay",instance="relay.internal:42002"}'
+        values: '0 0 0 0 0 0 0 0 0'
+      - series: 'mini_tunnel_relay_internal_failures_total{job="mini-tunnel-relay",instance="relay.internal:42002"}'
+        values: '0 0 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: MiniTunnelRelayClassificationMetricsMissing
+        exp_alerts: []
+
   - name: fires for sustained requests over five seconds
     interval: 1m
     input_series:
