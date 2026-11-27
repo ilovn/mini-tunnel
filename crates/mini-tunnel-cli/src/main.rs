@@ -36,6 +36,9 @@ mod windows_service_runtime;
 
 const PEER_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(5);
 const COORDINATOR_HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
+// Recovery peers already have a reliable path and enter direct probing on a shared cadence.
+// Bound only candidate dialing; keep the longer authenticated probation after a channel connects.
+const DIRECT_RECOVERY_DIAL_TIMEOUT: Duration = Duration::from_secs(12);
 const ICE_PATH_PROMOTION_PROBATION: Duration = Duration::from_secs(31);
 const ICE_INITIAL_PATH_PROBATION: Duration = Duration::from_secs(5);
 const INITIAL_ICE_SNAPSHOT_REFRESH_RETRIES: usize = 3;
@@ -3346,6 +3349,30 @@ impl IceProbeValidation {
     }
 }
 
+async fn bounded_recovery_dial<T, F>(future: F) -> Result<T, mini_tunnel_agent::IdentityError>
+where
+    F: Future<Output = Result<T, mini_tunnel_agent::IdentityError>>,
+{
+    bounded_recovery_dial_with_timeout(DIRECT_RECOVERY_DIAL_TIMEOUT, future).await
+}
+
+async fn bounded_recovery_dial_with_timeout<T, F>(
+    timeout: Duration,
+    future: F,
+) -> Result<T, mini_tunnel_agent::IdentityError>
+where
+    F: Future<Output = Result<T, mini_tunnel_agent::IdentityError>>,
+{
+    tokio::time::timeout(timeout, future)
+        .await
+        .unwrap_or_else(|_| {
+            Err(mini_tunnel_agent::IdentityError::Transport(format!(
+                "direct recovery dial exceeded {} ms",
+                timeout.as_millis()
+            )))
+        })
+}
+
 const RELIABLE_RELAY_RACE_DELAY: Duration = Duration::from_millis(250);
 const DIRECT_RELAY_RACE_DELAY: Duration = Duration::from_secs(5);
 
@@ -3907,7 +3934,7 @@ fn build_mesh_peer_connectors(
                 let peer = peer.clone();
                 Box::pin(async move {
                     let probe_relays = udp_recovery_probe_endpoints(relay_endpoints, try_udp_relay);
-                    let connection = match connect_mesh_peer(
+                    let connection = match bounded_recovery_dial(connect_mesh_peer(
                         &endpoint,
                         &network_id,
                         &coordinator_url,
@@ -3919,7 +3946,7 @@ fn build_mesh_peer_connectors(
                             ice_probe_validation: IceProbeValidation::Recovery,
                             early_ice_monitor_tx: None,
                         },
-                    )
+                    ))
                     .await
                     {
                         Ok(connection) => connection,
@@ -3977,79 +4004,85 @@ fn build_mesh_peer_connectors(
                             "discarded queued accepted channels before direct recovery"
                         );
                     }
-                    let direct_result = async {
-                        let mut monitor = select_current_ice_peer_address(
-                            &endpoint,
-                            &coordinator_url,
-                            &network_id,
-                            &peer,
-                            &identity,
-                        )
-                        .await
-                        .map(|(_, monitor)| monitor);
-                        tracing::debug!(
-                            peer_id = %peer.device_id,
-                            nominated = monitor.is_some(),
-                            "direct recovery accepted-side ICE checklist completed"
-                        );
-                        let accepted = tokio::time::timeout(direct_wait, async {
-                            receiver.lock().await.recv().await
-                        })
-                        .await;
-                        let mut channel = match accepted {
-                            Ok(Some(channel)) => channel,
-                            Ok(None) => {
-                                if let Some(monitor) = monitor.take() {
-                                    monitor.stop().await;
-                                }
-                                return Err(mini_tunnel_agent::IdentityError::Transport(
-                                    "peer accept dispatcher stopped".to_owned(),
-                                ));
-                            }
-                            Err(_) => {
-                                if let Some(monitor) = monitor.take() {
-                                    monitor.stop().await;
-                                }
-                                return Err(mini_tunnel_agent::IdentityError::Transport(
-                                    "timed out waiting for direct recovery probe".to_owned(),
-                                ));
-                            }
-                        };
-                        tracing::debug!(
-                            peer_id = %peer.device_id,
-                            path = channel.transport_name(),
-                            has_ice_consent = channel.has_ice_consent_monitor(),
-                            "direct recovery accepted candidate channel received"
-                        );
-                        if let Some(monitor) = monitor.take() {
-                            channel.set_ice_consent_monitor(monitor);
-                        }
-                        Ok(channel)
-                    }
-                    .await;
-
-                    match direct_result {
-                        Ok(channel) => {
-                            validate_udp_probe(channel, require_ice_consent, &peer.device_id).await
-                        }
-                        Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer) => {
-                            Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer)
-                        }
-                        Err(direct_error) if use_udp_relay => {
-                            let relay = relay_endpoints.udp.expect("checked above");
-                            tracing::debug!(
-                                peer_id = %peer.device_id,
-                                %direct_error,
-                                "direct recovery failed; trying authenticated UDP Relay"
-                            );
-                            let channel = connect_peer_via_udp_relay(
-                                relay,
+                    let dial_result = bounded_recovery_dial(async {
+                        let direct_result = async {
+                            let mut monitor = select_current_ice_peer_address(
+                                &endpoint,
                                 &coordinator_url,
                                 &network_id,
-                                &identity,
                                 &peer,
+                                &identity,
                             )
-                            .await?;
+                            .await
+                            .map(|(_, monitor)| monitor);
+                            tracing::debug!(
+                                peer_id = %peer.device_id,
+                                nominated = monitor.is_some(),
+                                "direct recovery accepted-side ICE checklist completed"
+                            );
+                            let accepted = tokio::time::timeout(direct_wait, async {
+                                receiver.lock().await.recv().await
+                            })
+                            .await;
+                            let mut channel = match accepted {
+                                Ok(Some(channel)) => channel,
+                                Ok(None) => {
+                                    if let Some(monitor) = monitor.take() {
+                                        monitor.stop().await;
+                                    }
+                                    return Err(mini_tunnel_agent::IdentityError::Transport(
+                                        "peer accept dispatcher stopped".to_owned(),
+                                    ));
+                                }
+                                Err(_) => {
+                                    if let Some(monitor) = monitor.take() {
+                                        monitor.stop().await;
+                                    }
+                                    return Err(mini_tunnel_agent::IdentityError::Transport(
+                                        "timed out waiting for direct recovery probe".to_owned(),
+                                    ));
+                                }
+                            };
+                            tracing::debug!(
+                                peer_id = %peer.device_id,
+                                path = channel.transport_name(),
+                                has_ice_consent = channel.has_ice_consent_monitor(),
+                                "direct recovery accepted candidate channel received"
+                            );
+                            if let Some(monitor) = monitor.take() {
+                                channel.set_ice_consent_monitor(monitor);
+                            }
+                            Ok(channel)
+                        }
+                        .await;
+
+                        match direct_result {
+                            Ok(channel) => Ok(channel),
+                            Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer) => {
+                                Err(mini_tunnel_agent::IdentityError::UnauthorizedPeer)
+                            }
+                            Err(direct_error) if use_udp_relay => {
+                                let relay = relay_endpoints.udp.expect("checked above");
+                                tracing::debug!(
+                                    peer_id = %peer.device_id,
+                                    %direct_error,
+                                    "direct recovery failed; trying authenticated UDP Relay"
+                                );
+                                connect_peer_via_udp_relay(
+                                    relay,
+                                    &coordinator_url,
+                                    &network_id,
+                                    &identity,
+                                    &peer,
+                                )
+                                .await
+                            }
+                            Err(error) => Err(error),
+                        }
+                    })
+                    .await;
+                    match dial_result {
+                        Ok(channel) => {
                             validate_udp_probe(channel, require_ice_consent, &peer.device_id).await
                         }
                         Err(error) => Err(error),
@@ -6344,6 +6377,52 @@ fn print_tunnel_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_recovery_dial_cancels_a_stalled_candidate_connection() {
+        struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let future_cancelled = std::sync::Arc::clone(&cancelled);
+        let future = async move {
+            let _drop_flag = DropFlag(future_cancelled);
+            std::future::pending::<Result<(), mini_tunnel_agent::IdentityError>>().await
+        };
+        let started = tokio::time::Instant::now();
+        let (result, other_peer) = tokio::join!(
+            bounded_recovery_dial_with_timeout(Duration::from_millis(20), future),
+            bounded_recovery_dial_with_timeout(Duration::from_secs(1), async {
+                Ok::<_, mini_tunnel_agent::IdentityError>("other peer recovered")
+            })
+        );
+
+        let error = result.expect_err("stalled candidate dialing must be bounded");
+        assert!(
+            error
+                .to_string()
+                .contains("direct recovery dial exceeded 20 ms")
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(other_peer.unwrap(), "other peer recovered");
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "timed-out candidate future must be dropped before the next rendezvous"
+        );
+        assert_eq!(
+            bounded_recovery_dial_with_timeout(Duration::from_secs(1), async {
+                Ok::<_, mini_tunnel_agent::IdentityError>("next rendezvous succeeded")
+            })
+            .await
+            .unwrap(),
+            "next rendezvous succeeded"
+        );
+    }
 
     #[test]
     fn coordinator_proxy_policy_bypasses_private_hosts_only() {
