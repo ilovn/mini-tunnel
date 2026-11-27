@@ -13,6 +13,18 @@ from pathlib import Path
 from typing import Any
 
 
+RELAY_FAILURE_CLASS_METRICS = {
+    "malformed_protocol": "mini_tunnel_relay_malformed_protocol_failures_total",
+    "ticket_rejections": "mini_tunnel_relay_ticket_rejections_total",
+    "identity_rejections": "mini_tunnel_relay_identity_rejections_total",
+    "pairing_rejections": "mini_tunnel_relay_pairing_rejections_total",
+    "timeouts": "mini_tunnel_relay_handshake_timeouts_total",
+    "client_disconnects": "mini_tunnel_relay_client_disconnects_total",
+    "io_failures": "mini_tunnel_relay_io_failures_total",
+    "internal_failures": "mini_tunnel_relay_internal_failures_total",
+}
+
+
 def parse_timestamp(value: Any) -> dt.datetime | None:
     if not isinstance(value, str):
         return None
@@ -118,6 +130,7 @@ def analyze_file(
     relay_values: dict[str, list[float]] = defaultdict(list)
     relay_sample_count = 0
     relay_metrics_errors = 0
+    classified_relay_samples = 0
     for timestamp, record in timestamps:
         if record.get("relay_error"):
             relay_metrics_errors += 1
@@ -157,12 +170,16 @@ def analyze_file(
         relay = record.get("relay")
         if isinstance(relay, dict):
             relay_sample_count += 1
-            for field in (
+            metric_fields = (
                 "mini_tunnel_relay_active_connections",
                 "mini_tunnel_relay_active_sessions",
                 "mini_tunnel_relay_handshake_failures_total",
                 "mini_tunnel_relay_bytes_forwarded_total",
-            ):
+                *RELAY_FAILURE_CLASS_METRICS.values(),
+            )
+            if all(field in relay for field in RELAY_FAILURE_CLASS_METRICS.values()):
+                classified_relay_samples += 1
+            for field in metric_fields:
                 value = number(relay.get(field))
                 if value is not None and value >= 0:
                     relay_values[field].append(value)
@@ -186,6 +203,24 @@ def analyze_file(
         "mini_tunnel_relay_handshake_failures_total"
     ]
     relay_handshake_failure_increase = counter_increase(handshake_failures)
+    failure_class_increases = {
+        name: counter_increase(relay_values[metric])
+        for name, metric in RELAY_FAILURE_CLASS_METRICS.items()
+    }
+    classified_failure_metrics = (
+        relay_sample_count > 0 and classified_relay_samples == relay_sample_count
+    )
+    # Only failures after a syntactically valid, authenticated client reached pairing state,
+    # or server-side I/O/internal failures are availability failures. Protocol noise,
+    # unauthenticated credentials, client disconnects, and auth timeouts remain diagnostics.
+    gated_relay_failure_increase = (
+        sum(
+            failure_class_increases[name]
+            for name in ("pairing_rejections", "io_failures", "internal_failures")
+        )
+        if classified_failure_metrics
+        else relay_handshake_failure_increase
+    )
     relay_metrics = {
         "samples": relay_sample_count,
         "handshake_failures_first": handshake_failures[0]
@@ -195,6 +230,9 @@ def analyze_file(
         if handshake_failures
         else None,
         "handshake_failures_increase": relay_handshake_failure_increase,
+        "handshake_failure_class_increases": failure_class_increases,
+        "classified_failure_metrics": classified_failure_metrics,
+        "gated_handshake_failures_increase": gated_relay_failure_increase,
         "active_connections_max": max(
             relay_values["mini_tunnel_relay_active_connections"], default=None
         ),
@@ -327,7 +365,7 @@ def analyze_file(
         failures.append("missing_process_samples")
     if relay_metrics_errors:
         failures.append("relay_metrics_errors")
-    if relay_handshake_failure_increase > 0:
+    if gated_relay_failure_increase > 0:
         failures.append("relay_handshake_failures")
     if offline_peers:
         failures.append("offline_peer_samples")

@@ -140,6 +140,14 @@ class SoakMonitorTests(unittest.TestCase):
             "mini_tunnel_relay_active_connections 2\n"
             "mini_tunnel_relay_active_sessions 1\n"
             "mini_tunnel_relay_handshake_failures_total 3\n"
+            "mini_tunnel_relay_malformed_protocol_failures_total 2\n"
+            "mini_tunnel_relay_ticket_rejections_total 1\n"
+            "mini_tunnel_relay_identity_rejections_total 0\n"
+            "mini_tunnel_relay_pairing_rejections_total 0\n"
+            "mini_tunnel_relay_handshake_timeouts_total 0\n"
+            "mini_tunnel_relay_client_disconnects_total 0\n"
+            "mini_tunnel_relay_io_failures_total 0\n"
+            "mini_tunnel_relay_internal_failures_total 0\n"
             "mini_tunnel_relay_bytes_forwarded_total 1024\n"
             "private_metric{peer=\"secret\"} 99\n"
             "mini_tunnel_relay_active_sessions NaN\n"
@@ -150,6 +158,14 @@ class SoakMonitorTests(unittest.TestCase):
                 "mini_tunnel_relay_active_connections": 2,
                 "mini_tunnel_relay_active_sessions": 1,
                 "mini_tunnel_relay_handshake_failures_total": 3,
+                "mini_tunnel_relay_malformed_protocol_failures_total": 2,
+                "mini_tunnel_relay_ticket_rejections_total": 1,
+                "mini_tunnel_relay_identity_rejections_total": 0,
+                "mini_tunnel_relay_pairing_rejections_total": 0,
+                "mini_tunnel_relay_handshake_timeouts_total": 0,
+                "mini_tunnel_relay_client_disconnects_total": 0,
+                "mini_tunnel_relay_io_failures_total": 0,
+                "mini_tunnel_relay_internal_failures_total": 0,
                 "mini_tunnel_relay_bytes_forwarded_total": 1024,
             },
         )

@@ -780,9 +780,33 @@ async fn relay_metrics(State(relay): State<RelayMetricsState>) -> impl IntoRespo
          # HELP mini_tunnel_relay_capacity_rejections_total Connections rejected by global or source IP limits.\n\
          # TYPE mini_tunnel_relay_capacity_rejections_total counter\n\
          mini_tunnel_relay_capacity_rejections_total {}\n\
-         # HELP mini_tunnel_relay_handshake_failures_total Relay protocol or identity handshakes that failed or timed out.\n\
+         # HELP mini_tunnel_relay_handshake_failures_total TCP relay authentication or pairing handshakes that failed or timed out.\n\
          # TYPE mini_tunnel_relay_handshake_failures_total counter\n\
          mini_tunnel_relay_handshake_failures_total {}\n\
+         # HELP mini_tunnel_relay_malformed_protocol_failures_total TCP relay requests rejected for malformed framing or fields.\n\
+         # TYPE mini_tunnel_relay_malformed_protocol_failures_total counter\n\
+         mini_tunnel_relay_malformed_protocol_failures_total {}\n\
+         # HELP mini_tunnel_relay_ticket_rejections_total TCP relay tickets rejected as invalid, expired, or unverifiable.\n\
+         # TYPE mini_tunnel_relay_ticket_rejections_total counter\n\
+         mini_tunnel_relay_ticket_rejections_total {}\n\
+         # HELP mini_tunnel_relay_identity_rejections_total TCP relay clients rejected by identity authorization.\n\
+         # TYPE mini_tunnel_relay_identity_rejections_total counter\n\
+         mini_tunnel_relay_identity_rejections_total {}\n\
+         # HELP mini_tunnel_relay_pairing_rejections_total TCP relay requests rejected by replay or session state checks.\n\
+         # TYPE mini_tunnel_relay_pairing_rejections_total counter\n\
+         mini_tunnel_relay_pairing_rejections_total {}\n\
+         # HELP mini_tunnel_relay_handshake_timeouts_total TCP relay authentication handshakes that exceeded the deadline.\n\
+         # TYPE mini_tunnel_relay_handshake_timeouts_total counter\n\
+         mini_tunnel_relay_handshake_timeouts_total {}\n\
+         # HELP mini_tunnel_relay_client_disconnects_total TCP clients that disconnected before completing authentication.\n\
+         # TYPE mini_tunnel_relay_client_disconnects_total counter\n\
+         mini_tunnel_relay_client_disconnects_total {}\n\
+         # HELP mini_tunnel_relay_io_failures_total TCP relay handshakes that failed due to server-side I/O errors.\n\
+         # TYPE mini_tunnel_relay_io_failures_total counter\n\
+         mini_tunnel_relay_io_failures_total {}\n\
+         # HELP mini_tunnel_relay_internal_failures_total TCP relay handshakes that failed due to internal server errors.\n\
+         # TYPE mini_tunnel_relay_internal_failures_total counter\n\
+         mini_tunnel_relay_internal_failures_total {}\n\
          # HELP mini_tunnel_relay_bytes_forwarded_total Bytes forwarded across all sessions.\n\
          # TYPE mini_tunnel_relay_bytes_forwarded_total counter\n\
          mini_tunnel_relay_bytes_forwarded_total {}\n\
@@ -823,6 +847,14 @@ async fn relay_metrics(State(relay): State<RelayMetricsState>) -> impl IntoRespo
         stats.accepted_connections_total,
         stats.capacity_rejections_total,
         stats.handshake_failures_total,
+        stats.handshake_failure_classes.malformed_protocol_total,
+        stats.handshake_failure_classes.ticket_rejections_total,
+        stats.handshake_failure_classes.identity_rejections_total,
+        stats.handshake_failure_classes.pairing_rejections_total,
+        stats.handshake_failure_classes.timeouts_total,
+        stats.handshake_failure_classes.client_disconnects_total,
+        stats.handshake_failure_classes.io_failures_total,
+        stats.handshake_failure_classes.internal_failures_total,
         stats.bytes_forwarded_total,
         udp_stats.active_sessions,
         udp_stats.pending_authentications,
@@ -10042,6 +10074,15 @@ mod tests {
         assert!(body.contains("mini_tunnel_relay_active_connections 0"));
         assert!(body.contains("mini_tunnel_relay_active_sessions 0"));
         assert!(body.contains("mini_tunnel_relay_bytes_forwarded_total 0"));
+        assert!(body.contains("mini_tunnel_relay_handshake_failures_total 0"));
+        assert!(body.contains("mini_tunnel_relay_malformed_protocol_failures_total 0"));
+        assert!(body.contains("mini_tunnel_relay_ticket_rejections_total 0"));
+        assert!(body.contains("mini_tunnel_relay_identity_rejections_total 0"));
+        assert!(body.contains("mini_tunnel_relay_pairing_rejections_total 0"));
+        assert!(body.contains("mini_tunnel_relay_handshake_timeouts_total 0"));
+        assert!(body.contains("mini_tunnel_relay_client_disconnects_total 0"));
+        assert!(body.contains("mini_tunnel_relay_io_failures_total 0"));
+        assert!(body.contains("mini_tunnel_relay_internal_failures_total 0"));
         assert!(body.contains("mini_tunnel_udp_relay_active_sessions 0"));
         assert!(body.contains("mini_tunnel_udp_relay_forwarded_datagrams_total 0"));
         assert!(body.contains("mini_tunnel_udp_relay_auth_rate_limited_total 1"));

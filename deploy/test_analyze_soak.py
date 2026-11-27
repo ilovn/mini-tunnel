@@ -14,6 +14,16 @@ from analyze_soak import analyze_file
 ROOT = Path(__file__).resolve().parent
 TOOL = ROOT / "analyze_soak.py"
 UTC = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+RELAY_FAILURE_CLASS_METRICS = {
+    "mini_tunnel_relay_malformed_protocol_failures_total": 0,
+    "mini_tunnel_relay_ticket_rejections_total": 0,
+    "mini_tunnel_relay_identity_rejections_total": 0,
+    "mini_tunnel_relay_pairing_rejections_total": 0,
+    "mini_tunnel_relay_handshake_timeouts_total": 0,
+    "mini_tunnel_relay_client_disconnects_total": 0,
+    "mini_tunnel_relay_io_failures_total": 0,
+    "mini_tunnel_relay_internal_failures_total": 0,
+}
 
 
 def row(
@@ -238,11 +248,83 @@ class AnalyzeSoakTests(unittest.TestCase):
                 "handshake_failures_first": 0,
                 "handshake_failures_last": 1,
                 "handshake_failures_increase": 1,
+                "handshake_failure_class_increases": {
+                    "malformed_protocol": 0,
+                    "ticket_rejections": 0,
+                    "identity_rejections": 0,
+                    "pairing_rejections": 0,
+                    "timeouts": 0,
+                    "client_disconnects": 0,
+                    "io_failures": 0,
+                    "internal_failures": 0,
+                },
+                "classified_failure_metrics": False,
+                "gated_handshake_failures_increase": 1,
                 "active_connections_max": 2,
                 "active_sessions_max": 1,
                 "bytes_forwarded_increase": 50,
             },
         )
+
+    def test_malformed_public_relay_probes_are_reported_without_failing_peer_soak(self) -> None:
+        start = {**RELAY_FAILURE_CLASS_METRICS}
+        end = {**RELAY_FAILURE_CLASS_METRICS}
+        end["mini_tunnel_relay_malformed_protocol_failures_total"] = 2
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "relay-probes.jsonl"
+            write_jsonl(
+                path,
+                [
+                    row(
+                        1,
+                        0,
+                        probe={"sent": 5, "received": 5},
+                        relay={"mini_tunnel_relay_handshake_failures_total": 0, **start},
+                    ),
+                    row(
+                        2,
+                        10,
+                        probe={"sent": 5, "received": 5},
+                        relay={"mini_tunnel_relay_handshake_failures_total": 2, **end},
+                    ),
+                ],
+            )
+            report = self.analyze(path)
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["relay_metrics"]["handshake_failures_increase"], 2)
+        self.assertEqual(
+            report["relay_metrics"]["handshake_failure_class_increases"]["malformed_protocol"],
+            2,
+        )
+        self.assertEqual(report["relay_metrics"]["gated_handshake_failures_increase"], 0)
+
+    def test_relay_pairing_rejections_remain_a_soak_failure(self) -> None:
+        start = {**RELAY_FAILURE_CLASS_METRICS}
+        end = {**RELAY_FAILURE_CLASS_METRICS}
+        end["mini_tunnel_relay_pairing_rejections_total"] = 1
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "relay-pairing-failure.jsonl"
+            write_jsonl(
+                path,
+                [
+                    row(
+                        1,
+                        0,
+                        probe={"sent": 5, "received": 5},
+                        relay={"mini_tunnel_relay_handshake_failures_total": 0, **start},
+                    ),
+                    row(
+                        2,
+                        10,
+                        probe={"sent": 5, "received": 5},
+                        relay={"mini_tunnel_relay_handshake_failures_total": 1, **end},
+                    ),
+                ],
+            )
+            report = self.analyze(path)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["relay_metrics"]["gated_handshake_failures_increase"], 1)
+        self.assertIn("relay_handshake_failures", report["failures"])
 
     def test_relay_failure_counter_increase_survives_a_counter_reset(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

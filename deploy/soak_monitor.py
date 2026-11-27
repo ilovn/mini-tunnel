@@ -25,12 +25,23 @@ from urllib.parse import urlsplit
 
 MAX_HTTP_BYTES = 1_048_576
 MAX_STATUS_PEERS = 4096
-RELAY_METRIC_NAMES = (
+RELAY_REQUIRED_METRIC_NAMES = (
     "mini_tunnel_relay_active_connections",
     "mini_tunnel_relay_active_sessions",
     "mini_tunnel_relay_handshake_failures_total",
     "mini_tunnel_relay_bytes_forwarded_total",
 )
+RELAY_DIAGNOSTIC_METRIC_NAMES = (
+    "mini_tunnel_relay_malformed_protocol_failures_total",
+    "mini_tunnel_relay_ticket_rejections_total",
+    "mini_tunnel_relay_identity_rejections_total",
+    "mini_tunnel_relay_pairing_rejections_total",
+    "mini_tunnel_relay_handshake_timeouts_total",
+    "mini_tunnel_relay_client_disconnects_total",
+    "mini_tunnel_relay_io_failures_total",
+    "mini_tunnel_relay_internal_failures_total",
+)
+RELAY_METRIC_NAMES = RELAY_REQUIRED_METRIC_NAMES + RELAY_DIAGNOSTIC_METRIC_NAMES
 _NO_REDIRECT = urllib.request.build_opener(
     urllib.request.ProxyHandler({}),
     type(
@@ -164,7 +175,7 @@ def fetch_relay_metrics(
     metrics = parse_prometheus_metrics(text)
     return (
         (metrics, None)
-        if all(name in metrics for name in RELAY_METRIC_NAMES)
+        if all(name in metrics for name in RELAY_REQUIRED_METRIC_NAMES)
         else (None, "invalid_metrics")
     )
 

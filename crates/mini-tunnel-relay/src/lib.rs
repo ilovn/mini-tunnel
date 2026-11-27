@@ -75,7 +75,22 @@ pub struct RelayStats {
     pub accepted_connections_total: u64,
     pub capacity_rejections_total: u64,
     pub handshake_failures_total: u64,
+    pub handshake_failure_classes: RelayHandshakeFailureStats,
     pub bytes_forwarded_total: u64,
+}
+
+/// Low-cardinality classifications for failed TCP relay handshakes. These counters never retain
+/// source addresses or any handshake material.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RelayHandshakeFailureStats {
+    pub malformed_protocol_total: u64,
+    pub ticket_rejections_total: u64,
+    pub identity_rejections_total: u64,
+    pub pairing_rejections_total: u64,
+    pub timeouts_total: u64,
+    pub client_disconnects_total: u64,
+    pub io_failures_total: u64,
+    pub internal_failures_total: u64,
 }
 
 impl RelayConfig {
@@ -140,8 +155,50 @@ struct RelayInner {
     accepted_connections_total: AtomicU64,
     capacity_rejections_total: AtomicU64,
     handshake_failures_total: AtomicU64,
+    handshake_failure_classes: RelayHandshakeFailureCounters,
     bytes_forwarded_total: AtomicU64,
     shutdown: watch::Sender<bool>,
+}
+
+#[derive(Default)]
+struct RelayHandshakeFailureCounters {
+    malformed_protocol: AtomicU64,
+    ticket_rejections: AtomicU64,
+    identity_rejections: AtomicU64,
+    pairing_rejections: AtomicU64,
+    timeouts: AtomicU64,
+    client_disconnects: AtomicU64,
+    io_failures: AtomicU64,
+    internal_failures: AtomicU64,
+}
+
+impl RelayHandshakeFailureCounters {
+    fn record(&self, class: RelayHandshakeFailureClass) {
+        let counter = match class {
+            RelayHandshakeFailureClass::MalformedProtocol => &self.malformed_protocol,
+            RelayHandshakeFailureClass::TicketRejected => &self.ticket_rejections,
+            RelayHandshakeFailureClass::IdentityRejected => &self.identity_rejections,
+            RelayHandshakeFailureClass::PairingRejected => &self.pairing_rejections,
+            RelayHandshakeFailureClass::Timeout => &self.timeouts,
+            RelayHandshakeFailureClass::ClientDisconnect => &self.client_disconnects,
+            RelayHandshakeFailureClass::IoFailure => &self.io_failures,
+            RelayHandshakeFailureClass::InternalFailure => &self.internal_failures,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> RelayHandshakeFailureStats {
+        RelayHandshakeFailureStats {
+            malformed_protocol_total: self.malformed_protocol.load(Ordering::Relaxed),
+            ticket_rejections_total: self.ticket_rejections.load(Ordering::Relaxed),
+            identity_rejections_total: self.identity_rejections.load(Ordering::Relaxed),
+            pairing_rejections_total: self.pairing_rejections.load(Ordering::Relaxed),
+            timeouts_total: self.timeouts.load(Ordering::Relaxed),
+            client_disconnects_total: self.client_disconnects.load(Ordering::Relaxed),
+            io_failures_total: self.io_failures.load(Ordering::Relaxed),
+            internal_failures_total: self.internal_failures.load(Ordering::Relaxed),
+        }
+    }
 }
 
 struct SourceConnectionTracker {
@@ -255,6 +312,7 @@ impl RelayServer {
                 accepted_connections_total: AtomicU64::new(0),
                 capacity_rejections_total: AtomicU64::new(0),
                 handshake_failures_total: AtomicU64::new(0),
+                handshake_failure_classes: RelayHandshakeFailureCounters::default(),
                 bytes_forwarded_total: AtomicU64::new(0),
                 shutdown,
             }),
@@ -277,6 +335,7 @@ impl RelayServer {
                 .load(Ordering::Relaxed),
             capacity_rejections_total: self.inner.capacity_rejections_total.load(Ordering::Relaxed),
             handshake_failures_total: self.inner.handshake_failures_total.load(Ordering::Relaxed),
+            handshake_failure_classes: self.inner.handshake_failure_classes.snapshot(),
             bytes_forwarded_total: self.inner.bytes_forwarded_total.load(Ordering::Relaxed),
         }
     }
@@ -330,11 +389,14 @@ impl RelayServer {
                             server.handle_connection(stream, permit, source_permit),
                         )
                         .await;
-                        if !matches!(result, Ok(Ok(()))) {
-                            server
-                                .inner
-                                .handshake_failures_total
-                                .fetch_add(1, Ordering::Relaxed);
+                        let failure = match result {
+                            Ok(Ok(())) => None,
+                            Ok(Err(error)) => Some(error.failure_class()),
+                            Err(_) => Some(RelayHandshakeFailureClass::Timeout),
+                        };
+                        if let Some(class) = failure {
+                            server.inner.handshake_failures_total.fetch_add(1, Ordering::Relaxed);
+                            server.inner.handshake_failure_classes.record(class);
                         }
                     });
                 }
@@ -739,6 +801,18 @@ pub fn unix_time_ms() -> Option<u64> {
         .ok()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayHandshakeFailureClass {
+    MalformedProtocol,
+    TicketRejected,
+    IdentityRejected,
+    PairingRejected,
+    Timeout,
+    ClientDisconnect,
+    IoFailure,
+    InternalFailure,
+}
+
 #[derive(Debug, thiserror::Error)]
 enum RelayError {
     #[error("invalid relay protocol preface")]
@@ -759,6 +833,25 @@ enum RelayError {
     Io(#[from] io::Error),
 }
 
+impl RelayError {
+    fn failure_class(&self) -> RelayHandshakeFailureClass {
+        match self {
+            Self::Protocol => RelayHandshakeFailureClass::MalformedProtocol,
+            Self::InvalidTicket | Self::Ticket(_) => RelayHandshakeFailureClass::TicketRejected,
+            Self::Unauthorized => RelayHandshakeFailureClass::IdentityRejected,
+            Self::Replay | Self::Busy => RelayHandshakeFailureClass::PairingRejected,
+            Self::Entropy => RelayHandshakeFailureClass::InternalFailure,
+            Self::Io(error) => match error.kind() {
+                io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::BrokenPipe => RelayHandshakeFailureClass::ClientDisconnect,
+                _ => RelayHandshakeFailureClass::IoFailure,
+            },
+        }
+    }
+}
+
 /// Bind and run a relay process.
 pub async fn serve(address: SocketAddr, ticket_key: [u8; 32]) -> io::Result<()> {
     let listener = TcpListener::bind(address).await?;
@@ -776,6 +869,91 @@ mod tests {
 
     fn identity(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
+    }
+
+    #[test]
+    fn handshake_failures_are_classified_without_sensitive_labels() {
+        assert_eq!(
+            RelayError::Protocol.failure_class(),
+            RelayHandshakeFailureClass::MalformedProtocol
+        );
+        assert_eq!(
+            RelayError::InvalidTicket.failure_class(),
+            RelayHandshakeFailureClass::TicketRejected
+        );
+        assert_eq!(
+            RelayError::Unauthorized.failure_class(),
+            RelayHandshakeFailureClass::IdentityRejected
+        );
+        assert_eq!(
+            RelayError::Replay.failure_class(),
+            RelayHandshakeFailureClass::PairingRejected
+        );
+        assert_eq!(
+            RelayError::Io(io::Error::from(io::ErrorKind::UnexpectedEof)).failure_class(),
+            RelayHandshakeFailureClass::ClientDisconnect
+        );
+        assert_eq!(
+            RelayError::Io(io::Error::other("test error")).failure_class(),
+            RelayHandshakeFailureClass::IoFailure
+        );
+
+        let counters = RelayHandshakeFailureCounters::default();
+        for class in [
+            RelayHandshakeFailureClass::MalformedProtocol,
+            RelayHandshakeFailureClass::TicketRejected,
+            RelayHandshakeFailureClass::IdentityRejected,
+            RelayHandshakeFailureClass::PairingRejected,
+            RelayHandshakeFailureClass::Timeout,
+            RelayHandshakeFailureClass::ClientDisconnect,
+            RelayHandshakeFailureClass::IoFailure,
+            RelayHandshakeFailureClass::InternalFailure,
+        ] {
+            counters.record(class);
+        }
+        assert_eq!(
+            counters.snapshot(),
+            RelayHandshakeFailureStats {
+                malformed_protocol_total: 1,
+                ticket_rejections_total: 1,
+                identity_rejections_total: 1,
+                pairing_rejections_total: 1,
+                timeouts_total: 1,
+                client_disconnects_total: 1,
+                io_failures_total: 1,
+                internal_failures_total: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_public_handshake_increments_aggregate_and_protocol_counter() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind relay");
+        let address = listener.local_addr().expect("relay address");
+        let relay = RelayServer::new(RelayConfig::new([31; 32]));
+        let observed_relay = relay.clone();
+        let relay_task = tokio::spawn(async move { relay.run(listener).await });
+
+        let mut client = TcpStream::connect(address).await.expect("connect relay");
+        client
+            .write_all(b"BADPREFX")
+            .await
+            .expect("send malformed preface");
+        drop(client);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while observed_relay.stats().await.handshake_failures_total == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("malformed handshake counter timeout");
+        let stats = observed_relay.stats().await;
+        assert_eq!(stats.handshake_failures_total, 1);
+        assert_eq!(stats.handshake_failure_classes.malformed_protocol_total, 1);
+        assert_eq!(stats.handshake_failure_classes.client_disconnects_total, 0);
+
+        relay_task.abort();
     }
 
     fn claims(source: &SigningKey, target: &SigningKey, ticket_id: u8) -> RelayTicketClaims {
