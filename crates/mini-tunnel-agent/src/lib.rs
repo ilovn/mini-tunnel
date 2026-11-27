@@ -374,6 +374,20 @@ pub enum PeerChannelCloseReason {
 }
 
 impl PeerChannelCloseReason {
+    /// Stable QUIC application error code for this local channel-close decision.
+    ///
+    /// Values use an application-specific range and are safe to extend without changing the
+    /// overlay frame format. Remote peers may still send any QUIC application error code.
+    #[must_use]
+    pub const fn application_error_code(self) -> u32 {
+        match self {
+            Self::LocalShutdown => 0x4d54_0001,
+            Self::PathNotSelected => 0x4d54_0002,
+            Self::DuplicatePath => 0x4d54_0003,
+            Self::PathProbationFailed => 0x4d54_0004,
+        }
+    }
+
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -914,10 +928,14 @@ impl PeerChannel {
             tracing::debug!(
                 channel_id = self.channel_id,
                 remote = %connection.remote_address(),
+                application_error_code = reason.application_error_code(),
                 close_reason = reason_text,
                 "closing QUIC peer channel locally"
             );
-            connection.close(0_u32.into(), reason_text.as_bytes());
+            connection.close(
+                reason.application_error_code().into(),
+                reason_text.as_bytes(),
+            );
         }
     }
 
@@ -1211,14 +1229,24 @@ impl PeerChannel {
                     Ok(frame) => frame.to_vec(),
                     Err(error) => {
                         let close_class = quic_connection_error_class(&error);
+                        let application_close = quic_application_close_details(&error);
+                        let application_error_code =
+                            application_close.as_ref().map(|details| details.error_code);
+                        let application_close_reason = application_close
+                            .as_ref()
+                            .map_or("", |details| details.reason.as_str());
+                        let diagnostic =
+                            quic_connection_error_diagnostic(&error, application_close.as_ref());
                         tracing::warn!(
                             channel_id = self.channel_id,
                             remote = %connection.remote_address(),
                             close_class,
-                            %error,
+                            application_error_code = ?application_error_code,
+                            application_close_reason,
+                            error = %diagnostic,
                             "QUIC peer datagram receive failed"
                         );
-                        return Err(IdentityError::Transport(error.to_string()));
+                        return Err(IdentityError::Transport(diagnostic));
                     }
                 },
                 PeerTransport::Tcp(transport) => {
@@ -1416,6 +1444,59 @@ fn quic_connection_error_class(error: &quinn::ConnectionError) -> &'static str {
         quinn::ConnectionError::TimedOut => "timeout",
         quinn::ConnectionError::LocallyClosed => "local_close",
         quinn::ConnectionError::CidsExhausted => "cid_exhaustion",
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct QuicApplicationCloseDetails {
+    error_code: u64,
+    reason: String,
+}
+
+fn quic_application_close_details(
+    error: &quinn::ConnectionError,
+) -> Option<QuicApplicationCloseDetails> {
+    let quinn::ConnectionError::ApplicationClosed(close) = error else {
+        return None;
+    };
+    Some(QuicApplicationCloseDetails {
+        error_code: close.error_code.into_inner(),
+        reason: sanitize_quic_close_reason(&close.reason),
+    })
+}
+
+fn sanitize_quic_close_reason(reason: &[u8]) -> String {
+    String::from_utf8_lossy(reason)
+        .chars()
+        .take(128)
+        .map(|character| {
+            if character.is_control() {
+                '\u{fffd}'
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn quic_connection_error_diagnostic(
+    error: &quinn::ConnectionError,
+    application_close: Option<&QuicApplicationCloseDetails>,
+) -> String {
+    if let Some(close) = application_close {
+        if close.reason.is_empty() {
+            format!(
+                "peer closed QUIC channel with application error {}",
+                close.error_code
+            )
+        } else {
+            format!(
+                "peer closed QUIC channel with application error {}: {}",
+                close.error_code, close.reason
+            )
+        }
+    } else {
+        error.to_string()
     }
 }
 
@@ -2977,6 +3058,49 @@ mod tests {
             PeerChannelCloseReason::PathProbationFailed.as_str(),
             "path probation failed"
         );
+        assert_eq!(
+            PeerChannelCloseReason::LocalShutdown.application_error_code(),
+            0x4d54_0001
+        );
+        assert_eq!(
+            PeerChannelCloseReason::PathNotSelected.application_error_code(),
+            0x4d54_0002
+        );
+        assert_eq!(
+            PeerChannelCloseReason::DuplicatePath.application_error_code(),
+            0x4d54_0003
+        );
+        assert_eq!(
+            PeerChannelCloseReason::PathProbationFailed.application_error_code(),
+            0x4d54_0004
+        );
+    }
+
+    #[test]
+    fn quic_application_close_diagnostics_preserve_code_and_sanitize_reason() {
+        let error = quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code: PeerChannelCloseReason::PathNotSelected
+                .application_error_code()
+                .into(),
+            reason: Bytes::from_static(b"peer path not selected\n\0"),
+        });
+        let details = quic_application_close_details(&error).expect("application close details");
+        assert_eq!(details.error_code, 0x4d54_0002);
+        assert_eq!(details.reason, "peer path not selected\u{fffd}\u{fffd}");
+
+        let diagnostic = quic_connection_error_diagnostic(&error, Some(&details));
+        assert_eq!(
+            diagnostic,
+            format!(
+                "peer closed QUIC channel with application error {}: peer path not selected\u{fffd}\u{fffd}",
+                PeerChannelCloseReason::PathNotSelected.application_error_code()
+            )
+        );
+        assert_eq!(
+            sanitize_quic_close_reason(&vec![b'x'; 256]).chars().count(),
+            128,
+            "untrusted remote close reason is bounded"
+        );
     }
 
     #[tokio::test]
@@ -3298,6 +3422,13 @@ mod tests {
         assert!(
             peer_close.to_string().contains("peer path not selected"),
             "peer-side close diagnostics preserve the election decision: {peer_close}"
+        );
+        assert!(
+            peer_close.to_string().contains(&format!(
+                "application error {}",
+                PeerChannelCloseReason::PathNotSelected.application_error_code()
+            )),
+            "peer-side diagnostics preserve the QUIC application error code: {peer_close}"
         );
         endpoint_a.close(0_u32.into(), b"test complete");
         endpoint_b.close(0_u32.into(), b"test complete");
