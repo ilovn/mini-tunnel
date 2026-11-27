@@ -16,4 +16,6 @@ cargo test -p mini-tunnel-coordinator \
 
 Result: **1 passed, 0 failed, 0 ignored** (0.35 seconds; test binary already built). The test exercises two Coordinator state/router instances against one PostgreSQL database and checks shared per-IP rate limiting, concurrent overlapping network creation, single-use invite and unique address allocation, shared peer candidates and ICE credentials, consistent Relay ticket pairing, state restoration in a newly connected instance, PostgreSQL-to-JSON export and JSON-to-PostgreSQL import, revocation propagation, and fail-closed writes/readiness after closing the database pool.
 
+The exact report commit `44b5d73da1ea86fa39bb0275db0263724ba6002d` also passed the complete GitHub Actions [CI run 45980301165](https://github.com/ilovn/mini-tunnel/actions/runs/45980301165): Ubuntu, Windows, and macOS verification; Linux x86_64 and ARM64 release staging builds; and the dedicated PostgreSQL integration job with its own disposable database and restricted runtime role.
+
 This is real PostgreSQL integration coverage, not a separate-process or production failover test. It does not establish cross-host TLS/connection-pool behavior, database failover, rolling schema upgrades, or production write throughput. The sanitized command result is retained in the local Harness evidence directory and is not committed.
