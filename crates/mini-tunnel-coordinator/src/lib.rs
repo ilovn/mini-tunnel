@@ -5546,7 +5546,7 @@ mod tests {
         );
 
         let remaining_timestamp = unix_time_ms().expect("clock");
-        let remaining_candidates = vec!["udp://198.51.100.20:43210".to_owned()];
+        let remaining_candidates = vec!["198.51.100.20:43210".to_owned()];
         let remaining_ice = IceCredentials {
             ufrag: "remainingPeerUfrag".to_owned(),
             password: "remaining-peer-ice-password-123456".to_owned(),
