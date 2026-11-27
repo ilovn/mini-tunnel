@@ -6175,6 +6175,7 @@ fn create_tun(
     let mut config = mini_tunnel_agent::tun_device::TunConfig::ipv4(local_ipv4, prefix_len);
     config = config.with_ipv6(local_ipv6, 64);
     config.mtu = mtu;
+    configure_platform_tun_name(&mut config, std::process::id());
     let (device, ipv6_enabled, ipv6_error) = create_tun_with_ipv6_fallback(config, |config| {
         mini_tunnel_agent::tun_device::TunDevice::create(config)
     })?;
@@ -6185,6 +6186,25 @@ fn create_tun(
         );
     }
     Ok(device)
+}
+
+fn configure_platform_tun_name(
+    config: &mut mini_tunnel_agent::tun_device::TunConfig,
+    process_id: u32,
+) {
+    #[cfg(target_os = "windows")]
+    {
+        config.name = Some(windows_tun_interface_name(process_id));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (config, process_id);
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_tun_interface_name(process_id: u32) -> String {
+    format!("mtun{}", process_id % 100_000)
 }
 
 fn create_tun_with_ipv6_fallback<T>(
@@ -6377,6 +6397,21 @@ fn print_tunnel_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_tun_interface_name_is_stable_and_bounded_by_process_id() {
+        assert_eq!(windows_tun_interface_name(69_696), "mtun69696");
+        assert_eq!(windows_tun_interface_name(100_001), "mtun1");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_platform_tun_uses_explicit_process_scoped_name() {
+        let mut config =
+            mini_tunnel_agent::tun_device::TunConfig::ipv4(Ipv4Addr::new(10, 77, 0, 2), 24);
+        configure_platform_tun_name(&mut config, 69_696);
+        assert_eq!(config.name.as_deref(), Some("mtun69696"));
+    }
 
     #[tokio::test]
     async fn bounded_recovery_dial_cancels_a_stalled_candidate_connection() {
