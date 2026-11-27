@@ -2,6 +2,12 @@
 
 Status: **public NAT/QoS matrix incomplete**. The loopback ICE mapping proxy verifies packet rewriting and session behavior, but it does not establish interoperability across public NATs. The VPS, domestic NAT, Windows, and cross-border runs below are individual topology samples; they do not complete the broader NAT/QoS matrix.
 
+### 15-second synchronized direct recovery on domestic NAT (2026-11-27)
+
+- From attested release-staging artifacts for `c7163a5`, Guangzhou and the domestic NAT peer passed direct UDP baseline probes, fell back to TCP Relay under a narrowly scoped UDP drop, and recovered direct UDP after removing the rule. Both directions retained 0% overlay ping loss on Relay and after recovery.
+- Two recovery samples completed in about 47 and 68 seconds after loss removal, compared with about 75 seconds in the prior 60-second cadence run. The result supports faster recovery on this topology but is not a service-level bound; ICE nomination and the 31-second health probation affect the observed time.
+- Test members were explicitly revoked, task-owned state and services removed, and both default routes plus Guangzhou's production Relay were verified intact. See the [full report](testing/direct-recovery-15s-domestic-nat-2026-11.md).
+
 ### Guangzhou–Hong Kong ICE probation retest (2026-11-27)
 
 - Used Linux x86_64 binaries from the attested Release staging run `45886332907` (source `c72a255d5b881d316abafca6279e6fdf1eae15ed`); neither VPS compiled source. Both peers nominated the direct ICE pair and Guangzhou's initial authenticated health probes passed.
