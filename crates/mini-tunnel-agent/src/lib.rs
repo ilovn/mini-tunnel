@@ -350,6 +350,8 @@ pub struct PeerChannel {
     path_promotion: Mutex<PathPromotionState>,
     path_promotion_changed: tokio::sync::Notify,
     candidate_binding_changed: tokio::sync::Notify,
+    #[cfg(test)]
+    test_drop_path_controls: Mutex<HashMap<u8, usize>>,
     ice_consent: Option<ice::IceConsentMonitor>,
     _relay_endpoint: Option<Endpoint>,
 }
@@ -360,6 +362,8 @@ const PATH_CONTROL_PREFIX: [u8; 8] = *b"MT-PATH1";
 const PATH_PROMOTION_OFFER: u8 = 1;
 const PATH_PROMOTION_ACK: u8 = 2;
 const PATH_CANDIDATE_BINDING_OFFER: u8 = 3;
+const PATH_CANDIDATE_BINDING_ACK: u8 = 4;
+const PATH_CONTROL_RETRY_INTERVAL: Duration = Duration::from_millis(150);
 const PATH_PROMOTION_OFFER_TTL: Duration = Duration::from_secs(3);
 const PATH_CANDIDATE_BINDING_TTL: Duration = Duration::from_secs(15);
 pub const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -387,6 +391,7 @@ struct PathPromotionState {
     pending_remote_offers: VecDeque<(u64, [u8; 32], Instant)>,
     acknowledged_offers: std::collections::HashSet<u64>,
     pending_candidate_offers: VecDeque<([u8; 16], Instant)>,
+    pending_candidate_acks: VecDeque<([u8; 16], Instant)>,
 }
 
 #[derive(Default)]
@@ -532,8 +537,10 @@ impl PeerChannel {
             return false;
         }
         let deadline = tokio::time::Instant::now() + timeout;
+        let binding_timeout = timeout.min(Duration::from_secs(2)) / 2;
         let binding =
-            match tokio::time::timeout_at(deadline, candidate.exchange_direct_path_binding()).await
+            match tokio::time::timeout(binding_timeout, candidate.exchange_direct_path_binding())
+                .await
             {
                 Ok(Some(binding)) => binding,
                 Ok(None) | Err(_) => return false,
@@ -553,47 +560,105 @@ impl PeerChannel {
         offer[..8].copy_from_slice(&PATH_CONTROL_PREFIX);
         offer[8] = PATH_CANDIDATE_BINDING_OFFER;
         offer[9..].copy_from_slice(&local_nonce);
-        self.send_packet(&offer).await.ok()?;
-
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let mut next_retry = tokio::time::Instant::now();
+        let mut completed: Option<([u8; 32], tokio::time::Instant)> = None;
         loop {
             let notified = self.candidate_binding_changed.notified();
             tokio::pin!(notified);
-            let remote_nonce = {
+            let (remote_nonce, local_acknowledged) = {
                 let mut state = self.path_promotion.lock().ok()?;
                 let now = Instant::now();
                 state.pending_candidate_offers.retain(|(_, received_at)| {
                     now.duration_since(*received_at) < PATH_CANDIDATE_BINDING_TTL
                 });
-                state
-                    .pending_candidate_offers
-                    .pop_front()
-                    .map(|(nonce, _)| nonce)
-            };
-            if let Some(remote_nonce) = remote_nonce {
-                let (first, second) = if local_nonce <= remote_nonce {
-                    (local_nonce, remote_nonce)
+                state.pending_candidate_acks.retain(|(_, received_at)| {
+                    now.duration_since(*received_at) < PATH_CANDIDATE_BINDING_TTL
+                });
+                let acknowledged = state
+                    .pending_candidate_acks
+                    .iter()
+                    .any(|(nonce, _)| *nonce == local_nonce);
+                let remote = if acknowledged {
+                    state
+                        .pending_candidate_offers
+                        .back()
+                        .map(|(nonce, _)| *nonce)
                 } else {
-                    (remote_nonce, local_nonce)
+                    None
                 };
-                let mut digest = Sha256::new();
-                digest.update(b"mini-tunnel/direct-path-binding/v1");
-                digest.update(first);
-                digest.update(second);
-                return Some(digest.finalize().into());
+                (remote, acknowledged)
+            };
+            if let (Some(remote_nonce), true) = (remote_nonce, local_acknowledged) {
+                let binding = if let Some((binding, _)) = completed {
+                    binding
+                } else {
+                    let (first, second) = if local_nonce <= remote_nonce {
+                        (local_nonce, remote_nonce)
+                    } else {
+                        (remote_nonce, local_nonce)
+                    };
+                    let mut digest = Sha256::new();
+                    digest.update(b"mini-tunnel/direct-path-binding/v1");
+                    digest.update(first);
+                    digest.update(second);
+                    let binding = digest.finalize().into();
+                    completed = Some((binding, tokio::time::Instant::now()));
+                    binding
+                };
+                if completed.is_some_and(|(_, at)| {
+                    tokio::time::Instant::now().duration_since(at)
+                        >= PATH_CONTROL_RETRY_INTERVAL * 4
+                }) {
+                    return Some(binding);
+                }
             }
 
+            if tokio::time::Instant::now() >= next_retry {
+                if self.send_path_control_packet(&offer).await.is_err() {
+                    return None;
+                }
+                next_retry = tokio::time::Instant::now() + PATH_CONTROL_RETRY_INTERVAL;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
             tokio::select! {
+                _ = tokio::time::sleep_until(next_retry) => {}
                 _ = &mut notified => {}
                 result = self.recv_packet_from_transport() => {
                     let payload = result.ok()?;
-                    if !payload.is_empty()
-                        && self
-                            .pending_probe_packets
-                            .lock()
-                            .ok()?
-                            .push(payload)
-                            .is_err()
-                    {
+                    if payload.len() == 25 && payload[..8] == PATH_CONTROL_PREFIX {
+                        match payload[8] {
+                            PATH_CANDIDATE_BINDING_OFFER => {
+                                let nonce: [u8; 16] = payload[9..].try_into().ok()?;
+                                if let Ok(mut state) = self.path_promotion.lock() {
+                                    let now = Instant::now();
+                                    if !state.pending_candidate_offers.iter().any(|(seen, _)| *seen == nonce) {
+                                        if state.pending_candidate_offers.len() >= 8 { state.pending_candidate_offers.pop_front(); }
+                                        state.pending_candidate_offers.push_back((nonce, now));
+                                    }
+                                }
+                                let mut ack = [0_u8; 25];
+                                ack[..8].copy_from_slice(&PATH_CONTROL_PREFIX);
+                                ack[8] = PATH_CANDIDATE_BINDING_ACK;
+                                ack[9..].copy_from_slice(&nonce);
+                                let _ = self.send_path_control_packet(&ack).await;
+                                self.candidate_binding_changed.notify_one();
+                            }
+                            PATH_CANDIDATE_BINDING_ACK => {
+                                let nonce: [u8; 16] = payload[9..].try_into().ok()?;
+                                if let Ok(mut state) = self.path_promotion.lock()
+                                    && !state.pending_candidate_acks.iter().any(|(seen, _)| *seen == nonce) {
+                                    if state.pending_candidate_acks.len() >= 8 { state.pending_candidate_acks.pop_front(); }
+                                    state.pending_candidate_acks.push_back((nonce, Instant::now()));
+                                }
+                                self.candidate_binding_changed.notify_one();
+                            }
+                            _ => return None,
+                        }
+                    } else if !payload.is_empty()
+                        && self.pending_probe_packets.lock().ok()?.push(payload).is_err() {
                         return None;
                     }
                 }
@@ -637,14 +702,16 @@ impl PeerChannel {
         offer[8] = PATH_PROMOTION_OFFER;
         offer[9..17].copy_from_slice(&nonce_bytes);
         offer[17..].copy_from_slice(&binding);
-        let mut sent = self.send_packet(&offer).await.is_ok();
+        let sent = true;
         for remote_nonce in pending_acks {
-            sent &= self.send_path_promotion_ack(remote_nonce).await.is_ok();
+            let _ = self.send_path_promotion_ack(remote_nonce).await;
         }
         let deadline = tokio::time::Instant::now() + timeout;
         let result = if sent {
+            let mut next_retry = tokio::time::Instant::now();
             loop {
                 let notified = self.path_promotion_changed.notified();
+                tokio::pin!(notified);
                 let acknowledged = self
                     .path_promotion
                     .lock()
@@ -652,13 +719,28 @@ impl PeerChannel {
                 if acknowledged {
                     break true;
                 }
-                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                if tokio::time::Instant::now() >= deadline {
+                    break false;
+                }
+                if tokio::time::Instant::now() >= next_retry {
+                    let _ = self.send_path_control_packet(&offer).await;
+                    next_retry = tokio::time::Instant::now() + PATH_CONTROL_RETRY_INTERVAL;
+                }
+                if tokio::time::timeout_at(deadline.min(next_retry), &mut notified)
+                    .await
+                    .is_err()
+                    && tokio::time::Instant::now() >= deadline
+                {
                     break false;
                 }
             }
         } else {
             false
         };
+        if result {
+            // Stay ready long enough to answer the peer's retransmission if our ACK was lost.
+            tokio::time::sleep(PATH_CONTROL_RETRY_INTERVAL * 4).await;
+        }
         if let Ok(mut state) = self.path_promotion.lock() {
             state.local_ready = false;
             state.local_binding = None;
@@ -672,7 +754,31 @@ impl PeerChannel {
         ack[..8].copy_from_slice(&PATH_CONTROL_PREFIX);
         ack[8] = PATH_PROMOTION_ACK;
         ack[9..].copy_from_slice(&nonce.to_be_bytes());
-        self.send_packet(&ack).await
+        self.send_path_control_packet(&ack).await
+    }
+
+    async fn send_path_control_packet(&self, payload: &[u8]) -> Result<(), IdentityError> {
+        #[cfg(test)]
+        if payload.len() > 8 && payload[..8] == PATH_CONTROL_PREFIX {
+            let mut drops = self
+                .test_drop_path_controls
+                .lock()
+                .map_err(|_| IdentityError::InvalidFrame)?;
+            if let Some(count) = drops.get_mut(&payload[8])
+                && *count > 0
+            {
+                *count -= 1;
+                return Ok(());
+            }
+        }
+        self.send_packet(payload).await
+    }
+
+    #[cfg(test)]
+    fn drop_next_path_control(&self, kind: u8) {
+        if let Ok(mut drops) = self.test_drop_path_controls.lock() {
+            *drops.entry(kind).or_default() += 1;
+        }
     }
 
     pub(crate) fn retain_relay_endpoint(&mut self, endpoint: Endpoint) {
@@ -1121,17 +1227,25 @@ impl PeerChannel {
                             } else if state.local_ready {
                                 false
                             } else {
-                                if state.pending_remote_offers.len() >= 8 {
+                                if let Some(existing) = state.pending_remote_offers.iter_mut().find(
+                                    |(seen_nonce, seen_binding, _)| {
+                                        *seen_nonce == nonce && *seen_binding == binding
+                                    },
+                                ) {
+                                    existing.2 = now;
+                                } else if state.pending_remote_offers.len() >= 8 {
                                     state.pending_remote_offers.pop_front();
+                                    state.pending_remote_offers.push_back((nonce, binding, now));
+                                } else {
+                                    state.pending_remote_offers.push_back((nonce, binding, now));
                                 }
-                                state.pending_remote_offers.push_back((nonce, binding, now));
                                 false
                             }
                         } else {
                             false
                         };
-                        if ack_now {
-                            self.send_path_promotion_ack(nonce).await?;
+                        if ack_now && let Err(error) = self.send_path_promotion_ack(nonce).await {
+                            tracing::debug!(%error, "path promotion acknowledgment send failed; waiting for retry");
                         }
                     }
                     PATH_PROMOTION_ACK => {
@@ -1163,10 +1277,50 @@ impl PeerChannel {
                             state.pending_candidate_offers.retain(|(_, received_at)| {
                                 now.duration_since(*received_at) < PATH_CANDIDATE_BINDING_TTL
                             });
-                            if state.pending_candidate_offers.len() >= 8 {
+                            if let Some(existing) = state
+                                .pending_candidate_offers
+                                .iter_mut()
+                                .find(|(existing, _)| *existing == nonce)
+                            {
+                                existing.1 = now;
+                            } else if state.pending_candidate_offers.len() >= 8 {
                                 state.pending_candidate_offers.pop_front();
+                                state.pending_candidate_offers.push_back((nonce, now));
+                            } else {
+                                state.pending_candidate_offers.push_back((nonce, now));
                             }
-                            state.pending_candidate_offers.push_back((nonce, now));
+                        }
+                        let mut ack = [0_u8; 25];
+                        ack[..8].copy_from_slice(&PATH_CONTROL_PREFIX);
+                        ack[8] = PATH_CANDIDATE_BINDING_ACK;
+                        ack[9..].copy_from_slice(&nonce);
+                        if let Err(error) = self.send_path_control_packet(&ack).await {
+                            tracing::debug!(%error, "candidate binding acknowledgment send failed; waiting for retry");
+                        }
+                        self.candidate_binding_changed.notify_one();
+                    }
+                    PATH_CANDIDATE_BINDING_ACK => {
+                        if payload.len() != 25 {
+                            return Err(IdentityError::InvalidFrame);
+                        }
+                        let nonce: [u8; 16] = payload[9..]
+                            .try_into()
+                            .map_err(|_| IdentityError::InvalidFrame)?;
+                        if let Ok(mut state) = self.path_promotion.lock() {
+                            let now = Instant::now();
+                            state.pending_candidate_acks.retain(|(_, received_at)| {
+                                now.duration_since(*received_at) < PATH_CANDIDATE_BINDING_TTL
+                            });
+                            if !state
+                                .pending_candidate_acks
+                                .iter()
+                                .any(|(existing, _)| *existing == nonce)
+                            {
+                                if state.pending_candidate_acks.len() >= 8 {
+                                    state.pending_candidate_acks.pop_front();
+                                }
+                                state.pending_candidate_acks.push_back((nonce, now));
+                            }
                         }
                         self.candidate_binding_changed.notify_one();
                     }
@@ -2221,6 +2375,8 @@ fn new_channel(connection: Connection, network_id: &str) -> PeerChannel {
         path_promotion: Mutex::new(PathPromotionState::default()),
         path_promotion_changed: tokio::sync::Notify::new(),
         candidate_binding_changed: tokio::sync::Notify::new(),
+        #[cfg(test)]
+        test_drop_path_controls: Mutex::new(HashMap::new()),
         ice_consent: None,
         _relay_endpoint: None,
     }
@@ -2252,6 +2408,8 @@ fn new_tcp_channel(
         path_promotion: Mutex::new(PathPromotionState::default()),
         path_promotion_changed: tokio::sync::Notify::new(),
         candidate_binding_changed: tokio::sync::Notify::new(),
+        #[cfg(test)]
+        test_drop_path_controls: Mutex::new(HashMap::new()),
         ice_consent: None,
         _relay_endpoint: None,
     }
@@ -3173,21 +3331,67 @@ mod tests {
             tokio::join!(candidate_accept, candidate_connect);
         let candidate_a = candidate_connected.unwrap();
         let candidate_b = candidate_accepted.unwrap().1;
+        candidate_a.drop_next_path_control(PATH_CANDIDATE_BINDING_OFFER);
+        candidate_b.drop_next_path_control(PATH_CANDIDATE_BINDING_ACK);
+        channel_a.drop_next_path_control(PATH_PROMOTION_OFFER);
+        channel_b.drop_next_path_control(PATH_PROMOTION_ACK);
         let reader_a = std::sync::Arc::clone(&channel_a);
         let reader_b = std::sync::Arc::clone(&channel_b);
         let task_a = tokio::spawn(async move { while reader_a.recv_packet().await.is_ok() {} });
         let task_b = tokio::spawn(async move { while reader_b.recv_packet().await.is_ok() {} });
-        let (ready_a, ready_b) = tokio::time::timeout(Duration::from_secs(2), async {
+        let (ready_a, ready_b) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(
-                channel_a.negotiate_direct_path_promotion(&candidate_a, Duration::from_secs(1)),
-                channel_b.negotiate_direct_path_promotion(&candidate_b, Duration::from_secs(1))
+                channel_a.negotiate_direct_path_promotion(&candidate_a, Duration::from_secs(3)),
+                channel_b.negotiate_direct_path_promotion(&candidate_b, Duration::from_secs(3))
             )
         })
         .await
         .expect("promotion negotiation completes");
         assert!(
             ready_a && ready_b,
-            "both locally healthy peers confirm promotion"
+            "both locally healthy peers confirm promotion after dropped control frames are retried (a={ready_a}, b={ready_b}, candidate_a={:?}, candidate_b={:?})",
+            candidate_a
+                .path_promotion
+                .lock()
+                .unwrap()
+                .pending_candidate_acks,
+            candidate_b
+                .path_promotion
+                .lock()
+                .unwrap()
+                .pending_candidate_acks,
+        );
+        assert!(
+            channel_a
+                .test_drop_path_controls
+                .lock()
+                .unwrap()
+                .values()
+                .all(|count| *count == 0)
+        );
+        assert!(
+            channel_b
+                .test_drop_path_controls
+                .lock()
+                .unwrap()
+                .values()
+                .all(|count| *count == 0)
+        );
+        assert!(
+            candidate_a
+                .test_drop_path_controls
+                .lock()
+                .unwrap()
+                .values()
+                .all(|count| *count == 0)
+        );
+        assert!(
+            candidate_b
+                .test_drop_path_controls
+                .lock()
+                .unwrap()
+                .values()
+                .all(|count| *count == 0)
         );
         task_a.abort();
         task_b.abort();
