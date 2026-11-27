@@ -200,4 +200,4 @@ ICE 实现选型、Quinn 同 socket 分流边界和兼容策略见 [ICE integrat
 - [RFC 9221: QUIC DATAGRAM](https://www.rfc-editor.org/rfc/rfc9221.html)：QUIC 的不可靠 datagram 扩展；必须协商接收大小，datagram 不可分片，应用需考虑路径 MTU。
 - [RFC 9001: Using TLS to Secure QUIC](https://www.rfc-editor.org/rfc/rfc9001.html)：QUIC 使用 TLS 1.3 进行传输安全保护。
 
-以上 RFC 是可核验事实；推荐 Rust、状态阈值、MTU、CLI 和验收数值是工程推断或待验证建议，不是标准要求。仓库已有 Coordinator、Agent、Relay、CLI 和多 peer 的实现与单元/loopback/真实 PostgreSQL 集成测试；公网 NAT/QoS 矩阵、特权 TUN 实机验收、生产负载压测和用户规模数据仍未完成，不能由现有测试推断这些场景已经满足。
+以上 RFC 是可核验事实；推荐 Rust、状态阈值、MTU、CLI 和验收数值是工程推断或待验证建议，不是标准要求。仓库已有 Coordinator、Agent、Relay、CLI 和多 peer 的实现与单元/loopback/真实 PostgreSQL 集成测试；2026-11-27 使用独立 runtime DML 角色在临时 PostgreSQL 17.11 实例通过了两 Coordinator 状态实例共享状态、并发分配、导入导出、撤销和 fail-closed 检查（[测试记录](testing/postgres-coordinator-integration-2026-11.md)）。该集成测试仍是在单机进程内创建两个实例，不等同于跨主机部署/故障切换。公网 NAT/QoS 矩阵、生产负载压测和用户规模数据仍未完成，不能由现有测试推断这些场景已经满足。
