@@ -1648,7 +1648,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     } else {
                                         // The smaller device owns the data session. This reverse
                                         // connection is only a simultaneous UDP hole-punch probe.
-                                        channel.close_async().await;
+                                        channel
+                                            .close_async_with_reason(
+                                                mini_tunnel_agent::PeerChannelCloseReason::PathNotSelected,
+                                            )
+                                            .await;
                                     }
                                 }
                             }
@@ -1764,6 +1768,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 match accepted {
                                     Some((peer, mut channel, remote)) => {
                                         tracing::debug!(
+                                            channel_id = channel.channel_id(),
                                             peer_id = %peer.device_id,
                                             path = channel.transport_name(),
                                             has_ice_consent = channel.has_ice_consent_monitor(),
@@ -1774,12 +1779,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                                 && known.1.transport_name() == "QUIC/UDP"
                                         }) {
                                             tracing::debug!(
+                                                channel_id = channel.channel_id(),
                                                 peer_id = %peer.device_id,
                                                 path = channel.transport_name(),
                                                 reason = "direct_path_already_connected",
                                                 "closing duplicate accepted mesh channel"
                                             );
-                                            channel.close_async().await;
+                                            channel
+                                                .close_async_with_reason(
+                                                    mini_tunnel_agent::PeerChannelCloseReason::DuplicatePath,
+                                                )
+                                                .await;
                                         } else if require_ice_consent && channel.transport_name() == "QUIC/UDP" {
                                             if let Some((nominated_remote, monitor)) = pending_ice_monitors.remove(&peer.device_id) {
                                                 if attach_nominated_ice_monitor(
@@ -1844,13 +1854,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                             .contains(&peer.device_id)
                                             && connection.channel.transport_name() == "QUIC/UDP";
                                         if peer_already_connected || peer_direct_path_validating {
-                                            connection.channel.close_async().await;
+                                            connection
+                                                .channel
+                                                .close_async_with_reason(
+                                                    mini_tunnel_agent::PeerChannelCloseReason::DuplicatePath,
+                                                )
+                                                .await;
                                             if let Some((_, monitor)) = connection.nominated_ice_monitor.take() {
                                                 monitor.stop().await;
                                             }
                                             continue;
                                         }
                                         tracing::debug!(
+                                            channel_id = connection.channel.channel_id(),
                                             peer_id = %peer.device_id,
                                             outbound_elected = keep_outbound,
                                             path = connection.channel.transport_name(),
@@ -1868,12 +1884,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                             if let Some((accepted_peer, mut accepted_channel, accepted_remote)) = pending_accepted_channels.remove(&peer.device_id) {
                                                 if accepted_remote == remote && transfer_peer_ice_consent_monitor(&mut channel, &mut accepted_channel) {
                                                     tracing::debug!(
+                                                        channel_id = accepted_channel.channel_id(),
+                                                        probe_channel_id = channel.channel_id(),
                                                         peer_id = %accepted_peer.device_id,
                                                         path = accepted_channel.transport_name(),
                                                         has_ice_consent = accepted_channel.has_ice_consent_monitor(),
                                                         "selected accepted mesh channel after transferring ICE consent"
                                                     );
                                                     tracing::debug!(
+                                                        channel_id = accepted_channel.channel_id(),
                                                         peer_id = %accepted_peer.device_id,
                                                         "accepted ICE path attached to its consent monitor; starting health probation"
                                                     );
@@ -1916,12 +1935,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                         ) {
                                             if connected.iter().any(|known| known.0.device_id == peer.device_id) {
                                                 tracing::debug!(
+                                                    channel_id = channel.channel_id(),
                                                     peer_id = %peer.device_id,
                                                     path = channel.transport_name(),
                                                     reason = "peer_path_already_connected",
                                                     "closing duplicate outbound mesh channel"
                                                 );
-                                                channel.close_async().await;
+                                                channel
+                                                    .close_async_with_reason(
+                                                        mini_tunnel_agent::PeerChannelCloseReason::DuplicatePath,
+                                                    )
+                                                    .await;
                                             } else {
                                                 let connector = peer_connectors.remove(&peer.device_id).expect("peer connector exists");
                                                 let probe = peer_probes.remove(&peer.device_id).expect("peer probe exists");
@@ -1942,13 +1966,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                             // This authenticated reverse connection opened the
                                             // NAT mapping; keep the elected inbound session instead.
                                             tracing::debug!(
+                                                channel_id = channel.channel_id(),
                                                 peer_id = %peer.device_id,
                                                 path = channel.transport_name(),
                                                 outbound_elected = keep_outbound,
                                                 reason = "outbound_path_lost_deterministic_election",
                                                 "closing non-elected outbound mesh channel"
                                             );
-                                            channel.close_async().await;
+                                            channel
+                                                .close_async_with_reason(
+                                                    mini_tunnel_agent::PeerChannelCloseReason::PathNotSelected,
+                                                )
+                                                .await;
                                         }
                                     }
                                     Err(error) => eprintln!("Peer {} UDP probe unavailable: {error}", peer.device_id),
@@ -3781,7 +3810,7 @@ fn transfer_peer_ice_consent_monitor(
         return false;
     };
     accepted_channel.set_ice_consent_monitor(monitor);
-    probe_channel.close();
+    probe_channel.close_with_reason(mini_tunnel_agent::PeerChannelCloseReason::PathNotSelected);
     true
 }
 
@@ -3815,6 +3844,7 @@ async fn clone_mesh_peer_channel(
         return None;
     };
     tracing::info!(
+        channel_id = channel.channel_id(),
         peer_id = %peer.device_id,
         path = channel.transport_name(),
         has_ice_consent = channel.has_ice_consent_monitor(),
@@ -4712,6 +4742,7 @@ async fn validate_elected_mesh_ice_paths(
                 Err(error) => {
                     let health = channel.health_snapshot();
                     tracing::warn!(
+                        channel_id = channel.channel_id(),
                         peer_id = %peer_id,
                         %error,
                         probes_succeeded = health.probes_succeeded,
@@ -4719,7 +4750,11 @@ async fn validate_elected_mesh_ice_paths(
                         "elected ICE path failed initial health probation; switching to reliable path"
                     );
                     channel.stop_ice_consent_monitor().await;
-                    channel.close_async().await;
+                    channel
+                        .close_async_with_reason(
+                            mini_tunnel_agent::PeerChannelCloseReason::PathProbationFailed,
+                        )
+                        .await;
                     match connector(true).await {
                         Ok(channel)
                             if matches!(channel.transport_name(), "TLS/TCP" | "Relay/TLS") =>
@@ -4808,6 +4843,7 @@ async fn validate_udp_probe_with_context(
     let mut rtt_probation = CandidateRttProbation::default();
     let health_before_candidate_validation = channel.health_snapshot();
     tracing::debug!(
+        channel_id = channel.channel_id(),
         peer_id = peer_id.unwrap_or("test"),
         path = channel.transport_name(),
         has_ice_consent = channel.has_ice_consent_monitor(),
@@ -4827,6 +4863,7 @@ async fn validate_udp_probe_with_context(
         Ok(rtt) => rtt,
         Err(error) => {
             tracing::warn!(
+                channel_id = channel.channel_id(),
                 peer_id = peer_id.unwrap_or("test"),
                 path = channel.transport_name(),
                 stage = "initial_authenticated_health_probes",
@@ -4837,6 +4874,7 @@ async fn validate_udp_probe_with_context(
         }
     };
     tracing::debug!(
+        channel_id = channel.channel_id(),
         peer_id = peer_id.unwrap_or("test"),
         path = channel.transport_name(),
         rtt_ms = rtt.as_millis() as u64,
@@ -4844,6 +4882,7 @@ async fn validate_udp_probe_with_context(
     );
     if rtt_probation.observe(rtt, bad_rtt_sample_limit) {
         tracing::warn!(
+            channel_id = channel.channel_id(),
             peer_id = peer_id.unwrap_or("test"),
             path = channel.transport_name(),
             stage = "initial_rtt_threshold",
@@ -4859,6 +4898,7 @@ async fn validate_udp_probe_with_context(
     if require_ice_consent {
         if !channel.has_ice_consent_monitor() {
             tracing::warn!(
+                channel_id = channel.channel_id(),
                 peer_id = peer_id.unwrap_or("test"),
                 path = channel.transport_name(),
                 stage = "consent_presence_check",
@@ -4877,6 +4917,7 @@ async fn validate_udp_probe_with_context(
             tokio::select! {
                 () = channel.wait_ice_consent_failure() => {
                     tracing::warn!(
+                        channel_id = channel.channel_id(),
                         peer_id = peer_id.unwrap_or("test"),
                         path = channel.transport_name(),
                         stage = "ice_consent_probation",
@@ -4896,6 +4937,7 @@ async fn validate_udp_probe_with_context(
                         }
                         Err(error) => {
                             tracing::warn!(
+                                channel_id = channel.channel_id(),
                                 peer_id = peer_id.unwrap_or("test"),
                                 path = channel.transport_name(),
                                 stage = "ice_probation_authenticated_health_probe",
@@ -4907,6 +4949,7 @@ async fn validate_udp_probe_with_context(
                     };
                     if rtt_probation.observe(rtt, bad_rtt_sample_limit) {
                         tracing::warn!(
+                            channel_id = channel.channel_id(),
                             peer_id = peer_id.unwrap_or("test"),
                             path = channel.transport_name(),
                             stage = "ice_probation_rtt_threshold",
@@ -4953,6 +4996,7 @@ async fn validate_udp_probe_with_context(
                         }
                         Err(error) => {
                             tracing::warn!(
+                                channel_id = channel.channel_id(),
                                 peer_id = peer_id.unwrap_or("test"),
                                 path = channel.transport_name(),
                                 stage = "probation_authenticated_health_probe",
@@ -4964,6 +5008,7 @@ async fn validate_udp_probe_with_context(
                     };
                     if rtt_probation.observe(rtt, bad_rtt_sample_limit) {
                         tracing::warn!(
+                            channel_id = channel.channel_id(),
                             peer_id = peer_id.unwrap_or("test"),
                             path = channel.transport_name(),
                             stage = "probation_rtt_threshold",
@@ -4994,6 +5039,7 @@ async fn validate_udp_probe_with_context(
         }
     }
     tracing::info!(
+        channel_id = channel.channel_id(),
         peer_id = peer_id.unwrap_or("test"),
         path = channel.transport_name(),
         has_ice_consent = channel.has_ice_consent_monitor(),
@@ -5019,6 +5065,7 @@ async fn probe_candidate_initial_health(
             }
             Err(error) if is_candidate_probation_timeout(&error) => {
                 tracing::debug!(
+                    channel_id = channel.channel_id(),
                     peer_id = peer_id.unwrap_or("test"),
                     attempts = progress.attempts.saturating_add(1),
                     attempt_limit = progress.attempt_limit,
@@ -5112,6 +5159,7 @@ async fn probe_candidate_probation_once(
         Ok(rtt) => Ok(Some(rtt)),
         Err(error) if is_candidate_probation_timeout(&error) => {
             tracing::debug!(
+                channel_id = channel.channel_id(),
                 peer_id = peer_id.unwrap_or("test"),
                 path = channel.transport_name(),
                 "UDP candidate probation probe timed out; counting it toward the loss threshold"
@@ -5156,6 +5204,7 @@ fn probation_loss_threshold_error(
     let observed_misses = after.probes_missed.saturating_sub(before.probes_missed);
     let probes_missed = observed_misses.max(timed_out_probe_attempts);
     tracing::warn!(
+        channel_id = channel.channel_id(),
         peer_id = peer_id.unwrap_or("test"),
         path = channel.transport_name(),
         stage,

@@ -18,7 +18,10 @@ use std::{
     io::{self, Read, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -306,6 +309,11 @@ const TCP_CANDIDATE_TIMEOUT: Duration = Duration::from_secs(5);
 const CANDIDATE_CONNECT_BUDGET: Duration = Duration::from_secs(30);
 const UDP_CANDIDATE_PARALLELISM: usize = 4;
 const MAX_PEER_CANDIDATES: usize = 8;
+static NEXT_PEER_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_peer_channel_id() -> u64 {
+    NEXT_PEER_CHANNEL_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Return a full-jitter reconnect delay with exponential growth and a 30-second cap.
 #[must_use]
@@ -338,6 +346,7 @@ enum PeerTransport {
 
 /// Authenticated QUIC or TLS/TCP connection to one authorized peer.
 pub struct PeerChannel {
+    channel_id: u64,
     transport: PeerTransport,
     relay: bool,
     network_tag: [u8; 16],
@@ -354,6 +363,26 @@ pub struct PeerChannel {
     test_drop_path_controls: Mutex<HashMap<u8, usize>>,
     ice_consent: Option<ice::IceConsentMonitor>,
     _relay_endpoint: Option<Endpoint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerChannelCloseReason {
+    LocalShutdown,
+    PathNotSelected,
+    DuplicatePath,
+    PathProbationFailed,
+}
+
+impl PeerChannelCloseReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalShutdown => "peer channel closed",
+            Self::PathNotSelected => "peer path not selected",
+            Self::DuplicatePath => "duplicate mesh path",
+            Self::PathProbationFailed => "path probation failed",
+        }
+    }
 }
 
 const HEALTH_PING: u8 = 0xf0;
@@ -845,6 +874,11 @@ impl PeerChannel {
     }
 
     #[must_use]
+    pub fn channel_id(&self) -> u64 {
+        self.channel_id
+    }
+
+    #[must_use]
     pub fn remote_address(&self) -> SocketAddr {
         match &self.transport {
             PeerTransport::Quic(connection) => connection.remote_address(),
@@ -862,18 +896,28 @@ impl PeerChannel {
         }
     }
 
-    /// Close the QUIC transport immediately, for example after losing connection election.
+    /// Close the transport with a generic local shutdown reason.
     ///
     /// This does not wait for an attached ICE consent monitor. Use [`Self::close_async`] when
     /// the caller must wait for ICE session cleanup before retrying the same peer credentials.
     pub fn close(&self) {
+        self.close_with_reason(PeerChannelCloseReason::LocalShutdown);
+    }
+
+    /// Close a QUIC transport with a reason that identifies the local decision.
+    ///
+    /// Use `peer path not selected` only when deterministic connection election rejects this
+    /// channel. Other cleanup paths should use a distinct reason or [`Self::close`].
+    pub fn close_with_reason(&self, reason: PeerChannelCloseReason) {
+        let reason_text = reason.as_str();
         if let PeerTransport::Quic(connection) = &self.transport {
             tracing::debug!(
+                channel_id = self.channel_id,
                 remote = %connection.remote_address(),
-                close_class = "local_path_not_selected",
+                close_reason = reason_text,
                 "closing QUIC peer channel locally"
             );
-            connection.close(0_u32.into(), b"peer path not selected");
+            connection.close(0_u32.into(), reason_text.as_bytes());
         }
     }
 
@@ -881,8 +925,14 @@ impl PeerChannel {
     ///
     /// For TLS/TCP this also shuts down the local write half.
     pub async fn close_async(&self) {
+        self.close_async_with_reason(PeerChannelCloseReason::LocalShutdown)
+            .await;
+    }
+
+    /// Stop consent tracking and close with a decision-specific reason.
+    pub async fn close_async_with_reason(&self, reason: PeerChannelCloseReason) {
         self.stop_ice_consent_monitor().await;
-        self.close();
+        self.close_with_reason(reason);
         if let PeerTransport::Tcp(transport) = &self.transport {
             let mut sender = transport.sender.lock().await;
             let _ = sender.shutdown().await;
@@ -1162,6 +1212,7 @@ impl PeerChannel {
                     Err(error) => {
                         let close_class = quic_connection_error_class(&error);
                         tracing::warn!(
+                            channel_id = self.channel_id,
                             remote = %connection.remote_address(),
                             close_class,
                             %error,
@@ -2363,6 +2414,7 @@ fn new_channel(connection: Connection, network_id: &str) -> PeerChannel {
     let mut network_tag = [0_u8; 16];
     network_tag.copy_from_slice(&hash[..16]);
     PeerChannel {
+        channel_id: next_peer_channel_id(),
         transport: PeerTransport::Quic(connection),
         relay: false,
         network_tag,
@@ -2392,6 +2444,7 @@ fn new_tcp_channel(
     network_tag.copy_from_slice(&hash[..16]);
     let (receiver, sender) = tokio::io::split(stream);
     PeerChannel {
+        channel_id: next_peer_channel_id(),
         transport: PeerTransport::Tcp(TcpPeerTransport {
             sender: tokio::sync::Mutex::new(sender),
             receiver: tokio::sync::Mutex::new(receiver),
@@ -2910,6 +2963,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn peer_channel_close_reasons_keep_election_distinct_from_shutdown() {
+        assert_ne!(
+            PeerChannelCloseReason::LocalShutdown.as_str(),
+            PeerChannelCloseReason::PathNotSelected.as_str()
+        );
+        assert_eq!(
+            PeerChannelCloseReason::DuplicatePath.as_str(),
+            "duplicate mesh path"
+        );
+        assert_eq!(
+            PeerChannelCloseReason::PathProbationFailed.as_str(),
+            "path probation failed"
+        );
+    }
+
     #[tokio::test]
     async fn close_async_waits_for_ice_monitor_and_releases_registration() {
         let router = ice::IceDatagramRouterHandle::default();
@@ -3195,6 +3264,11 @@ mod tests {
             .expect("accept task")
             .expect("accepted QUIC peer");
         assert_eq!(channel_a.transport_name(), "QUIC/UDP");
+        assert_ne!(
+            channel_a.channel_id(),
+            channel_b.channel_id(),
+            "each authenticated connection gets its own local correlation ID"
+        );
         channel_a
             .send_packet(b"overlay-ip-packet")
             .await
@@ -3216,6 +3290,15 @@ mod tests {
             channel_a.send_packet(&vec![0; MAX_TUN_PACKET + 1]).await,
             Err(IdentityError::InvalidFrame)
         ));
+        channel_a.close_with_reason(PeerChannelCloseReason::PathNotSelected);
+        let peer_close = tokio::time::timeout(Duration::from_secs(1), channel_b.recv_packet())
+            .await
+            .expect("peer receives the election close")
+            .expect_err("closed QUIC channel cannot deliver another frame");
+        assert!(
+            peer_close.to_string().contains("peer path not selected"),
+            "peer-side close diagnostics preserve the election decision: {peer_close}"
+        );
         endpoint_a.close(0_u32.into(), b"test complete");
         endpoint_b.close(0_u32.into(), b"test complete");
         fs::remove_dir_all(temp).expect("remove test identities");
