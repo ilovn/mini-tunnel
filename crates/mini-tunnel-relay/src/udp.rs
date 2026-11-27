@@ -573,7 +573,14 @@ impl UdpRelayServer {
             return Ok(self.reject(DropReason::Authentication));
         }
         drop(state);
-        if !verify_proof(ticket, &pending.challenge, &public_key, &signature) {
+        let proof_ticket = ticket.to_owned();
+        let challenge = pending.challenge;
+        let signature_valid = tokio::task::spawn_blocking(move || {
+            verify_proof(&proof_ticket, &challenge, &public_key, &signature)
+        })
+        .await
+        .map_err(io::Error::other)?;
+        if !signature_valid {
             return Ok(self.reject(DropReason::Authentication));
         }
 

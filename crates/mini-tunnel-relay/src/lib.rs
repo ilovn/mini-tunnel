@@ -435,50 +435,47 @@ impl RelayServer {
     async fn register_connection(&self, pending: PendingConnection) -> Result<(), RelayError> {
         let now_ms = unix_time_ms().ok_or(RelayError::Protocol)?;
         let key = session_key(&pending.claims);
-        let sender = {
-            let mut state = self.inner.state.lock().await;
-            state
-                .used_tickets
-                .retain(|_, expires_at| *expires_at > now_ms);
-            if state.used_tickets.contains_key(&pending.claims.ticket_id) {
-                return Err(RelayError::Replay);
-            }
-            if state.used_tickets.len() >= MAX_USED_TICKETS {
-                return Err(RelayError::Busy);
-            }
-            if !state.sessions.contains_key(&key)
-                && state.sessions.len() >= self.inner.config.max_pending_sessions.max(1)
-            {
-                return Err(RelayError::Busy);
-            }
-            let sender = if let Some(entry) = state.sessions.get(&key) {
-                entry.sender.clone()
-            } else {
-                let generation = self.inner.next_generation.fetch_add(1, Ordering::Relaxed);
-                let (sender, receiver) = mpsc::channel(2);
-                state.sessions.insert(
-                    key.clone(),
-                    SessionEntry {
-                        generation,
-                        sender: sender.clone(),
-                    },
-                );
-                let inner = Arc::clone(&self.inner);
-                let key = key.clone();
-                tokio::spawn(async move {
-                    pair_session(inner, key, generation, receiver).await;
-                });
-                sender
-            };
-            state
-                .used_tickets
-                .insert(pending.claims.ticket_id, pending.claims.expires_at_ms);
+        let ticket_id = pending.claims.ticket_id;
+        let ticket_expires_at_ms = pending.claims.expires_at_ms;
+        let mut state = self.inner.state.lock().await;
+        state
+            .used_tickets
+            .retain(|_, expires_at| *expires_at > now_ms);
+        if state.used_tickets.contains_key(&ticket_id) {
+            return Err(RelayError::Replay);
+        }
+        if state.used_tickets.len() >= MAX_USED_TICKETS {
+            return Err(RelayError::Busy);
+        }
+        if !state.sessions.contains_key(&key)
+            && state.sessions.len() >= self.inner.config.max_pending_sessions.max(1)
+        {
+            return Err(RelayError::Busy);
+        }
+        let sender = if let Some(entry) = state.sessions.get(&key) {
+            entry.sender.clone()
+        } else {
+            let generation = self.inner.next_generation.fetch_add(1, Ordering::Relaxed);
+            let (sender, receiver) = mpsc::channel(2);
+            state.sessions.insert(
+                key.clone(),
+                SessionEntry {
+                    generation,
+                    sender: sender.clone(),
+                },
+            );
+            let inner = Arc::clone(&self.inner);
+            let key = key.clone();
+            tokio::spawn(async move {
+                pair_session(inner, key, generation, receiver).await;
+            });
             sender
         };
         sender.try_send(pending).map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => RelayError::Busy,
             mpsc::error::TrySendError::Closed(_) => RelayError::Busy,
         })?;
+        state.used_tickets.insert(ticket_id, ticket_expires_at_ms);
         Ok(())
     }
 }
@@ -834,6 +831,88 @@ mod tests {
         message.fill(0);
         stream.write_all(&signature).await.expect("write proof");
         stream
+    }
+
+    async fn pending_connection(
+        relay: &RelayServer,
+        claims: RelayTicketClaims,
+    ) -> PendingConnection {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind pending socket");
+        let client = TcpStream::connect(listener.local_addr().expect("pending address"))
+            .await
+            .expect("connect pending socket");
+        let (stream, _) = listener.accept().await.expect("accept pending socket");
+        drop(client);
+        PendingConnection {
+            claims,
+            stream,
+            _connection_permit: Arc::clone(&relay.inner.connections)
+                .try_acquire_owned()
+                .expect("connection permit"),
+            _source_permit: relay
+                .inner
+                .source_connections
+                .try_acquire(IpAddr::V4(Ipv4Addr::LOCALHOST))
+                .expect("source permit"),
+        }
+    }
+
+    #[tokio::test]
+    async fn full_pairing_queue_does_not_consume_relay_ticket() {
+        let key = [12; 32];
+        let a = identity(12);
+        let b = identity(13);
+        let first_claims = claims(&a, &b, 60);
+        let second_claims = claims(&a, &b, 61);
+        let retry_claims = claims(&a, &b, 62);
+        let relay = RelayServer::new(RelayConfig::new(key));
+        let key = session_key(&first_claims);
+        let (sender, mut receiver) = mpsc::channel(2);
+        assert!(
+            sender
+                .try_send(pending_connection(&relay, first_claims).await)
+                .is_ok()
+        );
+        assert!(
+            sender
+                .try_send(pending_connection(&relay, second_claims).await)
+                .is_ok()
+        );
+        relay.inner.state.lock().await.sessions.insert(
+            key,
+            SessionEntry {
+                generation: 1,
+                sender,
+            },
+        );
+
+        let ticket_id = retry_claims.ticket_id;
+        let ticket_expires_at_ms = retry_claims.expires_at_ms;
+        let rejected = relay
+            .register_connection(pending_connection(&relay, retry_claims.clone()).await)
+            .await;
+        assert!(matches!(rejected, Err(RelayError::Busy)));
+        assert!(
+            !relay
+                .inner
+                .state
+                .lock()
+                .await
+                .used_tickets
+                .contains_key(&ticket_id)
+        );
+
+        drop(receiver.recv().await.expect("dequeue pending connection"));
+        relay
+            .register_connection(pending_connection(&relay, retry_claims).await)
+            .await
+            .expect("retry after queue capacity is available");
+        assert_eq!(
+            relay.inner.state.lock().await.used_tickets.get(&ticket_id),
+            Some(&ticket_expires_at_ms)
+        );
     }
 
     #[tokio::test]
