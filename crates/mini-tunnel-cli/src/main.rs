@@ -22,11 +22,12 @@ use clap::{Parser, Subcommand};
 use futures_util::future::join_all;
 use mini_tunnel_protocol::{
     ApiErrorResponse, CandidateUpdateRequest, CandidateUpdateResponse, CreateInviteRequest,
-    CreateInviteResponse, CreateNetworkRequest, CreateNetworkResponse, IceCredentials,
-    JoinNetworkRequest, JoinNetworkResponse, PeerInfo, PeerListRequest, PeerListResponse,
-    RelayTicketRequest, RelayTicketResponse, RevokeMemberRequest, RevokeMemberResponse,
-    candidate_signing_bytes, candidate_signing_bytes_with_ice, join_signing_bytes,
-    peers_signing_bytes, relay_ticket_request_signing_bytes,
+    CreateInviteResponse, CreateNetworkRequest, CreateNetworkResponse, DeleteNetworkRequest,
+    DeleteNetworkResponse, IceCredentials, JoinNetworkRequest, JoinNetworkResponse, PeerInfo,
+    PeerListRequest, PeerListResponse, RelayTicketRequest, RelayTicketResponse,
+    RevokeMemberRequest, RevokeMemberResponse, candidate_signing_bytes,
+    candidate_signing_bytes_with_ice, join_signing_bytes, peers_signing_bytes,
+    relay_ticket_request_signing_bytes,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -316,6 +317,21 @@ enum NetworkCommand {
         network_id: String,
         #[arg(long)]
         device_id: String,
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_COORDINATOR_URL",
+            default_value = "http://127.0.0.1:8080"
+        )]
+        coordinator_url: String,
+    },
+    /// Permanently delete a network. Repeat its canonical UUID to confirm; all members are removed.
+    /// Reads MINI_TUNNEL_ADMIN_TOKEN from the environment.
+    Delete {
+        #[arg(long)]
+        network_id: String,
+        /// Must exactly repeat --network-id to confirm this irreversible deletion.
+        #[arg(long)]
+        confirm_network_id: String,
         #[arg(
             long,
             env = "MINI_TUNNEL_COORDINATOR_URL",
@@ -898,6 +914,23 @@ fn load_invite_token(
         return Err("invite token is empty".to_owned());
     }
     Ok(token)
+}
+
+fn confirmed_network_id(network_id: &str, confirmation: &str) -> std::io::Result<String> {
+    let parsed = Uuid::parse_str(network_id).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "network_id must be a valid UUID",
+        )
+    })?;
+    let canonical = parsed.to_string();
+    if confirmation != canonical {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--confirm-network-id must exactly match the canonical --network-id",
+        ));
+    }
+    Ok(canonical)
 }
 
 fn read_invite_token_file(path: &Path) -> Result<String, String> {
@@ -2238,6 +2271,26 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!(
                     "Revoked device {device_id}; released IPv4 {}",
                     response.released_ipv4
+                );
+            }
+            NetworkCommand::Delete {
+                network_id,
+                confirm_network_id,
+                coordinator_url,
+            } => {
+                let canonical_id = confirmed_network_id(&network_id, &confirm_network_id)?;
+                let admin_token = std::env::var("MINI_TUNNEL_ADMIN_TOKEN")
+                    .map_err(|_| "set MINI_TUNNEL_ADMIN_TOKEN before deleting a network")?;
+                let request = DeleteNetworkRequest {
+                    admin_token,
+                    confirm_network_id: canonical_id.clone(),
+                };
+                let path = format!("/v1/networks/{canonical_id}/delete");
+                let response: DeleteNetworkResponse =
+                    post_json(&coordinator_url, &path, &request).await?;
+                println!(
+                    "Deleted network {canonical_id}; removed {} members and invalidated {} invitations",
+                    response.removed_members, response.invalidated_invites
                 );
             }
             NetworkCommand::Join {
@@ -6777,6 +6830,41 @@ mod tests {
             panic!("expected network create command");
         };
         assert_eq!(network_id, Some(expected));
+    }
+
+    #[test]
+    fn network_delete_requires_canonical_uuid_confirmation() {
+        let network_id = "81af0d3b-be18-4b8f-976e-2b2a37ddfbc9";
+        assert!(confirmed_network_id(network_id, network_id).is_ok());
+        assert!(confirmed_network_id(network_id, "81af0d3b-be18-4b8f-976e-2b2a37ddfbc8").is_err());
+        assert!(confirmed_network_id("not-a-uuid", "not-a-uuid").is_err());
+
+        let parsed = Cli::try_parse_from([
+            "mini-tunnel",
+            "network",
+            "delete",
+            "--network-id",
+            network_id,
+            "--confirm-network-id",
+            network_id,
+        ])
+        .expect("network deletion requires and accepts repeated UUID");
+        assert!(matches!(
+            parsed.command,
+            Command::Network {
+                command: NetworkCommand::Delete { .. }
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "mini-tunnel",
+                "network",
+                "delete",
+                "--network-id",
+                network_id,
+            ])
+            .is_err()
+        );
     }
 
     #[test]

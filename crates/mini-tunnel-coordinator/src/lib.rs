@@ -28,13 +28,13 @@ use getrandom::fill as random_fill;
 use ipnet::{IpNet, Ipv4Net};
 use mini_tunnel_protocol::{
     ApiErrorResponse, CandidateUpdateRequest, CandidateUpdateResponse, CreateInviteRequest,
-    CreateInviteResponse, CreateNetworkRequest, CreateNetworkResponse, IceCredentials,
-    JoinNetworkRequest, JoinNetworkResponse, MAX_NETWORK_MEMBERS, PeerInfo, PeerListRequest,
-    PeerListResponse, RELAY_TICKET_VERSION, RelayTicketClaims, RelayTicketRequest,
-    RelayTicketResponse, RevokeMemberRequest, RevokeMemberResponse, candidate_signing_bytes,
-    candidate_signing_bytes_with_ice, device_id_from_public_key, issue_relay_ticket,
-    join_signing_bytes, overlay_ipv6_prefix, peers_signing_bytes,
-    relay_ticket_request_signing_bytes,
+    CreateInviteResponse, CreateNetworkRequest, CreateNetworkResponse, DeleteNetworkRequest,
+    DeleteNetworkResponse, IceCredentials, JoinNetworkRequest, JoinNetworkResponse,
+    MAX_NETWORK_MEMBERS, PeerInfo, PeerListRequest, PeerListResponse, RELAY_TICKET_VERSION,
+    RelayTicketClaims, RelayTicketRequest, RelayTicketResponse, RevokeMemberRequest,
+    RevokeMemberResponse, candidate_signing_bytes, candidate_signing_bytes_with_ice,
+    device_id_from_public_key, issue_relay_ticket, join_signing_bytes, overlay_ipv6_prefix,
+    peers_signing_bytes, relay_ticket_request_signing_bytes,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -99,6 +99,7 @@ pub struct CoordinatorState {
     persistence: Option<Arc<PathBuf>>,
     postgres: Option<Arc<PgPool>>,
     postgres_request_lock: Arc<AsyncMutex<()>>,
+    network_runtime_lock: Arc<AsyncMutex<()>>,
     _state_lock: Option<Arc<fs::File>>,
     request_limiter: RequestRateLimiter,
     request_slots: RequestSlots,
@@ -773,6 +774,7 @@ impl CoordinatorState {
         network_id: Uuid,
         request: RelayTicketRequest,
     ) -> Result<RelayTicketResponse, ApiError> {
+        let _runtime_guard = self.network_runtime_lock.lock().await;
         let key = self.relay_ticket_key.as_ref().ok_or(ApiError::Internal)?;
         let now = unix_time_ms().ok_or(ApiError::Internal)?;
         if request.device_id == request.peer_id
@@ -1022,6 +1024,7 @@ impl CoordinatorState {
         network_id: Uuid,
         request: RevokeMemberRequest,
     ) -> Result<RevokeMemberResponse, ApiError> {
+        let _runtime_guard = self.network_runtime_lock.lock().await;
         if request.device_id.trim().is_empty()
             || request.device_id.len() > MAX_DEVICE_ID_BYTES
             || request.device_id.chars().any(char::is_control)
@@ -1059,6 +1062,47 @@ impl CoordinatorState {
         Ok(RevokeMemberResponse {
             revoked: true,
             released_ipv4: member.address.to_string(),
+        })
+    }
+
+    async fn delete_network(
+        &self,
+        network_id: Uuid,
+        request: DeleteNetworkRequest,
+    ) -> Result<DeleteNetworkResponse, ApiError> {
+        if request.confirm_network_id != network_id.to_string() {
+            return Err(ApiError::InvalidRequest(
+                "confirm_network_id must exactly match the canonical network UUID",
+            ));
+        }
+        let _runtime_guard = self.network_runtime_lock.lock().await;
+        let mut store = self.inner.write().await;
+        let previous = store.clone();
+        let network = store.networks.get(&network_id).ok_or(ApiError::NotFound)?;
+        if !constant_time_equal(&network.admin_token_hash, &token_hash(&request.admin_token)) {
+            self.record_admin_auth_failure("network_delete_denied", network_id);
+            return Err(ApiError::Unauthorized);
+        }
+        let removed_members =
+            u32::try_from(network.members.len()).map_err(|_| ApiError::Internal)?;
+        let invalidated_invites =
+            u32::try_from(network.invites.len()).map_err(|_| ApiError::Internal)?;
+        store.networks.remove(&network_id);
+        self.persist_or_restore(&mut store, previous)?;
+        self.audit_success("network_deleted", network_id, None);
+        drop(store);
+
+        self.ice_credentials
+            .write()
+            .await
+            .retain(|(stored_network_id, _), _| *stored_network_id != network_id);
+        lock_recover(&self.relay_pairs)
+            .retain(|(stored_network_id, _, _), _| *stored_network_id != network_id);
+
+        Ok(DeleteNetworkResponse {
+            deleted: true,
+            removed_members,
+            invalidated_invites,
         })
     }
 
@@ -1177,6 +1221,7 @@ impl CoordinatorState {
         network_id: Uuid,
         request: CandidateUpdateRequest,
     ) -> Result<CandidateUpdateResponse, ApiError> {
+        let _runtime_guard = self.network_runtime_lock.lock().await;
         let now = unix_time_ms().ok_or(ApiError::Internal)?;
         if request.timestamp_ms.abs_diff(now) > SIGNATURE_CLOCK_SKEW_MS
             || request.candidates.len() > MAX_CANDIDATES
@@ -1289,6 +1334,7 @@ impl CoordinatorState {
         network_id: Uuid,
         request: PeerListRequest,
     ) -> Result<PeerListResponse, ApiError> {
+        let _runtime_guard = self.network_runtime_lock.lock().await;
         let now = unix_time_ms().ok_or(ApiError::Internal)?;
         if request.timestamp_ms.abs_diff(now) > SIGNATURE_CLOCK_SKEW_MS {
             return Err(ApiError::InvalidRequest(
@@ -2333,6 +2379,7 @@ pub fn router_with_state(state: CoordinatorState) -> Router {
         .route("/healthz", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/networks", post(create_network))
+        .route("/v1/networks/{network_id}/delete", post(delete_network))
         .route("/v1/networks/{network_id}/invites", post(create_invite))
         .route(
             "/v1/networks/{network_id}/members/revoke",
@@ -2651,6 +2698,16 @@ async fn create_invite(
     let network_id = Uuid::parse_str(&network_id)
         .map_err(|_| ApiError::InvalidRequest("network_id must be a UUID"))?;
     state.create_invite(network_id, request).await.map(Json)
+}
+
+async fn delete_network(
+    State(state): State<CoordinatorState>,
+    Path(network_id): Path<String>,
+    Json(request): Json<DeleteNetworkRequest>,
+) -> Result<Json<DeleteNetworkResponse>, ApiError> {
+    let network_id = Uuid::parse_str(&network_id)
+        .map_err(|_| ApiError::InvalidRequest("network_id must be a UUID"))?;
+    state.delete_network(network_id, request).await.map(Json)
 }
 
 async fn join_network(
@@ -4510,6 +4567,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn network_delete_requires_admin_and_confirmation_and_persists_full_cleanup() {
+        let directory =
+            std::env::temp_dir().join(format!("mini-tunnel-network-delete-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).expect("create isolated state directory");
+        let state_path = directory.join("coordinator.json");
+        let state = CoordinatorState::load(&state_path).expect("load persistent Coordinator");
+        let requested_id = Uuid::new_v4();
+        let created = state
+            .create_network(CreateNetworkRequest {
+                name: "delete integration".to_owned(),
+                cidr: "10.89.0.0/24".to_owned(),
+                network_id: Some(requested_id),
+            })
+            .await
+            .expect("create persistent network");
+        let network_id = network_uuid(&created);
+        let consumed_invite = state
+            .create_invite(
+                network_id,
+                CreateInviteRequest {
+                    admin_token: created.admin_token.clone(),
+                },
+            )
+            .await
+            .expect("issue consumed invite");
+        let enrollment = state
+            .join_network(
+                network_id,
+                signed_join(network_id, consumed_invite.invite_token, 81),
+            )
+            .await
+            .expect("enroll a member");
+        state
+            .create_invite(
+                network_id,
+                CreateInviteRequest {
+                    admin_token: created.admin_token.clone(),
+                },
+            )
+            .await
+            .expect("issue second pending invite");
+
+        state.ice_credentials.write().await.insert(
+            (network_id, enrollment.device_id.clone()),
+            EphemeralIceCredentials {
+                credentials: IceCredentials {
+                    ufrag: "deleteTestUfrag".to_owned(),
+                    password: "delete-test-credential-must-not-be-logged".to_owned(),
+                    generation: 1,
+                },
+                updated_at_ms: unix_time_ms().expect("clock"),
+                request_timestamp_ms: unix_time_ms().expect("clock"),
+            },
+        );
+        lock_recover(&state.relay_pairs).insert(
+            (
+                network_id,
+                enrollment.device_id.clone(),
+                "peer-to-delete".to_owned(),
+            ),
+            RelayPair {
+                session_id: [42; 16],
+                expires_at_ms: u64::MAX,
+                first_device: enrollment.device_id.clone(),
+            },
+        );
+
+        let app = router_with_state(state.clone());
+        let path = format!("/v1/networks/{network_id}/delete");
+        let unauthorized = post_json(
+            app.clone(),
+            &path,
+            &DeleteNetworkRequest {
+                admin_token: "incorrect-capability".to_owned(),
+                confirm_network_id: network_id.to_string(),
+            },
+        )
+        .await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let unconfirmed = post_json(
+            app.clone(),
+            &path,
+            &DeleteNetworkRequest {
+                admin_token: created.admin_token.clone(),
+                confirm_network_id: Uuid::new_v4().to_string(),
+            },
+        )
+        .await;
+        assert_eq!(unconfirmed.status(), StatusCode::BAD_REQUEST);
+        let malformed = post_json(
+            router_with_state(state.clone()),
+            "/v1/networks/not-a-uuid/delete",
+            &DeleteNetworkRequest {
+                admin_token: created.admin_token.clone(),
+                confirm_network_id: network_id.to_string(),
+            },
+        )
+        .await;
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        assert!(state.inner.read().await.networks.contains_key(&network_id));
+        assert_eq!(state.ice_credentials.read().await.len(), 1);
+        assert_eq!(lock_recover(&state.relay_pairs).len(), 1);
+
+        let deleted = post_json(
+            app,
+            &path,
+            &DeleteNetworkRequest {
+                admin_token: created.admin_token,
+                confirm_network_id: network_id.to_string(),
+            },
+        )
+        .await;
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let deleted: DeleteNetworkResponse = response_json(deleted).await;
+        assert_eq!(
+            deleted,
+            DeleteNetworkResponse {
+                deleted: true,
+                removed_members: 1,
+                invalidated_invites: 2,
+            }
+        );
+        assert!(!state.inner.read().await.networks.contains_key(&network_id));
+        assert!(state.ice_credentials.read().await.is_empty());
+        assert!(lock_recover(&state.relay_pairs).is_empty());
+        assert_eq!(state.admin_auth_failures_total.load(Ordering::Relaxed), 1);
+        drop(state);
+
+        let restored = CoordinatorState::load(&state_path).expect("reload deleted snapshot");
+        assert!(restored.inner.read().await.networks.is_empty());
+        let recreated = restored
+            .create_network(CreateNetworkRequest {
+                name: "reuse released id and CIDR".to_owned(),
+                cidr: "10.89.0.0/24".to_owned(),
+                network_id: Some(network_id),
+            })
+            .await
+            .expect("deleted UUID and IPv4 range are reusable");
+        assert_eq!(recreated.network_id, network_id.to_string());
+        drop(restored);
+        fs::remove_file(&state_path).expect("remove persistent test snapshot");
+        fs::remove_file(state_lock_path(&state_path).expect("state lock path"))
+            .expect("remove persistent test lock");
+        fs::remove_dir_all(directory).expect("remove isolated state directory");
+    }
+
+    #[tokio::test]
     async fn metrics_are_loopback_only_and_report_basic_service_totals() {
         let state = CoordinatorState {
             request_limiter: RequestRateLimiter::new(1, Duration::from_secs(60)),
@@ -4771,7 +4975,33 @@ mod tests {
                     .await,
                 Err(ApiError::Unauthorized)
             ));
-            assert_eq!(state.admin_auth_failures_total.load(Ordering::Relaxed), 2);
+            let invalid_delete_token = "submitted-delete-token-must-not-be-logged";
+            assert!(matches!(
+                state
+                    .delete_network(
+                        network_id,
+                        DeleteNetworkRequest {
+                            admin_token: invalid_delete_token.to_owned(),
+                            confirm_network_id: network_id.to_string(),
+                        },
+                    )
+                    .await,
+                Err(ApiError::Unauthorized)
+            ));
+            let deleted = state
+                .delete_network(
+                    network_id,
+                    DeleteNetworkRequest {
+                        admin_token: created.admin_token.clone(),
+                        confirm_network_id: network_id.to_string(),
+                    },
+                )
+                .await
+                .expect("administrator deletes network");
+            assert!(deleted.deleted);
+            assert_eq!(deleted.removed_members, 0);
+            assert_eq!(deleted.invalidated_invites, 0);
+            assert_eq!(state.admin_auth_failures_total.load(Ordering::Relaxed), 3);
             (
                 created.network_id,
                 enrolled.device_id,
@@ -4782,6 +5012,7 @@ mod tests {
                     signature,
                     invalid_invite_token.to_owned(),
                     invalid_revoke_token.to_owned(),
+                    invalid_delete_token.to_owned(),
                     attempted_device_id.to_owned(),
                 ],
             )
@@ -4818,6 +5049,8 @@ mod tests {
             "member_revoked",
             "invite_issue_denied",
             "member_revoke_denied",
+            "network_delete_denied",
+            "network_deleted",
         ] {
             assert!(
                 records.contains(event),
@@ -5311,6 +5544,74 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "revocation must be visible on other Coordinator instances"
         );
+
+        let remaining_timestamp = unix_time_ms().expect("clock");
+        let remaining_candidates = vec!["udp://198.51.100.20:43210".to_owned()];
+        let remaining_ice = IceCredentials {
+            ufrag: "remainingPeerUfrag".to_owned(),
+            password: "remaining-peer-ice-password-123456".to_owned(),
+            generation: 3,
+        };
+        let remaining_signature = second_key.sign(&candidate_signing_bytes_with_ice(
+            &network_id.to_string(),
+            &second_join.device_id,
+            remaining_timestamp,
+            &remaining_candidates,
+            &remaining_ice,
+        ));
+        let remaining_update = post_json(
+            app_b.clone(),
+            &candidate_path,
+            &CandidateUpdateRequest {
+                device_id: second_join.device_id.clone(),
+                timestamp_ms: remaining_timestamp,
+                candidates: remaining_candidates,
+                ice_credentials: Some(remaining_ice),
+                signature: URL_SAFE_NO_PAD.encode(remaining_signature.to_bytes()),
+            },
+        )
+        .await;
+        assert_eq!(remaining_update.status(), StatusCode::OK);
+
+        let delete_path = format!("/v1/networks/{network_id}/delete");
+        let deleted = post_json(
+            app_b.clone(),
+            &delete_path,
+            &DeleteNetworkRequest {
+                admin_token: created.admin_token.clone(),
+                confirm_network_id: network_id.to_string(),
+            },
+        )
+        .await;
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let deleted: DeleteNetworkResponse = response_json(deleted).await;
+        assert_eq!(deleted.removed_members, 1);
+        assert_eq!(deleted.invalidated_invites, 1);
+        for table in [
+            "mini_tunnel_networks",
+            "mini_tunnel_members",
+            "mini_tunnel_invites",
+            "mini_tunnel_ice_credentials",
+            "mini_tunnel_relay_pairs",
+        ] {
+            let remaining: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE network_id = $1"
+            ))
+            .bind(network_id)
+            .fetch_one(app_pool.as_ref())
+            .await
+            .expect("query deleted network residue");
+            assert_eq!(remaining, 0, "network deletion left rows in {table}");
+        }
+        let deleted_invite = post_json(
+            app_a.clone(),
+            &format!("/v1/networks/{network_id}/invites"),
+            &CreateInviteRequest {
+                admin_token: created.admin_token.clone(),
+            },
+        )
+        .await;
+        assert_eq!(deleted_invite.status(), StatusCode::NOT_FOUND);
         cleanup_postgres_network(pool, network_id).await;
         let _ = fs::remove_file(&snapshot_path);
         let _ = fs::remove_file(state_lock_path(&snapshot_path).expect("snapshot lock path"));

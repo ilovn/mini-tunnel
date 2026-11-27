@@ -407,6 +407,22 @@ pub struct RevokeMemberRequest {
     pub device_id: String,
 }
 
+/// Permanently remove an overlay network and all of its enrolled state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteNetworkRequest {
+    pub admin_token: String,
+    /// Must exactly match the network UUID in the request path.
+    pub confirm_network_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteNetworkResponse {
+    pub deleted: bool,
+    pub removed_members: u32,
+    pub invalidated_invites: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevokeMemberResponse {
     pub revoked: bool,
