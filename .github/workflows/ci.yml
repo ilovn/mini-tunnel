@@ -201,7 +201,9 @@ jobs:
           SQL
 
       - name: Run real PostgreSQL multi-instance integration
-        run: cargo +stable test -p mini-tunnel-coordinator postgres_coordinator_instances_serialize_join_and_restore_state -- --ignored --nocapture
+        run: |
+          cargo +stable test -p mini-tunnel-coordinator postgres_coordinator_instances_serialize_join_and_restore_state -- --ignored --nocapture
+          cargo +stable test -p mini-tunnel --test postgres_processes postgres_state_is_shared_between_coordinator_processes -- --ignored --nocapture
 
   verify:
     name: Verify (${{ matrix.os }})
