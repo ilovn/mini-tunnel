@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     io,
     net::{IpAddr, SocketAddr},
     sync::{
@@ -92,6 +93,7 @@ pub struct UdpRelayStats {
     pub authentication_rejections_total: u64,
     pub session_rejections_total: u64,
     pub capacity_rejections_total: u64,
+    pub send_errors_total: u64,
 }
 
 #[derive(Clone)]
@@ -109,6 +111,7 @@ struct Inner {
     authentication_rejected: AtomicU64,
     session_rejected: AtomicU64,
     capacity_rejected: AtomicU64,
+    send_errors: AtomicU64,
     shutdown: watch::Sender<bool>,
 }
 
@@ -252,6 +255,7 @@ impl UdpRelayServer {
                 authentication_rejected: AtomicU64::new(0),
                 session_rejected: AtomicU64::new(0),
                 capacity_rejected: AtomicU64::new(0),
+                send_errors: AtomicU64::new(0),
                 shutdown,
             }),
         }
@@ -277,7 +281,35 @@ impl UdpRelayServer {
                 .load(Ordering::Relaxed),
             session_rejections_total: self.inner.session_rejected.load(Ordering::Relaxed),
             capacity_rejections_total: self.inner.capacity_rejected.load(Ordering::Relaxed),
+            send_errors_total: self.inner.send_errors.load(Ordering::Relaxed),
         }
+    }
+
+    async fn try_send_to<F>(&self, destination: SocketAddr, send: F) -> bool
+    where
+        F: Future<Output = io::Result<usize>>,
+    {
+        match send.await {
+            Ok(_) => true,
+            Err(error) => {
+                self.inner.send_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(%destination, %error, "UDP relay send failed; dropping packet and keeping listener active");
+                false
+            }
+        }
+    }
+
+    async fn send_ready(
+        &self,
+        socket: &UdpSocket,
+        destination: SocketAddr,
+        session_id: [u8; 16],
+    ) -> bool {
+        let mut response = Vec::with_capacity(24);
+        response.extend_from_slice(READY);
+        response.extend_from_slice(&session_id);
+        self.try_send_to(destination, socket.send_to(&response, destination))
+            .await
     }
 
     /// Serve a bound UDP socket until shutdown. Malformed and unauthorized packets are dropped.
@@ -387,7 +419,12 @@ impl UdpRelayServer {
         let Some(target) = target else {
             return Ok(self.reject(DropReason::Session));
         };
-        socket.send_to(packet, target).await?;
+        if !self
+            .try_send_to(target, socket.send_to(packet, target))
+            .await
+        {
+            return Ok(false);
+        }
         self.inner.forwarded.fetch_add(1, Ordering::Relaxed);
         Ok(true)
     }
@@ -476,8 +513,9 @@ impl UdpRelayServer {
             response.extend_from_slice(CHALLENGE);
             response.extend_from_slice(&pending.challenge);
             drop(state);
-            socket.send_to(&response, source).await?;
-            return Ok(true);
+            return Ok(self
+                .try_send_to(source, socket.send_to(&response, source))
+                .await);
         }
         let mut challenge = [0; 32];
         getrandom::fill(&mut challenge).map_err(io::Error::other)?;
@@ -499,8 +537,9 @@ impl UdpRelayServer {
         let mut response = Vec::with_capacity(40);
         response.extend_from_slice(CHALLENGE);
         response.extend_from_slice(&challenge);
-        socket.send_to(&response, source).await?;
-        Ok(true)
+        Ok(self
+            .try_send_to(source, socket.send_to(&response, source))
+            .await)
     }
 
     async fn handle_proof(
@@ -558,7 +597,7 @@ impl UdpRelayServer {
             AcceptedProofRetry::WaitingForPeer => return Ok(true),
             AcceptedProofRetry::Ready => {
                 drop(state);
-                return send_udp_relay_ready(socket, source, claims.session_id).await;
+                return Ok(self.send_ready(socket, source, claims.session_id).await);
             }
             AcceptedProofRetry::Rejected(reason) => return Ok(self.reject(reason)),
         }
@@ -594,7 +633,7 @@ impl UdpRelayServer {
             AcceptedProofRetry::WaitingForPeer => return Ok(true),
             AcceptedProofRetry::Ready => {
                 drop(state);
-                return send_udp_relay_ready(socket, source, claims.session_id).await;
+                return Ok(self.send_ready(socket, source, claims.session_id).await);
             }
             AcceptedProofRetry::Rejected(reason) => return Ok(self.reject(reason)),
         }
@@ -660,9 +699,13 @@ impl UdpRelayServer {
             let mut response = Vec::with_capacity(24);
             response.extend_from_slice(READY);
             response.extend_from_slice(&session_id);
+            let mut all_sent = true;
             for address in ready_endpoints.into_iter().flatten() {
-                socket.send_to(&response, address).await?;
+                all_sent &= self
+                    .try_send_to(address, socket.send_to(&response, address))
+                    .await;
             }
+            return Ok(all_sent);
         }
         Ok(true)
     }
@@ -697,18 +740,6 @@ fn verify_udp_relay_proof(
             &Signature::from_bytes(signature),
         )
         .is_ok()
-}
-
-async fn send_udp_relay_ready(
-    socket: &UdpSocket,
-    destination: SocketAddr,
-    session_id: [u8; 16],
-) -> io::Result<bool> {
-    let mut response = Vec::with_capacity(24);
-    response.extend_from_slice(READY);
-    response.extend_from_slice(&session_id);
-    socket.send_to(&response, destination).await?;
-    Ok(true)
 }
 
 fn normalize_ip(ip: IpAddr) -> IpAddr {
@@ -858,6 +889,29 @@ mod tests {
 
     fn identity(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
+    }
+
+    #[tokio::test]
+    async fn socket_send_failure_is_counted_and_does_not_poison_later_sends() {
+        let relay = UdpRelayServer::new(UdpRelayConfig::new([20; 32]));
+        let destination = "127.0.0.1:43000".parse().expect("destination");
+
+        let sent = relay
+            .try_send_to(destination, async {
+                Err(io::Error::new(
+                    io::ErrorKind::NetworkUnreachable,
+                    "test failure",
+                ))
+            })
+            .await;
+        assert!(!sent);
+        assert_eq!(relay.stats().await.send_errors_total, 1);
+
+        let sent = relay
+            .try_send_to(destination, async { Ok::<usize, io::Error>(24) })
+            .await;
+        assert!(sent);
+        assert_eq!(relay.stats().await.send_errors_total, 1);
     }
 
     fn device_id(identity: &SigningKey) -> String {

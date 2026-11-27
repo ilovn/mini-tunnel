@@ -761,6 +761,9 @@ async fn relay_metrics(State(relay): State<RelayMetricsState>) -> impl IntoRespo
          # HELP mini_tunnel_udp_relay_dropped_datagrams_total UDP relay packets rejected or dropped for any reason.\n\
          # TYPE mini_tunnel_udp_relay_dropped_datagrams_total counter\n\
          mini_tunnel_udp_relay_dropped_datagrams_total {}\n\
+         # HELP mini_tunnel_udp_relay_send_errors_total UDP relay socket send errors; each failed datagram is dropped without stopping the listener.\n\
+         # TYPE mini_tunnel_udp_relay_send_errors_total counter\n\
+         mini_tunnel_udp_relay_send_errors_total {}\n\
          # HELP mini_tunnel_udp_relay_malformed_datagrams_total Malformed UDP relay packets dropped.\n\
          # TYPE mini_tunnel_udp_relay_malformed_datagrams_total counter\n\
          mini_tunnel_udp_relay_malformed_datagrams_total {}\n\
@@ -786,6 +789,7 @@ async fn relay_metrics(State(relay): State<RelayMetricsState>) -> impl IntoRespo
         udp_stats.forwarded_datagrams_total,
         udp_stats.auth_rate_limited_total,
         udp_stats.dropped_datagrams_total,
+        udp_stats.send_errors_total,
         udp_stats.malformed_datagrams_total,
         udp_stats.authentication_rejections_total,
         udp_stats.session_rejections_total,
@@ -9534,6 +9538,7 @@ mod tests {
         assert!(body.contains("mini_tunnel_udp_relay_forwarded_datagrams_total 0"));
         assert!(body.contains("mini_tunnel_udp_relay_auth_rate_limited_total 1"));
         assert!(body.contains("mini_tunnel_udp_relay_dropped_datagrams_total 2"));
+        assert!(body.contains("mini_tunnel_udp_relay_send_errors_total 0"));
         assert!(body.contains("mini_tunnel_udp_relay_malformed_datagrams_total 1"));
         assert!(body.contains("mini_tunnel_udp_relay_authentication_rejections_total 0"));
         assert!(body.contains("mini_tunnel_udp_relay_session_rejections_total 0"));
