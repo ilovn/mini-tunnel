@@ -2,6 +2,13 @@
 
 Status: **public NAT/QoS matrix incomplete**. The loopback ICE mapping proxy verifies packet rewriting and session behavior, but it does not establish interoperability across public NATs. The VPS, domestic NAT, Windows, and cross-border runs below are individual topology samples; they do not complete the broader NAT/QoS matrix.
 
+### Windows UDP-blocked TCP Relay fallback on current main (2026-11-27)
+
+- Windows x64 and Linux x86_64 release-staging artifacts from [run 46015015506](https://github.com/ilovn/mini-tunnel/actions/runs/46015015506), built from `14ecdca2429893d913625747d59377208c9e16b9`, passed SHA-256 and GitHub Sigstore provenance checks. No endpoint built from source and the release publish job was skipped.
+- On the Windows 10 VM and Guangzhou VPS, both peers joined a fresh private overlay. Inbound and outbound UDP were blocked only for the Windows peer executable, with a bounded SYSTEM rollback task armed first. With no UDP Relay configured, both peers selected authenticated `Relay/TLS`; TCP Relay metrics showed five accepted connections, zero handshake failures, 118,548 forwarded bytes, and no UDP Relay sessions.
+- Overlay ping passed 20/20 in both directions with 0% loss (about 16.6 ms Guangzhou→Windows and 13 ms Windows→Guangzhou average). The Windows VM egress has previously matched the Hong Kong VPS public address, so this validates UDP-blocked fallback on this VM path, not an independent NAT topology. The broader matrix remains incomplete. See the [detailed report](testing/windows-udp-blocked-relay-current-main-2026-11.md).
+- Both members were revoked. Windows test processes, adapter, route, firewall rules, tasks, and files were removed; its default route and YunShu state were unchanged. Guangzhou temporary services and files were removed; default route and production Relay PID/ports were unchanged.
+
 ### Bounded direct-recovery dial on domestic NAT (2026-11-27)
 
 - Used the attested Linux x86_64 artifact for `6bbffe4` on Guangzhou and the domestic NAT Ubuntu peer. A targeted UDP drop moved both peers to Relay/TLS; bidirectional overlay probes passed 10/10 with 0% loss while direct recovery dialing was blocked.
