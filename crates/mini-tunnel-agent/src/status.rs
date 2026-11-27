@@ -13,6 +13,14 @@ use serde::{Deserialize, Serialize};
 const MAX_STATUS_PEERS: usize = 4096;
 static PEERS: OnceLock<RwLock<BTreeMap<String, PeerStatus>>> = OnceLock::new();
 static TRAFFIC: OnceLock<RwLock<BTreeMap<String, Arc<PeerTrafficCounters>>>> = OnceLock::new();
+static PROBE_BASELINES: OnceLock<RwLock<BTreeMap<String, ProbeBaseline>>> = OnceLock::new();
+
+#[derive(Clone)]
+struct ProbeBaseline {
+    active_path: String,
+    succeeded: u64,
+    missed: u64,
+}
 
 #[derive(Default)]
 struct PeerTrafficCounters {
@@ -31,6 +39,7 @@ pub struct PeerStatus {
     pub online: bool,
     pub active_path: String,
     pub rtt_ms: Option<u64>,
+    /// Loss in the most recent non-empty probe sample for `active_path`.
     pub loss_percent: Option<u8>,
     #[serde(default)]
     pub packets_sent_total: u64,
@@ -50,6 +59,15 @@ fn peers() -> &'static RwLock<BTreeMap<String, PeerStatus>> {
 
 fn traffic() -> &'static RwLock<BTreeMap<String, Arc<PeerTrafficCounters>>> {
     TRAFFIC.get_or_init(|| RwLock::new(BTreeMap::new()))
+}
+
+fn probe_baselines() -> &'static RwLock<BTreeMap<String, ProbeBaseline>> {
+    PROBE_BASELINES.get_or_init(|| RwLock::new(BTreeMap::new()))
+}
+
+fn probe_loss_percent(succeeded: u64, missed: u64) -> Option<u8> {
+    let total = u128::from(succeeded) + u128::from(missed);
+    (total > 0).then(|| (u128::from(missed) * 100 / total) as u8)
 }
 
 /// Return the current live peer snapshot. It contains no identity or transport credentials.
@@ -132,10 +150,10 @@ fn prometheus_for_snapshot(snapshot: &[PeerStatus]) -> String {
          # HELP mini_tunnel_peer_loss_measurements Peers with a current probe loss measurement.\n\
          # TYPE mini_tunnel_peer_loss_measurements gauge\n\
          mini_tunnel_peer_loss_measurements {loss_count}\n\
-         # HELP mini_tunnel_peer_loss_percent_total Sum of current peer probe loss percentages.\n\
+         # HELP mini_tunnel_peer_loss_percent_total Sum of most recent peer probe loss percentages.\n\
          # TYPE mini_tunnel_peer_loss_percent_total gauge\n\
          mini_tunnel_peer_loss_percent_total {loss_sum}\n\
-         # HELP mini_tunnel_peer_loss_percent_max Maximum current peer probe loss percentage.\n\
+         # HELP mini_tunnel_peer_loss_percent_max Maximum most recent peer probe loss percentage.\n\
          # TYPE mini_tunnel_peer_loss_percent_max gauge\n\
          mini_tunnel_peer_loss_percent_max {loss_max}\n\
          # HELP mini_tunnel_peer_packets_sent_total Overlay IP packets successfully sent to peers.\n\
@@ -165,9 +183,6 @@ pub fn update(
 ) {
     let peer = peer.into();
     let active_path = active_path.into();
-    let total = probes_succeeded.saturating_add(probes_missed);
-    let loss_percent =
-        (total > 0).then(|| u8::try_from(probes_missed.saturating_mul(100) / total).unwrap_or(100));
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -182,10 +197,56 @@ pub fn update(
                 if let Ok(mut counters) = traffic().write() {
                     counters.remove(&stale);
                 }
+                if let Ok(mut baselines) = probe_baselines().write() {
+                    baselines.remove(&stale);
+                }
             } else {
                 return;
             }
         }
+        let previous_loss = peers.get(&peer).and_then(|status| {
+            (status.active_path == active_path)
+                .then_some(status.loss_percent)
+                .flatten()
+        });
+        let loss_percent = if let Ok(mut baselines) = probe_baselines().write() {
+            let previous = baselines.get(&peer);
+            let same_path_and_monotonic = previous.is_some_and(|baseline| {
+                baseline.active_path == active_path
+                    && probes_succeeded >= baseline.succeeded
+                    && probes_missed >= baseline.missed
+            });
+            let (sample_succeeded, sample_missed) = if let Some(baseline) = previous
+                && same_path_and_monotonic
+            {
+                (
+                    probes_succeeded - baseline.succeeded,
+                    probes_missed - baseline.missed,
+                )
+            } else {
+                (probes_succeeded, probes_missed)
+            };
+            let had_previous_baseline = previous.is_some();
+            baselines.insert(
+                peer.clone(),
+                ProbeBaseline {
+                    active_path: active_path.clone(),
+                    succeeded: probes_succeeded,
+                    missed: probes_missed,
+                },
+            );
+            if !same_path_and_monotonic && had_previous_baseline {
+                // A new transport or recreated channel may have accumulated standby or
+                // probation probes; establish a baseline and wait for a fresh sample.
+                None
+            } else if sample_succeeded == 0 && sample_missed == 0 {
+                previous_loss
+            } else {
+                probe_loss_percent(sample_succeeded, sample_missed)
+            }
+        } else {
+            probe_loss_percent(probes_succeeded, probes_missed)
+        };
         let _ = traffic_counter(&peer);
         let previous_reason = peers
             .get(&peer)
@@ -300,7 +361,8 @@ mod tests {
         assert!(status.online);
         assert_eq!(status.active_path, "QUIC/UDP");
         assert_eq!(status.rtt_ms, Some(18));
-        assert_eq!(status.loss_percent, Some(10));
+        // A path transition resets the measurement until the new path yields samples.
+        assert_eq!(status.loss_percent, None);
         assert_eq!(status.packets_sent_total, 1);
         assert_eq!(status.packets_received_total, 1);
         assert_eq!(status.packets_dropped_total, 1);
@@ -320,6 +382,40 @@ mod tests {
         assert_eq!(legacy.packets_received_total, 0);
         assert_eq!(legacy.packets_dropped_total, 0);
         assert_eq!(legacy.packets_rejected_total, 0);
+    }
+
+    #[test]
+    fn status_loss_percent_tracks_new_probe_samples_and_resets_on_path_change() {
+        let key = format!("status-probe-window-{}", std::process::id());
+        update(&key, true, "QUIC/UDP", Some(20), 3, 1, None);
+        assert_eq!(get_status(&key).loss_percent, Some(25));
+
+        // Historical misses must not be diluted by later successful probes.
+        update(&key, true, "QUIC/UDP", Some(20), 6, 1, None);
+        assert_eq!(get_status(&key).loss_percent, Some(0));
+
+        // An update without new probes retains the most recent measured interval.
+        update(&key, true, "QUIC/UDP", Some(20), 6, 1, None);
+        assert_eq!(get_status(&key).loss_percent, Some(0));
+
+        // A new transport may have accumulated standby probes; wait for a fresh sample.
+        update(&key, true, "Relay/TLS", Some(30), 1, 1, None);
+        assert_eq!(get_status(&key).loss_percent, None);
+        update(&key, true, "Relay/TLS", Some(30), 2, 2, None);
+        assert_eq!(get_status(&key).loss_percent, Some(50));
+
+        // Recreated channels can reset counters without changing the transport name.
+        update(&key, true, "Relay/TLS", Some(30), 1, 0, None);
+        assert_eq!(get_status(&key).loss_percent, None);
+        update(&key, true, "Relay/TLS", Some(30), 1, 1, None);
+        assert_eq!(get_status(&key).loss_percent, Some(100));
+    }
+
+    fn get_status(peer: &str) -> PeerStatus {
+        snapshot()
+            .into_iter()
+            .find(|status| status.peer == peer)
+            .unwrap()
     }
 
     #[test]
