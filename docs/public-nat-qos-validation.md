@@ -9,6 +9,13 @@ Status: **public NAT/QoS matrix incomplete**. The loopback ICE mapping proxy ver
 - Overlay ping passed 20/20 in both directions with 0% loss (about 16.6 ms Guangzhou→Windows and 13 ms Windows→Guangzhou average). The Windows VM egress has previously matched the Hong Kong VPS public address, so this validates UDP-blocked fallback on this VM path, not an independent NAT topology. The broader matrix remains incomplete. See the [detailed report](testing/windows-udp-blocked-relay-current-main-2026-11.md).
 - Both members were revoked. Windows test processes, adapter, route, firewall rules, tasks, and files were removed; its default route and YunShu state were unchanged. Guangzhou temporary services and files were removed; default route and production Relay PID/ports were unchanged.
 
+### Windows UDP-blocked TCP Relay fallback on current main (2026-11-28)
+
+- Tested the exact source `91fe96a010ec6a3608b5a1e7c8a3cb08bd052f0f` using attested Linux x86_64 and Windows x64 prebuilt artifacts from [Release staging run 46075694945](https://github.com/ilovn/mini-tunnel/actions/runs/46075694945). Neither endpoint built source.
+- On the Windows 10 VM and Guangzhou VPS, the exact Windows peer executable had inbound and outbound UDP blocked. Both peers reported authenticated `Relay/TLS`; no UDP Relay endpoint was configured, and UDP Relay sessions remained zero. TCP Relay handshake failures, pairing rejections, and timeouts remained zero.
+- Overlay ICMP passed 20/20 in both directions with 0% loss (about 18.0 ms Guangzhou→Windows and 13 ms Windows→Guangzhou mean). Each peer counted 40 sent and received packets with zero drops or rejects. This is one Windows UDP-blocked fallback sample; it does not complete the public NAT/QoS matrix. See the [detailed report](testing/windows-udp-blocked-relay-91fe96a-2026-11.md).
+- Both memberships were revoked and all test resources were removed. The Windows route/YunShu state and the existing domestic soak on GZ/NAT remained intact.
+
 ### Bounded direct-recovery dial on domestic NAT (2026-11-27)
 
 - Used the attested Linux x86_64 artifact for `6bbffe4` on Guangzhou and the domestic NAT Ubuntu peer. A targeted UDP drop moved both peers to Relay/TLS; bidirectional overlay probes passed 10/10 with 0% loss while direct recovery dialing was blocked.
