@@ -25,9 +25,9 @@ use mini_tunnel_protocol::{
     CreateInviteResponse, CreateNetworkRequest, CreateNetworkResponse, DeleteNetworkRequest,
     DeleteNetworkResponse, IceCredentials, JoinNetworkRequest, JoinNetworkResponse, PeerInfo,
     PeerListRequest, PeerListResponse, RelayTicketRequest, RelayTicketResponse,
-    RevokeMemberRequest, RevokeMemberResponse, candidate_signing_bytes,
-    candidate_signing_bytes_with_ice, join_signing_bytes, peers_signing_bytes,
-    relay_ticket_request_signing_bytes,
+    RevokeMemberRequest, RevokeMemberResponse, RotateAdminTokenRequest, RotateAdminTokenResponse,
+    candidate_signing_bytes, candidate_signing_bytes_with_ice, join_signing_bytes,
+    peers_signing_bytes, relay_ticket_request_signing_bytes,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -332,6 +332,18 @@ enum NetworkCommand {
         /// Must exactly repeat --network-id to confirm this irreversible deletion.
         #[arg(long)]
         confirm_network_id: String,
+        #[arg(
+            long,
+            env = "MINI_TUNNEL_COORDINATOR_URL",
+            default_value = "http://127.0.0.1:8080"
+        )]
+        coordinator_url: String,
+    },
+    /// Rotate the network admin capability and display the replacement once.
+    /// Reads the current MINI_TUNNEL_ADMIN_TOKEN from the environment.
+    RotateAdminToken {
+        #[arg(long)]
+        network_id: String,
         #[arg(
             long,
             env = "MINI_TUNNEL_COORDINATOR_URL",
@@ -916,13 +928,24 @@ fn load_invite_token(
     Ok(token)
 }
 
-fn confirmed_network_id(network_id: &str, confirmation: &str) -> std::io::Result<String> {
+fn canonical_network_uuid(network_id: &str) -> std::io::Result<Uuid> {
     let parsed = Uuid::parse_str(network_id).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "network_id must be a valid UUID",
         )
     })?;
+    if parsed.to_string() != network_id {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "network_id must be a canonical UUID",
+        ));
+    }
+    Ok(parsed)
+}
+
+fn confirmed_network_id(network_id: &str, confirmation: &str) -> std::io::Result<String> {
+    let parsed = canonical_network_uuid(network_id)?;
     let canonical = parsed.to_string();
     if confirmation != canonical {
         return Err(std::io::Error::new(
@@ -2291,6 +2314,23 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!(
                     "Deleted network {canonical_id}; removed {} members and invalidated {} invitations",
                     response.removed_members, response.invalidated_invites
+                );
+            }
+            NetworkCommand::RotateAdminToken {
+                network_id,
+                coordinator_url,
+            } => {
+                let network_id = canonical_network_uuid(&network_id)
+                    .map_err(|_| "network_id must be a canonical UUID")?;
+                let admin_token = std::env::var("MINI_TUNNEL_ADMIN_TOKEN")
+                    .map_err(|_| "set MINI_TUNNEL_ADMIN_TOKEN before rotating it")?;
+                let request = RotateAdminTokenRequest { admin_token };
+                let path = format!("/v1/networks/{network_id}/admin-token/rotate");
+                let response: RotateAdminTokenResponse =
+                    post_json(&coordinator_url, &path, &request).await?;
+                println!(
+                    "New admin token (save it in your secret manager; it cannot be retrieved again): {}",
+                    response.admin_token
                 );
             }
             NetworkCommand::Join {
@@ -6865,6 +6905,28 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn network_rotate_admin_token_accepts_canonical_network_id() {
+        let network_id = "81af0d3b-be18-4b8f-976e-2b2a37ddfbc9";
+        assert!(canonical_network_uuid(network_id).is_ok());
+        assert!(canonical_network_uuid("81AF0D3B-BE18-4B8F-976E-2B2A37DDFBC9").is_err());
+        assert!(canonical_network_uuid("not-a-uuid").is_err());
+        let parsed = Cli::try_parse_from([
+            "mini-tunnel",
+            "network",
+            "rotate-admin-token",
+            "--network-id",
+            network_id,
+        ])
+        .expect("rotation command accepts a canonical UUID");
+        assert!(matches!(
+            parsed.command,
+            Command::Network {
+                command: NetworkCommand::RotateAdminToken { .. }
+            }
+        ));
     }
 
     #[test]

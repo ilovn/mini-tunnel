@@ -32,9 +32,10 @@ use mini_tunnel_protocol::{
     DeleteNetworkResponse, IceCredentials, JoinNetworkRequest, JoinNetworkResponse,
     MAX_NETWORK_MEMBERS, PeerInfo, PeerListRequest, PeerListResponse, RELAY_TICKET_VERSION,
     RelayTicketClaims, RelayTicketRequest, RelayTicketResponse, RevokeMemberRequest,
-    RevokeMemberResponse, candidate_signing_bytes, candidate_signing_bytes_with_ice,
-    device_id_from_public_key, issue_relay_ticket, join_signing_bytes, overlay_ipv6_prefix,
-    peers_signing_bytes, relay_ticket_request_signing_bytes,
+    RevokeMemberResponse, RotateAdminTokenRequest, RotateAdminTokenResponse,
+    candidate_signing_bytes, candidate_signing_bytes_with_ice, device_id_from_public_key,
+    issue_relay_ticket, join_signing_bytes, overlay_ipv6_prefix, peers_signing_bytes,
+    relay_ticket_request_signing_bytes,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1104,6 +1105,29 @@ impl CoordinatorState {
             removed_members,
             invalidated_invites,
         })
+    }
+
+    async fn rotate_admin_token(
+        &self,
+        network_id: Uuid,
+        request: RotateAdminTokenRequest,
+    ) -> Result<RotateAdminTokenResponse, ApiError> {
+        let _runtime_guard = self.network_runtime_lock.lock().await;
+        let mut store = self.inner.write().await;
+        let previous = store.clone();
+        let network = store
+            .networks
+            .get_mut(&network_id)
+            .ok_or(ApiError::NotFound)?;
+        if !constant_time_equal(&network.admin_token_hash, &token_hash(&request.admin_token)) {
+            self.record_admin_auth_failure("admin_token_rotation_denied", network_id);
+            return Err(ApiError::Unauthorized);
+        }
+        let (admin_token, admin_token_hash) = create_token()?;
+        network.admin_token_hash = admin_token_hash;
+        self.persist_or_restore(&mut store, previous)?;
+        self.audit_success("admin_token_rotated", network_id, None);
+        Ok(RotateAdminTokenResponse { admin_token })
     }
 
     async fn join_network(
@@ -2380,6 +2404,10 @@ pub fn router_with_state(state: CoordinatorState) -> Router {
         .route("/metrics", get(metrics))
         .route("/v1/networks", post(create_network))
         .route("/v1/networks/{network_id}/delete", post(delete_network))
+        .route(
+            "/v1/networks/{network_id}/admin-token/rotate",
+            post(rotate_admin_token),
+        )
         .route("/v1/networks/{network_id}/invites", post(create_invite))
         .route(
             "/v1/networks/{network_id}/members/revoke",
@@ -2708,6 +2736,19 @@ async fn delete_network(
     let network_id = Uuid::parse_str(&network_id)
         .map_err(|_| ApiError::InvalidRequest("network_id must be a UUID"))?;
     state.delete_network(network_id, request).await.map(Json)
+}
+
+async fn rotate_admin_token(
+    State(state): State<CoordinatorState>,
+    Path(network_id): Path<String>,
+    Json(request): Json<RotateAdminTokenRequest>,
+) -> Result<Json<RotateAdminTokenResponse>, ApiError> {
+    let network_id = Uuid::parse_str(&network_id)
+        .map_err(|_| ApiError::InvalidRequest("network_id must be a UUID"))?;
+    state
+        .rotate_admin_token(network_id, request)
+        .await
+        .map(Json)
 }
 
 async fn join_network(
@@ -4567,6 +4608,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_token_rotation_is_serialized_and_persists_across_restart() {
+        let directory =
+            std::env::temp_dir().join(format!("mini-tunnel-token-rotation-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).expect("create isolated state directory");
+        let state_path = directory.join("coordinator.json");
+        let state = CoordinatorState::load(&state_path).expect("load persistent Coordinator");
+        let created = state
+            .create_network(create_request("rotation", "10.90.0.0/24"))
+            .await
+            .expect("create network");
+        let network_id = network_uuid(&created);
+        let app = router_with_state(state.clone());
+        let path = format!("/v1/networks/{network_id}/admin-token/rotate");
+
+        let denied = post_json(
+            app.clone(),
+            &path,
+            &RotateAdminTokenRequest {
+                admin_token: "wrong-rotation-token-must-not-be-logged".to_owned(),
+            },
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let denied_invite = state
+            .create_invite(
+                network_id,
+                CreateInviteRequest {
+                    admin_token: created.admin_token.clone(),
+                },
+            )
+            .await;
+        assert!(denied_invite.is_ok(), "denied rotation preserves old token");
+
+        let rotation = RotateAdminTokenRequest {
+            admin_token: created.admin_token.clone(),
+        };
+        let (first, second) = tokio::join!(
+            post_json(app.clone(), &path, &rotation),
+            post_json(app.clone(), &path, &rotation),
+        );
+        assert_eq!(
+            [first.status(), second.status()]
+                .into_iter()
+                .filter(|status| *status == StatusCode::OK)
+                .count(),
+            1,
+            "concurrent rotations with one old token must serialize"
+        );
+        assert_eq!(
+            [first.status(), second.status()]
+                .into_iter()
+                .filter(|status| *status == StatusCode::UNAUTHORIZED)
+                .count(),
+            1
+        );
+        let response = if first.status() == StatusCode::OK {
+            first
+        } else {
+            second
+        };
+        let rotated: RotateAdminTokenResponse = response_json(response).await;
+        assert_eq!(rotated.admin_token.len(), 43, "256-bit token encoding");
+
+        let old_token = state
+            .create_invite(
+                network_id,
+                CreateInviteRequest {
+                    admin_token: created.admin_token.clone(),
+                },
+            )
+            .await
+            .expect_err("old token is invalid after committed rotation");
+        assert!(matches!(old_token, ApiError::Unauthorized));
+        state
+            .create_invite(
+                network_id,
+                CreateInviteRequest {
+                    admin_token: rotated.admin_token.clone(),
+                },
+            )
+            .await
+            .expect("new token is immediately usable");
+        assert_eq!(state.admin_auth_failures_total.load(Ordering::Relaxed), 3);
+        drop(app);
+        drop(state);
+
+        let restored = CoordinatorState::load(&state_path).expect("reload rotated snapshot");
+        assert!(matches!(
+            restored
+                .create_invite(
+                    network_id,
+                    CreateInviteRequest {
+                        admin_token: created.admin_token.clone(),
+                    },
+                )
+                .await,
+            Err(ApiError::Unauthorized)
+        ));
+        restored
+            .create_invite(
+                network_id,
+                CreateInviteRequest {
+                    admin_token: rotated.admin_token,
+                },
+            )
+            .await
+            .expect("new token remains valid after restart");
+        drop(restored);
+        fs::remove_file(&state_path).expect("remove persistent test snapshot");
+        fs::remove_file(state_lock_path(&state_path).expect("state lock path"))
+            .expect("remove persistent test lock");
+        fs::remove_dir_all(directory).expect("remove isolated state directory");
+    }
+
+    #[tokio::test]
+    async fn admin_token_rotation_persistence_failure_preserves_old_token() {
+        let directory = std::env::temp_dir().join(format!(
+            "mini-tunnel-token-rotation-fail-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).expect("create directory used as invalid state target");
+        let mut state = CoordinatorState::default();
+        let created = state
+            .create_network(create_request("rotation failure", "10.91.0.0/24"))
+            .await
+            .expect("in-memory creation does not persist");
+        let network_id = network_uuid(&created);
+        state.persistence = Some(Arc::new(directory.clone()));
+        let result = state
+            .rotate_admin_token(
+                network_id,
+                RotateAdminTokenRequest {
+                    admin_token: created.admin_token.clone(),
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(ApiError::Persistence)));
+        assert_eq!(
+            state.inner.read().await.networks[&network_id].admin_token_hash,
+            token_hash(&created.admin_token),
+            "failed durable write must restore the old hash"
+        );
+        state.persistence = None;
+        state
+            .create_invite(
+                network_id,
+                CreateInviteRequest {
+                    admin_token: created.admin_token,
+                },
+            )
+            .await
+            .expect("old token remains valid after persistence failure");
+        fs::remove_dir_all(directory).expect("remove temporary directory");
+    }
+
+    #[tokio::test]
     async fn network_delete_requires_admin_and_confirmation_and_persists_full_cleanup() {
         let directory =
             std::env::temp_dir().join(format!("mini-tunnel-network-delete-{}", Uuid::new_v4()));
@@ -4988,11 +5185,43 @@ mod tests {
                     .await,
                 Err(ApiError::Unauthorized)
             ));
+            let invalid_rotation_token = "submitted-rotation-token-must-not-be-logged";
+            assert!(matches!(
+                state
+                    .rotate_admin_token(
+                        network_id,
+                        RotateAdminTokenRequest {
+                            admin_token: invalid_rotation_token.to_owned(),
+                        },
+                    )
+                    .await,
+                Err(ApiError::Unauthorized)
+            ));
+            let rotated = state
+                .rotate_admin_token(
+                    network_id,
+                    RotateAdminTokenRequest {
+                        admin_token: created.admin_token.clone(),
+                    },
+                )
+                .await
+                .expect("rotate administrator capability");
+            assert!(matches!(
+                state
+                    .create_invite(
+                        network_id,
+                        CreateInviteRequest {
+                            admin_token: created.admin_token.clone(),
+                        },
+                    )
+                    .await,
+                Err(ApiError::Unauthorized)
+            ));
             let deleted = state
                 .delete_network(
                     network_id,
                     DeleteNetworkRequest {
-                        admin_token: created.admin_token.clone(),
+                        admin_token: rotated.admin_token.clone(),
                         confirm_network_id: network_id.to_string(),
                     },
                 )
@@ -5001,7 +5230,7 @@ mod tests {
             assert!(deleted.deleted);
             assert_eq!(deleted.removed_members, 0);
             assert_eq!(deleted.invalidated_invites, 0);
-            assert_eq!(state.admin_auth_failures_total.load(Ordering::Relaxed), 3);
+            assert_eq!(state.admin_auth_failures_total.load(Ordering::Relaxed), 5);
             (
                 created.network_id,
                 enrolled.device_id,
@@ -5013,6 +5242,8 @@ mod tests {
                     invalid_invite_token.to_owned(),
                     invalid_revoke_token.to_owned(),
                     invalid_delete_token.to_owned(),
+                    invalid_rotation_token.to_owned(),
+                    rotated.admin_token,
                     attempted_device_id.to_owned(),
                 ],
             )
@@ -5049,6 +5280,8 @@ mod tests {
             "member_revoked",
             "invite_issue_denied",
             "member_revoke_denied",
+            "admin_token_rotation_denied",
+            "admin_token_rotated",
             "network_delete_denied",
             "network_deleted",
         ] {
@@ -5341,6 +5574,7 @@ mod tests {
         let created: CreateNetworkResponse =
             serde_json::from_slice(&create_body).expect("create network JSON response");
         let network_id = Uuid::parse_str(&created.network_id).expect("network UUID");
+        let mut current_admin_token = created.admin_token.clone();
 
         let invite = post_json(
             app_b.clone(),
@@ -5573,12 +5807,91 @@ mod tests {
         .await;
         assert_eq!(remaining_update.status(), StatusCode::OK);
 
+        let rotate_path = format!("/v1/networks/{network_id}/admin-token/rotate");
+        let owner_pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect as schema owner to simulate a write failure");
+        sqlx::query("REVOKE UPDATE ON mini_tunnel_networks FROM mini_tunnel_runtime")
+            .execute(&owner_pool)
+            .await
+            .expect("temporarily deny admin hash persistence");
+        let failed_rotation = post_json(
+            app_b.clone(),
+            &rotate_path,
+            &RotateAdminTokenRequest {
+                admin_token: current_admin_token.clone(),
+            },
+        )
+        .await;
+        assert_eq!(
+            failed_rotation.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a database write failure must not return the replacement token"
+        );
+        sqlx::query("GRANT UPDATE ON mini_tunnel_networks TO mini_tunnel_runtime")
+            .execute(&owner_pool)
+            .await
+            .expect("restore admin hash update permission");
+        owner_pool.close().await;
+        let old_token_after_failure = post_json(
+            app_a.clone(),
+            &format!("/v1/networks/{network_id}/invites"),
+            &CreateInviteRequest {
+                admin_token: current_admin_token.clone(),
+            },
+        )
+        .await;
+        assert_eq!(
+            old_token_after_failure.status(),
+            StatusCode::OK,
+            "failed PostgreSQL commit must preserve the old capability"
+        );
+        let rotated = post_json(
+            app_b.clone(),
+            &rotate_path,
+            &RotateAdminTokenRequest {
+                admin_token: current_admin_token.clone(),
+            },
+        )
+        .await;
+        assert_eq!(rotated.status(), StatusCode::OK);
+        current_admin_token = response_json::<RotateAdminTokenResponse>(rotated)
+            .await
+            .admin_token;
+        let old_admin_token = post_json(
+            app_a.clone(),
+            &format!("/v1/networks/{network_id}/invites"),
+            &CreateInviteRequest {
+                admin_token: created.admin_token.clone(),
+            },
+        )
+        .await;
+        assert_eq!(
+            old_admin_token.status(),
+            StatusCode::UNAUTHORIZED,
+            "rotated token must be rejected on another Coordinator instance"
+        );
+        let new_admin_token = post_json(
+            app_a.clone(),
+            &format!("/v1/networks/{network_id}/invites"),
+            &CreateInviteRequest {
+                admin_token: current_admin_token.clone(),
+            },
+        )
+        .await;
+        assert_eq!(
+            new_admin_token.status(),
+            StatusCode::OK,
+            "new token must be visible on another Coordinator instance"
+        );
+
         let delete_path = format!("/v1/networks/{network_id}/delete");
         let deleted = post_json(
             app_b.clone(),
             &delete_path,
             &DeleteNetworkRequest {
-                admin_token: created.admin_token.clone(),
+                admin_token: current_admin_token,
                 confirm_network_id: network_id.to_string(),
             },
         )
@@ -5586,7 +5899,7 @@ mod tests {
         assert_eq!(deleted.status(), StatusCode::OK);
         let deleted: DeleteNetworkResponse = response_json(deleted).await;
         assert_eq!(deleted.removed_members, 1);
-        assert_eq!(deleted.invalidated_invites, 1);
+        assert_eq!(deleted.invalidated_invites, 3);
         for table in [
             "mini_tunnel_networks",
             "mini_tunnel_members",

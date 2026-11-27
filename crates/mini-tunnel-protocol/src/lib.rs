@@ -423,6 +423,19 @@ pub struct DeleteNetworkResponse {
     pub invalidated_invites: u32,
 }
 
+/// Replace a network admin capability after authenticating with the current token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RotateAdminTokenRequest {
+    pub admin_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RotateAdminTokenResponse {
+    /// One-time display of the replacement capability. Never log this value.
+    pub admin_token: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevokeMemberResponse {
     pub revoked: bool,
