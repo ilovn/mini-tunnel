@@ -73,11 +73,20 @@ without missing sequence numbers or an excessive sample gap. A healthy path tran
 `QUIC/UDP` and `Relay/TLS` is reported but is not itself a failure.
 
 When Relay metrics are present in the JSONL, the report summarizes active connection
-and session peaks, bytes forwarded, and the observed change in the handshake-failure
-counter. Any observed increase in `mini_tunnel_relay_handshake_failures_total` adds
-`relay_handshake_failures` to the failure list. Counter resets are handled by summing
-positive steps between adjacent samples; the first value is a baseline and is not
-counted as a new failure.
+and session peaks, bytes forwarded, the aggregate handshake-failure increase, and any
+classified failure deltas. With the classified metrics, pairing/state rejections and
+server I/O/internal failures gate the run; malformed requests, ticket/identity rejects,
+client disconnects, and authentication timeouts remain visible diagnostics because a
+public listener can receive unrelated Internet probes.
+
+Older JSONL files with only the aggregate counter do not identify the failure source.
+An increase gates the run only when a Relay path was observed or an active Relay session
+was present. If all recorded paths are direct and the maximum Relay session count is
+zero, the increase is reported as an unattributed diagnostic rather than a peer outage.
+This does not hide whether the Relay was used: path transitions, session peaks, and the
+raw counter delta remain in the report. Counter resets are handled by summing positive
+steps between adjacent samples; the first value is a baseline and is not counted as a
+new failure.
 
 Set `--max-rss-kib`, `--max-fds`, or `--max-threads` to enforce local resource ceilings.
 The report includes first/last values and min/max ranges even when no ceiling is set.

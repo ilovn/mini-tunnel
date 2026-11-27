@@ -210,16 +210,29 @@ def analyze_file(
     classified_failure_metrics = (
         relay_sample_count > 0 and classified_relay_samples == relay_sample_count
     )
+    active_sessions_max = max(
+        relay_values["mini_tunnel_relay_active_sessions"], default=None
+    )
+    relay_path_observed = any(path.startswith("Relay/") for path in observed_paths)
+    legacy_failures_without_relay_path = (
+        relay_handshake_failure_increase
+        if not classified_failure_metrics
+        and not relay_path_observed
+        and active_sessions_max == 0
+        else 0.0
+    )
     # Only failures after a syntactically valid, authenticated client reached pairing state,
     # or server-side I/O/internal failures are availability failures. Protocol noise,
     # unauthenticated credentials, client disconnects, and auth timeouts remain diagnostics.
+    # With legacy aggregate-only metrics, do not attribute failed requests to the tunnel when
+    # the sample proves Relay was never on the data path and had no active sessions.
     gated_relay_failure_increase = (
         sum(
             failure_class_increases[name]
             for name in ("pairing_rejections", "io_failures", "internal_failures")
         )
         if classified_failure_metrics
-        else relay_handshake_failure_increase
+        else relay_handshake_failure_increase - legacy_failures_without_relay_path
     )
     relay_metrics = {
         "samples": relay_sample_count,
@@ -233,12 +246,12 @@ def analyze_file(
         "handshake_failure_class_increases": failure_class_increases,
         "classified_failure_metrics": classified_failure_metrics,
         "gated_handshake_failures_increase": gated_relay_failure_increase,
+        "legacy_failures_without_relay_path": legacy_failures_without_relay_path,
+        "relay_path_observed": relay_path_observed,
         "active_connections_max": max(
             relay_values["mini_tunnel_relay_active_connections"], default=None
         ),
-        "active_sessions_max": max(
-            relay_values["mini_tunnel_relay_active_sessions"], default=None
-        ),
+        "active_sessions_max": active_sessions_max,
         "bytes_forwarded_increase": counter_increase(
             relay_values["mini_tunnel_relay_bytes_forwarded_total"]
         ),

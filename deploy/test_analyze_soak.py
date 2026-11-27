@@ -260,11 +260,76 @@ class AnalyzeSoakTests(unittest.TestCase):
                 },
                 "classified_failure_metrics": False,
                 "gated_handshake_failures_increase": 1,
+                "legacy_failures_without_relay_path": 0,
+                "relay_path_observed": False,
                 "active_connections_max": 2,
                 "active_sessions_max": 1,
                 "bytes_forwarded_increase": 50,
             },
         )
+
+    def test_legacy_handshake_failures_are_diagnostic_when_relay_is_unused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy-unused-relay.jsonl"
+            write_jsonl(
+                path,
+                [
+                    row(
+                        1,
+                        0,
+                        probe={"sent": 5, "received": 5},
+                        relay={
+                            "mini_tunnel_relay_active_connections": 0,
+                            "mini_tunnel_relay_active_sessions": 0,
+                            "mini_tunnel_relay_handshake_failures_total": 0,
+                            "mini_tunnel_relay_bytes_forwarded_total": 0,
+                        },
+                    ),
+                    row(
+                        2,
+                        10,
+                        probe={"sent": 5, "received": 5},
+                        relay={
+                            "mini_tunnel_relay_active_connections": 1,
+                            "mini_tunnel_relay_active_sessions": 0,
+                            "mini_tunnel_relay_handshake_failures_total": 3,
+                            "mini_tunnel_relay_bytes_forwarded_total": 0,
+                        },
+                    ),
+                ],
+            )
+            report = self.analyze(path)
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["relay_metrics"]["handshake_failures_increase"], 3)
+        self.assertEqual(report["relay_metrics"]["legacy_failures_without_relay_path"], 3)
+        self.assertEqual(report["relay_metrics"]["gated_handshake_failures_increase"], 0)
+        self.assertFalse(report["relay_metrics"]["relay_path_observed"])
+
+    def test_legacy_handshake_failures_still_fail_when_relay_carries_traffic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy-active-relay.jsonl"
+            write_jsonl(
+                path,
+                [
+                    row(
+                        1,
+                        0,
+                        path="Relay/TLS",
+                        relay={"mini_tunnel_relay_active_sessions": 0, "mini_tunnel_relay_handshake_failures_total": 0},
+                    ),
+                    row(
+                        2,
+                        10,
+                        path="Relay/TLS",
+                        relay={"mini_tunnel_relay_active_sessions": 0, "mini_tunnel_relay_handshake_failures_total": 1},
+                    ),
+                ],
+            )
+            report = self.analyze(path)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["relay_metrics"]["gated_handshake_failures_increase"], 1)
+        self.assertTrue(report["relay_metrics"]["relay_path_observed"])
+        self.assertIn("relay_handshake_failures", report["failures"])
 
     def test_malformed_public_relay_probes_are_reported_without_failing_peer_soak(self) -> None:
         start = {**RELAY_FAILURE_CLASS_METRICS}
