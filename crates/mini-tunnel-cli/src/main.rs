@@ -10226,7 +10226,7 @@ mod tests {
             *direct_channel_for_accept.write().await = Some(std::sync::Arc::clone(&accepted));
             assert!(
                 reliable_for_peer_readiness
-                    .negotiate_direct_path_promotion(Duration::from_secs(3))
+                    .negotiate_direct_path_promotion(&accepted, Duration::from_secs(3))
                     .await,
                 "remote peer confirms the candidate over the existing reliable channel"
             );

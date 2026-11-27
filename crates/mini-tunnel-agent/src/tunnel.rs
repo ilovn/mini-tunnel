@@ -1446,7 +1446,7 @@ async fn receive_mesh_peer(receiver: MeshPeerReceiver) {
                             && path_rank(candidate.transport_name())
                                 < path_rank(coordination_channel.transport_name())
                             && !coordination_channel
-                                .negotiate_direct_path_promotion(Duration::from_secs(3))
+                                .negotiate_direct_path_promotion(candidate, Duration::from_secs(3))
                                 .await
                         {
                             tracing::warn!(
@@ -5226,9 +5226,10 @@ mod tests {
         .await
         .expect("remote direct candidate received its probation probes");
         let peer_ready_channel = Arc::clone(&remote_reliable);
+        let peer_ready_candidate = Arc::clone(&remote_direct);
         let peer_ready = tokio::spawn(async move {
             peer_ready_channel
-                .negotiate_direct_path_promotion(Duration::from_secs(3))
+                .negotiate_direct_path_promotion(&peer_ready_candidate, Duration::from_secs(3))
                 .await
         });
         assert!(
@@ -5841,7 +5842,7 @@ mod tests {
         .expect("remote direct candidate completed its local health probes");
         assert!(
             remote_initial
-                .negotiate_direct_path_promotion(Duration::from_secs(3))
+                .negotiate_direct_path_promotion(&remote, Duration::from_secs(3))
                 .await,
             "remote peer coordinates promotion over the reliable channel"
         );

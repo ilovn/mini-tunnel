@@ -349,6 +349,7 @@ pub struct PeerChannel {
     health: Mutex<PeerHealth>,
     path_promotion: Mutex<PathPromotionState>,
     path_promotion_changed: tokio::sync::Notify,
+    candidate_binding_changed: tokio::sync::Notify,
     ice_consent: Option<ice::IceConsentMonitor>,
     _relay_endpoint: Option<Endpoint>,
 }
@@ -358,7 +359,9 @@ const HEALTH_PONG: u8 = 0xf1;
 const PATH_CONTROL_PREFIX: [u8; 8] = *b"MT-PATH1";
 const PATH_PROMOTION_OFFER: u8 = 1;
 const PATH_PROMOTION_ACK: u8 = 2;
+const PATH_CANDIDATE_BINDING_OFFER: u8 = 3;
 const PATH_PROMOTION_OFFER_TTL: Duration = Duration::from_secs(3);
+const PATH_CANDIDATE_BINDING_TTL: Duration = Duration::from_secs(15);
 pub const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -380,8 +383,10 @@ struct PeerHealth {
 #[derive(Default)]
 struct PathPromotionState {
     local_ready: bool,
-    pending_remote_offers: VecDeque<(u64, Instant)>,
+    local_binding: Option<[u8; 32]>,
+    pending_remote_offers: VecDeque<(u64, [u8; 32], Instant)>,
     acknowledged_offers: std::collections::HashSet<u64>,
+    pending_candidate_offers: VecDeque<([u8; 16], Instant)>,
 }
 
 #[derive(Default)]
@@ -513,9 +518,94 @@ impl FragmentReassembler {
 }
 
 impl PeerChannel {
-    /// Coordinate direct-path promotion over the currently active authenticated channel.
-    /// Both peers must have completed their own direct-path probation before either switches.
-    pub async fn negotiate_direct_path_promotion(&self, timeout: Duration) -> bool {
+    /// Coordinate promotion over the active channel and bind it to the same candidate channel
+    /// at both peers. The candidate must already have completed local health/consent probation.
+    pub async fn negotiate_direct_path_promotion(
+        &self,
+        candidate: &PeerChannel,
+        timeout: Duration,
+    ) -> bool {
+        if timeout.is_zero() || timeout > Duration::from_secs(10) {
+            return false;
+        }
+        if self.network_tag != candidate.network_tag {
+            return false;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        let binding =
+            match tokio::time::timeout_at(deadline, candidate.exchange_direct_path_binding()).await
+            {
+                Ok(Some(binding)) => binding,
+                Ok(None) | Err(_) => return false,
+            };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        self.negotiate_path_promotion_with_binding(binding, remaining)
+            .await
+    }
+
+    async fn exchange_direct_path_binding(&self) -> Option<[u8; 32]> {
+        let mut local_nonce = [0_u8; 16];
+        getrandom::fill(&mut local_nonce).ok()?;
+        let mut offer = [0_u8; 25];
+        offer[..8].copy_from_slice(&PATH_CONTROL_PREFIX);
+        offer[8] = PATH_CANDIDATE_BINDING_OFFER;
+        offer[9..].copy_from_slice(&local_nonce);
+        self.send_packet(&offer).await.ok()?;
+
+        loop {
+            let notified = self.candidate_binding_changed.notified();
+            tokio::pin!(notified);
+            let remote_nonce = {
+                let mut state = self.path_promotion.lock().ok()?;
+                let now = Instant::now();
+                state.pending_candidate_offers.retain(|(_, received_at)| {
+                    now.duration_since(*received_at) < PATH_CANDIDATE_BINDING_TTL
+                });
+                state
+                    .pending_candidate_offers
+                    .pop_front()
+                    .map(|(nonce, _)| nonce)
+            };
+            if let Some(remote_nonce) = remote_nonce {
+                let (first, second) = if local_nonce <= remote_nonce {
+                    (local_nonce, remote_nonce)
+                } else {
+                    (remote_nonce, local_nonce)
+                };
+                let mut digest = Sha256::new();
+                digest.update(b"mini-tunnel/direct-path-binding/v1");
+                digest.update(first);
+                digest.update(second);
+                return Some(digest.finalize().into());
+            }
+
+            tokio::select! {
+                _ = &mut notified => {}
+                result = self.recv_packet_from_transport() => {
+                    let payload = result.ok()?;
+                    if !payload.is_empty()
+                        && self
+                            .pending_probe_packets
+                            .lock()
+                            .ok()?
+                            .push(payload)
+                            .is_err()
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn negotiate_path_promotion_with_binding(
+        &self,
+        binding: [u8; 32],
+        timeout: Duration,
+    ) -> bool {
         if timeout.is_zero() || timeout > Duration::from_secs(10) {
             return false;
         }
@@ -529,20 +619,24 @@ impl PeerChannel {
                 return false;
             };
             let now = Instant::now();
-            state.pending_remote_offers.retain(|(_, received_at)| {
-                now.duration_since(*received_at) < PATH_PROMOTION_OFFER_TTL
-            });
-            state.local_ready = true;
-            state
+            let pending_acks = state
                 .pending_remote_offers
                 .drain(..)
-                .map(|(offer, _)| offer)
-                .collect::<Vec<_>>()
+                .filter_map(|(offer, remote_binding, received_at)| {
+                    (now.duration_since(received_at) < PATH_PROMOTION_OFFER_TTL
+                        && remote_binding == binding)
+                        .then_some(offer)
+                })
+                .collect::<Vec<_>>();
+            state.local_ready = true;
+            state.local_binding = Some(binding);
+            pending_acks
         };
-        let mut offer = [0_u8; 17];
+        let mut offer = [0_u8; 49];
         offer[..8].copy_from_slice(&PATH_CONTROL_PREFIX);
         offer[8] = PATH_PROMOTION_OFFER;
-        offer[9..].copy_from_slice(&nonce_bytes);
+        offer[9..17].copy_from_slice(&nonce_bytes);
+        offer[17..].copy_from_slice(&binding);
         let mut sent = self.send_packet(&offer).await.is_ok();
         for remote_nonce in pending_acks {
             sent &= self.send_path_promotion_ack(remote_nonce).await.is_ok();
@@ -567,6 +661,7 @@ impl PeerChannel {
         };
         if let Ok(mut state) = self.path_promotion.lock() {
             state.local_ready = false;
+            state.local_binding = None;
             state.acknowledged_offers.remove(&nonce);
         }
         result
@@ -996,26 +1091,40 @@ impl PeerChannel {
                 }
                 None => decoded.payload.to_vec(),
             };
-            if payload.len() == 17 && payload[..8] == PATH_CONTROL_PREFIX {
-                let nonce = u64::from_be_bytes(
-                    payload[9..17]
-                        .try_into()
-                        .map_err(|_| IdentityError::InvalidFrame)?,
-                );
+            if payload.len() >= 9 && payload[..8] == PATH_CONTROL_PREFIX {
                 match payload[8] {
                     PATH_PROMOTION_OFFER => {
+                        // Older peers send the 17-byte nonce-only offer. Ignore it without
+                        // acknowledging or closing the reliable channel so mixed-version
+                        // sessions remain usable while direct promotion stays disabled.
+                        if payload.len() == 17 {
+                            return Ok(Vec::new());
+                        }
+                        if payload.len() != 49 {
+                            return Err(IdentityError::InvalidFrame);
+                        }
+                        let nonce = u64::from_be_bytes(
+                            payload[9..17]
+                                .try_into()
+                                .map_err(|_| IdentityError::InvalidFrame)?,
+                        );
+                        let binding: [u8; 32] = payload[17..]
+                            .try_into()
+                            .map_err(|_| IdentityError::InvalidFrame)?;
                         let ack_now = if let Ok(mut state) = self.path_promotion.lock() {
                             let now = Instant::now();
-                            state.pending_remote_offers.retain(|(_, received_at)| {
+                            state.pending_remote_offers.retain(|(_, _, received_at)| {
                                 now.duration_since(*received_at) < PATH_PROMOTION_OFFER_TTL
                             });
-                            if state.local_ready {
+                            if state.local_ready && state.local_binding == Some(binding) {
                                 true
+                            } else if state.local_ready {
+                                false
                             } else {
                                 if state.pending_remote_offers.len() >= 8 {
                                     state.pending_remote_offers.pop_front();
                                 }
-                                state.pending_remote_offers.push_back((nonce, now));
+                                state.pending_remote_offers.push_back((nonce, binding, now));
                                 false
                             }
                         } else {
@@ -1026,6 +1135,14 @@ impl PeerChannel {
                         }
                     }
                     PATH_PROMOTION_ACK => {
+                        if payload.len() != 17 {
+                            return Err(IdentityError::InvalidFrame);
+                        }
+                        let nonce = u64::from_be_bytes(
+                            payload[9..17]
+                                .try_into()
+                                .map_err(|_| IdentityError::InvalidFrame)?,
+                        );
                         if let Ok(mut state) = self.path_promotion.lock() {
                             if state.acknowledged_offers.len() >= 8 {
                                 state.acknowledged_offers.clear();
@@ -1033,6 +1150,25 @@ impl PeerChannel {
                             state.acknowledged_offers.insert(nonce);
                         }
                         self.path_promotion_changed.notify_one();
+                    }
+                    PATH_CANDIDATE_BINDING_OFFER => {
+                        if payload.len() != 25 {
+                            return Err(IdentityError::InvalidFrame);
+                        }
+                        let nonce: [u8; 16] = payload[9..]
+                            .try_into()
+                            .map_err(|_| IdentityError::InvalidFrame)?;
+                        if let Ok(mut state) = self.path_promotion.lock() {
+                            let now = Instant::now();
+                            state.pending_candidate_offers.retain(|(_, received_at)| {
+                                now.duration_since(*received_at) < PATH_CANDIDATE_BINDING_TTL
+                            });
+                            if state.pending_candidate_offers.len() >= 8 {
+                                state.pending_candidate_offers.pop_front();
+                            }
+                            state.pending_candidate_offers.push_back((nonce, now));
+                        }
+                        self.candidate_binding_changed.notify_one();
                     }
                     _ => return Err(IdentityError::InvalidFrame),
                 }
@@ -2084,6 +2220,7 @@ fn new_channel(connection: Connection, network_id: &str) -> PeerChannel {
         health: Mutex::new(PeerHealth::default()),
         path_promotion: Mutex::new(PathPromotionState::default()),
         path_promotion_changed: tokio::sync::Notify::new(),
+        candidate_binding_changed: tokio::sync::Notify::new(),
         ice_consent: None,
         _relay_endpoint: None,
     }
@@ -2114,6 +2251,7 @@ fn new_tcp_channel(
         health: Mutex::new(PeerHealth::default()),
         path_promotion: Mutex::new(PathPromotionState::default()),
         path_promotion_changed: tokio::sync::Notify::new(),
+        candidate_binding_changed: tokio::sync::Notify::new(),
         ice_consent: None,
         _relay_endpoint: None,
     }
@@ -3018,14 +3156,31 @@ mod tests {
         let (accepted, connected) = tokio::join!(accept, connect);
         let channel_a = std::sync::Arc::new(connected.unwrap());
         let channel_b = std::sync::Arc::new(accepted.unwrap().1);
+        let candidate_listener =
+            peer_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await
+                .unwrap();
+        let candidate_accept =
+            accept_tcp_peer_any(&candidate_listener, "path-promotion", &b, &allowed);
+        let candidate_connect = connect_tcp_peer(
+            candidate_listener.local_addr().unwrap(),
+            "path-promotion",
+            &a,
+            &b_id,
+            b.public_key(),
+        );
+        let (candidate_accepted, candidate_connected) =
+            tokio::join!(candidate_accept, candidate_connect);
+        let candidate_a = candidate_connected.unwrap();
+        let candidate_b = candidate_accepted.unwrap().1;
         let reader_a = std::sync::Arc::clone(&channel_a);
         let reader_b = std::sync::Arc::clone(&channel_b);
         let task_a = tokio::spawn(async move { while reader_a.recv_packet().await.is_ok() {} });
         let task_b = tokio::spawn(async move { while reader_b.recv_packet().await.is_ok() {} });
         let (ready_a, ready_b) = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::join!(
-                channel_a.negotiate_direct_path_promotion(Duration::from_secs(1)),
-                channel_b.negotiate_direct_path_promotion(Duration::from_secs(1))
+                channel_a.negotiate_direct_path_promotion(&candidate_a, Duration::from_secs(1)),
+                channel_b.negotiate_direct_path_promotion(&candidate_b, Duration::from_secs(1))
             )
         })
         .await
@@ -3036,6 +3191,115 @@ mod tests {
         );
         task_a.abort();
         task_b.abort();
+        candidate_a.close_async().await;
+        candidate_b.close_async().await;
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_path_promotion_rejects_different_candidate_channels() {
+        async fn tcp_pair(a: &Identity, b: &Identity, network: &str) -> (PeerChannel, PeerChannel) {
+            let listener = peer_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await
+                .unwrap();
+            let allowed = vec![(a.device_id(), a.public_key())];
+            let accept = accept_tcp_peer_any(&listener, network, b, &allowed);
+            let peer_id = b.device_id();
+            let connect = connect_tcp_peer(
+                listener.local_addr().unwrap(),
+                network,
+                a,
+                &peer_id,
+                b.public_key(),
+            );
+            let (accepted, connected) = tokio::join!(accept, connect);
+            (connected.unwrap(), accepted.unwrap().1)
+        }
+
+        let temp = std::env::temp_dir().join(format!(
+            "mini-tunnel-path-promotion-mismatch-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let a = Identity::load_or_create_at(temp.join("a/device.key")).unwrap();
+        let b = Identity::load_or_create_at(temp.join("b/device.key")).unwrap();
+        let (active_a, active_b) = tcp_pair(&a, &b, "path-promotion-mismatch").await;
+        let (candidate_a, unselected_b) = tcp_pair(&a, &b, "path-promotion-mismatch").await;
+        let (unselected_a, candidate_b) = tcp_pair(&a, &b, "path-promotion-mismatch").await;
+
+        let mut legacy_offer = [0_u8; 17];
+        legacy_offer[..8].copy_from_slice(&PATH_CONTROL_PREFIX);
+        legacy_offer[8] = PATH_PROMOTION_OFFER;
+        active_a.send_packet(&legacy_offer).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), active_b.recv_packet())
+                .await
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        active_a
+            .send_packet(b"reliable path remains open")
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), active_b.recv_packet())
+                .await
+                .unwrap()
+                .unwrap(),
+            b"reliable path remains open"
+        );
+
+        let active_reader_a = std::sync::Arc::new(active_a);
+        let active_reader_b = std::sync::Arc::new(active_b);
+        let reader_a = std::sync::Arc::clone(&active_reader_a);
+        let reader_b = std::sync::Arc::clone(&active_reader_b);
+        let active_task_a =
+            tokio::spawn(async move { while reader_a.recv_packet().await.is_ok() {} });
+        let active_task_b =
+            tokio::spawn(async move { while reader_b.recv_packet().await.is_ok() {} });
+        let read_unselected_b = std::sync::Arc::new(unselected_b);
+        let read_unselected_a = std::sync::Arc::new(unselected_a);
+        let reader_unselected_b = std::sync::Arc::clone(&read_unselected_b);
+        let reader_unselected_a = std::sync::Arc::clone(&read_unselected_a);
+        let unselected_task_b =
+            tokio::spawn(async move { while reader_unselected_b.recv_packet().await.is_ok() {} });
+        let unselected_task_a =
+            tokio::spawn(async move { while reader_unselected_a.recv_packet().await.is_ok() {} });
+
+        let (ready_a, ready_b) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                active_reader_a
+                    .negotiate_direct_path_promotion(&candidate_a, Duration::from_millis(100)),
+                active_reader_b
+                    .negotiate_direct_path_promotion(&candidate_b, Duration::from_millis(100))
+            )
+        })
+        .await
+        .expect("mismatched candidate binding stays bounded");
+        assert!(!ready_a && !ready_b);
+
+        let (ready_a, ready_b) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                active_reader_a
+                    .negotiate_path_promotion_with_binding([0x11; 32], Duration::from_millis(100)),
+                active_reader_b
+                    .negotiate_path_promotion_with_binding([0x22; 32], Duration::from_millis(100))
+            )
+        })
+        .await
+        .expect("mismatched promotion identities stay bounded");
+        assert!(!ready_a && !ready_b);
+
+        active_task_a.abort();
+        active_task_b.abort();
+        unselected_task_a.abort();
+        unselected_task_b.abort();
+        candidate_a.close_async().await;
+        candidate_b.close_async().await;
+        read_unselected_a.close_async().await;
+        read_unselected_b.close_async().await;
+        active_reader_a.close_async().await;
+        active_reader_b.close_async().await;
         fs::remove_dir_all(temp).unwrap();
     }
 
