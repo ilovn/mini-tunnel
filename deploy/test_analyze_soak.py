@@ -283,6 +283,20 @@ class AnalyzeSoakTests(unittest.TestCase):
         self.assertEqual(report["relay_metrics"]["handshake_failures_increase"], 1)
         self.assertIn("relay_handshake_failures", report["failures"])
 
+    def test_relay_metrics_error_fails_when_collector_configured_the_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "relay-metrics-error.jsonl"
+            row_with_error = row(1, 0, probe={"sent": 5, "received": 5})
+            row_with_error["relay_error"] = "http_unavailable"
+            write_jsonl(
+                path,
+                [row_with_error, {"event": "monitor_stopped", "elapsed_seconds": 1}],
+            )
+            report = self.analyze(path, min_probes=1)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["relay_metrics_errors"], 1)
+        self.assertIn("relay_metrics_errors", report["failures"])
+
     def test_reports_consecutive_offline_intervals_without_peer_ids(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "offline-intervals.jsonl"

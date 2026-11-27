@@ -4,6 +4,44 @@
 measurements and stable failure codes; it does not print raw error strings, peer
 addresses, tokens, or record contents.
 
+## Collect a run
+
+`soak_monitor.py` is the Linux collector for a peer and its optional local Relay. Run it as
+the peer service account so it can inspect the peer process under `/proc`; the status and
+metrics listeners must remain loopback-only. The monitor accepts only loopback HTTP URLs
+and RFC1918/ULA overlay probe destinations. It writes a private, no-follow JSONL file
+(mode `0600`); it refuses to overwrite or append to an existing path so sample sequence
+numbers cannot silently restart in the middle of a run. HMAC-anonymizes peer IDs with an
+in-memory per-run salt, and stores only
+allowlisted status fields, parsed ping counts, process resource counts, and selected Relay
+metrics. Raw HTTP responses, command output, endpoint URLs, and error details are never
+written. Collection failures become stable error codes in the sample and sampling continues.
+
+For one Linux `systemd` peer and its local Relay, start the 12-hour collector with:
+
+```sh
+sudo -u mini-tunnel python3 deploy/soak_monitor.py \
+  --side gz \
+  --status-url http://127.0.0.1:42003/status \
+  --systemd-unit mini-tunnel-peer@office.service \
+  --probe-destination 10.248.0.2 \
+  --relay-metrics-url http://127.0.0.1:42002/metrics \
+  --sample-interval-seconds 10 \
+  --probe-interval-seconds 300 \
+  --probe-count 5 \
+  --duration-seconds 43200 \
+  --output /var/lib/mini-tunnel/soak-office.jsonl
+```
+
+Choose the peer's actual status port, local Relay metrics port (omit `--relay-metrics-url`
+if none), and a remote overlay address. Keep the JSONL private because it contains path,
+health, and resource measurements. `Ctrl-C` or `SIGTERM` appends a `monitor_stopped` record;
+without that marker the analyzer derives duration from sample timestamps. `--samples` can
+bound a short collection for a smoke check.
+
+Before starting a long soak, verify that the output is being updated and run a short
+collection through the analyzer. Do not infer long-run stability from a short smoke run.
+
 For a 12-hour run sampled every 10 seconds, with five-packet probes every five minutes:
 
 ```sh
@@ -13,19 +51,19 @@ python3 deploy/analyze_soak.py \
   --sample-interval-seconds 10 \
   --max-sample-gap-seconds 15 \
   --probe-interval-seconds 300 \
-  --probe-jitter-seconds 0 \
+  --probe-jitter-seconds 10 \
   --max-probe-loss-percent 0 \
   --minimum-duration-seconds 43200 \
   --minimum-probe-rounds 144
 ```
 
-Set the jitter to one sample interval when auditing logs from a monitor that triggers
-work only from its periodic sampling loop. Use zero when the monitor schedules probes
-against a fixed cadence. For older monitor runs that rebase the next probe deadline
+Set the jitter to one sample interval for `soak_monitor.py`; probe work is picked up on
+the next sampler tick after its fixed deadline. Use zero only when another collector
+records the actual probe time independently of the status sampling loop. For older monitor runs that rebase the next probe deadline
 on each sample, use a 10-second jitter allowance and a minimum of 140 rounds for a
-12-hour run. The run fails on offline peer samples, status errors,
-malformed records, sample gaps, missing scheduled probes, invalid probe records, or
-packet loss above the configured threshold. `failed_probe_rounds` counts invalid probe
+12-hour run. The run fails on offline peer samples, status errors, configured Relay
+metrics errors, malformed records, sample gaps, missing scheduled probes, invalid probe
+records, or packet loss above the configured threshold. `failed_probe_rounds` counts invalid probe
 records (missing, non-finite, or inconsistent sent/received counts); `probe_loss_rounds`
 reports valid probe rounds that lost one or more packets. The configured packet-loss
 threshold controls whether those valid losses fail the run, and defaults to strict zero

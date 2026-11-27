@@ -15,6 +15,11 @@
       "name": "workspace-clippy",
       "argv": ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"],
       "timeout_seconds": 900
+    },
+    {
+      "name": "deploy-python-tests",
+      "argv": ["python3", "-m", "unittest", "discover", "-s", "deploy"],
+      "timeout_seconds": 300
     }
   ],
   "loop": {

@@ -117,7 +117,10 @@ def analyze_file(
     missing_process_samples = 0
     relay_values: dict[str, list[float]] = defaultdict(list)
     relay_sample_count = 0
+    relay_metrics_errors = 0
     for timestamp, record in timestamps:
+        if record.get("relay_error"):
+            relay_metrics_errors += 1
         status_error = bool(record.get("status_error"))
         if status_error:
             status_errors += 1
@@ -322,6 +325,8 @@ def analyze_file(
         failures.append("status_errors")
     if missing_process_samples:
         failures.append("missing_process_samples")
+    if relay_metrics_errors:
+        failures.append("relay_metrics_errors")
     if relay_handshake_failure_increase > 0:
         failures.append("relay_handshake_failures")
     if offline_peers:
@@ -361,6 +366,7 @@ def analyze_file(
         "invalid_timestamps": invalid_timestamps,
         "status_errors": status_errors,
         "missing_process_samples": missing_process_samples,
+        "relay_metrics_errors": relay_metrics_errors,
         "offline_peer_samples": offline_peers,
         "sample_gaps": gap_count,
         "max_sample_gap_seconds": round(max_gap, 3),
