@@ -2,6 +2,12 @@
 
 Status: **public NAT/QoS matrix incomplete**. The loopback ICE mapping proxy verifies packet rewriting and session behavior, but it does not establish interoperability across public NATs. The VPS, domestic NAT, Windows, and cross-border runs below are individual topology samples; they do not complete the broader NAT/QoS matrix.
 
+### Bounded direct-recovery dial on domestic NAT (2026-11-27)
+
+- Used the attested Linux x86_64 artifact for `6bbffe4` on Guangzhou and the domestic NAT Ubuntu peer. A targeted UDP drop moved both peers to Relay/TLS; bidirectional overlay probes passed 10/10 with 0% loss while direct recovery dialing was blocked.
+- Guangzhou's stalled outbound recovery dial was canceled at 12.000 seconds. Further attempts were bounded and retried while the active Relay/TLS path remained available. After removing the drop, both peers passed authenticated 31-second probation and converged on QUIC/UDP; one initial promoted channel was rejected by peer path election, then the retry passed. The final direct sample remained healthy for over two minutes; 20/20 overlay pings in each direction had 0% loss and roughly 10 ms average RTT.
+- Both temporary members were revoked. Test services, routes and firewall state were removed; the two original default routes and Guangzhou's production Relay listeners were verified intact. This confirms the recovery dial bound and eventual direct recovery on this topology, not a recovery-time SLA or broad NAT/QoS interoperability. See the [full report](testing/direct-recovery-dial-timeout-domestic-nat-2026-11.md).
+
 ### 15-second synchronized direct recovery on domestic NAT (2026-11-27)
 
 - From attested release-staging artifacts for `c7163a5`, Guangzhou and the domestic NAT peer passed direct UDP baseline probes, fell back to TCP Relay under a narrowly scoped UDP drop, and recovered direct UDP after removing the rule. Both directions retained 0% overlay ping loss on Relay and after recovery.
