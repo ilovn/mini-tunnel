@@ -351,6 +351,15 @@ jobs:
           & $testExecutable --exact tun_device::tests::privileged_windows_wintun_routes_packets_and_cleans_up --ignored --nocapture
           if ($LASTEXITCODE -ne 0) { throw 'Privileged Windows Wintun runtime test failed' }
 
+          cargo +stable build --locked -p mini-tunnel --bin mini-tunnel
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to build mini-tunnel for native SCM integration' }
+          $cli = Join-Path $env:GITHUB_WORKSPACE 'target\debug\mini-tunnel.exe'
+          if (-not (Test-Path $cli)) { throw "Windows mini-tunnel binary missing: $cli" }
+          $scmTest = Join-Path $env:GITHUB_WORKSPACE 'deploy\windows\test-scm-lifecycle.ps1'
+          $powershell = (Get-Command pwsh.exe).Source
+          & $powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $scmTest -BinaryPath $cli -WintunDllPath $dll
+          if ($LASTEXITCODE -ne 0) { throw 'Native Windows SCM lifecycle integration failed' }
+
       - name: Run privileged macOS utun packet round trip
         if: runner.os == 'macOS'
         run: |
