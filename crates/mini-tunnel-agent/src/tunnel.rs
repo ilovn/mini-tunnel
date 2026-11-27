@@ -28,6 +28,7 @@ const HEALTH_PROBE_INTERVAL: Duration = Duration::from_millis(400);
 const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DIRECT_PROBE_HANDOFF_GRACE: Duration = Duration::from_secs(2);
 const DIRECT_PROBE_RENDEZVOUS_INTERVAL: Duration = Duration::from_secs(60);
+pub const DEFAULT_DIRECT_RECOVERY_PROBE_INTERVAL: Duration = Duration::from_secs(15);
 
 fn mesh_event_queue_capacity(peer_count: usize) -> usize {
     peer_count
@@ -3644,6 +3645,12 @@ mod tests {
     fn mesh_uses_one_probe_cadence_for_all_direct_peers() {
         assert_eq!(
             common_probe_rendezvous_interval(
+                [Some(DEFAULT_DIRECT_RECOVERY_PROBE_INTERVAL)].into_iter()
+            ),
+            DEFAULT_DIRECT_RECOVERY_PROBE_INTERVAL
+        );
+        assert_eq!(
+            common_probe_rendezvous_interval(
                 [
                     Some(Duration::from_secs(240)),
                     None,
@@ -3657,6 +3664,27 @@ mod tests {
             common_probe_rendezvous_interval([Some(Duration::ZERO)].into_iter()),
             Duration::from_millis(1)
         );
+    }
+
+    #[test]
+    fn default_recovery_probes_join_the_next_shared_fifteen_second_slot() {
+        let period = DEFAULT_DIRECT_RECOVERY_PROBE_INTERVAL;
+        let failures = [
+            UNIX_EPOCH + Duration::from_millis(1_234),
+            UNIX_EPOCH + Duration::from_millis(14_999),
+            UNIX_EPOCH + Duration::from_millis(15_001),
+        ];
+        let slots: Vec<_> = failures
+            .into_iter()
+            .map(|failure| failure + next_direct_probe_rendezvous_delay(failure, period))
+            .collect();
+
+        assert_eq!(slots[0], UNIX_EPOCH + Duration::from_secs(15));
+        assert_eq!(slots[1], UNIX_EPOCH + Duration::from_secs(15));
+        assert_eq!(slots[2], UNIX_EPOCH + Duration::from_secs(30));
+        for (failure, slot) in failures.into_iter().zip(slots) {
+            assert!(slot.duration_since(failure).unwrap() <= period);
+        }
     }
 
     #[tokio::test]

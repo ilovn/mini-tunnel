@@ -2791,7 +2791,7 @@ async fn run_peer_tunnel(
             channel: std::sync::Arc::clone(&channel),
             connector,
             probe: Some(probe),
-            probe_cooldown: Duration::from_secs(60),
+            probe_cooldown: mini_tunnel_agent::tunnel::DEFAULT_DIRECT_RECOVERY_PROBE_INTERVAL,
             relay_standby: false,
         }],
         shutdown_rx,
@@ -4460,7 +4460,7 @@ fn spawn_mesh_membership_refresh_with_period(
                                             channel: std::sync::Arc::new(channel),
                                             connector,
                                             probe,
-                                            probe_cooldown: Duration::from_secs(60),
+                                            probe_cooldown: mini_tunnel_agent::tunnel::DEFAULT_DIRECT_RECOVERY_PROBE_INTERVAL,
                                             relay_standby,
                                         },
                                     );
@@ -5119,7 +5119,7 @@ async fn run_peer_mesh(
             channel: std::sync::Arc::new(channel),
             connector,
             probe: Some(probe),
-            probe_cooldown: Duration::from_secs(60),
+            probe_cooldown: mini_tunnel_agent::tunnel::DEFAULT_DIRECT_RECOVERY_PROBE_INTERVAL,
             relay_standby,
         });
     }
