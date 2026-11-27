@@ -116,6 +116,29 @@ async fn postgres_state_is_shared_between_coordinator_processes() {
         false
     };
 
+    drop(first);
+    let restarted_address = unused_loopback_address();
+    let restarted = CoordinatorProcess::start(restarted_address, &database_url);
+    wait_until_healthy(&client, restarted_address).await;
+    let restarted_url = format!("http://{restarted_address}");
+    let restarted_invite_result = client
+        .post(format!("{restarted_url}/v1/networks/{network_id}/invites"))
+        .json(&CreateInviteRequest {
+            admin_token: created.admin_token.clone(),
+        })
+        .send()
+        .await
+        .expect("create invite through restarted Coordinator");
+    let restart_preserved_state = if restarted_invite_result.status().is_success() {
+        let invite: CreateInviteResponse = restarted_invite_result
+            .json()
+            .await
+            .expect("decode invite response from restarted Coordinator");
+        !invite.invite_token.is_empty() && invite.expires_in_seconds > 0
+    } else {
+        false
+    };
+
     let deleted = client
         .post(format!("{second_url}/v1/networks/{network_id}/delete"))
         .json(&DeleteNetworkRequest {
@@ -142,7 +165,11 @@ async fn postgres_state_is_shared_between_coordinator_processes() {
         invite_is_shared,
         "second Coordinator must read the network created by the first process"
     );
+    assert!(
+        restart_preserved_state,
+        "a fresh Coordinator process must read the network persisted by its predecessor"
+    );
 
+    drop(restarted);
     drop(second);
-    drop(first);
 }
