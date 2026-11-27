@@ -5549,7 +5549,7 @@ mod tests {
         let remaining_candidates = vec!["198.51.100.20:43210".to_owned()];
         let remaining_ice = IceCredentials {
             ufrag: "remainingPeerUfrag".to_owned(),
-            password: "remaining-peer-ice-password-123456".to_owned(),
+            password: "remainingPeerIcePassword123456".to_owned(),
             generation: 3,
         };
         let remaining_signature = second_key.sign(&candidate_signing_bytes_with_ice(
