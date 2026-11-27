@@ -1034,6 +1034,11 @@ After each phase, stop both clients cleanly, verify their peer routes are gone, 
 
 ### Domestic NAT recovery-probe backoff follow-up (2026-11-27)
 
-- The current-main attested staging build verified direct `QUIC/UDP` baseline, exact UDP loss causing `Relay/TLS` fallback, and bidirectional overlay traffic over Relay. After removing loss, both peers stayed online over Relay, but direct recovery did not complete.
-- The field run exposed that independent per-peer retry cooldowns can put ICE probes in different rendezvous slots. Guangzhou's attempt timed out while waiting for the NAT peer; the peers remained on Relay/TLS with 0% loss. A follow-up change now schedules all direct probes in one mesh on a shared UTC cadence. This source change still requires a fresh attested field run; the recorded run does **not** pass direct recovery. See [the detailed field report](testing/direct-recovery-backoff-domestic-nat-2026-11.md).
+- The initial `3d3a46e` attested staging build verified direct `QUIC/UDP` baseline, exact UDP loss causing `Relay/TLS` fallback, and bidirectional overlay traffic over Relay. After removing loss, both peers stayed online over Relay, but direct recovery did not complete.
+- That field run exposed that independent per-peer retry cooldowns can put ICE probes in different rendezvous slots. Guangzhou's attempt timed out while waiting for the NAT peer; the peers remained on Relay/TLS with 0% loss. The initial run therefore does **not** pass direct recovery. See [the detailed field report](testing/direct-recovery-backoff-domestic-nat-2026-11.md); the synchronized fix and successful retest are recorded below.
 - All test memberships and temporary services, routes, firewall rules, timers, and files were removed. The Guangzhou production Relay ports and both default routes remained unchanged.
+
+### Synchronized direct-recovery retest (2026-11-27)
+
+- The `a5617cf` fix passed a new checksum- and Sigstore-verified Linux x86_64 staging artifact test on Guangzhou and domestic NAT. After scoped UDP loss was removed, both endpoints re-nominated direct ICE candidates on the shared UTC cadence, passed authenticated UDP probation, and returned to `QUIC/UDP`. Bidirectional pings passed 20/20 with 0% loss.
+- Both memberships were revoked and addresses released. Temporary test services, routes, firewall rule, timers, binaries, and files were removed. The Guangzhou production Relay PID/ports and both default routes remained unchanged. See [the synchronized recovery test report](testing/direct-recovery-synchronized-domestic-nat-2026-11.md).
