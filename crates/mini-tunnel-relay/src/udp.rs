@@ -174,6 +174,54 @@ struct AcceptedProof {
     packet: Vec<u8>,
 }
 
+enum AcceptedProofRetry {
+    NotAccepted,
+    WaitingForPeer,
+    Ready,
+    Rejected(DropReason),
+}
+
+fn accepted_proof_retry(
+    state: &State,
+    ticket_id: &[u8; 16],
+    packet: &[u8],
+    claims: &RelayTicketClaims,
+    source: SocketAddr,
+) -> AcceptedProofRetry {
+    let Some(existing) = state.accepted_proofs.get(ticket_id) else {
+        return AcceptedProofRetry::NotAccepted;
+    };
+    if existing.packet.as_slice() != packet {
+        return AcceptedProofRetry::Rejected(DropReason::Authentication);
+    }
+    let source_index = if claims.source_device_id < claims.target_device_id {
+        0
+    } else {
+        1
+    };
+    let paired = state
+        .sessions
+        .get(&claims.session_id)
+        .is_some_and(|session| {
+            session.endpoints.iter().all(Option::is_some)
+                && session.endpoints.contains(&Some(source))
+        });
+    let waiting_for_peer = state
+        .sessions
+        .get(&claims.session_id)
+        .is_some_and(|session| {
+            session.endpoints[source_index] == Some(source)
+                && session.endpoints[1 - source_index].is_none()
+        });
+    if waiting_for_peer {
+        AcceptedProofRetry::WaitingForPeer
+    } else if paired {
+        AcceptedProofRetry::Ready
+    } else {
+        AcceptedProofRetry::Rejected(DropReason::Session)
+    }
+}
+
 struct AuthRateLimit {
     tokens_milli: u32,
     last_refill: tokio::time::Instant,
@@ -461,6 +509,20 @@ impl UdpRelayServer {
         source: SocketAddr,
         packet: &[u8],
     ) -> io::Result<bool> {
+        self.handle_proof_with_verifier(socket, source, packet, verify_udp_relay_proof)
+            .await
+    }
+
+    async fn handle_proof_with_verifier<F>(
+        &self,
+        socket: &UdpSocket,
+        source: SocketAddr,
+        packet: &[u8],
+        verify_proof: F,
+    ) -> io::Result<bool>
+    where
+        F: FnOnce(&str, &[u8; 32], &[u8; 32], &[u8; 64]) -> bool + Send + 'static,
+    {
         if packet.len() < 8 + 2 + 1 + 32 + 64 || packet.get(..8) != Some(PROOF.as_slice()) {
             return Ok(self.reject(DropReason::Malformed));
         }
@@ -475,112 +537,74 @@ impl UdpRelayServer {
         let Some(ticket) = ticket else {
             return Ok(self.reject(DropReason::Malformed));
         };
-        let mut state = self.inner.state.lock().await;
         let now_ms =
             unix_time_ms().ok_or_else(|| io::Error::other("system clock is before epoch"))?;
-        let now = tokio::time::Instant::now();
-        prune_expired_state(&mut state, now, now_ms);
-        let ticket_id = match verify_relay_ticket(&self.inner.config.ticket_key, ticket, now_ms)
-            .or_else(|error| {
-                self.inner
-                    .config
-                    .previous_ticket_key
-                    .as_ref()
-                    .ok_or(error)
-                    .and_then(|key| verify_relay_ticket(key, ticket, now_ms))
-            }) {
-            Ok(claims) => claims.ticket_id,
+        let claims = match verify_udp_relay_ticket(&self.inner.config, ticket, now_ms) {
+            Ok(claims) => claims,
             Err(_) => return Ok(self.reject(DropReason::Authentication)),
         };
-        if let Some(existing) = state.accepted_proofs.get(&ticket_id) {
-            let claims = match verify_relay_ticket(&self.inner.config.ticket_key, ticket, now_ms)
-                .or_else(|error| {
-                    self.inner
-                        .config
-                        .previous_ticket_key
-                        .as_ref()
-                        .ok_or(error)
-                        .and_then(|key| verify_relay_ticket(key, ticket, now_ms))
-                }) {
-                Ok(claims) => claims,
-                Err(_) => return Ok(self.reject(DropReason::Authentication)),
-            };
-            if existing.packet.as_slice() != packet {
-                return Ok(self.reject(DropReason::Authentication));
-            }
-            let source_index = if claims.source_device_id < claims.target_device_id {
-                0
-            } else {
-                1
-            };
-            let paired = state
-                .sessions
-                .get(&claims.session_id)
-                .is_some_and(|session| {
-                    session.endpoints.iter().all(Option::is_some)
-                        && session.endpoints.contains(&Some(source))
-                });
-            let waiting_for_peer = state
-                .sessions
-                .get(&claims.session_id)
-                .is_some_and(|session| {
-                    session.endpoints[source_index] == Some(source)
-                        && session.endpoints[1 - source_index].is_none()
-                });
-            if waiting_for_peer {
-                return Ok(true);
-            }
-            if !paired {
-                return Ok(self.reject(DropReason::Session));
-            }
-            drop(state);
-            let mut response = Vec::with_capacity(24);
-            response.extend_from_slice(READY);
-            response.extend_from_slice(&claims.session_id);
-            socket.send_to(&response, source).await?;
-            return Ok(true);
-        }
-        let Some(pending) = state.pending.get(&source).cloned() else {
-            return Ok(self.reject(DropReason::Authentication));
-        };
+        let ticket_id = claims.ticket_id;
         let public_key: [u8; 32] = packet[10 + ticket_length..10 + ticket_length + 32]
             .try_into()
             .map_err(|_| io::Error::other("invalid public key length"))?;
         let signature: [u8; 64] = packet[10 + ticket_length + 32..]
             .try_into()
             .map_err(|_| io::Error::other("invalid signature length"))?;
+        let mut state = self.inner.state.lock().await;
+        let now = tokio::time::Instant::now();
+        prune_expired_state(&mut state, now, now_ms);
+        match accepted_proof_retry(&state, &ticket_id, packet, &claims, source) {
+            AcceptedProofRetry::NotAccepted => {}
+            AcceptedProofRetry::WaitingForPeer => return Ok(true),
+            AcceptedProofRetry::Ready => {
+                drop(state);
+                return send_udp_relay_ready(socket, source, claims.session_id).await;
+            }
+            AcceptedProofRetry::Rejected(reason) => return Ok(self.reject(reason)),
+        }
+        let Some(pending) = state.pending.get(&source).cloned() else {
+            return Ok(self.reject(DropReason::Authentication));
+        };
         if pending.expires_at <= tokio::time::Instant::now()
             || public_key != pending.public_key
-            || state.used_tickets.contains_key(&pending.claims.ticket_id)
-            || !matches!(verify_relay_ticket(&self.inner.config.ticket_key, ticket, now_ms)
-                .or_else(|error| {
-                    self.inner
-                        .config
-                        .previous_ticket_key
-                        .as_ref()
-                        .ok_or(error)
-                        .and_then(|key| verify_relay_ticket(key, ticket, now_ms))
-                }), Ok(ref claims) if claims == &pending.claims)
+            || state.used_tickets.contains_key(&ticket_id)
+            || claims != pending.claims
         {
             return Ok(self.reject(DropReason::Authentication));
         }
-        let verifying_key = match VerifyingKey::from_bytes(&public_key) {
-            Ok(key) => key,
-            Err(_) => return Ok(self.reject(DropReason::Authentication)),
-        };
-        if verifying_key
-            .verify_strict(
-                &relay_auth_signing_bytes(ticket, &pending.challenge, &public_key),
-                &Signature::from_bytes(&signature),
-            )
-            .is_err()
+        drop(state);
+        if !verify_proof(ticket, &pending.challenge, &public_key, &signature) {
+            return Ok(self.reject(DropReason::Authentication));
+        }
+
+        let now_ms =
+            unix_time_ms().ok_or_else(|| io::Error::other("system clock is before epoch"))?;
+        let mut state = self.inner.state.lock().await;
+        let now = tokio::time::Instant::now();
+        prune_expired_state(&mut state, now, now_ms);
+        match accepted_proof_retry(&state, &ticket_id, packet, &claims, source) {
+            AcceptedProofRetry::NotAccepted => {}
+            AcceptedProofRetry::WaitingForPeer => return Ok(true),
+            AcceptedProofRetry::Ready => {
+                drop(state);
+                return send_udp_relay_ready(socket, source, claims.session_id).await;
+            }
+            AcceptedProofRetry::Rejected(reason) => return Ok(self.reject(reason)),
+        }
+        if !state.pending.get(&source).is_some_and(|current| {
+            current.claims == pending.claims
+                && current.public_key == pending.public_key
+                && current.challenge == pending.challenge
+                && current.expires_at == pending.expires_at
+        }) || pending.expires_at <= now
+            || claims.expires_at_ms <= now_ms
+            || state.used_tickets.contains_key(&ticket_id)
         {
             return Ok(self.reject(DropReason::Authentication));
         }
         if state.used_tickets.len() >= MAX_USED_TICKETS {
             return Ok(self.reject(DropReason::Capacity));
         }
-        let claims = pending.claims;
         let session_id = claims.session_id;
         let target_index = if claims.source_device_id < claims.target_device_id {
             0
@@ -635,6 +659,49 @@ impl UdpRelayServer {
         }
         Ok(true)
     }
+}
+
+fn verify_udp_relay_ticket(
+    config: &UdpRelayConfig,
+    ticket: &str,
+    now_ms: u64,
+) -> Result<RelayTicketClaims, mini_tunnel_protocol::RelayTicketError> {
+    verify_relay_ticket(&config.ticket_key, ticket, now_ms).or_else(|error| {
+        config
+            .previous_ticket_key
+            .as_ref()
+            .ok_or(error)
+            .and_then(|key| verify_relay_ticket(key, ticket, now_ms))
+    })
+}
+
+fn verify_udp_relay_proof(
+    ticket: &str,
+    challenge: &[u8; 32],
+    public_key: &[u8; 32],
+    signature: &[u8; 64],
+) -> bool {
+    let Ok(verifying_key) = VerifyingKey::from_bytes(public_key) else {
+        return false;
+    };
+    verifying_key
+        .verify_strict(
+            &relay_auth_signing_bytes(ticket, challenge, public_key),
+            &Signature::from_bytes(signature),
+        )
+        .is_ok()
+}
+
+async fn send_udp_relay_ready(
+    socket: &UdpSocket,
+    destination: SocketAddr,
+    session_id: [u8; 16],
+) -> io::Result<bool> {
+    let mut response = Vec::with_capacity(24);
+    response.extend_from_slice(READY);
+    response.extend_from_slice(&session_id);
+    socket.send_to(&response, destination).await?;
+    Ok(true)
 }
 
 fn normalize_ip(ip: IpAddr) -> IpAddr {
@@ -1303,6 +1370,193 @@ mod tests {
 
         relay.shutdown();
         runner.await.expect("relay task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn udp_proof_signature_verification_does_not_hold_state_lock() {
+        use std::sync::Barrier;
+
+        let key = [47; 32];
+        let alice = identity(41);
+        let bob = identity(42);
+        let alice_ticket = ticket(&key, &alice, &bob, 43, 1_000);
+        let relay = UdpRelayServer::new(UdpRelayConfig::new(key));
+        let relay_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("relay socket"));
+        let alice_socket = UdpSocket::bind("127.0.0.1:0").await.expect("alice socket");
+        let source = alice_socket.local_addr().expect("alice address");
+        let hello =
+            udp_relay_hello(&alice_ticket, &alice.verifying_key().to_bytes()).expect("alice hello");
+        assert!(
+            relay
+                .handle_hello(&relay_socket, source, &hello)
+                .await
+                .expect("handle hello")
+        );
+        let mut response = [0; 64];
+        let (length, _) = timeout(
+            Duration::from_secs(1),
+            alice_socket.recv_from(&mut response),
+        )
+        .await
+        .expect("challenge timeout")
+        .expect("challenge");
+        let challenge: [u8; 32] = response[8..length].try_into().expect("challenge bytes");
+        let proof = udp_relay_proof(&alice_ticket, &challenge, &alice).expect("proof");
+        let entered = Arc::new(Barrier::new(3));
+        let release = Arc::new(Barrier::new(3));
+        let proof_tasks = (0..2)
+            .map(|_| {
+                let relay = relay.clone();
+                let relay_socket = Arc::clone(&relay_socket);
+                let proof = proof.clone();
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                tokio::spawn(async move {
+                    relay
+                        .handle_proof_with_verifier(
+                            &relay_socket,
+                            source,
+                            &proof,
+                            move |ticket, challenge, public_key, signature| {
+                                entered.wait();
+                                release.wait();
+                                verify_udp_relay_proof(ticket, challenge, public_key, signature)
+                            },
+                        )
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let entered_wait = Arc::clone(&entered);
+        tokio::task::spawn_blocking(move || entered_wait.wait())
+            .await
+            .expect("enter verifier");
+        let state_guard = timeout(Duration::from_millis(100), relay.inner.state.lock())
+            .await
+            .expect("state lock remains available during signature verification");
+        drop(state_guard);
+        let release_wait = Arc::clone(&release);
+        tokio::task::spawn_blocking(move || release_wait.wait())
+            .await
+            .expect("release verifier");
+
+        for proof_task in proof_tasks {
+            assert!(proof_task.await.expect("proof task").expect("handle proof"));
+        }
+        assert_eq!(relay.stats().await.active_sessions, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn udp_relay_revalidates_challenge_after_proof_verification() {
+        use std::sync::Barrier;
+
+        let key = [48; 32];
+        let alice = identity(51);
+        let bob = identity(52);
+        let first_ticket = ticket(&key, &alice, &bob, 53, 10_000);
+        let replacement_ticket = ticket(&key, &alice, &bob, 54, 10_000);
+        let relay = UdpRelayServer::new(UdpRelayConfig::new(key));
+        let relay_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("relay socket"));
+        let alice_socket = UdpSocket::bind("127.0.0.1:0").await.expect("alice socket");
+        let source = alice_socket.local_addr().expect("alice address");
+        let first_hello =
+            udp_relay_hello(&first_ticket, &alice.verifying_key().to_bytes()).expect("hello");
+        assert!(
+            relay
+                .handle_hello(&relay_socket, source, &first_hello)
+                .await
+                .expect("handle first hello")
+        );
+        let mut response = [0; 64];
+        let (length, _) = timeout(
+            Duration::from_secs(1),
+            alice_socket.recv_from(&mut response),
+        )
+        .await
+        .expect("first challenge timeout")
+        .expect("first challenge");
+        let first_challenge: [u8; 32] = response[8..length]
+            .try_into()
+            .expect("first challenge bytes");
+        let stale_proof =
+            udp_relay_proof(&first_ticket, &first_challenge, &alice).expect("stale proof");
+
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let stale_proof_task = {
+            let relay = relay.clone();
+            let relay_socket = Arc::clone(&relay_socket);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                relay
+                    .handle_proof_with_verifier(
+                        &relay_socket,
+                        source,
+                        &stale_proof,
+                        move |ticket, challenge, public_key, signature| {
+                            entered.wait();
+                            release.wait();
+                            verify_udp_relay_proof(ticket, challenge, public_key, signature)
+                        },
+                    )
+                    .await
+            })
+        };
+        let entered_wait = Arc::clone(&entered);
+        tokio::task::spawn_blocking(move || entered_wait.wait())
+            .await
+            .expect("enter verifier");
+
+        let replacement_hello =
+            udp_relay_hello(&replacement_ticket, &alice.verifying_key().to_bytes())
+                .expect("replacement hello");
+        assert!(
+            relay
+                .handle_hello(&alice_socket, source, &replacement_hello)
+                .await
+                .expect("handle replacement hello")
+        );
+        let (length, _) = timeout(
+            Duration::from_secs(1),
+            alice_socket.recv_from(&mut response),
+        )
+        .await
+        .expect("replacement challenge timeout")
+        .expect("replacement challenge");
+        let replacement_challenge: [u8; 32] = response[8..length]
+            .try_into()
+            .expect("replacement challenge bytes");
+        let release_wait = Arc::clone(&release);
+        tokio::task::spawn_blocking(move || release_wait.wait())
+            .await
+            .expect("release verifier");
+
+        assert!(
+            !stale_proof_task
+                .await
+                .expect("stale proof task")
+                .expect("handle stale proof")
+        );
+        let stats = relay.stats().await;
+        assert_eq!(stats.active_sessions, 0);
+        assert_eq!(stats.pending_authentications, 1);
+        assert_eq!(stats.authentication_rejections_total, 1);
+
+        let replacement_proof =
+            udp_relay_proof(&replacement_ticket, &replacement_challenge, &alice)
+                .expect("replacement proof");
+        assert!(
+            relay
+                .handle_proof(&relay_socket, source, &replacement_proof)
+                .await
+                .expect("handle replacement proof")
+        );
+        let stats = relay.stats().await;
+        assert_eq!(stats.active_sessions, 1);
+        assert_eq!(stats.pending_authentications, 0);
+        assert_eq!(stats.authentication_rejections_total, 1);
     }
 
     #[tokio::test]
