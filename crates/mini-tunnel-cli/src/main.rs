@@ -51,7 +51,10 @@ const INITIAL_ICE_SNAPSHOT_REFRESH_RETRIES: usize = 3;
 const COORDINATOR_CA_CERT_FILE_ENV: &str = "MINI_TUNNEL_COORDINATOR_CA_CERT_FILE";
 const MAX_COORDINATOR_CA_BUNDLE_BYTES: u64 = 1024 * 1024;
 const MAX_INVITE_TOKEN_FILE_BYTES: u64 = 4096;
-const ICE_PATH_PROBATION_HEALTH_INTERVAL: Duration = Duration::from_secs(10);
+// A 31-second candidate probation needs enough authenticated samples to measure the
+// configured loss percentage. Ten-second sampling yielded only three samples, where
+// one transient miss could look like >20% loss. Two-second sampling gives at least 15.
+const ICE_PATH_PROBATION_HEALTH_INTERVAL: Duration = Duration::from_secs(2);
 const ICE_INITIAL_PATH_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
 const DIRECT_PATH_PROMOTION_PROBATION: Duration = Duration::from_secs(31);
 
@@ -4706,18 +4709,27 @@ async fn validate_udp_probe_with_context(
     // Recovery from a reliable path needs more evidence than initial direct dialing:
     // several clean probes plus a probation window prevent a lucky short burst from
     // promoting a lossy UDP candidate.
-    let initial_probes = if require_ice_consent { 3 } else { 8 };
+    let initial_probes: u8 = if require_ice_consent { 3 } else { 8 };
+    let initial_probe_attempt_limit = initial_probes.saturating_add(2);
+    let bad_rtt_sample_limit = mini_tunnel_agent::tunnel::path_quality_bad_window_limit();
+    let mut rtt_probation = CandidateRttProbation::default();
+    let health_before_candidate_validation = channel.health_snapshot();
     tracing::debug!(
         peer_id = peer_id.unwrap_or("test"),
         path = channel.transport_name(),
         has_ice_consent = channel.has_ice_consent_monitor(),
         initial_probes,
+        initial_probe_attempt_limit,
         probation_ms = consent_window.as_millis() as u64,
         "starting UDP candidate authenticated health validation"
     );
-    let rtt = match channel
-        .probe_health(initial_probes, Duration::from_secs(2))
-        .await
+    let rtt = match probe_candidate_initial_health(
+        channel,
+        initial_probes,
+        initial_probe_attempt_limit,
+        peer_id,
+    )
+    .await
     {
         Ok(rtt) => rtt,
         Err(error) => {
@@ -4737,13 +4749,14 @@ async fn validate_udp_probe_with_context(
         rtt_ms = rtt.as_millis() as u64,
         "UDP candidate initial authenticated health probes passed"
     );
-    let health_before_probation = channel.health_snapshot();
-    if !mini_tunnel_agent::tunnel::path_quality_rtt_is_acceptable(rtt) {
+    if rtt_probation.observe(rtt, bad_rtt_sample_limit) {
         tracing::warn!(
             peer_id = peer_id.unwrap_or("test"),
             path = channel.transport_name(),
             stage = "initial_rtt_threshold",
             rtt_ms = rtt.as_millis() as u64,
+            bad_rtt_samples = rtt_probation.consecutive_bad_samples,
+            bad_rtt_sample_limit,
             "UDP candidate health validation failed"
         );
         return Err(mini_tunnel_agent::IdentityError::Transport(
@@ -4799,12 +4812,14 @@ async fn validate_udp_probe_with_context(
                             return Err(error);
                         }
                     };
-                    if !mini_tunnel_agent::tunnel::path_quality_rtt_is_acceptable(rtt) {
+                    if rtt_probation.observe(rtt, bad_rtt_sample_limit) {
                         tracing::warn!(
                             peer_id = peer_id.unwrap_or("test"),
                             path = channel.transport_name(),
                             stage = "ice_probation_rtt_threshold",
                             rtt_ms = rtt.as_millis() as u64,
+                            bad_rtt_samples = rtt_probation.consecutive_bad_samples,
+                            bad_rtt_sample_limit,
                             "UDP candidate health validation failed"
                         );
                         return Err(mini_tunnel_agent::IdentityError::Transport(
@@ -4815,14 +4830,14 @@ async fn validate_udp_probe_with_context(
             }
         }
         if !udp_probation_loss_is_acceptable(
-            health_before_probation,
+            health_before_candidate_validation,
             channel.health_snapshot(),
             timed_out_probe_attempts,
         ) {
             return Err(probation_loss_threshold_error(
                 channel,
                 peer_id,
-                health_before_probation,
+                health_before_candidate_validation,
                 timed_out_probe_attempts,
                 "ice_probation_loss_threshold",
             ));
@@ -4854,12 +4869,14 @@ async fn validate_udp_probe_with_context(
                             return Err(error);
                         }
                     };
-                    if !mini_tunnel_agent::tunnel::path_quality_rtt_is_acceptable(rtt) {
+                    if rtt_probation.observe(rtt, bad_rtt_sample_limit) {
                         tracing::warn!(
                             peer_id = peer_id.unwrap_or("test"),
                             path = channel.transport_name(),
                             stage = "probation_rtt_threshold",
                             rtt_ms = rtt.as_millis() as u64,
+                            bad_rtt_samples = rtt_probation.consecutive_bad_samples,
+                            bad_rtt_sample_limit,
                             "UDP candidate health validation failed"
                         );
                         return Err(mini_tunnel_agent::IdentityError::Transport(
@@ -4870,14 +4887,14 @@ async fn validate_udp_probe_with_context(
             }
         }
         if !udp_probation_loss_is_acceptable(
-            health_before_probation,
+            health_before_candidate_validation,
             channel.health_snapshot(),
             timed_out_probe_attempts,
         ) {
             return Err(probation_loss_threshold_error(
                 channel,
                 peer_id,
-                health_before_probation,
+                health_before_candidate_validation,
                 timed_out_probe_attempts,
                 "probation_loss_threshold",
             ));
@@ -4891,6 +4908,104 @@ async fn validate_udp_probe_with_context(
         "UDP candidate health validation passed"
     );
     Ok(())
+}
+
+async fn probe_candidate_initial_health(
+    channel: &mini_tunnel_agent::PeerChannel,
+    required_successes: u8,
+    attempt_limit: u8,
+    peer_id: Option<&str>,
+) -> Result<Duration, mini_tunnel_agent::IdentityError> {
+    let mut progress = CandidateInitialProbeProgress::new(required_successes, attempt_limit)?;
+    let mut maximum_rtt = Duration::ZERO;
+    loop {
+        let succeeded = match channel.probe_health(1, Duration::from_secs(2)).await {
+            Ok(rtt) => {
+                maximum_rtt = maximum_rtt.max(rtt);
+                true
+            }
+            Err(error) if is_candidate_probation_timeout(&error) => {
+                tracing::debug!(
+                    peer_id = peer_id.unwrap_or("test"),
+                    attempts = progress.attempts.saturating_add(1),
+                    attempt_limit = progress.attempt_limit,
+                    "initial UDP candidate probe timed out; retrying within the bounded sample budget"
+                );
+                false
+            }
+            Err(error) => return Err(error),
+        };
+        match progress.record(succeeded) {
+            CandidateInitialProbeState::NeedMore => {}
+            CandidateInitialProbeState::Ready => return Ok(maximum_rtt),
+            CandidateInitialProbeState::Exhausted => {
+                return Err(mini_tunnel_agent::IdentityError::CandidateProbeTimeout);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CandidateInitialProbeState {
+    NeedMore,
+    Ready,
+    Exhausted,
+}
+
+#[derive(Debug)]
+struct CandidateInitialProbeProgress {
+    required_successes: u8,
+    attempt_limit: u8,
+    attempts: u8,
+    successes: u8,
+}
+
+impl CandidateInitialProbeProgress {
+    fn new(
+        required_successes: u8,
+        attempt_limit: u8,
+    ) -> Result<Self, mini_tunnel_agent::IdentityError> {
+        if required_successes == 0 || attempt_limit < required_successes || attempt_limit > 16 {
+            return Err(mini_tunnel_agent::IdentityError::InvalidFrame);
+        }
+        Ok(Self {
+            required_successes,
+            attempt_limit,
+            attempts: 0,
+            successes: 0,
+        })
+    }
+
+    fn record(&mut self, succeeded: bool) -> CandidateInitialProbeState {
+        self.attempts = self.attempts.saturating_add(1);
+        if succeeded {
+            self.successes = self.successes.saturating_add(1);
+        }
+        if self.successes >= self.required_successes {
+            CandidateInitialProbeState::Ready
+        } else if self.attempts >= self.attempt_limit {
+            CandidateInitialProbeState::Exhausted
+        } else {
+            CandidateInitialProbeState::NeedMore
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CandidateRttProbation {
+    consecutive_bad_samples: u8,
+}
+
+impl CandidateRttProbation {
+    /// A transient outlier does not reject recovery; consecutive bad samples do.
+    fn observe(&mut self, rtt: Duration, bad_sample_limit: u8) -> bool {
+        if mini_tunnel_agent::tunnel::path_quality_rtt_is_acceptable(rtt) {
+            self.consecutive_bad_samples = 0;
+            return false;
+        }
+        self.consecutive_bad_samples = self.consecutive_bad_samples.saturating_add(1);
+        self.consecutive_bad_samples >= bad_sample_limit.max(1)
+    }
 }
 
 async fn probe_candidate_probation_once(
@@ -6746,6 +6861,15 @@ mod tests {
             },
             0,
         ));
+        assert!(udp_probation_loss_is_acceptable(
+            before,
+            mini_tunnel_agent::PeerHealthSnapshot {
+                rtt: None,
+                probes_succeeded: 30,
+                probes_missed: 1,
+            },
+            0,
+        ));
         assert!(!udp_probation_loss_is_acceptable(
             before,
             mini_tunnel_agent::PeerHealthSnapshot {
@@ -6764,6 +6888,61 @@ mod tests {
             },
             1,
         ));
+    }
+
+    #[test]
+    fn direct_recovery_probation_collects_enough_samples_for_loss_estimation() {
+        let sample_count = DIRECT_PATH_PROMOTION_PROBATION.as_secs()
+            / ICE_PATH_PROBATION_HEALTH_INTERVAL.as_secs();
+        assert!(
+            sample_count >= 15,
+            "got only {sample_count} probation samples"
+        );
+        assert!(udp_probation_loss_is_acceptable(
+            mini_tunnel_agent::PeerHealthSnapshot {
+                rtt: None,
+                probes_succeeded: 0,
+                probes_missed: 0,
+            },
+            mini_tunnel_agent::PeerHealthSnapshot {
+                rtt: None,
+                probes_succeeded: sample_count,
+                probes_missed: 1,
+            },
+            0,
+        ));
+    }
+
+    #[test]
+    fn initial_candidate_probe_budget_tolerates_isolated_misses() {
+        let mut progress = CandidateInitialProbeProgress::new(3, 5).unwrap();
+        assert_eq!(progress.record(false), CandidateInitialProbeState::NeedMore);
+        assert_eq!(progress.record(true), CandidateInitialProbeState::NeedMore);
+        assert_eq!(progress.record(true), CandidateInitialProbeState::NeedMore);
+        assert_eq!(progress.record(true), CandidateInitialProbeState::Ready);
+
+        let mut exhausted = CandidateInitialProbeProgress::new(3, 5).unwrap();
+        for _ in 0..4 {
+            assert_eq!(
+                exhausted.record(false),
+                CandidateInitialProbeState::NeedMore
+            );
+        }
+        assert_eq!(
+            exhausted.record(false),
+            CandidateInitialProbeState::Exhausted
+        );
+    }
+
+    #[test]
+    fn candidate_rtt_probation_tolerates_one_spike_and_rejects_persistent_rtt() {
+        let mut tracker = CandidateRttProbation::default();
+        let bad_sample_limit = 2;
+        assert!(!tracker.observe(Duration::from_millis(455), bad_sample_limit));
+        assert!(!tracker.observe(Duration::from_millis(40), bad_sample_limit));
+        assert_eq!(tracker.consecutive_bad_samples, 0);
+        assert!(!tracker.observe(Duration::from_millis(424), bad_sample_limit));
+        assert!(tracker.observe(Duration::from_millis(481), bad_sample_limit));
     }
 
     #[test]

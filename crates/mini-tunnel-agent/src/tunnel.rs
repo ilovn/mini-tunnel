@@ -314,6 +314,12 @@ pub fn path_quality_rtt_is_acceptable(rtt: Duration) -> bool {
     path_quality_rtt_is_acceptable_with_policy(rtt, *path_quality_policy())
 }
 
+/// Number of consecutive bad RTT samples required before a path is considered degraded.
+#[must_use]
+pub fn path_quality_bad_window_limit() -> u8 {
+    path_quality_policy().bad_windows
+}
+
 fn path_quality_rtt_is_acceptable_with_policy(rtt: Duration, policy: PathQualityPolicy) -> bool {
     rtt <= policy.max_rtt
 }
