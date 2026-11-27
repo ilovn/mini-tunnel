@@ -61,6 +61,21 @@ sudo -u mini-tunnel /usr/local/bin/mini-tunnel peer status --url http://127.0.0.
 
 The script requires Linux, systemd 247+, `/dev/net/tun`, and a binary for the target CPU architecture. It does not open firewall ports. For multiple networks on one host, use a distinct `--instance`, `--bind-address`, and `--status-listen` port for each instance. For rollback, stop/disable the instance with `sudo systemctl disable --now mini-tunnel-peer@office.service`; its identity and membership remain under `/var/lib/mini-tunnel`, and its config remains under `/etc/mini-tunnel` so a stopped deployment can be inspected or restarted.
 
+## Uninstall one Linux peer
+
+The installer places `/usr/local/lib/mini-tunnel/uninstall-peer.sh` on the host. The default operation stops and disables only the selected systemd instance and removes its environment file and per-instance Coordinator CA. It preserves the shared executable, service account, device identity, and all joined-network membership files. The Coordinator membership is not revoked by local uninstall; revoke the device separately with an administrator token.
+
+```sh
+sudo /usr/local/lib/mini-tunnel/uninstall-peer.sh --instance office
+```
+
+Use `--dry-run` to inspect the target paths first. If the local membership for this network should also be removed, pass `--remove-membership`; the command asks for confirmation unless `--yes` is supplied. It removes only that network's local membership JSON and refuses when another configured peer instance uses the same network ID. It never deletes `/var/lib/mini-tunnel` recursively because that shared directory also stores the device identity and can contain Coordinator state. The shared binary and service account are retained for other instances or services.
+
+```sh
+sudo /usr/local/lib/mini-tunnel/uninstall-peer.sh --instance office --dry-run
+sudo /usr/local/lib/mini-tunnel/uninstall-peer.sh --instance office --remove-membership
+```
+
 ## Linux peer mesh service
 
 `mini-tunnel-peer@.service` runs one mesh network per systemd instance under the dedicated `mini-tunnel` account. It enables ICE, configures the selected STUN service, installs only authenticated peer host routes, and restarts the foreground CLI after an unexpected exit. It grants `CAP_NET_ADMIN`, access to `/dev/net/tun`, and the `AF_NETLINK` family required for TUN and route setup. It explicitly removes Coordinator admin, invite, and Relay signing-key variables before starting the peer process.

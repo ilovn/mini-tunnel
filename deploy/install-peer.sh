@@ -87,6 +87,8 @@ fi
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 unit_source="$script_dir/systemd/mini-tunnel-peer@.service"
 [[ -r "$unit_source" ]] || die "peer systemd unit not found next to installer: $unit_source"
+uninstaller_source="$script_dir/uninstall-peer.sh"
+[[ -r "$uninstaller_source" ]] || die "peer uninstaller not found next to installer: $uninstaller_source"
 
 if [[ "$validate_only" == true ]]; then
   printf 'Inputs valid. No files changed; binary=%s network=%s instance=%s\n' "$binary" "$network_id" "$instance"
@@ -113,6 +115,8 @@ install -d -o mini-tunnel -g mini-tunnel -m 0700 /var/lib/mini-tunnel
 install -m 0755 -- "$binary" /usr/local/bin/mini-tunnel.new
 mv -f /usr/local/bin/mini-tunnel.new /usr/local/bin/mini-tunnel
 install -m 0644 -- "$unit_source" /etc/systemd/system/mini-tunnel-peer@.service
+install -d -m 0755 /usr/local/lib/mini-tunnel
+install -m 0755 -- "$uninstaller_source" /usr/local/lib/mini-tunnel/uninstall-peer.sh
 
 ca_runtime_path=
 if [[ -n "$coordinator_ca" ]]; then
@@ -160,5 +164,6 @@ Peer installed and started: $service_name
 Live status: sudo -u mini-tunnel /usr/local/bin/mini-tunnel peer status --url http://${status_listen}
 Logs:        sudo journalctl -fu $service_name
 Stop:        sudo systemctl disable --now $service_name
+Uninstall:   sudo /usr/local/lib/mini-tunnel/uninstall-peer.sh --instance $instance
 Config:      $config_path
 EOF
