@@ -113,11 +113,14 @@ async fn main() -> Result<(), Error> {
             .format(|buf, record| {
                 writeln!(
                     buf,
-                    "{}:{} [{}] {} - {}",
+                    "{}:{} [{}] {:.6} - {}",
                     record.file().unwrap_or("unknown"),
                     record.line().unwrap_or(0),
                     record.level(),
-                    chrono::Local::now().format("%H:%M:%S.%6f"),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs_f64(),
                     record.args()
                 )
             })

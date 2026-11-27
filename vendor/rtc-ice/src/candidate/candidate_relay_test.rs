@@ -28,25 +28,8 @@ impl AuthHandler for OptimisticAuthHandler {
     }
 }
 
-//use std::io::Write;
-
 #[tokio::test]
 async fn test_relay_only_connection() -> Result<(), Error> {
-    /*env_logger::Builder::new()
-    .format(|buf, record| {
-        writeln!(
-            buf,
-            "{}:{} [{}] {} - {}",
-            record.file().unwrap_or("unknown"),
-            record.line().unwrap_or(0),
-            record.level(),
-            chrono::Local::now().format("%H:%M:%S.%6f"),
-            record.args()
-        )
-    })
-    .filter(None, LevelFilter::Trace)
-    .init();*/
-
     let server_listener = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
     let server_port = server_listener.local_addr()?.port();
 

@@ -590,21 +590,6 @@ fn build_msg(c: MessageClass, username: String, key: String) -> Result<Message> 
 
 #[test]
 fn test_inbound_validity() -> Result<()> {
-    /*env_logger::Builder::new()
-    .format(|buf, record| {
-        writeln!(
-            buf,
-            "{}:{} [{}] {} - {}",
-            record.file().unwrap_or("unknown"),
-            record.line().unwrap_or(0),
-            record.level(),
-            chrono::Local::now().format("%H:%M:%S.%6f"),
-            record.args()
-        )
-    })
-    .filter(None, LevelFilter::Trace)
-    .init();*/
-
     let remote = SocketAddr::from_str("172.17.0.3:999")?;
     let local: Arc<dyn Candidate + Send + Sync> = Arc::new(
         CandidateHostConfig {
@@ -867,21 +852,6 @@ fn test_invalid_agent_starts() -> Result<()> {
 // Assert that Agent emits Connecting/Connected/Disconnected/Failed/Closed messages
 #[test]
 fn test_connection_state_callback() -> Result<()> {
-    /*env_logger::Builder::new()
-    .format(|buf, record| {
-        writeln!(
-            buf,
-            "{}:{} [{}] {} - {}",
-            record.file().unwrap_or("unknown"),
-            record.line().unwrap_or(0),
-            record.level(),
-            chrono::Local::now().format("%H:%M:%S.%6f"),
-            record.args()
-        )
-    })
-    .filter(None, LevelFilter::Trace)
-    .init();*/
-
     let disconnected_duration = Duration::from_secs(1);
     let failed_duration = Duration::from_secs(1);
     let keepalive_interval = Duration::from_secs(0);
