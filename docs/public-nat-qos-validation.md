@@ -1054,3 +1054,9 @@ After each phase, stop both clients cleanly, verify their peer routes are gone, 
 
 - The `a5617cf` fix passed a new checksum- and Sigstore-verified Linux x86_64 staging artifact test on Guangzhou and domestic NAT. After scoped UDP loss was removed, both endpoints re-nominated direct ICE candidates on the shared UTC cadence, passed authenticated UDP probation, and returned to `QUIC/UDP`. Bidirectional pings passed 20/20 with 0% loss.
 - Both memberships were revoked and addresses released. Temporary test services, routes, firewall rule, timers, binaries, and files were removed. The Guangzhou production Relay PID/ports and both default routes remained unchanged. See [the synchronized recovery test report](testing/direct-recovery-synchronized-domestic-nat-2026-11.md).
+
+### Windows direct-promotion field check (`aef3d5b`, 2026-11-27)
+
+- Staging binaries from [run 45953596363](https://github.com/ilovn/mini-tunnel/actions/runs/45953596363) had verified checksums and Sigstore attestations. The Windows VM joined an isolated Guangzhou test network and passed overlay pings 5/5 in each direction over `Relay/QUIC/UDP`, with 0% loss.
+- Windows ICE did not nominate a direct candidate pair; the new direct-promotion/channel-binding handshake was therefore not exercised. Both configured STUN endpoints were silent in this run. No firewall impairment was applied.
+- Both members, temporary services, routes, adapters, listeners, and files were removed. Windows and Guangzhou default routes and the Guangzhou production Relay were unchanged. See the [detailed Windows test report](testing/windows-nat-udp-probation-2026-11.md).
