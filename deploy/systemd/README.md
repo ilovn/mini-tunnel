@@ -162,6 +162,8 @@ If serving Coordinator HTTPS directly, expose its configured TLS listener instea
 
 Clients initiating connections need outbound HTTPS to the Coordinator, UDP to STUN (if configured), UDP to peer candidates, and TCP to peer candidates or the Relay as used. UDP NAT traversal usually requires no inbound firewall pinhole on the client, but symmetric/firewall-restricted NATs can prevent direct paths; configure relay fallback for those networks. If a peer accepts direct connections behind a router, forward the selected UDP/TCP bind port to that device and advertise the matching public candidate.
 
+The CLI bypasses inherited `HTTP_PROXY`/`HTTPS_PROXY` settings for Coordinator URLs that use loopback, RFC1918/private, link-local, or IPv4-mapped private IP literals, plus `localhost` names. Public Coordinator URLs keep the normal `reqwest` proxy behavior. If a private Coordinator uses a custom DNS name, include that name in `NO_PROXY`/`no_proxy` so system proxy configuration does not send internal traffic to an external proxy.
+
 ## Install
 
 Build a release binary and install it at `/usr/local/bin/mini-tunnel`. Create a dedicated account and configuration directories:

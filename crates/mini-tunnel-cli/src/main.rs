@@ -1,7 +1,7 @@
 use std::{
     fs::File,
     io::{self, Read},
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     process::ExitCode,
     time::{Duration, Instant},
@@ -563,7 +563,7 @@ async fn fetch_coordinator_health(
     url: &str,
 ) -> Result<HealthResponse, Box<dyn std::error::Error + Send + Sync>> {
     let endpoint = format!("{}/healthz", url.trim_end_matches('/'));
-    let response = coordinator_http_client(COORDINATOR_HEALTH_TIMEOUT)?
+    let response = coordinator_http_client(COORDINATOR_HEALTH_TIMEOUT, url)?
         .get(endpoint)
         .send()
         .await?
@@ -2494,7 +2494,7 @@ where
     Response: for<'de> Deserialize<'de>,
 {
     let url = format!("{}{path}", base_url.trim_end_matches('/'));
-    let response = coordinator_http_client(Duration::from_secs(5))?
+    let response = coordinator_http_client(Duration::from_secs(5), base_url)?
         .post(url)
         .json(request)
         .send()
@@ -2518,21 +2518,94 @@ where
 
 fn coordinator_http_client(
     timeout: Duration,
+    coordinator_url: &str,
 ) -> Result<reqwest::Client, Box<dyn std::error::Error + Send + Sync>> {
     let ca_bundle_path = std::env::var_os(COORDINATOR_CA_CERT_FILE_ENV).map(PathBuf::from);
-    coordinator_http_client_with_ca_bundle(timeout, ca_bundle_path.as_deref())
+    coordinator_http_client_with_ca_bundle(timeout, ca_bundle_path.as_deref(), coordinator_url)
 }
 
 fn coordinator_http_client_with_ca_bundle(
     timeout: Duration,
     ca_bundle_path: Option<&Path>,
+    coordinator_url: &str,
 ) -> Result<reqwest::Client, Box<dyn std::error::Error + Send + Sync>> {
-    let mut builder = reqwest::Client::builder().timeout(timeout);
+    let builder = apply_coordinator_proxy_policy(
+        reqwest::Client::builder().timeout(timeout),
+        coordinator_url,
+    );
+    let mut builder = builder;
     if let Some(ca_bundle_path) = ca_bundle_path {
         let certificates = read_coordinator_ca_bundle(ca_bundle_path)?;
         builder = builder.tls_certs_merge(certificates);
     }
     Ok(builder.build()?)
+}
+
+fn apply_coordinator_proxy_policy(
+    builder: reqwest::ClientBuilder,
+    coordinator_url: &str,
+) -> reqwest::ClientBuilder {
+    if coordinator_url_uses_private_endpoint(coordinator_url) {
+        builder.no_proxy()
+    } else {
+        builder
+    }
+}
+
+fn coordinator_url_uses_private_endpoint(coordinator_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(coordinator_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+
+    if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost") {
+        return true;
+    }
+
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => ipv4_is_private_endpoint(address),
+        Ok(IpAddr::V6(address)) => ipv6_is_private_endpoint(address),
+        Err(_) => false,
+    }
+}
+
+fn ipv4_is_private_endpoint(address: Ipv4Addr) -> bool {
+    address.is_private()
+        || address.is_loopback()
+        || address.is_link_local()
+        || address.is_unspecified()
+        || address.is_broadcast()
+}
+
+fn ipv6_is_private_endpoint(address: Ipv6Addr) -> bool {
+    if address.is_loopback() || address.is_unspecified() {
+        return true;
+    }
+
+    let segments = address.segments();
+    // Unique-local fc00::/7 and link-local fe80::/10 addresses are not sent
+    // through ambient HTTP proxies for an internal Coordinator connection.
+    if segments[0] & 0xfe00 == 0xfc00 || segments[0] & 0xffc0 == 0xfe80 {
+        return true;
+    }
+
+    // Treat IPv4-mapped IPv6 literals according to their embedded IPv4 scope.
+    if segments[..5] == [0; 5] && segments[5] == 0xffff {
+        return ipv4_is_private_endpoint(Ipv4Addr::new(
+            (segments[6] >> 8) as u8,
+            segments[6] as u8,
+            (segments[7] >> 8) as u8,
+            segments[7] as u8,
+        ));
+    }
+
+    false
 }
 
 fn read_coordinator_ca_bundle(path: &Path) -> Result<Vec<reqwest::Certificate>, io::Error> {
@@ -6267,6 +6340,129 @@ fn print_tunnel_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coordinator_proxy_policy_bypasses_private_hosts_only() {
+        let direct_urls = [
+            "http://localhost:8080",
+            "http://peer.localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://10.0.20.5:44441",
+            "http://172.16.12.74:8080",
+            "http://192.168.196.130:8080",
+            "http://169.254.1.2:8080",
+            "http://[::1]:8080",
+            "http://[fc00::1]:8080",
+            "http://[fd12:3456::1]:8080",
+            "http://[fe80::1]:8080",
+            "http://[::ffff:10.0.20.5]:8080",
+        ];
+        for url in direct_urls {
+            assert!(
+                coordinator_url_uses_private_endpoint(url),
+                "expected direct Coordinator connection for {url}"
+            );
+        }
+
+        let proxied_urls = [
+            "https://coordinator.example:8443",
+            "https://193.112.165.176:8443",
+            "https://[2001:4860:4860::8888]:8443",
+            "not a URL",
+        ];
+        for url in proxied_urls {
+            assert!(
+                !coordinator_url_uses_private_endpoint(url),
+                "expected existing proxy behavior for {url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_proxy_policy_bypasses_proxy_for_private_urls_and_keeps_it_for_public_urls()
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let coordinator_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind private mock Coordinator");
+        let coordinator_address = coordinator_listener
+            .local_addr()
+            .expect("private Coordinator address");
+        let coordinator = tokio::spawn(async move {
+            let (mut stream, _) = coordinator_listener
+                .accept()
+                .await
+                .expect("accept private Coordinator request");
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await.expect("read request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndirect",
+                )
+                .await
+                .expect("write direct response");
+        });
+
+        let unreachable_proxy =
+            reqwest::Proxy::all("http://127.0.0.1:1").expect("configure unreachable proxy");
+        let private_url = format!("http://{coordinator_address}/healthz");
+        let private_client = apply_coordinator_proxy_policy(
+            reqwest::Client::builder().proxy(unreachable_proxy),
+            &private_url,
+        )
+        .build()
+        .expect("build private Coordinator client");
+        let private_response = private_client
+            .get(&private_url)
+            .send()
+            .await
+            .expect("private Coordinator must bypass the proxy");
+        assert_eq!(
+            private_response.text().await.expect("read response"),
+            "direct"
+        );
+        coordinator.await.expect("join private mock Coordinator");
+
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock HTTP proxy");
+        let proxy_address = proxy_listener.local_addr().expect("proxy address");
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _) = proxy_listener
+                .accept()
+                .await
+                .expect("accept proxied request");
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request).await.expect("read proxy request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nproxied",
+                )
+                .await
+                .expect("write proxy response");
+        });
+
+        let public_url = "http://coordinator.example:8080/healthz";
+        let configured_proxy =
+            reqwest::Proxy::all(format!("http://{proxy_address}")).expect("configure mock proxy");
+        let public_client = apply_coordinator_proxy_policy(
+            reqwest::Client::builder().proxy(configured_proxy),
+            public_url,
+        )
+        .build()
+        .expect("build public Coordinator client");
+        let public_response = public_client
+            .get(public_url)
+            .send()
+            .await
+            .expect("public Coordinator must retain proxy behavior");
+        assert_eq!(
+            public_response.text().await.expect("read proxy response"),
+            "proxied"
+        );
+        proxy.await.expect("join mock HTTP proxy");
+    }
 
     #[tokio::test]
     async fn relay_race_uses_tcp_when_udp_pairing_stalls() {
