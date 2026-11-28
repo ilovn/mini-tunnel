@@ -250,16 +250,17 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           cargo install cargo-audit --version 0.22.2 --locked
-          # rsa is an unbuilt optional dependency of SQLx's disabled MySQL driver; the advisory has no fix.
-          # libsqlite3-sys is only in Cargo.lock through SQLx's disabled SQLite driver;
-          # SQLx 0.9 would fix it but requires Rust 1.94, above this project's Rust 1.89 MSRV.
-          sqlite_tree="$(cargo tree -i libsqlite3-sys --target all --locked --prefix none 2>/dev/null)"
-          if [ -n "$sqlite_tree" ]; then
-            printf '%s\n' "$sqlite_tree"
-            echo 'The SQLite driver became active; remove its advisory exception and resolve the vulnerability.' >&2
-            exit 1
-          fi
-          cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459
+          # These two advisories are only present through SQLx's disabled optional drivers.
+          # Keep both drivers outside the active dependency graph while their lockfile entries remain ignored.
+          for driver in sqlx-mysql sqlx-sqlite; do
+            driver_tree="$(cargo tree -i "$driver" --target all --locked --prefix none 2>/dev/null)"
+            if [ -n "$driver_tree" ]; then
+              printf '%s\n' "$driver_tree"
+              echo "The $driver became active; remove its advisory exception and resolve its vulnerability." >&2
+              exit 1
+            fi
+          done
+          cargo audit --deny warnings --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459
 
       - name: Validate Prometheus rules
         if: runner.os == 'Linux'
