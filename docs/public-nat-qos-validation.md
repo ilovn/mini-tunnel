@@ -2,6 +2,12 @@
 
 Status: **public NAT/QoS matrix incomplete**. The loopback ICE mapping proxy verifies packet rewriting and session behavior, but it does not establish interoperability across public NATs. The VPS, domestic NAT, Windows, and cross-border runs below are individual topology samples; they do not complete the broader NAT/QoS matrix.
 
+### Exact-main direct fallback and recovery on nested domestic NAT (2026-11-28)
+
+- The attestation-verified Linux x86_64 artifact for `91fe96a010ec6a3608b5a1e7c8a3cb08bd052f0f` established online `QUIC/UDP`, switched to authenticated `Relay/TLS` under one UDP rule scoped to the test socket, then recovered to `QUIC/UDP` after that rule was removed. Both phases passed 20/20 overlay pings in each direction with 0% loss.
+- While on TCP Relay, metrics showed one active session and 32,088 forwarded bytes; handshake, pairing, and timeout failures were zero. UDP Relay remained unused. After recovery, Relay connections/sessions drained to zero.
+- This test ran over the existing domestic soak tunnel as its underlay. It proves path failover/recovery on a nested path, not independent public NAT traversal. All temporary test resources were removed and the soak timers/routes/services remained intact. See the [detailed report](testing/domestic-nat-direct-fallback-recovery-91fe96a-2026-11.md).
+
 ### Windows UDP-blocked TCP Relay fallback on current main (2026-11-27)
 
 - Windows x64 and Linux x86_64 release-staging artifacts from [run 46015015506](https://github.com/ilovn/mini-tunnel/actions/runs/46015015506), built from `14ecdca2429893d913625747d59377208c9e16b9`, passed SHA-256 and GitHub Sigstore provenance checks. No endpoint built from source and the release publish job was skipped.
